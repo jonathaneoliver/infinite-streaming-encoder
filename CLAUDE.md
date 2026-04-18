@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Go HTTP server + single-page UI that wraps ABR (adaptive bitrate) video encoding scripts. The Go code is a thin control plane — the actual encoding work lives in the bash/python scripts under `scripts/`, each run in its own **detached sibling Docker container** (so encodes survive a restart of the server's own container). The server submits encode jobs, tails their stdout via `docker logs -f` into a log buffer, and exposes a web UI for browsing sources, kicking off jobs, and playing back the resulting HLS output.
+A Go HTTP server + single-page UI that drives video encoding. The Go code is a thin control plane — the actual encoding work lives in the Python package under `scripts/encoder/`, each run in its own **detached sibling Docker container** (so encodes survive a restart of the server's own container). The server submits encode jobs, tails their stdout via `docker logs -f` into a log buffer, and exposes a web UI for browsing sources, kicking off jobs, and playing back the resulting HLS output.
 
 No tests exist in this repo — do not invent a test command.
 
@@ -58,7 +58,7 @@ Two key naming/skip conventions in this file:
 - `JobConfig.OutputStem(filename)` — `<stem>_p<partialMs>[_padblack|_padpink]`. The encoding script then appends `_<codec>` to produce the final output dir name (e.g. `myclip_p200_h264`). The watcher and `parseOutputMeta` both rely on this layout.
 - `Manager.resolveCodec` — before encoding, checks which `<stem>_h264` / `_hevc` / `_av1` dirs already exist in `OutputDir` and narrows the codec flag to only the missing ones. Returns `""` → skip this file entirely. Bypassed when `ForceReencode=true`.
 
-The worker container's entrypoint is overridden to `scripts/create_abr_ladder.sh` (local) or `scripts/cloud_encode.sh` (cloud). Cloud workers additionally receive `HOST_AWS_DIR` as `/root/.aws:ro` and the AWS/GHCR env vars listed in `cloudEnvPassthrough`. Stdout is line-scanned into `job.logLines` (capped at 1000 lines, trimmed to last 500) and the latest line (ANSI-stripped) becomes `job.Progress`, which the SSE stream surfaces live.
+The worker container's entrypoint is overridden to `scripts/encoder/cli_local.py` (local) or `scripts/encoder/cli_cloud.py` (cloud). Cloud workers additionally receive `HOST_AWS_DIR` as `/root/.aws:ro` and the AWS/GHCR env vars listed in `cloudEnvPassthrough`. Stdout is line-scanned into `job.logLines` (capped at 1000 lines, trimmed to last 500) and the latest line (ANSI-stripped) becomes `job.Progress`, which the SSE stream surfaces live.
 
 **`internal/api/handlers.go`** — the HTTP surface. Routes defined in `NewServer`:
 - JSON API: `GET /api/sources`, `GET/POST` under `/api/encode`, `/api/jobs`, `/api/jobs/{id}/logs`, `/api/outputs`, `/api/outputs/{name}`, `/api/outputs/{name}/playlists`, `/api/outputs/{name}/logs`.
@@ -70,7 +70,26 @@ The worker container's entrypoint is overridden to `scripts/create_abr_ladder.sh
 
 **`internal/watcher/watcher.go`** — polls `SourceDir` on `watch-interval` (default 30s). A file is auto-submitted when: (1) it's been seen before, (2) its size hasn't changed since last scan (ensures write is complete), (3) `alreadyEncoded` returns false. `alreadyEncoded` checks both in-memory jobs and `OutputDir` for any dir matching `<stem>_*` — so deleting an output dir triggers re-encode on next scan without needing a restart. First scan after startup only seeds `seen` and does not submit.
 
-**`scripts/`** — the real encoder. Edits here affect encode behavior without touching Go code. `create_abr_ladder.sh` handles local ffmpeg + Shaka Packager encoding; `cloud_encode.sh` uploads to S3, launches a spot EC2 instance with user-data that runs the same encode inside a container from GHCR, then syncs results back.
+**`scripts/encoder/`** — the real encoder, as a Python package. Edits here affect encode behavior without touching Go. Orchestrators:
+- `cli_local.py` — local pipeline entry. Runs input probe, mezzanine stream-copy, variant encodes (per codec × resolution), audio extract, Shaka Packager DASH, fragment byteranges, LL-HLS playlists, and optional TS HLS.
+- `cli_cloud.py` — cloud pipeline entry. Uploads inputs to S3, launches a spot EC2 instance (with AZ + instance-type fallback on InsufficientInstanceCapacity), polls for `_DONE`/`_FAILED` markers, syncs outputs back. Uses boto3.
+
+Supporting modules (all stdlib-only except `cloud/*` which uses boto3):
+- `ffprobe.py` — structured ffprobe wrapper; fps as `Fraction` for exact GOP math.
+- `mezzanine.py`, `audio.py`, `encode_variants.py`, `packager.py`, `hls.py` — one per phase; each exposes a pure builder for its ffmpeg/packager argv plus a function that runs the subprocess.
+- `ladder.py` — 6-tier bitrate table × 3 codecs + `--bitrate-override-*` parsing.
+- `gop.py` — `KEYINT = round(fps × gop_s)`, min 1, on Fraction fps.
+- `padding.py` — LCM-based segment-boundary padding; 0.5s skip-threshold.
+- `burnin.py` — 5-layer drawtext filter (timecode, rate, codec+res+fps, encoder, watermark) + optional PADDING label on padded frames only.
+- `vmaf.py` — CSV lookup with linear interpolation; no-op when CSV absent.
+- `manifests.py` — folds the former `convert_to_segmentlist.py` (DASH SegmentTemplate → SegmentList) and an HLS master/variant generator.
+- `fragments.py` — fMP4 box walker producing `.byteranges` sidecars for EXT-X-PART. Reimplementation of the external `parse_fmp4_fragments.py` (not in the original repo) using stdlib `struct` only.
+- `resume.py` — scans a temp dir for `{codec}_{res}.mp4` files, used by `--resume-package-from` to skip phases 1-4.
+- `cloud/` — boto3-backed subpackage: `aws.py` (client factory + STS preflight), `launch.py` (spot run-instances + fallback), `userdata.py` (remote bash template, shlex-quoted), `poll.py` (S3 marker polling), `sync.py` (idempotent upload + paginated download).
+
+Hardware encoding (VideoToolbox `--force-hardware`) was intentionally dropped in the rewrite — it only works on macOS hosts, not Linux workers.
+
+The EC2 user-data itself is still bash (it runs on the remote instance) — `cloud/userdata.py` renders it as a template string. The remote still calls `/generate_abr/create_abr_ladder.sh` from the `ghcr.io/jonathaneoliver/infinite-streaming` image; replacing that remote image with the Python one is a separate concern.
 
 **`static/index.html`** — a single self-contained HTML file (vanilla JS, no build step). Served directly by the Go file server. It polls `/api/jobs/stream` for live updates and plays HLS via hls.js pointed at `/content/<dir>/<playlist>.m3u8`.
 
