@@ -5,14 +5,16 @@ export
 IMAGE_NAME ?= encoder
 CONTAINER_NAME ?= encoder
 PORT ?= 8080
-SOURCE_DIR ?= /Volumes/4TB/media/originals
-OUTPUT_DIR ?= /Volumes/4TB/media/dynamic_content
-TMP_DIR ?= /Volumes/4TB/media/tmp
+
+require-paths:
+	@: $${SOURCE_DIR:?SOURCE_DIR is not set — create a .env (see .env.example)}
+	@: $${OUTPUT_DIR:?OUTPUT_DIR is not set — create a .env (see .env.example)}
+	@: $${TMP_DIR:?TMP_DIR is not set — create a .env (see .env.example)}
 
 build:
 	docker build -t $(IMAGE_NAME) .
 
-run: build
+run: require-paths build
 	docker run --rm -d \
 		--name $(CONTAINER_NAME) \
 		-p $(PORT):8080 \
@@ -25,6 +27,11 @@ run: build
 		-e OUTPUT_DIR=/media/dynamic_content \
 		-e TMP_DIR=/media/tmp \
 		-e SCRIPTS_DIR=/app/scripts \
+		-e HOST_SOURCE_DIR=$(SOURCE_DIR) \
+		-e HOST_OUTPUT_DIR=$(OUTPUT_DIR) \
+		-e HOST_TMP_DIR=$(TMP_DIR) \
+		-e HOST_AWS_DIR=$(HOME)/.aws \
+		-e ENCODER_IMAGE=$(IMAGE_NAME) \
 		-e AUTO_WATCH=$(AUTO_WATCH) \
 		-e DEFAULT_TARGET=$(DEFAULT_TARGET) \
 		-e DEFAULT_CODEC=$(DEFAULT_CODEC) \

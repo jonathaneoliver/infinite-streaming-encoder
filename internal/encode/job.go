@@ -2,6 +2,7 @@ package encode
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -84,29 +85,63 @@ type Manager struct {
 	mu   sync.Mutex
 	jobs []*Job
 
-	SourceDir    string
-	OutputDir    string
-	TmpDir       string
-	ScriptsDir   string
-	DockerImage  string
+	SourceDir   string
+	OutputDir   string
+	TmpDir      string
+	ScriptsDir  string
+	DockerImage string
+
+	// Host-side paths (as the Docker daemon sees them) for bind-mounting into
+	// worker containers. When the Go server is itself inside a container,
+	// `-v SourceDir:...` would refer to the wrong path because `docker run`
+	// bind mounts are resolved by the daemon against the host filesystem.
+	HostSourceDir string
+	HostOutputDir string
+	HostTmpDir    string
+	HostAWSDir    string
+
+	// Image used for detached worker containers.
+	EncoderImage string
 
 	sem         chan struct{}
 	subscribers []chan *Job
 	subMu       sync.Mutex
 }
 
-func NewManager(sourceDir, outputDir, tmpDir, scriptsDir, dockerImage string, maxConcurrent int) *Manager {
-	if maxConcurrent < 1 {
-		maxConcurrent = 1
+type ManagerConfig struct {
+	SourceDir     string
+	OutputDir     string
+	TmpDir        string
+	ScriptsDir    string
+	DockerImage   string
+	HostSourceDir string
+	HostOutputDir string
+	HostTmpDir    string
+	HostAWSDir    string
+	EncoderImage  string
+	MaxConcurrent int
+}
+
+func NewManager(cfg ManagerConfig) *Manager {
+	if cfg.MaxConcurrent < 1 {
+		cfg.MaxConcurrent = 1
 	}
-	os.MkdirAll(tmpDir, 0755)
+	if cfg.EncoderImage == "" {
+		cfg.EncoderImage = "encoder:latest"
+	}
+	os.MkdirAll(cfg.TmpDir, 0755)
 	return &Manager{
-		SourceDir:   sourceDir,
-		OutputDir:   outputDir,
-		TmpDir:      tmpDir,
-		ScriptsDir:  scriptsDir,
-		DockerImage: dockerImage,
-		sem:         make(chan struct{}, maxConcurrent),
+		SourceDir:     cfg.SourceDir,
+		OutputDir:     cfg.OutputDir,
+		TmpDir:        cfg.TmpDir,
+		ScriptsDir:    cfg.ScriptsDir,
+		DockerImage:   cfg.DockerImage,
+		HostSourceDir: cfg.HostSourceDir,
+		HostOutputDir: cfg.HostOutputDir,
+		HostTmpDir:    cfg.HostTmpDir,
+		HostAWSDir:    cfg.HostAWSDir,
+		EncoderImage:  cfg.EncoderImage,
+		sem:           make(chan struct{}, cfg.MaxConcurrent),
 	}
 }
 
@@ -171,20 +206,29 @@ func (m *Manager) Submit(cfg JobConfig) *Job {
 	m.mu.Lock()
 	m.jobs = append(m.jobs, job)
 	m.mu.Unlock()
+	m.persistState(job, 0)
 	m.notify(job)
 
-	go m.run(job)
+	go m.run(job, 0)
 	return job
 }
 
-func (m *Manager) run(job *Job) {
-	job.Progress = "waiting for slot"
+func (m *Manager) run(job *Job, startIdx int) {
+	if startIdx == 0 {
+		job.Progress = "waiting for slot"
+	} else {
+		job.Progress = fmt.Sprintf("resuming at file %d/%d", startIdx+1, len(job.Config.Files))
+	}
 	m.notify(job)
 	m.sem <- struct{}{}
 	defer func() { <-m.sem }()
 
 	job.Status = StatusRunning
-	job.Progress = "starting"
+	if startIdx == 0 {
+		job.Progress = "starting"
+	} else {
+		job.Progress = fmt.Sprintf("resumed at file %d/%d", startIdx+1, len(job.Config.Files))
+	}
 	m.notify(job)
 
 	// Encode into TmpDir so partial output never appears in OutputDir.
@@ -192,12 +236,12 @@ func (m *Manager) run(job *Job) {
 	jobTmpDir := filepath.Join(m.TmpDir, job.ID)
 	os.MkdirAll(jobTmpDir, 0755)
 
-	var err error
+	script := filepath.Join(m.ScriptsDir, "create_abr_ladder.sh")
 	if job.Config.Target == TargetCloud {
-		err = m.runCloud(job, jobTmpDir)
-	} else {
-		err = m.runLocal(job, jobTmpDir)
+		script = filepath.Join(m.ScriptsDir, "cloud_encode.sh")
 	}
+
+	err := m.encodeFilesFrom(job, jobTmpDir, script, startIdx)
 
 	now := time.Now()
 	job.EndedAt = &now
@@ -218,6 +262,7 @@ func (m *Manager) run(job *Job) {
 		}
 	}
 	os.RemoveAll(jobTmpDir)
+	m.removePersistedState(job.ID)
 	m.writeHistory(job)
 	m.notify(job)
 }
@@ -395,16 +440,11 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	return args
 }
 
-func (m *Manager) runCloud(job *Job, tmpDir string) error {
-	return m.encodeFiles(job, tmpDir, m.ScriptsDir+"/cloud_encode.sh")
-}
+func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int) error {
+	for i := startIdx; i < len(job.Config.Files); i++ {
+		m.persistState(job, i)
 
-func (m *Manager) runLocal(job *Job, tmpDir string) error {
-	return m.encodeFiles(job, tmpDir, m.ScriptsDir+"/create_abr_ladder.sh")
-}
-
-func (m *Manager) encodeFiles(job *Job, tmpDir, script string) error {
-	for i, f := range job.Config.Files {
+		f := job.Config.Files[i]
 		job.Progress = fmt.Sprintf("encoding %d/%d: %s", i+1, len(job.Config.Files), f)
 		m.notify(job)
 
@@ -420,7 +460,7 @@ func (m *Manager) encodeFiles(job *Job, tmpDir, script string) error {
 		fileCfg := job.Config
 		fileCfg.Codec = codec
 		args := fileCfg.encodeArgsForFile(m.SourceDir, tmpDir, f)
-		if err := m.execScript(job, script, args); err != nil {
+		if err := m.runFileContainer(job, i, script, args); err != nil {
 			return fmt.Errorf("%s: %w", f, err)
 		}
 	}
@@ -483,18 +523,90 @@ func dirExistsWithFiles(path string) bool {
 	return false
 }
 
-func (m *Manager) execScript(job *Job, script string, args []string) error {
-	cmd := exec.Command(script, args...)
-	cmd.Dir = m.OutputDir
+// workerName is the deterministic docker container name for a given job+file.
+// Reconciliation on startup relies on this being stable so we can reattach to
+// a worker that was still running when the server died.
+func workerName(jobID string, fileIdx int) string {
+	return fmt.Sprintf("encoder_job_%s_f%d", jobID, fileIdx)
+}
 
-	stdout, err := cmd.StdoutPipe()
+// runFileContainer encodes one file in a detached sibling container.
+// If a container with the expected name already exists (reconciliation path
+// after a server restart), it re-attaches to it instead of creating a new one.
+func (m *Manager) runFileContainer(job *Job, fileIdx int, script string, args []string) error {
+	name := workerName(job.ID, fileIdx)
+
+	exists, _, err := containerState(name)
 	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
+		return fmt.Errorf("inspect %s: %w", name, err)
 	}
-	cmd.Stderr = cmd.Stdout
 
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start: %w", err)
+	if !exists {
+		runArgs := m.buildRunArgs(job, name, script, args)
+		out, err := exec.Command("docker", runArgs...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("docker run %s: %w: %s", name, err, strings.TrimSpace(string(out)))
+		}
+		job.AppendLog(fmt.Sprintf("launched worker container %s", name))
+	} else {
+		job.AppendLog(fmt.Sprintf("reattaching to worker container %s", name))
+	}
+	m.notify(job)
+
+	return m.attachAndWait(job, name)
+}
+
+func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []string) []string {
+	runArgs := []string{
+		"run", "-d",
+		"--name", name,
+		"--label", "encoder.job_id=" + job.ID,
+		"--label", "encoder.role=encode-worker",
+		"--label", fmt.Sprintf("encoder.target=%s", job.Config.Target),
+		"-v", m.HostSourceDir + ":" + m.SourceDir + ":ro",
+		"-v", m.HostOutputDir + ":" + m.OutputDir,
+		"-v", m.HostTmpDir + ":" + m.TmpDir,
+		"--entrypoint", script,
+	}
+	// Cloud jobs drive AWS from inside the worker; pass the credentials
+	// directory and the AWS / GHCR env vars the wrapper expects.
+	if job.Config.Target == TargetCloud {
+		if m.HostAWSDir != "" {
+			runArgs = append(runArgs, "-v", m.HostAWSDir+":/root/.aws:ro")
+		}
+		for _, key := range cloudEnvPassthrough {
+			if v := os.Getenv(key); v != "" {
+				runArgs = append(runArgs, "-e", key+"="+v)
+			}
+		}
+	}
+	runArgs = append(runArgs, m.EncoderImage)
+	runArgs = append(runArgs, scriptArgs...)
+	return runArgs
+}
+
+var cloudEnvPassthrough = []string{
+	"AWS_REGION", "AWS_PROFILE",
+	"S3_BUCKET",
+	"INSTANCE_TYPE", "INSTANCE_TYPE_FALLBACKS",
+	"USE_SPOT", "AMI_ID",
+	"SUBNET_ID", "SECURITY_GROUP_ID", "INSTANCE_PROFILE",
+	"GHCR_USERNAME", "GHCR_PAT",
+	"DOCKER_IMAGE",
+}
+
+// attachAndWait streams the worker container's logs into the job log buffer
+// and blocks until the container exits. Returns an error if the container
+// exited with a non-zero status. The container itself is removed after exit.
+func (m *Manager) attachAndWait(job *Job, name string) error {
+	logs := exec.Command("docker", "logs", "-f", name)
+	stdout, err := logs.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("logs pipe: %w", err)
+	}
+	logs.Stderr = logs.Stdout
+	if err := logs.Start(); err != nil {
+		return fmt.Errorf("docker logs start: %w", err)
 	}
 
 	scanner := bufio.NewScanner(stdout)
@@ -505,6 +617,123 @@ func (m *Manager) execScript(job *Job, script string, args []string) error {
 		job.Progress = stripANSI(line)
 		m.notify(job)
 	}
+	logs.Wait()
 
-	return cmd.Wait()
+	exitCode, err := containerExitCode(name)
+	// Remove the worker regardless of exit outcome.
+	exec.Command("docker", "rm", "-f", name).Run()
+
+	if err != nil {
+		return fmt.Errorf("inspect exit code: %w", err)
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("worker exited with code %d", exitCode)
+	}
+	return nil
+}
+
+// containerState reports whether a container with the given name exists and,
+// if it does, whether it is currently running.
+func containerState(name string) (exists bool, running bool, err error) {
+	out, runErr := exec.Command("docker", "inspect",
+		"-f", "{{.State.Running}}", name).Output()
+	if runErr != nil {
+		// `docker inspect` exits non-zero when the container doesn't exist;
+		// distinguishing "not found" from a real daemon error would require
+		// parsing stderr, which isn't worth it here — treat non-zero as absent.
+		return false, false, nil
+	}
+	return true, strings.TrimSpace(string(out)) == "true", nil
+}
+
+func containerExitCode(name string) (int, error) {
+	out, err := exec.Command("docker", "inspect",
+		"-f", "{{.State.ExitCode}}", name).Output()
+	if err != nil {
+		return -1, err
+	}
+	code := 0
+	fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &code)
+	return code, nil
+}
+
+// persistedState is written to $TmpDir/jobs/<id>.json while a job is active.
+// Its presence on startup marks a job we need to reconcile; CurrentFileIdx
+// tells us where the loop was when the server died.
+type persistedState struct {
+	ID             string    `json:"id"`
+	Config         JobConfig `json:"config"`
+	StartedAt      time.Time `json:"started_at"`
+	CurrentFileIdx int       `json:"current_file_idx"`
+}
+
+func (m *Manager) statePath(jobID string) string {
+	return filepath.Join(m.TmpDir, "jobs", jobID+".json")
+}
+
+func (m *Manager) persistState(job *Job, fileIdx int) {
+	os.MkdirAll(filepath.Join(m.TmpDir, "jobs"), 0755)
+	data, err := json.Marshal(persistedState{
+		ID:             job.ID,
+		Config:         job.Config,
+		StartedAt:      job.StartedAt,
+		CurrentFileIdx: fileIdx,
+	})
+	if err != nil {
+		return
+	}
+	os.WriteFile(m.statePath(job.ID), data, 0644)
+}
+
+func (m *Manager) removePersistedState(jobID string) {
+	os.Remove(m.statePath(jobID))
+}
+
+func (m *Manager) loadPersistedStates() []persistedState {
+	entries, err := os.ReadDir(filepath.Join(m.TmpDir, "jobs"))
+	if err != nil {
+		return nil
+	}
+	var out []persistedState
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(m.TmpDir, "jobs", e.Name()))
+		if err != nil {
+			continue
+		}
+		var s persistedState
+		if err := json.Unmarshal(data, &s); err != nil {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// Reconcile rebuilds in-memory jobs from persisted state files and resumes
+// them. For each job, the starting file index is taken from the state file;
+// if a worker container still exists for that file (running or already
+// exited), runFileContainer will reattach via `docker logs -f` rather than
+// launching a duplicate.
+//
+// Call this before accepting new submissions — it re-pushes jobs into the
+// semaphore just like Submit would, so concurrency limits still apply.
+func (m *Manager) Reconcile() {
+	states := m.loadPersistedStates()
+	for _, s := range states {
+		job := &Job{
+			ID:        s.ID,
+			Config:    s.Config,
+			Status:    StatusQueued,
+			StartedAt: s.StartedAt,
+			Progress:  "resuming after restart",
+		}
+		m.mu.Lock()
+		m.jobs = append(m.jobs, job)
+		m.mu.Unlock()
+		m.notify(job)
+		go m.run(job, s.CurrentFileIdx)
+	}
 }

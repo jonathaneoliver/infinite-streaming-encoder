@@ -39,6 +39,14 @@ func main() {
 	tmpDir := flag.String("tmp-dir", env("TMP_DIR", "/media/tmp"), "temporary directory for in-progress encodes")
 	scriptsDir := flag.String("scripts-dir", env("SCRIPTS_DIR", "/scripts"), "directory containing encode scripts")
 	dockerImage := flag.String("docker-image", env("DOCKER_IMAGE", "ghcr.io/jonathaneoliver/infinite-streaming:latest"), "Docker image for local encoding")
+	// Host-side paths for bind-mounting into sibling worker containers.
+	// `docker run -v` from inside a container resolves paths against the
+	// host daemon, so the in-container paths above aren't usable there.
+	hostSourceDir := flag.String("host-source-dir", env("HOST_SOURCE_DIR", ""), "host path for SourceDir (for worker container mounts)")
+	hostOutputDir := flag.String("host-output-dir", env("HOST_OUTPUT_DIR", ""), "host path for OutputDir")
+	hostTmpDir := flag.String("host-tmp-dir", env("HOST_TMP_DIR", ""), "host path for TmpDir")
+	hostAWSDir := flag.String("host-aws-dir", env("HOST_AWS_DIR", ""), "host path for ~/.aws (cloud jobs only)")
+	encoderImage := flag.String("encoder-image", env("ENCODER_IMAGE", "encoder:latest"), "image used for worker containers")
 	autoWatch := flag.Bool("auto-watch", env("AUTO_WATCH", "true") == "true", "auto-encode new files in source dir")
 	watchInterval := flag.Duration("watch-interval", 30*time.Second, "filesystem watch polling interval")
 	defaultTarget := flag.String("default-target", env("DEFAULT_TARGET", "local"), "default encode target: cloud or local")
@@ -47,7 +55,20 @@ func main() {
 	maxConcurrent := flag.Int("max-concurrent", intEnv("MAX_CONCURRENT", 1), "max concurrent encode jobs")
 	flag.Parse()
 
-	mgr := encode.NewManager(*sourceDir, *outputDir, *tmpDir, *scriptsDir, *dockerImage, *maxConcurrent)
+	mgr := encode.NewManager(encode.ManagerConfig{
+		SourceDir:     *sourceDir,
+		OutputDir:     *outputDir,
+		TmpDir:        *tmpDir,
+		ScriptsDir:    *scriptsDir,
+		DockerImage:   *dockerImage,
+		HostSourceDir: *hostSourceDir,
+		HostOutputDir: *hostOutputDir,
+		HostTmpDir:    *hostTmpDir,
+		HostAWSDir:    *hostAWSDir,
+		EncoderImage:  *encoderImage,
+		MaxConcurrent: *maxConcurrent,
+	})
+	mgr.Reconcile()
 
 	if *autoWatch {
 		defaults := encode.JobConfig{

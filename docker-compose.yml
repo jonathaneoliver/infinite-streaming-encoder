@@ -5,11 +5,11 @@ services:
       - "8080:8080"
     volumes:
       # Source videos — read-only, the app browses this directory
-      - ${SOURCE_DIR:-/Volumes/4TB/media/originals}:/media/originals:ro
+      - ${SOURCE_DIR:?SOURCE_DIR must be set in .env}:/media/originals:ro
       # Encoded output — read-write
-      - ${OUTPUT_DIR:-/Volumes/4TB/media/dynamic_content}:/media/dynamic_content
+      - ${OUTPUT_DIR:?OUTPUT_DIR must be set in .env}:/media/dynamic_content
       # Temporary directory for in-progress encodes
-      - ${TMP_DIR:-/Volumes/4TB/media/tmp}:/media/tmp
+      - ${TMP_DIR:?TMP_DIR must be set in .env}:/media/tmp
       # Docker socket — needed for local encoding via docker run
       - /var/run/docker.sock:/var/run/docker.sock
       # AWS credentials — needed for cloud encoding
@@ -19,6 +19,13 @@ services:
       - OUTPUT_DIR=/media/dynamic_content
       - TMP_DIR=/media/tmp
       - SCRIPTS_DIR=/app/scripts
+      # Host-side paths — needed when spawning sibling worker containers, since
+      # `docker run -v` resolves against the host filesystem, not this container.
+      - HOST_SOURCE_DIR=${SOURCE_DIR}
+      - HOST_OUTPUT_DIR=${OUTPUT_DIR}
+      - HOST_TMP_DIR=${TMP_DIR}
+      - HOST_AWS_DIR=${HOME}/.aws
+      - ENCODER_IMAGE=${ENCODER_IMAGE:-encoder:latest}
       - DOCKER_IMAGE=${DOCKER_IMAGE:-ghcr.io/jonathaneoliver/infinite-streaming:latest}
       - AUTO_WATCH=${AUTO_WATCH:-true}
       - DEFAULT_TARGET=${DEFAULT_TARGET:-local}
