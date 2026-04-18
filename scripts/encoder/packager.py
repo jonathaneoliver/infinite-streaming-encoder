@@ -15,6 +15,7 @@ used by the caller today.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,8 +88,13 @@ def package(spec: PackageSpec) -> Path:
         (spec.output_dir / "audio").mkdir(exist_ok=True)
 
     cmd = build_packager_cmd(spec)
+    # Shaka Packager writes intermediate files (packager-tempfile-*) under
+    # TMPDIR and then renames to manifest.mpd. If TMPDIR is on a different
+    # filesystem than output_dir, the rename fails with EXDEV. Pin TMPDIR
+    # to the output_dir itself so the rename stays on one filesystem.
+    env = {**os.environ, "TMPDIR": str(spec.output_dir)}
     try:
-        subprocess.run(cmd, check=True, cwd=spec.output_dir)
+        subprocess.run(cmd, check=True, cwd=spec.output_dir, env=env)
     except subprocess.CalledProcessError as e:
         raise PackagerError(f"shaka packager failed ({e.returncode})") from e
 
