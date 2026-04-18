@@ -236,9 +236,9 @@ func (m *Manager) run(job *Job, startIdx int) {
 	jobTmpDir := filepath.Join(m.TmpDir, job.ID)
 	os.MkdirAll(jobTmpDir, 0755)
 
-	script := filepath.Join(m.ScriptsDir, "create_abr_ladder.sh")
+	script := filepath.Join(m.ScriptsDir, "encoder", "cli_local.py")
 	if job.Config.Target == TargetCloud {
-		script = filepath.Join(m.ScriptsDir, "cloud_encode.sh")
+		script = filepath.Join(m.ScriptsDir, "encoder", "cli_cloud.py")
 	}
 
 	err := m.encodeFilesFrom(job, jobTmpDir, script, startIdx)

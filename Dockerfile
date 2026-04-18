@@ -59,7 +59,12 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.
 COPY --from=builder /encoder /usr/local/bin/encoder
 COPY static/ /app/static/
 COPY scripts/ /app/scripts/
-RUN chmod +x /app/scripts/*.sh /app/scripts/*.py 2>/dev/null || true
+RUN chmod +x /app/scripts/*.sh 2>/dev/null || true; \
+    find /app/scripts -name '*.py' -exec chmod +x {} + 2>/dev/null || true
+
+# PYTHONPATH lets `python3 -m encoder.foo` and `from encoder.foo import bar`
+# resolve regardless of the worker container's CWD.
+ENV PYTHONPATH=/app/scripts
 
 WORKDIR /app
 EXPOSE 8080
