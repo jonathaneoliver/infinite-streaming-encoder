@@ -1,0 +1,1017 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Encoder</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
+
+.tabs { display: flex; gap: 0; margin: 20px 0 0; border-bottom: 2px solid #16213e; }
+.tab { padding: 10px 24px; cursor: pointer; color: #888; font-size: 0.95rem; font-weight: 500; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.15s; }
+.tab:hover { color: #ccc; }
+.tab.active { color: #4361ee; border-bottom-color: #4361ee; }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+.panel { background: #16213e; border-radius: 8px; padding: 20px; margin-bottom: 20px; margin-top: 20px; }
+.file-list { max-height: 400px; overflow-y: auto; }
+.file-item { display: flex; align-items: center; padding: 8px 12px; border-radius: 4px; cursor: pointer; }
+.file-item:hover { background: #1a2a4a; }
+.file-item input[type="checkbox"] { margin-right: 12px; accent-color: #4361ee; width: 18px; height: 18px; }
+.file-name { flex: 1; font-family: 'SF Mono', Menlo, monospace; font-size: 0.9rem; cursor: pointer; }
+.btn-play { color: #4361ee; cursor: pointer; font-size: 0.9rem; padding: 4px 8px; border-radius: 4px; margin-left: 8px; }
+.btn-play:hover { background: #1a2a4a; color: #4cc9f0; }
+.file-size { color: #888; font-size: 0.85rem; margin-left: 12px; }
+.file-count { color: #666; font-size: 0.8rem; margin-left: 12px; }
+
+.controls { display: flex; gap: 16px; flex-wrap: wrap; align-items: end; margin-top: 16px; }
+.control-group { display: flex; flex-direction: column; gap: 4px; }
+.control-group label { font-size: 0.75rem; color: #888; text-transform: uppercase; letter-spacing: 1px; }
+.control-group select, .control-group input {
+    background: #0f3460; border: 1px solid #333; color: #e0e0e0; padding: 8px 12px;
+    border-radius: 4px; font-size: 0.9rem; min-width: 120px;
+}
+
+.btn { padding: 10px 24px; border: none; border-radius: 6px; font-size: 0.95rem; cursor: pointer; font-weight: 600; }
+.btn-primary { background: #4361ee; color: #fff; }
+.btn-primary:hover { background: #3a56d4; }
+.btn-primary:disabled { background: #333; color: #666; cursor: not-allowed; }
+.btn-select { padding: 6px 12px; font-size: 0.8rem; background: #0f3460; color: #aaa; border: 1px solid #333; border-radius: 4px; cursor: pointer; }
+.btn-select:hover { background: #1a2a4a; }
+.btn-back { padding: 6px 12px; font-size: 0.8rem; background: none; color: #4361ee; border: none; cursor: pointer; margin-bottom: 12px; }
+.btn-back:hover { text-decoration: underline; }
+
+.job { background: #0f3460; border-radius: 6px; padding: 16px; margin-bottom: 12px; }
+.job-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.job-files { font-family: 'SF Mono', Menlo, monospace; font-size: 0.85rem; }
+.job-meta { font-size: 0.8rem; color: #888; }
+.job-progress { margin-top: 8px; font-family: 'SF Mono', Menlo, monospace; font-size: 0.8rem; color: #4cc9f0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.status-queued { color: #888; }
+.status-running { color: #4cc9f0; }
+.status-done { color: #06d6a0; }
+.status-failed { color: #ef476f; }
+
+.no-files { color: #666; font-style: italic; padding: 20px; text-align: center; }
+.col-header { display: flex; padding: 6px 12px; border-bottom: 1px solid #333; margin-bottom: 4px; font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing: 1px; }
+.col-header span { cursor: pointer; user-select: none; }
+.col-header span:hover { color: #aaa; }
+.col-header .sort-active { color: #4361ee; }
+.col-header .col-name { flex: 1; padding-left: 42px; }
+.col-header .col-size { width: 80px; text-align: right; }
+.col-header .col-date { width: 130px; text-align: right; margin-right: 40px; }
+.output-grid { display: grid !important; grid-template-columns: 24px 1fr 65px 110px 55px 70px 110px 30px; align-items: center; padding: 6px 12px; column-gap: 8px; }
+.output-grid > span { text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.col-header-output { border-bottom: 1px solid #333; margin-bottom: 4px; font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+.col-header-output span { cursor: pointer; user-select: none; }
+.col-header-output span:hover { color: #aaa; }
+.file-date { color: #666; font-size: 0.8rem; }
+.select-actions { display: flex; gap: 8px; margin-bottom: 8px; }
+
+.log-viewer { max-height: 400px; overflow-y: auto; background: #111; padding: 10px; border-radius: 4px; margin-top: 8px; font-family: 'SF Mono', Menlo, monospace; font-size: 0.75rem; color: #aaa; white-space: pre-wrap; display: none; }
+.log-toggle { cursor: pointer; color: #4361ee; font-size: 0.8rem; margin-top: 4px; }
+
+.output-dir { border-radius: 4px; cursor: pointer; border-bottom: 1px solid #0f3460; }
+.output-dir:hover { background: #1a2a4a; }
+.output-dir:last-child { border-bottom: none; }
+.output-dir-name { font-family: 'SF Mono', Menlo, monospace; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.output-dir-stats { color: #888; font-size: 0.8rem; }
+
+.output-file { display: flex; align-items: center; padding: 6px 12px 6px 24px; font-size: 0.85rem; }
+.output-file-icon { margin-right: 10px; color: #666; }
+.output-file-name { flex: 1; font-family: 'SF Mono', Menlo, monospace; }
+
+.summary-bar { display: flex; gap: 24px; padding: 12px 0; color: #888; font-size: 0.85rem; }
+.summary-bar span { display: flex; align-items: center; gap: 6px; }
+.summary-val { color: #e0e0e0; font-weight: 600; }
+
+.badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.5px; margin-right: 4px; }
+.badge-h264 { background: #1a3a5c; color: #4cc9f0; }
+.badge-hevc { background: #1a4a3a; color: #06d6a0; }
+.badge-av1 { background: #4a3a1a; color: #f0c04c; }
+.badge-res { background: #2a2a3e; color: #aaa; }
+.badge-fmp4 { background: #2e1a3e; color: #b08cd6; }
+.badge-ts { background: #3e2e1a; color: #d6a86c; }
+.badge-pad { background: #3e1a1a; color: #d66c6c; }
+.badges { display: flex; gap: 3px; flex-wrap: wrap; align-items: center; }
+
+.filter-bar { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; }
+.filter-bar label { font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing: 1px; }
+.filter-bar select { background: #0f3460; border: 1px solid #333; color: #e0e0e0; padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; }
+
+.ctx-menu { position: fixed; background: #16213e; border: 1px solid #333; border-radius: 6px; padding: 4px 0; z-index: 1000; min-width: 180px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+.ctx-menu-item { padding: 8px 16px; cursor: pointer; font-size: 0.9rem; display: flex; align-items: center; gap: 8px; }
+.ctx-menu-item:hover { background: #1a2a4a; }
+.ctx-menu-separator { height: 1px; background: #333; margin: 4px 0; }
+.ctx-submenu { padding-left: 12px; }
+
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 2000; display: flex; align-items: center; justify-content: center; }
+.dialog { background: #16213e; border-radius: 8px; padding: 24px; max-width: 480px; width: 90vw; }
+.dialog-title { font-size: 1rem; font-weight: 600; color: #fff; margin-bottom: 12px; }
+.dialog-body { font-size: 0.9rem; color: #ccc; margin-bottom: 20px; line-height: 1.5; }
+.dialog-actions { display: flex; gap: 10px; justify-content: flex-end; }
+.dialog-actions .btn { min-width: 80px; text-align: center; }
+.btn-secondary { background: #333; color: #ccc; }
+.btn-secondary:hover { background: #444; }
+.btn-danger { background: #ef476f; color: #fff; }
+.btn-danger:hover { background: #d63a5e; }
+
+.toast-container { position: fixed; bottom: 24px; right: 24px; z-index: 3000; display: flex; flex-direction: column; gap: 8px; }
+.toast { background: #16213e; border: 1px solid #333; border-radius: 6px; padding: 12px 20px; font-size: 0.9rem; color: #e0e0e0; box-shadow: 0 4px 16px rgba(0,0,0,0.5); animation: toastIn 0.2s ease-out; max-width: 400px; }
+.toast-error { border-color: #ef476f; color: #ef476f; }
+.toast-success { border-color: #06d6a0; color: #06d6a0; }
+@keyframes toastIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+.player-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 2000; display: flex; align-items: center; justify-content: center; }
+.player-container { background: #111; border-radius: 8px; padding: 16px; max-width: 1000px; width: 90vw; }
+.player-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.player-title { font-size: 0.95rem; font-family: 'SF Mono', Menlo, monospace; color: #ccc; }
+.player-close { background: none; border: none; color: #888; font-size: 1.5rem; cursor: pointer; padding: 4px 8px; }
+.player-close:hover { color: #fff; }
+.player-video { width: 100%; border-radius: 4px; background: #000; }
+.player-info { margin-top: 8px; font-size: 0.8rem; color: #666; font-family: 'SF Mono', Menlo, monospace; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+</head>
+<body>
+<h1>Encoder</h1>
+
+<div class="tabs">
+    <div class="tab active" onclick="switchTab('originals')">Originals</div>
+    <div class="tab" onclick="switchTab('outputs')">Outputs</div>
+    <div class="tab" onclick="switchTab('jobs')">Jobs</div>
+</div>
+
+<!-- ENCODE TAB -->
+<div id="tab-originals" class="tab-content active">
+    <div class="panel">
+        <h2>Source Files</h2>
+        <div class="select-actions">
+            <button class="btn-select" onclick="selectAll()">Select All</button>
+            <button class="btn-select" onclick="selectNone()">Select None</button>
+            <span id="selected-count" style="color:#888;font-size:0.85rem;line-height:2;margin-left:8px"></span>
+        </div>
+        <div id="file-list" class="file-list">
+            <div class="no-files">Loading...</div>
+        </div>
+
+        <div class="controls">
+            <div class="control-group">
+                <label>Target</label>
+                <select id="target">
+                    <option value="local">Local</option>
+                    <option value="cloud">Cloud (AWS)</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Codec</label>
+                <select id="codec">
+                    <option value="both">Both (H.264 + HEVC)</option>
+                    <option value="h264">H.264 only</option>
+                    <option value="hevc">HEVC only</option>
+                    <option value="av1">AV1 only</option>
+                    <option value="all">All (H.264 + HEVC + AV1)</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Max Resolution</label>
+                <select id="max-res">
+                    <option value="">No limit (all rungs)</option>
+                    <option value="2160p">2160p</option>
+                    <option value="1440p">1440p</option>
+                    <option value="1080p">1080p</option>
+                    <option value="720p">720p</option>
+                    <option value="540p">540p</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Duration (s)</label>
+                <input type="text" id="time-limit" placeholder="full clip">
+            </div>
+            <div class="control-group">
+                <label>Segment (s)</label>
+                <input type="text" id="segment-duration" placeholder="6" value="6">
+            </div>
+            <div class="control-group">
+                <label>Partial (s)</label>
+                <input type="text" id="partial-duration" placeholder="0.2" value="0.2">
+            </div>
+            <div class="control-group">
+                <label>GOP (s)</label>
+                <input type="text" id="gop-duration" placeholder="1.0" value="1.0">
+            </div>
+            <div class="control-group">
+                <label>HLS Format</label>
+                <select id="hls-format">
+                    <option value="fmp4">fMP4 (default)</option>
+                    <option value="ts">MPEG-TS</option>
+                    <option value="both">Both</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Padding</label>
+                <select id="padding">
+                    <option value="">Off (default)</option>
+                    <option value="black">Black</option>
+                    <option value="pink">Pink</option>
+                </select>
+            </div>
+            <div class="control-group" style="align-self:center;padding-top:16px">
+                <label><input type="checkbox" id="keep-mezzanine" style="width:auto;min-width:auto"> Keep mezzanine</label>
+            </div>
+            <button class="btn btn-primary" id="encode-btn" onclick="startEncode()" disabled>Start Encode</button>
+        </div>
+    </div>
+</div>
+
+<!-- OUTPUTS TAB -->
+<div id="tab-outputs" class="tab-content">
+    <div class="panel">
+        <div id="outputs-header">
+            <h2>Encoded Content</h2>
+        </div>
+        <div class="filter-bar" id="output-filters">
+            <label>Codec</label>
+            <select id="filter-codec" onchange="renderOutputs()">
+                <option value="">All</option>
+                <option value="h264">H.264</option>
+                <option value="hevc">HEVC</option>
+                <option value="av1">AV1</option>
+            </select>
+            <label>Max Res</label>
+            <select id="filter-res" onchange="renderOutputs()">
+                <option value="">All</option>
+                <option value="2160p">2160p</option>
+                <option value="1440p">1440p</option>
+                <option value="1080p">1080p</option>
+                <option value="720p">720p</option>
+                <option value="540p">540p</option>
+                <option value="360p">360p</option>
+            </select>
+            <label>Format</label>
+            <select id="filter-format" onchange="renderOutputs()">
+                <option value="">All</option>
+                <option value="fmp4">fMP4</option>
+                <option value="ts">MPEG-TS</option>
+                <option value="both">Both</option>
+            </select>
+        </div>
+        <div id="outputs-summary" class="summary-bar"></div>
+        <div id="outputs-list" class="file-list">
+            <div class="no-files">Loading...</div>
+        </div>
+    </div>
+</div>
+
+<!-- JOBS TAB -->
+<div id="tab-jobs" class="tab-content">
+    <div class="panel">
+        <h2>Jobs</h2>
+        <div id="jobs-list">
+            <div class="no-files">No jobs yet</div>
+        </div>
+    </div>
+</div>
+
+<div class="toast-container" id="toast-container"></div>
+
+<script>
+let files = [];
+let jobs = {};
+let sourceSort = { key: 'mod_time', asc: false };
+let outputSort = { key: 'mod_time', asc: false };
+
+function formatDate(ms) {
+    if (!ms) return '';
+    const d = new Date(ms);
+    return d.toLocaleString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+function sortIndicator(sort, key) {
+    if (sort.key !== key) return '';
+    return sort.asc ? ' &#9650;' : ' &#9660;';
+}
+
+function sortBy(arr, key, asc) {
+    return arr.slice().sort((a, b) => {
+        let va = a[key], vb = b[key];
+        if (typeof va === 'string') va = va.toLowerCase();
+        if (typeof vb === 'string') vb = vb.toLowerCase();
+        if (va < vb) return asc ? -1 : 1;
+        if (va > vb) return asc ? 1 : -1;
+        return 0;
+    });
+}
+
+function toggleSourceSort(key) {
+    if (sourceSort.key === key) { sourceSort.asc = !sourceSort.asc; }
+    else { sourceSort.key = key; sourceSort.asc = key === 'name'; }
+    renderSources();
+}
+
+function toggleOutputSort(key) {
+    if (outputSort.key === key) { outputSort.asc = !outputSort.asc; }
+    else { outputSort.key = key; outputSort.asc = key === 'name'; }
+    renderOutputs();
+}
+
+// --- Toast + Dialog (replaces alert/confirm) ---
+
+function showToast(message, type = '') {
+    const container = document.getElementById('toast-container');
+    const toast = document.createElement('div');
+    toast.className = 'toast' + (type ? ' toast-' + type : '');
+    toast.textContent = message;
+    container.appendChild(toast);
+    setTimeout(() => { toast.style.opacity = '0'; toast.style.transition = 'opacity 0.3s'; setTimeout(() => toast.remove(), 300); }, 4000);
+}
+
+function showDialog(title, body, actions) {
+    return new Promise(resolve => {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        const html = `
+            <div class="dialog">
+                <div class="dialog-title">${escapeHtml(title)}</div>
+                <div class="dialog-body">${escapeHtml(body)}</div>
+                <div class="dialog-actions" id="dialog-actions"></div>
+            </div>
+        `;
+        overlay.innerHTML = html;
+        document.body.appendChild(overlay);
+
+        const actionsEl = overlay.querySelector('#dialog-actions');
+        actions.forEach(a => {
+            const btn = document.createElement('button');
+            btn.className = 'btn ' + (a.class || 'btn-secondary');
+            btn.textContent = a.label;
+            btn.onclick = () => { overlay.remove(); resolve(a.value); };
+            actionsEl.appendChild(btn);
+        });
+
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) { overlay.remove(); resolve(null); }
+        });
+        document.addEventListener('keydown', function esc(e) {
+            if (e.key === 'Escape') { overlay.remove(); resolve(null); document.removeEventListener('keydown', esc); }
+        });
+    });
+}
+let outputsView = 'list'; // 'list' or 'detail'
+
+function switchTab(name) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    document.querySelector(`.tab-content#tab-${name}`).classList.add('active');
+    document.querySelectorAll('.tab')[['encode','outputs','jobs'].indexOf(name)].classList.add('active');
+    if (name === 'outputs') loadOutputs();
+}
+
+function formatSize(bytes) {
+    if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
+    if (bytes >= 1e6) return (bytes / 1e6).toFixed(0) + ' MB';
+    if (bytes >= 1e3) return (bytes / 1e3).toFixed(0) + ' KB';
+    return bytes + ' B';
+}
+
+function updateSelectedCount() {
+    const checked = document.querySelectorAll('#file-list input:checked').length;
+    document.getElementById('selected-count').textContent = checked ? `${checked} selected` : '';
+    document.getElementById('encode-btn').disabled = checked === 0;
+}
+
+function selectAll() {
+    document.querySelectorAll('#file-list input').forEach(cb => cb.checked = true);
+    updateSelectedCount();
+}
+function selectNone() {
+    document.querySelectorAll('#file-list input').forEach(cb => cb.checked = false);
+    updateSelectedCount();
+}
+
+async function loadSources() {
+    try {
+        const res = await fetch('/api/sources');
+        files = await res.json() || [];
+        renderSources();
+    } catch (e) {
+        document.getElementById('file-list').innerHTML = '<div class="no-files">Failed to load sources</div>';
+    }
+}
+
+function renderSources() {
+    const list = document.getElementById('file-list');
+    if (!files || files.length === 0) {
+        list.innerHTML = '<div class="no-files">No video files found in source directory</div>';
+        return;
+    }
+    const sorted = sortBy(files, sourceSort.key, sourceSort.asc);
+    list.innerHTML = `
+        <div class="col-header">
+            <span class="col-name" onclick="toggleSourceSort('name')">Name${sortIndicator(sourceSort, 'name')}</span>
+            <span class="col-size" onclick="toggleSourceSort('size')">Size${sortIndicator(sourceSort, 'size')}</span>
+            <span class="col-date" onclick="toggleSourceSort('mod_time')">Modified${sortIndicator(sourceSort, 'mod_time')}</span>
+        </div>
+    ` + sorted.map(f => `
+        <div class="file-item" oncontextmenu="showSourceContextMenu(event, '${escapeAttr(f.name)}')">
+            <input type="checkbox" value="${f.name}" onclick="event.stopPropagation(); updateSelectedCount()">
+            <span class="file-name" onclick="this.parentElement.querySelector('input').click()">${f.name}</span>
+            <span class="file-size">${formatSize(f.size)}</span>
+            <span class="file-date">${formatDate(f.mod_time)}</span>
+            <span class="btn-play" onclick="event.stopPropagation(); playSource('${escapeAttr(f.name)}')" title="Play source">&#9654;</span>
+        </div>
+    `).join('');
+    updateSelectedCount();
+}
+
+async function startEncode() {
+    const selected = Array.from(document.querySelectorAll('#file-list input:checked')).map(cb => cb.value);
+    if (selected.length === 0) return;
+
+    const body = {
+        files: selected,
+        target: document.getElementById('target').value,
+        codec: document.getElementById('codec').value,
+        max_res: document.getElementById('max-res').value,
+        time: document.getElementById('time-limit').value,
+        segment_duration: document.getElementById('segment-duration').value,
+        partial_duration: document.getElementById('partial-duration').value,
+        gop_duration: document.getElementById('gop-duration').value,
+        hls_format: document.getElementById('hls-format').value,
+        padding: document.getElementById('padding').value,
+        keep_mezzanine: document.getElementById('keep-mezzanine').checked
+    };
+
+    try {
+        const res = await fetch('/api/encode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        if (!res.ok) {
+            const text = await res.text();
+            showToast('Encode failed: ' + text, 'error');
+            return;
+        }
+        selectNone();
+        showToast('Encode started', 'success');
+        switchTab('jobs');
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+// --- Outputs ---
+
+let outputDirs = [];
+
+const resOrder = { '2160p': 6, '1440p': 5, '1080p': 4, '720p': 3, '540p': 2, '360p': 1 };
+
+async function loadOutputs() {
+    try {
+        const res = await fetch('/api/outputs');
+        outputDirs = (await res.json() || []).map(d => ({
+            ...d,
+            max_res: d.resolutions && d.resolutions.length > 0 ? (resOrder[d.resolutions[0]] || 0) : 0
+        }));
+        renderOutputs();
+    } catch (e) {
+        document.getElementById('outputs-list').innerHTML = '<div class="no-files">Failed to load outputs</div>';
+    }
+}
+
+function renderOutputs() {
+    const list = document.getElementById('outputs-list');
+    const summary = document.getElementById('outputs-summary');
+
+    if (!outputDirs || outputDirs.length === 0) {
+        list.innerHTML = '<div class="no-files">No encoded content yet</div>';
+        summary.innerHTML = '';
+        return;
+    }
+
+    // Apply filters
+    const fCodec = document.getElementById('filter-codec').value;
+    const fRes = document.getElementById('filter-res').value;
+    const fFormat = document.getElementById('filter-format').value;
+
+    let filtered = outputDirs.filter(d => {
+        if (fCodec && d.codec !== fCodec) return false;
+        if (fRes && (!d.resolutions || !d.resolutions.includes(fRes))) return false;
+        if (fFormat && d.hls_format !== fFormat) return false;
+        return true;
+    });
+
+    const totalSize = filtered.reduce((s, d) => s + d.size, 0);
+    const totalFiles = filtered.reduce((s, d) => s + d.num_files, 0);
+    const filterNote = filtered.length < outputDirs.length ? ` (filtered from ${outputDirs.length})` : '';
+    summary.innerHTML = `
+        <span><span class="summary-val">${filtered.length}</span> packages${filterNote}</span>
+        <span><span class="summary-val">${totalFiles}</span> files</span>
+        <span><span class="summary-val">${formatSize(totalSize)}</span> total</span>
+    `;
+
+    document.getElementById('outputs-header').innerHTML = '<h2>Encoded Content</h2>';
+    const sorted = sortBy(filtered, outputSort.key, outputSort.asc);
+    list.innerHTML = `
+        <div class="output-grid col-header-output">
+            <span></span>
+            <span onclick="toggleOutputSort('name')">Name${sortIndicator(outputSort, 'name')}</span>
+            <span onclick="toggleOutputSort('codec')">Codec${sortIndicator(outputSort, 'codec')}</span>
+            <span onclick="toggleOutputSort('max_res')">Max Res${sortIndicator(outputSort, 'max_res')}</span>
+            <span onclick="toggleOutputSort('hls_format')">Format${sortIndicator(outputSort, 'hls_format')}</span>
+            <span onclick="toggleOutputSort('size')">Size${sortIndicator(outputSort, 'size')}</span>
+            <span onclick="toggleOutputSort('mod_time')">Modified${sortIndicator(outputSort, 'mod_time')}</span>
+            <span></span>
+        </div>
+    ` + sorted.map(d => `
+        <div class="output-grid output-dir" onclick="loadOutputDetail('${escapeAttr(d.name)}')" oncontextmenu="showContextMenu(event, '${escapeAttr(d.name)}')">
+            <span style="color:#4361ee">&#128193;</span>
+            <span class="output-dir-name">${escapeHtml(d.name)}</span>
+            <span>${renderCodecBadge(d)}</span>
+            <span>${renderResBadges(d)}</span>
+            <span>${renderFormatBadge(d)}</span>
+            <span class="output-dir-stats">${formatSize(d.size)}</span>
+            <span class="file-date">${formatDate(d.mod_time)}</span>
+            <span class="btn-play" onclick="event.stopPropagation(); playOutputMaster('${escapeAttr(d.name)}')" title="Play">&#9654;</span>
+        </div>
+    `).join('');
+}
+
+function renderCodecBadge(d) {
+    if (!d.codec) return '';
+    return `<span class="badge badge-${d.codec}">${d.codec.toUpperCase()}</span>`;
+}
+
+function renderFormatBadge(d) {
+    if (!d.hls_format) return '';
+    return `<span class="badge badge-${d.hls_format === 'both' ? 'fmp4' : d.hls_format}">${d.hls_format}</span>`;
+}
+
+function renderResBadges(d) {
+    let html = '';
+    if (d.resolutions && d.resolutions.length > 0) {
+        html += `<span class="badge badge-res">${d.resolutions[0]}</span>`;
+    }
+    if (d.partial) html += `<span class="badge badge-res">${d.partial}</span>`;
+    if (d.padding) html += `<span class="badge badge-pad">pad:${d.padding}</span>`;
+    return html;
+}
+
+async function loadOutputDetail(name) {
+    try {
+        const res = await fetch('/api/outputs/' + encodeURIComponent(name));
+        const files = await res.json();
+        const list = document.getElementById('outputs-list');
+
+        document.getElementById('outputs-header').innerHTML = `
+            <button class="btn-back" onclick="loadOutputs()">&larr; Back to all outputs</button>
+            <h2>${escapeHtml(name)}</h2>
+        `;
+
+        if (!files || files.length === 0) {
+            list.innerHTML = '<div class="no-files">Empty directory</div>';
+            return;
+        }
+
+        list.innerHTML = files.map(f => `
+            <div class="output-file">
+                <span class="output-file-icon">${f.dir ? '&#128193;' : '&#128196;'}</span>
+                <span class="output-file-name">${escapeHtml(f.name)}</span>
+                <span class="file-size">${formatSize(f.size)}</span>
+            </div>
+        `).join('');
+    } catch (e) {
+        document.getElementById('outputs-list').innerHTML = '<div class="no-files">Failed to load directory</div>';
+    }
+}
+
+// --- Jobs ---
+
+function renderJobs() {
+    const list = document.getElementById('jobs-list');
+    const sorted = Object.values(jobs).sort((a, b) =>
+        new Date(b.started_at) - new Date(a.started_at));
+
+    if (sorted.length === 0) {
+        list.innerHTML = '<div class="no-files">No jobs yet</div>';
+        return;
+    }
+
+    list.innerHTML = sorted.map(j => `
+        <div class="job">
+            <div class="job-header">
+                <div>
+                    <span class="job-files">${(j.config.files || []).join(', ')}</span>
+                    <span class="job-meta"> — ${j.config.target} / ${j.config.codec}${j.config.max_res ? ' / ' + j.config.max_res : ''}</span>
+                </div>
+                <span class="status-${j.status}">${j.status.toUpperCase()}</span>
+            </div>
+            <div class="job-progress">${escapeHtml(j.progress || '')}</div>
+            ${j.error ? '<div style="color:#ef476f;font-size:0.8rem;margin-top:4px">' + escapeHtml(j.error) + '</div>' : ''}
+            <div class="log-toggle" onclick="toggleLog('${j.id}')">Show log</div>
+            <div class="log-viewer" id="log-${j.id}"></div>
+        </div>
+    `).join('');
+}
+
+function escapeHtml(s) {
+    const div = document.createElement('div');
+    div.textContent = s;
+    return div.innerHTML;
+}
+
+function escapeAttr(s) {
+    return s.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+}
+
+async function toggleLog(id) {
+    const el = document.getElementById('log-' + id);
+    if (el.style.display === 'block') {
+        el.style.display = 'none';
+        return;
+    }
+    try {
+        const res = await fetch('/api/jobs/' + id + '/logs');
+        const lines = await res.json();
+        el.textContent = (lines || []).join('\n');
+        el.style.display = 'block';
+        el.scrollTop = el.scrollHeight;
+    } catch (e) {
+        el.textContent = 'Failed to load log';
+        el.style.display = 'block';
+    }
+}
+
+function connectSSE() {
+    const es = new EventSource('/api/jobs/stream');
+    es.onmessage = (e) => {
+        try {
+            const job = JSON.parse(e.data);
+            jobs[job.id] = job;
+            renderJobs();
+        } catch (err) {}
+    };
+    es.onerror = () => {
+        es.close();
+        setTimeout(connectSSE, 3000);
+    };
+}
+
+// --- Context Menu ---
+
+let ctxMenu = null;
+
+function showContextMenu(e, dirName) {
+    e.preventDefault();
+    hideContextMenu();
+
+    ctxMenu = document.createElement('div');
+    ctxMenu.className = 'ctx-menu';
+    ctxMenu.innerHTML = '<div class="ctx-menu-item" style="color:#666;font-size:0.8rem;pointer-events:none">Loading playlists...</div>';
+    ctxMenu.style.left = e.clientX + 'px';
+    ctxMenu.style.top = e.clientY + 'px';
+    document.body.appendChild(ctxMenu);
+
+    // Keep menu in viewport
+    requestAnimationFrame(() => {
+        if (!ctxMenu) return;
+        const rect = ctxMenu.getBoundingClientRect();
+        if (rect.right > window.innerWidth) ctxMenu.style.left = (window.innerWidth - rect.width - 8) + 'px';
+        if (rect.bottom > window.innerHeight) ctxMenu.style.top = (window.innerHeight - rect.height - 8) + 'px';
+    });
+
+    fetch('/api/outputs/' + encodeURIComponent(dirName) + '/playlists')
+        .then(r => r.json())
+        .then(playlists => {
+            if (!ctxMenu) return;
+            if (!playlists || playlists.length === 0) {
+                ctxMenu.innerHTML = '<div class="ctx-menu-item" style="color:#666">No playlists found</div>';
+                return;
+            }
+
+            // Group: master playlists first, then per-rung
+            const masters = playlists.filter(p => p.includes('master'));
+            const others = playlists.filter(p => !p.includes('master'));
+
+            let html = '';
+            if (masters.length > 0) {
+                masters.forEach(p => {
+                    const label = p.split('/').pop();
+                    html += `<div class="ctx-menu-item" onclick="playContent('${escapeAttr(p)}', '${escapeAttr(dirName)}')">&#9654; Play ${escapeHtml(label)}</div>`;
+                });
+            }
+            if (masters.length > 0 && others.length > 0) {
+                html += '<div class="ctx-menu-separator"></div>';
+            }
+            if (others.length > 0 && others.length <= 10) {
+                others.forEach(p => {
+                    const label = p.replace(dirName + '/', '');
+                    html += `<div class="ctx-menu-item ctx-submenu" onclick="playContent('${escapeAttr(p)}', '${escapeAttr(dirName)}')">&#9654; ${escapeHtml(label)}</div>`;
+                });
+            } else if (others.length > 10) {
+                html += `<div class="ctx-menu-item" style="color:#666;pointer-events:none">${others.length} rendition playlists</div>`;
+            }
+
+            html += '<div class="ctx-menu-separator"></div>';
+            html += `<div class="ctx-menu-item" onclick="loadOutputDetail('${escapeAttr(dirName)}'); hideContextMenu()">&#128193; Browse files</div>`;
+
+            ctxMenu.innerHTML = html;
+
+            // Check if encode logs exist and add menu item if so
+            fetch('/api/outputs/' + encodeURIComponent(dirName) + '/logs')
+                .then(r => r.json())
+                .then(logs => {
+                    if (ctxMenu && logs && logs.length > 0) {
+                        const logItem = document.createElement('div');
+                        logItem.className = 'ctx-menu-item';
+                        logItem.innerHTML = '&#128220; View encode log';
+                        logItem.onclick = () => { viewEncodeLogs(dirName); hideContextMenu(); };
+                        ctxMenu.querySelector('.ctx-menu-item:last-child').after(logItem);
+                    }
+                })
+                .catch(() => {});
+        })
+        .catch(() => {
+            if (ctxMenu) ctxMenu.innerHTML = '<div class="ctx-menu-item" style="color:#ef476f">Failed to load</div>';
+        });
+}
+
+function hideContextMenu() {
+    if (ctxMenu) {
+        ctxMenu.remove();
+        ctxMenu = null;
+    }
+}
+document.addEventListener('click', hideContextMenu);
+document.addEventListener('contextmenu', (e) => {
+    if (!e.target.closest('.output-dir') && !e.target.closest('.file-item')) hideContextMenu();
+});
+
+// --- Source Context Menu ---
+
+function showSourceContextMenu(e, fileName) {
+    e.preventDefault();
+    hideContextMenu();
+
+    ctxMenu = document.createElement('div');
+    ctxMenu.className = 'ctx-menu';
+    ctxMenu.innerHTML = `
+        <div class="ctx-menu-item" onclick="hideContextMenu(); playSource('${escapeAttr(fileName)}')">&#9654; Play source</div>
+        <div class="ctx-menu-separator"></div>
+        <div class="ctx-menu-item" onclick="hideContextMenu(); forceReencode('${escapeAttr(fileName)}')">&#128260; Force re-encode</div>
+    `;
+    ctxMenu.style.left = e.clientX + 'px';
+    ctxMenu.style.top = e.clientY + 'px';
+    document.body.appendChild(ctxMenu);
+
+    requestAnimationFrame(() => {
+        if (!ctxMenu) return;
+        const rect = ctxMenu.getBoundingClientRect();
+        if (rect.right > window.innerWidth) ctxMenu.style.left = (window.innerWidth - rect.width - 8) + 'px';
+        if (rect.bottom > window.innerHeight) ctxMenu.style.top = (window.innerHeight - rect.height - 8) + 'px';
+    });
+}
+
+async function forceReencode(fileName) {
+    const body = {
+        files: [fileName],
+        target: document.getElementById('target').value,
+        codec: document.getElementById('codec').value,
+        max_res: document.getElementById('max-res').value,
+        time: document.getElementById('time-limit').value,
+        segment_duration: document.getElementById('segment-duration').value,
+        partial_duration: document.getElementById('partial-duration').value,
+        gop_duration: document.getElementById('gop-duration').value,
+        hls_format: document.getElementById('hls-format').value,
+        padding: document.getElementById('padding').value,
+        keep_mezzanine: document.getElementById('keep-mezzanine').checked,
+        force_reencode: true
+    };
+
+    const result = await showDialog(
+        'Force Re-encode',
+        `Re-encode ${fileName} with current settings? Existing encodes will be moved to the archive directory.`,
+        [
+            { label: 'Cancel', value: false, class: 'btn-secondary' },
+            { label: 'Re-encode', value: true, class: 'btn-danger' }
+        ]
+    );
+    if (!result) return;
+
+    try {
+        const res = await fetch('/api/encode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        if (!res.ok) {
+            const text = await res.text();
+            showToast('Failed: ' + text, 'error');
+            return;
+        }
+        showToast('Re-encode started — previous output archived', 'success');
+        switchTab('jobs');
+    } catch (e) {
+        showToast('Error: ' + e.message, 'error');
+    }
+}
+
+// --- Source Playback (direct MP4/MKV) ---
+
+function playSource(name) {
+    const url = '/sources/' + encodeURIComponent(name);
+    const modal = document.createElement('div');
+    modal.className = 'player-modal';
+    modal.onclick = (e) => { if (e.target === modal) closePlayer(modal); };
+    modal.innerHTML = `
+        <div class="player-container">
+            <div class="player-header">
+                <span class="player-title">${escapeHtml(name)} (source)</span>
+                <button class="player-close" onclick="closePlayer(this.closest('.player-modal'))">&times;</button>
+            </div>
+            <video class="player-video" controls autoplay src="${url}"></video>
+            <div class="player-info">Direct source playback</div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    document.addEventListener('keydown', function escHandler(e) {
+        if (e.key === 'Escape') {
+            closePlayer(modal);
+            document.removeEventListener('keydown', escHandler);
+        }
+    });
+}
+
+// --- Encode Log Viewer ---
+
+async function viewEncodeLogs(dirName) {
+    const modal = document.createElement('div');
+    modal.className = 'modal-overlay';
+    modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
+    modal.innerHTML = `
+        <div class="player-container" style="max-width:900px">
+            <div class="player-header">
+                <span class="player-title">Encode logs: ${escapeHtml(dirName)}</span>
+                <button class="player-close" onclick="this.closest('.modal-overlay').remove()">&times;</button>
+            </div>
+            <div id="log-modal-content" style="color:#888;padding:12px">Loading...</div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    document.addEventListener('keydown', function esc(e) {
+        if (e.key === 'Escape') { modal.remove(); document.removeEventListener('keydown', esc); }
+    });
+
+    try {
+        const res = await fetch('/api/outputs/' + encodeURIComponent(dirName) + '/logs');
+        const logs = await res.json();
+        const content = document.getElementById('log-modal-content');
+
+        if (!logs || logs.length === 0) {
+            content.innerHTML = '<div style="color:#666;text-align:center;padding:20px">No encode logs found for this output</div>';
+            return;
+        }
+
+        content.innerHTML = logs.map(l => `
+            <div style="border-bottom:1px solid #333;padding:10px 0">
+                <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+                    <span style="color:#ccc;font-weight:500">Job ${escapeHtml(l.job_id)}</span>
+                    <span class="status-${l.status}" style="font-size:0.85rem">${escapeHtml(l.status).toUpperCase()}</span>
+                </div>
+                <div style="font-size:0.8rem;color:#888;margin-bottom:8px">${escapeHtml(l.started)}</div>
+                ${l.log_file ? `<button class="btn-select" onclick="showLogFile(this, '${escapeAttr(l.log_file)}')">Show full log</button>
+                <pre class="log-viewer" style="display:none;margin-top:8px"></pre>` : '<span style="color:#666;font-size:0.8rem">No log file available</span>'}
+            </div>
+        `).join('');
+    } catch (e) {
+        document.getElementById('log-modal-content').innerHTML = '<div style="color:#ef476f">Failed to load logs: ' + escapeHtml(e.message) + '</div>';
+    }
+}
+
+async function showLogFile(btn, filename) {
+    const pre = btn.nextElementSibling;
+    if (pre.style.display === 'block') {
+        pre.style.display = 'none';
+        btn.textContent = 'Show full log';
+        return;
+    }
+    btn.textContent = 'Loading...';
+    try {
+        const res = await fetch('/logs/' + encodeURIComponent(filename));
+        pre.textContent = await res.text();
+        pre.style.display = 'block';
+        pre.scrollTop = pre.scrollHeight;
+        btn.textContent = 'Hide log';
+    } catch (e) {
+        pre.textContent = 'Failed to load log file';
+        pre.style.display = 'block';
+        btn.textContent = 'Show full log';
+    }
+}
+
+// --- Quick play output master ---
+
+async function playOutputMaster(dirName) {
+    try {
+        const res = await fetch('/api/outputs/' + encodeURIComponent(dirName) + '/playlists');
+        const playlists = await res.json();
+        const master = (playlists || []).find(p => p.includes('master'));
+        if (master) {
+            playContent(master, dirName);
+        } else if (playlists && playlists.length > 0) {
+            playContent(playlists[0], dirName);
+        } else {
+            showToast('No playlists found in ' + dirName, 'error');
+        }
+    } catch (e) {
+        showToast('Failed to load playlists: ' + e.message, 'error');
+    }
+}
+
+// --- HLS.js Player ---
+
+let activeHls = null;
+
+function playContent(playlistPath, dirName) {
+    hideContextMenu();
+    const url = '/content/' + playlistPath;
+
+    const modal = document.createElement('div');
+    modal.className = 'player-modal';
+    modal.onclick = (e) => { if (e.target === modal) closePlayer(modal); };
+    modal.innerHTML = `
+        <div class="player-container">
+            <div class="player-header">
+                <span class="player-title">${escapeHtml(playlistPath)}</span>
+                <button class="player-close" onclick="closePlayer(this.closest('.player-modal'))">&times;</button>
+            </div>
+            <video class="player-video" id="player-video" controls autoplay></video>
+            <div class="player-info" id="player-info"></div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    const video = modal.querySelector('#player-video');
+    const info = modal.querySelector('#player-info');
+
+    if (Hls.isSupported()) {
+        activeHls = new Hls({
+            debug: false,
+            enableWorker: true,
+            lowLatencyMode: false,
+            backBufferLength: 30,
+        });
+        activeHls.loadSource(url);
+        activeHls.attachMedia(video);
+
+        activeHls.on(Hls.Events.MANIFEST_PARSED, (e, data) => {
+            info.textContent = `${data.levels.length} quality levels loaded`;
+            video.play().catch(() => {});
+        });
+        activeHls.on(Hls.Events.LEVEL_SWITCHED, (e, data) => {
+            const level = activeHls.levels[data.level];
+            if (level) {
+                info.textContent = `${level.width}x${level.height} @ ${(level.bitrate/1e6).toFixed(1)} Mbps`;
+            }
+        });
+        activeHls.on(Hls.Events.ERROR, (e, data) => {
+            if (data.fatal) {
+                info.textContent = `Error: ${data.details}`;
+                info.style.color = '#ef476f';
+            }
+        });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Safari native HLS
+        video.src = url;
+        video.addEventListener('loadedmetadata', () => video.play());
+    } else {
+        info.textContent = 'HLS playback not supported in this browser';
+        info.style.color = '#ef476f';
+    }
+
+    document.addEventListener('keydown', function escHandler(e) {
+        if (e.key === 'Escape') {
+            closePlayer(modal);
+            document.removeEventListener('keydown', escHandler);
+        }
+    });
+}
+
+function closePlayer(modal) {
+    if (activeHls) {
+        activeHls.destroy();
+        activeHls = null;
+    }
+    if (modal) modal.remove();
+}
+
+loadSources();
+connectSSE();
+setInterval(loadSources, 60000);
+</script>
+</body>
+</html>

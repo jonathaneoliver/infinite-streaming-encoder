@@ -1,0 +1,35 @@
+services:
+  encoder:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      # Source videos — read-only, the app browses this directory
+      - ${SOURCE_DIR:-/Volumes/4TB/media/originals}:/media/originals:ro
+      # Encoded output — read-write
+      - ${OUTPUT_DIR:-/Volumes/4TB/media/dynamic_content}:/media/dynamic_content
+      # Temporary directory for in-progress encodes
+      - ${TMP_DIR:-/Volumes/4TB/media/tmp}:/media/tmp
+      # Docker socket — needed for local encoding via docker run
+      - /var/run/docker.sock:/var/run/docker.sock
+      # AWS credentials — needed for cloud encoding
+      - ${HOME}/.aws:/root/.aws:ro
+    environment:
+      - SOURCE_DIR=/media/originals
+      - OUTPUT_DIR=/media/dynamic_content
+      - TMP_DIR=/media/tmp
+      - SCRIPTS_DIR=/app/scripts
+      - DOCKER_IMAGE=${DOCKER_IMAGE:-ghcr.io/jonathaneoliver/infinite-streaming:latest}
+      - AUTO_WATCH=${AUTO_WATCH:-true}
+      - DEFAULT_TARGET=${DEFAULT_TARGET:-local}
+      - DEFAULT_CODEC=${DEFAULT_CODEC:-both}
+      - DEFAULT_MAX_RES=${DEFAULT_MAX_RES:-}
+      - MAX_CONCURRENT=${MAX_CONCURRENT:-1}
+      - AWS_REGION=${AWS_REGION:-us-west-2}
+      - S3_BUCKET=${S3_BUCKET:-}
+      - SUBNET_ID=${SUBNET_ID:-}
+      - SECURITY_GROUP_ID=${SECURITY_GROUP_ID:-}
+      - INSTANCE_PROFILE=${INSTANCE_PROFILE:-encode-worker}
+      - INSTANCE_TYPE=${INSTANCE_TYPE:-c7i.xlarge}
+      - GHCR_PAT=${GHCR_PAT:-}
+    restart: unless-stopped
