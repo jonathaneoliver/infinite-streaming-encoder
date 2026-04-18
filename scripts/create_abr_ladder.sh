@@ -515,16 +515,12 @@ detect_hardware_encoders() {
 }
 
 detect_fragment_parser_script() {
-    if [[ -f "/sbin/parse_fmp4_fragments.py" ]]; then
-        FRAGMENT_PARSER_SCRIPT="/sbin/parse_fmp4_fragments.py"
-        return 0
-    fi
-    if [[ -f "$SCRIPT_DIR/../parse_fmp4_fragments.py" ]]; then
-        FRAGMENT_PARSER_SCRIPT="$SCRIPT_DIR/../parse_fmp4_fragments.py"
-        return 0
-    fi
-    if [[ -f "$SCRIPT_DIR/parse_fmp4_fragments.py" ]]; then
-        FRAGMENT_PARSER_SCRIPT="$SCRIPT_DIR/parse_fmp4_fragments.py"
+    # Fragment parsing now lives in the encoder.fragments module shipped
+    # with this image. The variable is kept only so callers can still say
+    # `python3 $FRAGMENT_PARSER_SCRIPT <args>` — here it expands to a
+    # `-m encoder.fragments` invocation.
+    if python3 -c 'import encoder.fragments' >/dev/null 2>&1; then
+        FRAGMENT_PARSER_SCRIPT="-m encoder.fragments"
         return 0
     fi
     FRAGMENT_PARSER_SCRIPT=""
@@ -2662,14 +2658,14 @@ parse_fmp4_fragments() {
             fi
             
             # Run parser without stdout/stderr to reduce pipe traffic
-            if python3 "$FRAGMENT_PARSER_SCRIPT" --track-type "$track_type" --segment-duration "$SEGMENT_DURATION" --gop-duration "$GOP_DURATION" "$segment" >/dev/null 2>&1; then
+            if python3 $FRAGMENT_PARSER_SCRIPT --track-type "$track_type" --segment-duration "$SEGMENT_DURATION" --gop-duration "$GOP_DURATION" "$segment" >/dev/null 2>&1; then
                 ((total_parsed++))
                 ((hevc_count++))
             else
                 ((total_failed++))
                 if [[ "$first_failure_logged" == "false" ]]; then
                     local err_sample
-                    err_sample=$(python3 "$FRAGMENT_PARSER_SCRIPT" --track-type "$track_type" --segment-duration "$SEGMENT_DURATION" --gop-duration "$GOP_DURATION" "$segment" 2>&1 | head -1)
+                    err_sample=$(python3 $FRAGMENT_PARSER_SCRIPT --track-type "$track_type" --segment-duration "$SEGMENT_DURATION" --gop-duration "$GOP_DURATION" "$segment" 2>&1 | head -1)
                     log_warn "Sample parser error: ${err_sample:-unknown}"
                     first_failure_logged=true
                 fi
@@ -2689,14 +2685,14 @@ parse_fmp4_fragments() {
             fi
             
             # Run parser without stdout/stderr to reduce pipe traffic
-            if python3 "$FRAGMENT_PARSER_SCRIPT" --track-type "$track_type" --segment-duration "$SEGMENT_DURATION" --gop-duration "$GOP_DURATION" "$segment" >/dev/null 2>&1; then
+            if python3 $FRAGMENT_PARSER_SCRIPT --track-type "$track_type" --segment-duration "$SEGMENT_DURATION" --gop-duration "$GOP_DURATION" "$segment" >/dev/null 2>&1; then
                 ((total_parsed++))
                 ((h264_count++))
             else
                 ((total_failed++))
                 if [[ "$first_failure_logged" == "false" ]]; then
                     local err_sample
-                    err_sample=$(python3 "$FRAGMENT_PARSER_SCRIPT" --track-type "$track_type" --segment-duration "$SEGMENT_DURATION" --gop-duration "$GOP_DURATION" "$segment" 2>&1 | head -1)
+                    err_sample=$(python3 $FRAGMENT_PARSER_SCRIPT --track-type "$track_type" --segment-duration "$SEGMENT_DURATION" --gop-duration "$GOP_DURATION" "$segment" 2>&1 | head -1)
                     log_warn "Sample parser error: ${err_sample:-unknown}"
                     first_failure_logged=true
                 fi
@@ -2713,14 +2709,14 @@ parse_fmp4_fragments() {
             if [[ "$segment_file" == */audio/* ]]; then
                 track_type="audio"
             fi
-            if python3 "$FRAGMENT_PARSER_SCRIPT" --track-type "$track_type" --segment-duration "$SEGMENT_DURATION" --gop-duration "$GOP_DURATION" "$segment_file" >/dev/null 2>&1; then
+            if python3 $FRAGMENT_PARSER_SCRIPT --track-type "$track_type" --segment-duration "$SEGMENT_DURATION" --gop-duration "$GOP_DURATION" "$segment_file" >/dev/null 2>&1; then
                 ((total_parsed++)) || true
                 ((av1_count++)) || true
             else
                 ((total_failed++)) || true
                 if [[ "$first_failure_logged" == "false" ]]; then
                     local err_sample
-                    err_sample=$(python3 "$FRAGMENT_PARSER_SCRIPT" --track-type "$track_type" --segment-duration "$SEGMENT_DURATION" --gop-duration "$GOP_DURATION" "$segment_file" 2>&1 | head -1)
+                    err_sample=$(python3 $FRAGMENT_PARSER_SCRIPT --track-type "$track_type" --segment-duration "$SEGMENT_DURATION" --gop-duration "$GOP_DURATION" "$segment_file" 2>&1 | head -1)
                     log_warn "Sample parser error: ${err_sample:-unknown}"
                     first_failure_logged=true
                 fi
