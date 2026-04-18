@@ -2209,14 +2209,8 @@ convert_to_segmentlist() {
     local manifest="$output_dir/manifest.mpd"
     
     log "Converting SegmentTemplate to SegmentList..."
-    
-    # Use external conversion script for proper SegmentTimeline support
-    if [[ -f "$SCRIPT_DIR/convert_to_segmentlist.py" ]]; then
-        python3 "$SCRIPT_DIR/convert_to_segmentlist.py" "$manifest" 2>&1 | grep -v "^DASH" | grep -v "^===" | grep -v "^$" | tee -a "$LOG_FILE"
-        log_success "Manifest converted to SegmentList"
-    else
-        log_warn "convert_to_segmentlist.py not found - manifest remains in SegmentTemplate format"
-    fi
+    python3 -m encoder.manifests convert-segmentlist "$manifest" 2>&1 | grep -v "^$" | tee -a "$LOG_FILE"
+    log_success "Manifest converted to SegmentList"
 }
 
 ################################################################################
