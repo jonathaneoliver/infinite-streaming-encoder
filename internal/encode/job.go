@@ -19,6 +19,25 @@ func stripANSI(s string) string {
 	return ansiRe.ReplaceAllString(s, "")
 }
 
+// splitLinesOrCR is a bufio.Scanner SplitFunc that emits a token on either
+// \n or \r. ffmpeg's -stats output uses \r to overwrite the same terminal
+// line, so splitting only on \n would buffer the entire encode's stats
+// into one token that only gets flushed when ffmpeg finally exits.
+func splitLinesOrCR(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	for i, b := range data {
+		if b == '\n' || b == '\r' {
+			return i + 1, data[:i], nil
+		}
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
 type Target string
 
 const (
@@ -634,7 +653,7 @@ func (m *Manager) runFileContainer(job *Job, fileIdx int, script string, args []
 
 func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []string) []string {
 	runArgs := []string{
-		"run", "-d",
+		"run", "-dt",
 		"--name", name,
 		"--label", "encoder.job_id=" + job.ID,
 		"--label", "encoder.role=encode-worker",
@@ -699,8 +718,16 @@ func (m *Manager) attachAndWait(job *Job, name string) error {
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	// ffmpeg's `-stats` progress updates use \r (not \n) to overwrite the
+	// same terminal line, so a plain ScanLines would never yield until the
+	// encode ends. Treat both \r and \n as line terminators so the UI sees
+	// live frame counts.
+	scanner.Split(splitLinesOrCR)
 	for scanner.Scan() {
 		line := scanner.Text()
+		if line == "" {
+			continue
+		}
 		job.AppendLog(line)
 		job.Progress = stripANSI(line)
 		m.notify(job)
