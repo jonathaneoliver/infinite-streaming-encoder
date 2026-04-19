@@ -29,10 +29,11 @@ const (
 type JobStatus string
 
 const (
-	StatusQueued   JobStatus = "queued"
-	StatusRunning  JobStatus = "running"
-	StatusDone     JobStatus = "done"
-	StatusFailed   JobStatus = "failed"
+	StatusQueued    JobStatus = "queued"
+	StatusRunning   JobStatus = "running"
+	StatusDone      JobStatus = "done"
+	StatusFailed    JobStatus = "failed"
+	StatusCancelled JobStatus = "cancelled"
 )
 
 type JobConfig struct {
@@ -59,9 +60,21 @@ type Job struct {
 	Progress  string    `json:"progress"`
 	Error     string    `json:"error,omitempty"`
 
-	mu       sync.Mutex
-	logLines []string
-	cancel   func()
+	mu        sync.Mutex
+	logLines  []string
+	cancelled bool
+}
+
+func (j *Job) MarkCancelled() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.cancelled = true
+}
+
+func (j *Job) IsCancelled() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.cancelled
 }
 
 func (j *Job) AppendLog(line string) {
@@ -223,6 +236,12 @@ func (m *Manager) run(job *Job, startIdx int) {
 	m.sem <- struct{}{}
 	defer func() { <-m.sem }()
 
+	// If cancel fired while this job was queued, skip straight to cleanup.
+	if job.IsCancelled() {
+		m.finalizeCancelled(job, filepath.Join(m.TmpDir, job.ID))
+		return
+	}
+
 	job.Status = StatusRunning
 	if startIdx == 0 {
 		job.Progress = "starting"
@@ -245,6 +264,10 @@ func (m *Manager) run(job *Job, startIdx int) {
 
 	now := time.Now()
 	job.EndedAt = &now
+	if job.IsCancelled() {
+		m.finalizeCancelled(job, jobTmpDir)
+		return
+	}
 	if err != nil {
 		job.Status = StatusFailed
 		job.Error = err.Error()
@@ -265,6 +288,59 @@ func (m *Manager) run(job *Job, startIdx int) {
 	m.removePersistedState(job.ID)
 	m.writeHistory(job)
 	m.notify(job)
+}
+
+// finalizeCancelled handles the post-cancel bookkeeping: discard any partial
+// tmp output, drop the persisted-state file, record the history entry, and
+// flip the job to cancelled. Called from both the pre-slot-acquire path
+// (job was queued when cancel fired) and the post-encode path (encode
+// returned an error because we killed the worker container).
+func (m *Manager) finalizeCancelled(job *Job, jobTmpDir string) {
+	now := time.Now()
+	job.EndedAt = &now
+	job.Status = StatusCancelled
+	job.Progress = "cancelled"
+	job.Error = ""
+	os.RemoveAll(jobTmpDir)
+	m.removePersistedState(job.ID)
+	m.writeHistory(job)
+	m.notify(job)
+}
+
+// Cancel signals a job to stop. For a queued job this just marks it; when
+// the goroutine picks up the semaphore slot it'll short-circuit into
+// finalizeCancelled. For a running job we additionally force-remove any
+// worker container carrying the matching label — that makes `docker logs`
+// return in attachAndWait, which unwinds the encode loop and lands us in
+// the same finalize path.
+//
+// Returns false if no job with that ID exists, or true in all other cases
+// (idempotent — calling twice on the same job is a no-op).
+func (m *Manager) Cancel(id string) bool {
+	job := m.GetJob(id)
+	if job == nil {
+		return false
+	}
+	if job.Status == StatusDone || job.Status == StatusFailed || job.Status == StatusCancelled {
+		return true
+	}
+	job.MarkCancelled()
+	m.notify(job)
+
+	// Kill any worker container for this job. The label filter matches
+	// every file-index container we might have spawned; there will only
+	// ever be one alive at a time under the current serial encode loop,
+	// but the filter is defensive against future parallelism.
+	out, err := exec.Command("docker", "ps", "-a",
+		"--filter", "label=encoder.job_id="+id,
+		"--format", "{{.Names}}",
+	).Output()
+	if err == nil {
+		for _, name := range strings.Fields(string(out)) {
+			exec.Command("docker", "rm", "-f", name).Run()
+		}
+	}
+	return true
 }
 
 func (m *Manager) writeHistory(job *Job) {

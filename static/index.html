@@ -52,6 +52,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
 .status-queued { color: #888; }
 .status-running { color: #4cc9f0; }
+.status-cancelled { color: #ffa94d; }
 .status-done { color: #06d6a0; }
 .status-failed { color: #ef476f; }
 
@@ -73,6 +74,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
 .log-viewer { max-height: 400px; overflow-y: auto; background: #111; padding: 10px; border-radius: 4px; margin-top: 8px; font-family: 'SF Mono', Menlo, monospace; font-size: 0.75rem; color: #aaa; white-space: pre-wrap; display: none; }
 .log-toggle { cursor: pointer; color: #4361ee; font-size: 0.8rem; margin-top: 4px; }
+.job-cancel { cursor: pointer; color: #ef476f; font-size: 0.8rem; margin-left: 12px; }
+.job-cancel:hover { text-decoration: underline; }
 
 .output-dir { border-radius: 4px; cursor: pointer; border-bottom: 1px solid #0f3460; }
 .output-dir:hover { background: #1a2a4a; }
@@ -612,10 +615,23 @@ function renderJobs() {
             </div>
             <div class="job-progress">${escapeHtml(j.progress || '')}</div>
             ${j.error ? '<div style="color:#ef476f;font-size:0.8rem;margin-top:4px">' + escapeHtml(j.error) + '</div>' : ''}
-            <div class="log-toggle" onclick="toggleLog('${j.id}')">Show log</div>
+            <div>
+                <span class="log-toggle" onclick="toggleLog('${j.id}')">Show log</span>
+                ${(j.status === 'queued' || j.status === 'running') ? `<span class="job-cancel" onclick="cancelJob('${j.id}')">Cancel</span>` : ''}
+            </div>
             <div class="log-viewer" id="log-${j.id}"></div>
         </div>
     `).join('');
+}
+
+async function cancelJob(id) {
+    if (!confirm('Cancel this job?')) return;
+    try {
+        const res = await fetch('/api/jobs/' + id + '/cancel', { method: 'POST' });
+        if (!res.ok) alert('Cancel failed: ' + res.status);
+    } catch (e) {
+        alert('Cancel failed: ' + e);
+    }
 }
 
 function escapeHtml(s) {

@@ -27,6 +27,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/jobs", s.listJobs)
 	s.Mux.HandleFunc("GET /api/jobs/{id}/logs", s.jobLogs)
 	s.Mux.HandleFunc("GET /api/jobs/stream", s.streamJobs)
+	s.Mux.HandleFunc("POST /api/jobs/{id}/cancel", s.cancelJob)
 	// Serve encode logs
 	s.Mux.Handle("GET /logs/", http.StripPrefix("/logs/", http.FileServer(http.Dir(filepath.Join(mgr.TmpDir, "logs")))))
 	// Serve encoded output files (segments, manifests) for HLS.js playback
@@ -89,6 +90,15 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.Manager.Jobs())
+}
+
+func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.Manager.Cancel(id) {
+		http.Error(w, "job not found", 404)
+		return
+	}
+	w.WriteHeader(204)
 }
 
 func (s *Server) jobLogs(w http.ResponseWriter, r *http.Request) {
