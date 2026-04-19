@@ -598,8 +598,20 @@ var cloudEnvPassthrough = []string{
 // attachAndWait streams the worker container's logs into the job log buffer
 // and blocks until the container exits. Returns an error if the container
 // exited with a non-zero status. The container itself is removed after exit.
+//
+// For already-exited containers we use plain `docker logs` (no -f) — some
+// Docker daemon versions hang indefinitely when `docker logs -f` is
+// started against an already-exited container, which would leave reconcile
+// goroutines pinned on the restart-resilience path. Plain `docker logs`
+// always drains the history and returns.
 func (m *Manager) attachAndWait(job *Job, name string) error {
-	logs := exec.Command("docker", "logs", "-f", name)
+	_, running, _ := containerState(name)
+
+	args := []string{"logs", name}
+	if running {
+		args = []string{"logs", "-f", name}
+	}
+	logs := exec.Command("docker", args...)
 	stdout, err := logs.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("logs pipe: %w", err)
