@@ -41,6 +41,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/outputs", s.listOutputs)
 	s.Mux.HandleFunc("GET /api/outputs/{name}", s.listOutputContents)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/playlists", s.listPlaylists)
+	s.Mux.HandleFunc("GET /api/outputs/{name}/ladder", s.ladder)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/logs", s.outputLogs)
 	s.Mux.HandleFunc("POST /api/encode", s.startEncode)
 	s.Mux.HandleFunc("GET /api/jobs", s.listJobs)

@@ -102,6 +102,24 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 /* --- AWS tab --- */
 .tab-aws { color: #ffa94d; }
 .tab-aws.active { color: #ffa94d; border-bottom-color: #ffa94d; }
+.ladder-panel { background: #181826; border: 1px solid #2a2a3a; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; }
+.ladder-title { font-size: 0.9rem; color: #8cf; font-weight: 600; margin-bottom: 8px; }
+.ladder-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.ladder-table th { text-align: left; color: #aac; font-weight: 600; padding: 6px 10px 6px 0; border-bottom: 1px solid #2a2a3a; }
+.ladder-table td { padding: 6px 10px 6px 0; vertical-align: middle; color: #eee; border-bottom: 1px solid #1f1f2e; }
+.ladder-table tbody tr:last-child td { border-bottom: none; }
+.ladder-res { font-weight: 600; color: #8cf; }
+.ladder-dim { color: #888; font-variant-numeric: tabular-nums; }
+.ladder-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ladder-bar-cell { width: 30%; }
+.ladder-bar-track { display: inline-block; vertical-align: middle; position: relative; width: calc(100% - 50px); height: 10px; background: #2a2a3a; border-radius: 3px; overflow: visible; }
+.ladder-bar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px 0 0 3px; }
+.ladder-bar-overshoot { position: absolute; left: 100%; top: -1px; bottom: -1px; background: repeating-linear-gradient(45deg, #ef476f, #ef476f 4px, #b83450 4px, #b83450 8px); border-radius: 0 3px 3px 0; opacity: 0.85; }
+.ladder-bar-good { background: #3aa76d; }
+.ladder-bar-warn { background: #f0c274; }
+.ladder-bar-bad { background: #ef476f; }
+.ladder-bar-empty { background: #444; }
+.ladder-bar-label { display: inline-block; width: 44px; text-align: right; margin-left: 6px; font-variant-numeric: tabular-nums; color: #aac; vertical-align: middle; }
 .about-list { display: grid; grid-template-columns: max-content 1fr; gap: 8px 20px; margin: 0; }
 .about-list dt { color: #aac; font-weight: 600; }
 .about-list dd { margin: 0; color: #eee; font-variant-numeric: tabular-nums; }
@@ -889,8 +907,12 @@ function renderResBadges(d) {
 
 async function loadOutputDetail(name) {
     try {
-        const res = await fetch('/api/outputs/' + encodeURIComponent(name));
-        const files = await res.json();
+        const [filesRes, ladderRes] = await Promise.all([
+            fetch('/api/outputs/' + encodeURIComponent(name)),
+            fetch('/api/outputs/' + encodeURIComponent(name) + '/ladder'),
+        ]);
+        const files = await filesRes.json();
+        const ladder = ladderRes.ok ? await ladderRes.json() : null;
         const list = document.getElementById('outputs-list');
 
         document.getElementById('outputs-header').innerHTML = `
@@ -903,7 +925,7 @@ async function loadOutputDetail(name) {
             return;
         }
 
-        list.innerHTML = files.map(f => `
+        list.innerHTML = renderLadderTable(ladder) + files.map(f => `
             <div class="output-file">
                 <span class="output-file-icon">${f.dir ? '&#128193;' : '&#128196;'}</span>
                 <span class="output-file-name">${escapeHtml(f.name)}</span>
@@ -913,6 +935,58 @@ async function loadOutputDetail(name) {
     } catch (e) {
         document.getElementById('outputs-list').innerHTML = '<div class="no-files">Failed to load directory</div>';
     }
+}
+
+// Ladder matrix: one row per tier with target vs actual bitrate + size.
+// The delta bar visualizes actual/target — >100% means the encoder
+// overshot its budget (x265 commonly does at low targets). Keeps the
+// view compact: 4 columns fit inside the outputs list width.
+function renderLadderTable(ladder) {
+    if (!ladder || !ladder.tiers || ladder.tiers.length === 0) return '';
+    const rows = ladder.tiers.map(t => {
+        const ratio = t.target_kbps > 0 ? (t.actual_kbps / t.target_kbps) : 0;
+        const pct = Math.min(150, Math.round(ratio * 100));
+        // Bar colour: green ≤110%, amber 110-125%, red >125%
+        const cls = ratio === 0 ? 'ladder-bar-empty'
+                  : ratio <= 1.10 ? 'ladder-bar-good'
+                  : ratio <= 1.25 ? 'ladder-bar-warn'
+                  : 'ladder-bar-bad';
+        const actualDisp = t.actual_kbps > 0 ? t.actual_kbps.toLocaleString() : '—';
+        return `
+            <tr>
+                <td class="ladder-res">${t.res}</td>
+                <td class="ladder-dim">${t.width}×${t.height}</td>
+                <td class="ladder-num">${t.target_kbps.toLocaleString()} k</td>
+                <td class="ladder-num">${actualDisp} k</td>
+                <td class="ladder-bar-cell">
+                    <div class="ladder-bar-track">
+                        <div class="ladder-bar-fill ${cls}" style="width:${Math.min(100, pct)}%"></div>
+                        ${pct > 100 ? `<div class="ladder-bar-overshoot" style="width:${Math.min(50, pct - 100)}%"></div>` : ''}
+                    </div>
+                    <span class="ladder-bar-label">${ratio === 0 ? '—' : (ratio * 100).toFixed(0) + '%'}</span>
+                </td>
+                <td class="ladder-num">${formatSize(t.size_bytes)}</td>
+            </tr>
+        `;
+    }).join('');
+    return `
+        <div class="ladder-panel">
+            <div class="ladder-title">ABR ladder — ${ladder.codec.toUpperCase()}</div>
+            <table class="ladder-table">
+                <thead>
+                    <tr>
+                        <th>Tier</th>
+                        <th>Dim</th>
+                        <th>Target</th>
+                        <th>Actual</th>
+                        <th>Budget usage</th>
+                        <th>Size</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>
+    `;
 }
 
 // --- Jobs ---
