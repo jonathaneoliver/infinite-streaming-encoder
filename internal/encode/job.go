@@ -623,17 +623,30 @@ func (m *Manager) Cancel(id string) bool {
 		return true
 	}
 
-	// Graceful stop runs in the background so the UI's POST returns
-	// immediately and the Cancel action feels instant. `docker stop
-	// --time 30` sends SIGTERM, waits up to 30s for the container to
-	// exit, then SIGKILLs if it didn't. boto3 TerminateInstances +
-	// CancelSpotInstanceRequests typically complete in 2-5s, so the
-	// budget is generous. After stop, `docker rm` cleans up the
-	// container record so runFileContainer's reattach-if-exists path
-	// can't pick it up on a subsequent retry.
+	// Stop strategy differs by target:
+	//
+	//   cloud: `docker stop --time 30` (SIGTERM + 30s grace). The
+	//   Python process inside has a SIGTERM handler that calls
+	//   terminate_job() to release the EC2 instance + spot request;
+	//   that typically completes in 2-5s, so 30s is generous.
+	//
+	//   local: `docker kill` (SIGKILL, immediate). There's no cloud
+	//   cleanup to run, and a graceful stop doesn't help anyway —
+	//   cli_local.py blocks in subprocess.run(ffmpeg) so its SIGTERM
+	//   handler (if any) can't fire until ffmpeg exits, which is
+	//   exactly the thing Cancel is trying to interrupt. SIGKILL to
+	//   PID 1 terminates the container and all children at once.
+	cancelMode := "stop"
+	if job.Config.Target == TargetLocal {
+		cancelMode = "kill"
+	}
 	go func() {
 		for _, name := range names {
-			exec.Command("docker", "stop", "--time", "30", name).Run()
+			if cancelMode == "kill" {
+				exec.Command("docker", "kill", name).Run()
+			} else {
+				exec.Command("docker", "stop", "--time", "30", name).Run()
+			}
 			exec.Command("docker", "rm", name).Run()
 		}
 	}()
