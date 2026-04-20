@@ -10,18 +10,32 @@ import (
 	"strings"
 
 	"github.com/jonathaneoliver/encoder/internal/encode"
+	"github.com/jonathaneoliver/encoder/internal/imageinfo"
 )
 
 type Server struct {
 	Manager *encode.Manager
 	Mux     *http.ServeMux
-	// Version is stamped by cmd/server from the -ldflags-injected
-	// main.version. Surfaced at /api/version for the SPA's About tab.
-	Version string
+	// Version + GitSha are stamped by cmd/server from -ldflags-injected
+	// main.version / main.gitSha. CloudImage is the DOCKER_IMAGE env var
+	// — what the EC2 worker user-data pulls on job start. The About tab
+	// pulls the image's OCI labels from GHCR to compare local vs cloud.
+	Version    string
+	GitSha     string
+	CloudImage string
+
+	imageInfo *imageinfo.Client
 }
 
 func NewServer(mgr *encode.Manager) *Server {
-	s := &Server{Manager: mgr, Mux: http.NewServeMux()}
+	s := &Server{
+		Manager: mgr,
+		Mux:     http.NewServeMux(),
+		imageInfo: imageinfo.NewClient(
+			os.Getenv("GHCR_USERNAME"),
+			os.Getenv("GHCR_PAT"),
+		),
+	}
 	s.Mux.HandleFunc("GET /api/version", s.getVersion)
 	s.Mux.HandleFunc("GET /api/sources", s.listSources)
 	s.Mux.HandleFunc("GET /api/outputs", s.listOutputs)
@@ -63,7 +77,17 @@ func noCache(h http.Handler) http.Handler {
 }
 
 func (s *Server) getVersion(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]string{"version": s.Version})
+	out := map[string]any{
+		"local": map[string]string{
+			"version":  s.Version,
+			"revision": s.GitSha,
+		},
+		"cloud_image": s.CloudImage,
+	}
+	if s.CloudImage != "" {
+		out["cloud"] = s.imageInfo.Get(r.Context(), s.CloudImage)
+	}
+	writeJSON(w, out)
 }
 
 type sourceFile struct {

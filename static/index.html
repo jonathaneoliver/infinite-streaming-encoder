@@ -100,6 +100,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .about-list { display: grid; grid-template-columns: max-content 1fr; gap: 8px 20px; margin: 0; }
 .about-list dt { color: #aac; font-weight: 600; }
 .about-list dd { margin: 0; color: #eee; font-variant-numeric: tabular-nums; }
+.about-subhead { color: #8cf; font-size: 0.95rem; margin: 0 0 8px 0; font-weight: 600; }
+.about-drift { background: #ef476f; color: #fff; padding: 2px 8px; border-radius: 10px; font-size: 0.7rem; margin-left: 8px; vertical-align: middle; }
+.about-match { background: #3aa76d; color: #fff; padding: 2px 8px; border-radius: 10px; font-size: 0.7rem; margin-left: 8px; vertical-align: middle; }
 .aws-panel { border-top: 3px solid #ffa94d; }
 .aws-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .aws-header-actions { display: flex; gap: 12px; align-items: center; }
@@ -445,10 +448,30 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 <div id="tab-about" class="tab-content">
     <div class="panel">
         <h2>About</h2>
+
+        <h3 class="about-subhead">Local server <span id="about-drift-badge" style="display:none"></span></h3>
         <dl class="about-list">
             <dt>Version</dt>
-            <dd id="about-version">—</dd>
-            <dt>Source</dt>
+            <dd id="about-local-version">—</dd>
+            <dt>Commit</dt>
+            <dd id="about-local-sha">—</dd>
+        </dl>
+
+        <h3 class="about-subhead" style="margin-top:18px">Cloud worker image</h3>
+        <dl class="about-list">
+            <dt>Image</dt>
+            <dd id="about-cloud-image">—</dd>
+            <dt>Version</dt>
+            <dd id="about-cloud-version">—</dd>
+            <dt>Commit</dt>
+            <dd id="about-cloud-sha">—</dd>
+            <dt>Digest</dt>
+            <dd id="about-cloud-digest" style="font-family:monospace;font-size:0.75rem">—</dd>
+        </dl>
+
+        <h3 class="about-subhead" style="margin-top:18px">Source</h3>
+        <dl class="about-list">
+            <dt>Repository</dt>
             <dd><a href="https://github.com/jonathaneoliver/Encoder" target="_blank" rel="noopener">github.com/jonathaneoliver/Encoder</a></dd>
         </dl>
     </div>
@@ -578,6 +601,7 @@ function switchTab(name) {
     }
     if (name === 'outputs') loadOutputs();
     if (name === 'aws') refreshAws();
+    if (name === 'about') loadVersion();
 }
 
 function formatSize(bytes) {
@@ -1706,10 +1730,40 @@ async function loadVersion() {
         const res = await fetch('/api/version');
         if (!res.ok) return;
         const j = await res.json();
-        const v = j.version || 'dev';
-        const el = document.getElementById('about-version');
-        if (el) el.textContent = v;
-    } catch (e) { /* offline — leave "—" */ }
+        const local = j.local || {};
+        const cloud = j.cloud || {};
+
+        document.getElementById('about-local-version').textContent = local.version || 'dev';
+        document.getElementById('about-local-sha').textContent = local.revision || 'unknown';
+
+        document.getElementById('about-cloud-image').textContent = j.cloud_image || '(not configured)';
+        if (cloud.error) {
+            document.getElementById('about-cloud-version').textContent = '(' + cloud.error + ')';
+            document.getElementById('about-cloud-sha').textContent = '—';
+            document.getElementById('about-cloud-digest').textContent = '—';
+        } else {
+            document.getElementById('about-cloud-version').textContent = cloud.version || '—';
+            document.getElementById('about-cloud-sha').textContent = cloud.revision || '—';
+            document.getElementById('about-cloud-digest').textContent = cloud.digest || '—';
+        }
+
+        // Drift badge — local vs cloud commit. Fires on mismatch so the
+        // user knows the next cloud encode won't match what they've
+        // been testing locally.
+        const badge = document.getElementById('about-drift-badge');
+        if (local.revision && cloud.revision && !cloud.error) {
+            if (local.revision === cloud.revision) {
+                badge.className = 'about-match';
+                badge.textContent = 'in sync with cloud';
+            } else {
+                badge.className = 'about-drift';
+                badge.textContent = 'drifted — cloud is ' + cloud.revision;
+            }
+            badge.style.display = 'inline-block';
+        } else {
+            badge.style.display = 'none';
+        }
+    } catch (e) { /* offline — leave defaults */ }
 }
 </script>
 </body>
