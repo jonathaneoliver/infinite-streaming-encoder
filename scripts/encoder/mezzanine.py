@@ -14,6 +14,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from encoder.progress import run_ffmpeg_with_progress
+
 
 @dataclass(frozen=True)
 class MezzanineSpec:
@@ -40,15 +42,23 @@ def build_ffmpeg_cmd(spec: MezzanineSpec) -> list[str]:
 
     Factored out so tests can verify the exact command shape without
     spawning a process.
+
+    We explicitly map the FIRST video and FIRST audio stream. Without
+    this, ffmpeg's default stream-selection rule ("most channels" for
+    audio) picks a 5.1 AC-3 track over a stereo MP3 track when the
+    source has both — that 6-channel audio then propagates through the
+    pipeline as 6-channel AAC, which many HLS players (and the Safari
+    AVFoundation stack) refuse to play, manifesting as NAL-unit decode
+    errors on the VIDEO track when renditions are multiplexed.
     """
     cmd: list[str] = ["ffmpeg", "-y", "-i", str(spec.input_path)]
 
-    # Map specific streams only when the caller has already selected a
-    # video track from a multi-variant source. Without this, ffmpeg's
-    # default behaviour picks streams itself and does the right thing
-    # for single-track containers.
     if spec.video_stream_index is not None:
-        cmd += ["-map", "0:a:0", "-map", f"0:v:{spec.video_stream_index}"]
+        cmd += ["-map", f"0:v:{spec.video_stream_index}"]
+    else:
+        cmd += ["-map", "0:v:0?"]
+    # `?` makes the audio map optional so video-only inputs still work.
+    cmd += ["-map", "0:a:0?"]
 
     if spec.time_limit_s is not None:
         cmd += ["-t", str(spec.time_limit_s)]
@@ -60,17 +70,23 @@ def build_ffmpeg_cmd(spec: MezzanineSpec) -> list[str]:
     return cmd
 
 
-def create_mezzanine(spec: MezzanineSpec) -> Path:
+def create_mezzanine(spec: MezzanineSpec, stage_key: str = "mezzanine",
+                     duration_s: float = 0.0) -> Path:
     """Run the ffmpeg stream copy and return the resulting mezzanine path.
 
-    Output is streamed to stdout so the worker container's log tail
-    (`docker logs -f` on the Go server side) sees progress in real time.
+    When `duration_s` is provided, live progress is emitted as
+    ENCODER-STAGE markers under `stage_key`. Passing 0 (the default)
+    keeps the old behaviour where ffmpeg inherits stderr and stats
+    stream directly into the log.
     """
     spec.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = build_ffmpeg_cmd(spec)
     try:
-        subprocess.run(cmd, check=True)
+        if duration_s > 0:
+            run_ffmpeg_with_progress(cmd, duration_s, stage_key)
+        else:
+            subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
         raise MezzanineError(f"ffmpeg stream copy failed ({e.returncode})") from e
 
