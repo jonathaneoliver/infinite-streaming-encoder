@@ -53,12 +53,39 @@ def render(spec: UserDataSpec) -> str:
     # Triple-brace blocks in f-strings would be awkward; compose plainly.
     return f"""#!/bin/bash
 set -euxo pipefail
-exec > >(tee /var/log/cloud-encode.log | aws s3 cp - {s3}/logs/user-data.log --region {region}) 2>&1
+
+# Tee everything to a local log. Streaming the pipe to S3 directly
+# doesn't work — `aws s3 cp -` from stdin does a multipart upload
+# that only becomes visible in S3 after CompleteMultipartUpload
+# fires, which means the local log-tail sees nothing until the script
+# finishes. Instead: tee to a local file here, and a background
+# uploader (started below) syncs that file to S3 every 5s. The local
+# tail sees ENCODER-STAGE markers within ~5s of the remote emitting
+# them.
+exec > /var/log/cloud-encode.log 2>&1
+
+# Start the log uploader in the background; runs until the script
+# exits. Copies the whole log each tick — S3 PutObject semantics make
+# every tick a complete, visible object. The `2>/dev/null` hides the
+# "file not found" at t=0 before tee has written anything.
+(
+    while true; do
+        aws s3 cp /var/log/cloud-encode.log {s3}/logs/user-data.log --region {region} 2>/dev/null || true
+        sleep 5
+    done
+) &
+LOG_UPLOADER_PID=$!
+
+# Also stream to the EC2 console for instance-connect debugging.
+exec > >(tee -a /dev/console) 2>&1
 
 CURRENT_CLIP="<pre-loop>"
 
 mark_failed() {{
     echo "FAILED at clip '${{CURRENT_CLIP}}': $1" | aws s3 cp - {s3}/_FAILED --region {region} || true
+    # One last log sync so the failure reason is captured.
+    aws s3 cp /var/log/cloud-encode.log {s3}/logs/user-data.log --region {region} 2>/dev/null || true
+    kill $LOG_UPLOADER_PID 2>/dev/null || true
     shutdown -h +1 "encode failed: $1"
     exit 1
 }}
@@ -110,5 +137,9 @@ aws s3 sync /work/output {s3}/output/ \\
     --region {region}
 
 echo "OK" | aws s3 cp - {s3}/_DONE --region {region}
+# Final log flush so the poll's last-tick fetch gets the tail of the
+# run (the 5s uploader may have just slept past the _DONE write).
+aws s3 cp /var/log/cloud-encode.log {s3}/logs/user-data.log --region {region} 2>/dev/null || true
+kill $LOG_UPLOADER_PID 2>/dev/null || true
 shutdown -h +1 "encode complete"
 """
