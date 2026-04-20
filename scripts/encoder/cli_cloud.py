@@ -47,7 +47,16 @@ _CLOUD_STAGES = [
 
 
 def _env(key: str, fallback: str = "") -> str:
-    return os.environ.get(key, fallback)
+    """Like os.environ.get(), but treats empty string as unset.
+
+    The Makefile interpolates `-e INSTANCE_TYPE=$(INSTANCE_TYPE)` literally,
+    so variables missing from .env land in the container as `KEY=""`. A
+    plain dict lookup returns the empty string, bypassing the fallback —
+    which is almost never what we want, since the fallback IS the desired
+    default for an unset value.
+    """
+    v = os.environ.get(key, "")
+    return v if v else fallback
 
 
 def _default_job_id() -> str:
