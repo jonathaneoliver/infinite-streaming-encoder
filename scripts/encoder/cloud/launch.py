@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from botocore.exceptions import ClientError
 
-from encoder.cloud.aws import ec2_client
+from encoder.cloud.aws import ec2_client, job_tags
 
 
 @dataclass(frozen=True)
@@ -86,6 +86,19 @@ def launch(spec: LaunchSpec) -> LaunchResult:
         for subnet in subnets:
             print(f">>> Launching {try_type} in subnet {subnet}", flush=True)
             try:
+                tags = job_tags(spec.job_id)
+                # Tag every resource type RunInstances creates: the instance
+                # itself, its spot request (if any), and its attached EBS
+                # volume. Scoped cleanup (issue #5) relies on all three
+                # carrying the Application=encoder-app tag.
+                tag_specs = [
+                    {"ResourceType": "instance", "Tags": tags},
+                    {"ResourceType": "volume", "Tags": tags},
+                ]
+                if spec.use_spot:
+                    tag_specs.append(
+                        {"ResourceType": "spot-instances-request", "Tags": tags},
+                    )
                 resp = ec2.run_instances(
                     ImageId=spec.ami_id,
                     InstanceType=try_type,
@@ -98,15 +111,18 @@ def launch(spec: LaunchSpec) -> LaunchResult:
                     UserData=user_data_b64,
                     BlockDeviceMappings=[{
                         "DeviceName": "/dev/xvda",
-                        "Ebs": {"VolumeSize": 100, "VolumeType": "gp3"},
+                        # DeleteOnTermination=True is the EBS default for
+                        # RunInstances, but stating it explicitly is worth
+                        # the extra bytes — if a future AWS SDK change ever
+                        # flipped the default, we'd start leaking volumes
+                        # into the "orphan" pile.
+                        "Ebs": {
+                            "VolumeSize": 100,
+                            "VolumeType": "gp3",
+                            "DeleteOnTermination": True,
+                        },
                     }],
-                    TagSpecifications=[{
-                        "ResourceType": "instance",
-                        "Tags": [
-                            {"Key": "Name", "Value": f"encode-{spec.job_id}"},
-                            {"Key": "JobId", "Value": spec.job_id},
-                        ],
-                    }],
+                    TagSpecifications=tag_specs,
                     **market_options,
                 )
             except ClientError as e:

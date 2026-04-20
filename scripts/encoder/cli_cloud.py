@@ -16,12 +16,14 @@ from __future__ import annotations
 import argparse
 import atexit
 import os
+import signal
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 from encoder.cloud.aws import AuthError, check_credentials, resolve_al2023_ami, region
-from encoder.cloud.launch import LaunchError, LaunchSpec, launch, terminate
+from encoder.cloud.cleanup import terminate_job
+from encoder.cloud.launch import LaunchError, LaunchSpec, launch
 from encoder.cloud.poll import poll_until_done
 from encoder.cloud.sync import (
     download_outputs, download_user_data_log, remove_staging, upload_inputs,
@@ -134,6 +136,43 @@ def main() -> int:
         print("(dry-run; exiting)")
         return 0
 
+    # Register the teardown BEFORE any AWS state is created, so even a
+    # crash in upload_inputs can't leave staging behind.
+    #
+    # --keep-instance / --keep-s3 opt the user out of automatic cleanup:
+    # a clean exit respects those flags; an abnormal exit (crash /
+    # signal) IGNORES them and forces full teardown. The whole point of
+    # this safety layer is that crashes don't leak resources. If you
+    # genuinely want the instance preserved through a crash for
+    # forensics, don't launch it through this tool.
+    state = {"cleaned": False, "exit_abnormal": True}
+
+    def _cleanup(reason: str) -> None:
+        if state["cleaned"]:
+            return
+        state["cleaned"] = True
+        force = state["exit_abnormal"]
+        if args.keep_instance and not force:
+            print(f">>> leaving instance up (--keep-instance), reason={reason}",
+                  flush=True)
+            return
+        print(f">>> cleanup ({reason}) for job {job_id}", flush=True)
+        report = terminate_job(job_id)
+        for action in report.actions:
+            # S3 on a clean keep-s3 exit is the user's call, but on a
+            # crash terminate_job deletes it anyway — safer default.
+            print(f"    {action.action:<11s} {action.kind:<13s} {action.id}",
+                  flush=True)
+
+    atexit.register(_cleanup, "atexit")
+
+    def _signal_handler(sig, _frame):
+        _cleanup(f"signal {sig}")
+        sys.exit(128 + sig)
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
     # Upload inputs
     upload_inputs(args.input, s3_prefix)
 
@@ -174,13 +213,8 @@ def main() -> int:
 
     print(f"    instance: {result.instance_id} "
           f"({result.instance_type} in {result.subnet_id})", flush=True)
-
-    # Cleanup trap — always terminate unless --keep-instance.
-    if not args.keep_instance:
-        atexit.register(
-            lambda: (print(f">>> Terminating {result.instance_id} (safety net)",
-                           flush=True), terminate(result.instance_id))
-        )
+    # The atexit handler registered above already knows how to tear
+    # down by job_id; it will find this instance via the JobId tag.
 
     # Poll for completion
     poll_timeout_per_clip = int(_env("POLL_TIMEOUT_PER_CLIP", "3600"))
@@ -203,7 +237,9 @@ def main() -> int:
     print(f"    downloaded {count} files", flush=True)
     download_user_data_log(s3_prefix, local_output_dir)
 
-    # Maybe clean up S3
+    # Maybe clean up S3 (atexit will pick up anything we leave behind
+    # on an abnormal exit, but clean-exit S3 lifecycle is controlled
+    # by --keep-s3 and the verified-download check).
     if args.keep_s3:
         print(f">>> Leaving S3 staging at {s3_prefix} (--keep-s3 set)", flush=True)
     elif count < 1:
@@ -214,6 +250,9 @@ def main() -> int:
               flush=True)
         remove_staging(s3_prefix)
 
+    # We reached the end cleanly — flag this so the atexit cleanup
+    # respects --keep-instance / --keep-s3 instead of forcing teardown.
+    state["exit_abnormal"] = False
     print(f">>> Done. Outputs in {local_output_dir}", flush=True)
     return 0
 

@@ -3,12 +3,53 @@
 Centralizes the `region_name` wiring so individual modules can just do
 `ec2_client()` / `s3_client()` / `ssm_client()` without repeating
 region plumbing.
+
+Also defines the resource-tagging contract this tool relies on for
+safe cleanup. Every EC2 instance, EBS volume, spot request, and
+(where the API permits) S3 object is tagged `Application=encoder-app`.
+The inventory and emergency-clear flows scope themselves strictly to
+that tag, so nothing un-tagged ever gets touched.
 """
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 
 import boto3
+
+
+# The only tag we use to identify resources this tool has created.
+# Do not change without a migration — the emergency-clear filter keys
+# off this exact value, and anything that doesn't match is treated as
+# user-owned and never touched.
+APP_TAG_KEY = "Application"
+APP_TAG_VALUE = "encoder-app"
+
+
+def app_tag() -> dict[str, str]:
+    """{'Key': 'Application', 'Value': 'encoder-app'} — the cleanup key."""
+    return {"Key": APP_TAG_KEY, "Value": APP_TAG_VALUE}
+
+
+def job_tags(job_id: str) -> list[dict[str, str]]:
+    """All tags to attach to every resource launched for one job.
+
+    - Application: static marker the cleanup flows filter on
+    - JobId: ties resources back to /api/jobs/<id> server-side
+    - LaunchedAt: RFC 3339 timestamp, used by the MaxLifetime watchdog
+      to kill instances that outlive their budget regardless of state
+    """
+    return [
+        app_tag(),
+        {"Key": "JobId", "Value": job_id},
+        {"Key": "LaunchedAt", "Value": datetime.now(timezone.utc).isoformat()},
+        {"Key": "Name", "Value": f"encode-{job_id}"},
+    ]
+
+
+def app_tag_filter() -> list[dict]:
+    """Filter list for ec2.describe_* / s3.list-by-tag queries."""
+    return [{"Name": f"tag:{APP_TAG_KEY}", "Values": [APP_TAG_VALUE]}]
 
 
 def region() -> str:

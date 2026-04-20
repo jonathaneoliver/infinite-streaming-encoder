@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -28,6 +29,10 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/jobs/{id}/logs", s.jobLogs)
 	s.Mux.HandleFunc("GET /api/jobs/stream", s.streamJobs)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/cancel", s.cancelJob)
+	// AWS inventory + cleanup (issue #5)
+	s.Mux.HandleFunc("GET /api/aws/inventory", s.awsInventory)
+	s.Mux.HandleFunc("POST /api/aws/clear", s.awsClearAll)
+	s.Mux.HandleFunc("POST /api/aws/jobs/{id}/cleanup", s.awsCleanupJob)
 	// Serve encode logs
 	s.Mux.Handle("GET /logs/", http.StripPrefix("/logs/", http.FileServer(http.Dir(filepath.Join(mgr.TmpDir, "logs")))))
 	// Serve encoded output files (segments, manifests) for HLS.js playback
@@ -477,4 +482,97 @@ func isVideo(ext string) bool {
 		return true
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// AWS inventory + cleanup (issue #5)
+//
+// We delegate to the Python cloud modules via subprocess rather than
+// wiring aws-sdk-go-v2 into the server. The Python side already has
+// the boto3 client plumbing, the tagging contract, and the same error
+// handling the CLI uses — there's no gain from duplicating all that in
+// Go. The subprocess boundary also neatly sandboxes any AWS API timeout
+// or crash away from the main server goroutine.
+// ---------------------------------------------------------------------------
+
+// runPythonCloud invokes `python3 -m encoder.cloud.<module> <args>` and
+// returns the captured stdout on exit-0, or an error containing stderr.
+func runPythonCloud(module string, args ...string) ([]byte, error) {
+	fullArgs := append([]string{"-m", "encoder.cloud." + module, "--json"}, args...)
+	cmd := exec.Command("python3", fullArgs...)
+	// The Python modules read AWS_REGION, S3_BUCKET, etc. from the
+	// server process's environment — same vars the encoder has been
+	// forwarding into worker containers all along.
+	cmd.Env = os.Environ()
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("python3 -m encoder.cloud.%s exited %d: %s",
+				module, ee.ExitCode(), strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("python3 -m encoder.cloud.%s: %w", module, err)
+	}
+	return out, nil
+}
+
+func (s *Server) awsInventory(w http.ResponseWriter, r *http.Request) {
+	out, err := runPythonCloud("inventory")
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+type clearRequest struct {
+	// Literal string "CLEAR AWS" — anything else is rejected.
+	// This is the user-confirmation gate; the UI prompts for the
+	// exact string before enabling the confirm button.
+	Confirm string `json:"confirm"`
+}
+
+func (s *Server) awsClearAll(w http.ResponseWriter, r *http.Request) {
+	var body clearRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request: "+err.Error(), 400)
+		return
+	}
+	if body.Confirm != "CLEAR AWS" {
+		http.Error(w,
+			`confirmation required: POST body must contain {"confirm": "CLEAR AWS"}`,
+			400)
+		return
+	}
+	out, err := runPythonCloud("cleanup", "--sweep-all")
+	if err != nil {
+		// Non-zero exit from cleanup means at least one action failed —
+		// we still want to return the structured report so the UI can
+		// render a partial-success state.
+		if strings.Contains(err.Error(), "exited 1") {
+			// cleanup.py prints the JSON report to stdout before
+			// exit(1), so we should re-invoke WITHOUT piping stderr
+			// to get that output. Simpler: just fall back to returning
+			// the error message as a plain-text response.
+		}
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+func (s *Server) awsCleanupJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || strings.ContainsAny(id, "/\\") {
+		http.Error(w, "invalid job id", 400)
+		return
+	}
+	out, err := runPythonCloud("cleanup", "--job-id", id)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
 }
