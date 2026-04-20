@@ -192,9 +192,11 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
 
-    # Upload inputs
+    # Upload inputs — sync.upload_inputs emits running/percent ticks
+    # when given a stage_key; we book-end with explicit running(0) and
+    # done(100) so the stage is visible even for skip-all-files reruns.
     emit_stage("cloud:upload", "running", 0.0)
-    upload_inputs(args.input, s3_prefix)
+    upload_inputs(args.input, s3_prefix, stage_key="cloud:upload")
     emit_stage("cloud:upload", "done", 100.0)
 
     # Render user-data
@@ -258,10 +260,10 @@ def main() -> int:
         return 2
     emit_stage("cloud:encode-remote", "done", 100.0)
 
-    # Download outputs
+    # Download outputs — same book-ending pattern as upload.
     emit_stage("cloud:download", "running", 0.0)
     print(f">>> Syncing outputs to {local_output_dir}", flush=True)
-    count = download_outputs(s3_prefix, local_output_dir)
+    count = download_outputs(s3_prefix, local_output_dir, stage_key="cloud:download")
     print(f"    downloaded {count} files", flush=True)
     download_user_data_log(s3_prefix, local_output_dir)
     emit_stage("cloud:download", "done", 100.0)
