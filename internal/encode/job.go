@@ -43,22 +43,46 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Lock()
 		// MERGE semantics: existing rows keep their status/percent (so
 		// the remote's PLAN can't wipe cloud:upload's "done" state when
-		// the local orchestrator finished it earlier). Any key in the
-		// new plan that we haven't seen before is APPENDED at the end
-		// — preserving the existing order so rows don't jump around
-		// in the UI mid-job.
+		// the local orchestrator finished it earlier).
+		//
+		// New keys from the incoming PLAN are inserted AFTER the last
+		// currently-running-or-done stage — not appended blindly at
+		// the end. This keeps chronological order when a second PLAN
+		// arrives mid-job: a cloud encode's remote Python pipeline
+		// emits its per-variant PLAN while `cloud:encode-remote` is
+		// the currently-running stage, so those per-variant entries
+		// slot in right after it and before any still-pending tail
+		// stages (remote:sync-outputs / cloud:download / cloud:cleanup).
 		existing := make(map[string]bool, len(j.Stages))
 		for _, s := range j.Stages {
 			existing[s.Key] = true
 		}
+
+		var newStages []StageProgress
 		for _, d := range desc {
 			if existing[d.Key] {
 				continue
 			}
-			j.Stages = append(j.Stages, StageProgress{
+			newStages = append(newStages, StageProgress{
 				Key: d.Key, Label: d.Label, Status: "pending", Percent: 0,
 			})
 			existing[d.Key] = true
+		}
+
+		if len(newStages) > 0 {
+			// Find the position right after the last non-pending stage.
+			// Fall back to end-of-list when every existing stage is
+			// still pending (e.g. the very first PLAN emission).
+			insertIdx := len(j.Stages)
+			for i := len(j.Stages) - 1; i >= 0; i-- {
+				if j.Stages[i].Status != "pending" {
+					insertIdx = i + 1
+					break
+				}
+			}
+			tail := append([]StageProgress{}, j.Stages[insertIdx:]...)
+			j.Stages = append(j.Stages[:insertIdx], newStages...)
+			j.Stages = append(j.Stages, tail...)
 		}
 		j.mu.Unlock()
 		return true
