@@ -283,8 +283,8 @@ def gc_failed_staging(max_age_s: int = 3600) -> CleanupReport:
     inputs + mezzanines + completed variants stay on S3; after that
     the prefix is reaped to keep storage cost bounded.
 
-    Only touches prefixes that contain a \`_FAILED\` object — a still-
-    running or successful (\`_DONE\`) job is skipped regardless of age.
+    Only touches prefixes that contain a `_FAILED` object — a still-
+    running or successful (`_DONE`) job is skipped regardless of age.
     """
     import time as _time
 

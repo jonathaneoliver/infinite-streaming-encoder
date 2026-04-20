@@ -256,10 +256,10 @@ for bn in {basenames}; do
     # markers from cli_local.py → they flow through docker → our
     # /var/log/cloud-encode.log → S3 → local poll tail.
     # On resume, hand cli_local.py a --resume-package-from that points
-    # at /work/output; its resume.py scans for {codec}_{res}.mp4 and
-    # skips the corresponding variant tiers. --resume-package-from is
-    # a no-op when the target dir is empty, so it's safe to always pass
-    # on the resume path.
+    # at /work/output; its resume.py scans for the per-variant MP4s
+    # (named by codec and tier) and skips the corresponding variant
+    # tiers. --resume-package-from is a no-op when the target dir is
+    # empty, so it's safe to always pass on the resume path.
     RESUME_ARG=""
     if [ -n "$RESUME_FROM" ]; then
         RESUME_ARG="--resume-package-from /work/output"
