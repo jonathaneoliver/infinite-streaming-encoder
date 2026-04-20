@@ -484,10 +484,14 @@ func (m *Manager) finalizeCancelled(job *Job, jobTmpDir string) {
 
 // Cancel signals a job to stop. For a queued job this just marks it; when
 // the goroutine picks up the semaphore slot it'll short-circuit into
-// finalizeCancelled. For a running job we additionally force-remove any
-// worker container carrying the matching label — that makes `docker logs`
-// return in attachAndWait, which unwinds the encode loop and lands us in
-// the same finalize path.
+// finalizeCancelled. For a running job we gracefully STOP the worker
+// container (SIGTERM + grace period) so the Python orchestrator inside
+// gets a chance to run its cleanup handlers — critical for cloud jobs,
+// where cli_cloud.py's SIGTERM handler calls terminate_job() which
+// terminates the EC2 instance via boto3 before exiting. Previously we
+// did `docker rm -f` here, which SIGKILLs the container immediately
+// and bypasses the Python cleanup, leaving the EC2 instance to bill
+// until the awswatch watchdog (4h default) reaped it.
 //
 // Returns false if no job with that ID exists, or true in all other cases
 // (idempotent — calling twice on the same job is a no-op).
@@ -502,7 +506,7 @@ func (m *Manager) Cancel(id string) bool {
 	job.MarkCancelled()
 	m.notify(job)
 
-	// Kill any worker container for this job. The label filter matches
+	// Discover worker containers for this job. The label filter matches
 	// every file-index container we might have spawned; there will only
 	// ever be one alive at a time under the current serial encode loop,
 	// but the filter is defensive against future parallelism.
@@ -510,11 +514,28 @@ func (m *Manager) Cancel(id string) bool {
 		"--filter", "label=encoder.job_id="+id,
 		"--format", "{{.Names}}",
 	).Output()
-	if err == nil {
-		for _, name := range strings.Fields(string(out)) {
-			exec.Command("docker", "rm", "-f", name).Run()
-		}
+	if err != nil {
+		return true
 	}
+	names := strings.Fields(string(out))
+	if len(names) == 0 {
+		return true
+	}
+
+	// Graceful stop runs in the background so the UI's POST returns
+	// immediately and the Cancel action feels instant. `docker stop
+	// --time 30` sends SIGTERM, waits up to 30s for the container to
+	// exit, then SIGKILLs if it didn't. boto3 TerminateInstances +
+	// CancelSpotInstanceRequests typically complete in 2-5s, so the
+	// budget is generous. After stop, `docker rm` cleans up the
+	// container record so runFileContainer's reattach-if-exists path
+	// can't pick it up on a subsequent retry.
+	go func() {
+		for _, name := range names {
+			exec.Command("docker", "stop", "--time", "30", name).Run()
+			exec.Command("docker", "rm", name).Run()
+		}
+	}()
 	return true
 }
 
