@@ -29,6 +29,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
 .controls { display: flex; gap: 16px; flex-wrap: wrap; align-items: end; margin-top: 16px; }
 .encode-options { border: 1px solid #2a3a5e; border-radius: 6px; padding: 16px 16px 18px; margin-top: 20px; background: #0f1b33; }
+.cloud-warning { background: rgba(255, 169, 77, 0.1); border: 1px solid #ffa94d; border-radius: 4px; padding: 10px 14px; margin-bottom: 16px; color: #ffa94d; font-size: 0.85rem; }
+.cloud-warning a { color: #ffd89b; text-decoration: underline; cursor: pointer; }
+.job-cloud-badge { display: inline-block; color: #ffa94d; background: rgba(255, 169, 77, 0.15); border: 1px solid #ffa94d; border-radius: 3px; padding: 0 6px; margin-left: 8px; font-size: 0.7rem; cursor: pointer; vertical-align: middle; }
+.job-cloud-badge:hover { background: rgba(255, 169, 77, 0.3); }
 .encode-options > legend { padding: 0 8px; color: #888; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; }
 .encode-options > .controls { margin-top: 0; }
 .control-group { display: flex; flex-direction: column; gap: 4px; }
@@ -230,10 +234,15 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
         <fieldset class="encode-options">
             <legend>Encoding Options</legend>
+            <div id="cloud-warning" class="cloud-warning" style="display:none">
+                ⚠ Cloud encodes launch billable AWS resources. Check the
+                <a onclick="switchTab('aws')">AWS tab</a>
+                to confirm nothing is leaking before and after each job.
+            </div>
             <div class="controls">
             <div class="control-group">
                 <label>Target</label>
-                <select id="target">
+                <select id="target" onchange="onTargetChange()">
                     <option value="local">Local</option>
                     <option value="cloud">Cloud (AWS)</option>
                 </select>
@@ -603,13 +612,47 @@ function renderSources() {
     updateSelectedCount();
 }
 
+function onTargetChange() {
+    const target = document.getElementById('target').value;
+    document.getElementById('cloud-warning').style.display =
+        target === 'cloud' ? 'block' : 'none';
+}
+
+// Before submitting a cloud encode, peek at the AWS inventory. If
+// something's already billing, make the user explicitly confirm they
+// meant to start another one. Failure to query inventory doesn't
+// block submission — user can still launch if they accept the risk.
+async function confirmCloudIfBilling() {
+    try {
+        const res = await fetch('/api/aws/inventory');
+        if (!res.ok) return true;
+        const inv = await res.json();
+        const running = (inv.summary && inv.summary.running_instances) || 0;
+        if (running === 0) return true;
+        const hourly = (inv.summary && inv.summary.estimated_hourly_usd) || 0;
+        return confirm(
+            `${running} AWS instance${running === 1 ? '' : 's'} already ` +
+            `running (~$${hourly.toFixed(2)}/hr). Start another cloud encode?`
+        );
+    } catch (e) {
+        // Can't reach inventory — let the user decide.
+        return confirm(
+            'Could not verify AWS state (' + e.message + '). ' +
+            'Start cloud encode anyway?'
+        );
+    }
+}
+
 async function startEncode() {
     const selected = Array.from(document.querySelectorAll('#file-list input:checked')).map(cb => cb.value);
     if (selected.length === 0) return;
 
+    const target = document.getElementById('target').value;
+    if (target === 'cloud' && !await confirmCloudIfBilling()) return;
+
     const body = {
         files: selected,
-        target: document.getElementById('target').value,
+        target: target,
         codec: document.getElementById('codec').value,
         max_res: document.getElementById('max-res').value,
         time: document.getElementById('time-limit').value,
@@ -772,12 +815,16 @@ async function loadOutputDetail(name) {
 const openLogs = new Set();
 
 function jobRowHtml(j) {
+    const cloudBadge = j.config.target === 'cloud'
+        ? `<span class="job-cloud-badge" onclick="switchTab('aws')" title="Click to view AWS resources">☁ cloud</span>`
+        : '';
     return `
         <div class="job" id="job-${j.id}">
             <div class="job-header">
                 <div>
                     <span class="job-files">${escapeHtml((j.config.files || []).join(', '))}</span>
                     <span class="job-meta"> — ${j.config.target} / ${j.config.codec}${j.config.max_res ? ' / ' + j.config.max_res : ''}</span>
+                    ${cloudBadge}
                 </div>
                 <span class="job-status status-${j.status}">${j.status.toUpperCase()}</span>
             </div>
