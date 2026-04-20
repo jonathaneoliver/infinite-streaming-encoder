@@ -262,6 +262,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="graviton">Graviton ARM (c7g)</option>
                 </select>
             </div>
+            <div class="control-group" id="spot-group" style="display:none;align-self:center;padding-top:16px">
+                <label title="Spot is ~2.6× cheaper but AWS can reclaim with 2 min notice. Uncheck to use on-demand (guaranteed, no interruption)."><input type="checkbox" id="use-spot" checked style="width:auto;min-width:auto"> Use spot (cheaper)</label>
+            </div>
             <div class="control-group">
                 <label>Codec</label>
                 <select id="codec">
@@ -669,6 +672,8 @@ function onTargetChange() {
     // doesn't suggest a setting that gets ignored.
     document.getElementById('cpu-arch-group').style.display =
         target === 'cloud' ? 'flex' : 'none';
+    document.getElementById('spot-group').style.display =
+        target === 'cloud' ? 'flex' : 'none';
 }
 
 // Before submitting a cloud encode, peek at the AWS inventory. If
@@ -750,6 +755,7 @@ async function startEncode(force = false) {
         padding: document.getElementById('padding').value,
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         cpu_arch: document.getElementById('cpu-arch').value,
+        use_spot: document.getElementById('use-spot').checked,
         force_reencode: force
     };
 
@@ -1499,6 +1505,7 @@ async function forceReencode(fileName) {
         padding: document.getElementById('padding').value,
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         cpu_arch: document.getElementById('cpu-arch').value,
+        use_spot: document.getElementById('use-spot').checked,
         force_reencode: true
     };
 

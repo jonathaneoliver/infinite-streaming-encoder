@@ -208,6 +208,10 @@ type JobConfig struct {
 	// Empty defaults to intel. Ignored for local encodes (which always
 	// run on the host's native architecture).
 	CpuArch string `json:"cpu_arch,omitempty"`
+	// UseSpot controls EC2 purchasing mode for cloud encodes. Pointer
+	// so `omitempty` works and an unset value lets cli_cloud.py apply
+	// its env-var default (USE_SPOT=true). Ignored for local encodes.
+	UseSpot *bool `json:"use_spot,omitempty"`
 }
 
 type StageProgress struct {
@@ -909,6 +913,9 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	if cfg.Target == TargetCloud && cfg.CpuArch != "" {
 		args = append(args, "--cpu-arch", cfg.CpuArch)
 	}
+	if cfg.Target == TargetCloud && cfg.UseSpot != nil && !*cfg.UseSpot {
+		args = append(args, "--no-spot")
+	}
 	return args
 }
 
@@ -965,6 +972,9 @@ func (cfg *JobConfig) cloudBatchArgs(sourceDir, outputDir string, filenames []st
 	}
 	if cfg.CpuArch != "" {
 		args = append(args, "--cpu-arch", cfg.CpuArch)
+	}
+	if cfg.UseSpot != nil && !*cfg.UseSpot {
+		args = append(args, "--no-spot")
 	}
 	return args
 }

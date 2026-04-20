@@ -178,24 +178,42 @@ def _s3_bucket_from_env() -> str | None:
 
 
 def _delete_s3_prefix(bucket: str, prefix: str, report: CleanupReport,
-                      job_id: str | None) -> None:
-    """Recursively delete every object under prefix. Does nothing if empty."""
+                      job_id: str | None, keep_logs: bool = False) -> None:
+    """Recursively delete every object under prefix. Does nothing if empty.
+
+    When `keep_logs=True`, objects under `<prefix>logs/` and the
+    `<prefix>_FAILED` marker are skipped — the idea is to drop the
+    expensive stuff (multi-GB inputs and partial outputs) while
+    preserving the kilobyte-scale evidence the user needs to debug.
+    """
     s3 = s3_client()
     paginator = s3.get_paginator("list_objects_v2")
     total = 0
+    logs_prefix = f"{prefix}logs/"
+    failed_marker = f"{prefix}_FAILED"
     try:
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             contents = page.get("Contents", [])
             if not contents:
                 continue
-            keys = [{"Key": obj["Key"]} for obj in contents]
+            keys = []
+            for obj in contents:
+                key = obj["Key"]
+                if keep_logs and (key.startswith(logs_prefix) or key == failed_marker):
+                    continue
+                keys.append({"Key": key})
+            if not keys:
+                continue
             s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
             total += len(keys)
         if total > 0:
+            detail = f"{total} object(s)"
+            if keep_logs:
+                detail += " (kept logs/ + _FAILED)"
             report.actions.append(ResourceAction(
                 kind="s3_prefix", id=f"s3://{bucket}/{prefix}",
                 job_id=job_id,
-                action="deleted", detail=f"{total} object(s)",
+                action="deleted", detail=detail,
             ))
     except ClientError as e:
         report.actions.append(ResourceAction(
@@ -208,7 +226,7 @@ def _delete_s3_prefix(bucket: str, prefix: str, report: CleanupReport,
 # Public entry points
 # ---------------------------------------------------------------------------
 
-def terminate_job(job_id: str, keep_s3: bool = False) -> CleanupReport:
+def terminate_job(job_id: str, keep_s3: "bool | str" = False) -> CleanupReport:
     """Tear down one job's AWS footprint. Safe for atexit handlers.
 
     Order: terminate instances first (this frees attached EBS as long
@@ -216,11 +234,15 @@ def terminate_job(job_id: str, keep_s3: bool = False) -> CleanupReport:
     then cancel any still-open spot request, then delete any orphaned
     volumes (shouldn't exist post-terminate, but defensive), then S3.
 
-    `keep_s3=True` skips the S3 prefix deletion. Useful on failures:
-    we still want to stop EC2 billing, but the remote's user-data.log
-    under `jobs/<id>/logs/user-data.log` is often the only diagnostic
-    evidence. The Emergency Clear button can tidy it up later once
-    the user has the answer they need.
+    `keep_s3` controls staging cleanup:
+
+      - False / "none"  — delete everything under jobs/<id>/
+      - True / "all"    — keep everything (legacy fail-open behaviour)
+      - "logs"          — delete inputs + partial outputs but KEEP
+                          logs/ and the _FAILED marker. Preferred for
+                          failed jobs: you keep the ~KB of diagnostic
+                          evidence but drop the GB-scale video data
+                          that makes S3 storage expensive.
     """
     report = CleanupReport(scope=f"job:{job_id}")
     ec2 = ec2_client()
@@ -234,12 +256,21 @@ def terminate_job(job_id: str, keep_s3: bool = False) -> CleanupReport:
     orphan_volumes = _describe_app_volumes(ec2, job_id, only_orphans=True)
     _delete_volumes(ec2, orphan_volumes, report)
 
-    if keep_s3:
+    # Normalise keep_s3 into one of: "none" | "logs" | "all".
+    if keep_s3 is True:
+        mode = "all"
+    elif keep_s3 is False:
+        mode = "none"
+    else:
+        mode = keep_s3  # string caller passed through
+
+    if mode == "all":
         return report
 
     bucket = _s3_bucket_from_env()
     if bucket:
-        _delete_s3_prefix(bucket, f"jobs/{job_id}/", report, job_id)
+        _delete_s3_prefix(bucket, f"jobs/{job_id}/", report, job_id,
+                          keep_logs=(mode == "logs"))
     return report
 
 

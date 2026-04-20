@@ -98,6 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "Picks instance type + AMI arch together; the "
                         "encoder image is multi-arch so both x86 and "
                         "Graviton work.")
+    # Mirrors USE_SPOT env var. --no-spot is the only override — spot
+    # is the default because it's ~2.6× cheaper. On-demand is for when
+    # you can't afford a 2-min spot interruption mid-encode.
+    p.add_argument("--no-spot", action="store_true", dest="no_spot",
+                   help="use on-demand EC2 instead of spot (guaranteed "
+                        "uptime; ~2.6× cost)")
 
     # Remaining args get forwarded verbatim to create_abr_ladder.sh on the remote.
     return p
@@ -161,7 +167,11 @@ def main() -> int:
         t for t in _env("INSTANCE_TYPE_FALLBACKS", arch_profile.fallbacks).split(",")
         if t.strip()
     ]
+    # CLI flag wins over env: --no-spot forces on-demand regardless of
+    # USE_SPOT. Otherwise fall through to the env default.
     use_spot = _env("USE_SPOT", "true").lower() == "true"
+    if args.no_spot:
+        use_spot = False
 
     print("=== cloud_encode plan ===")
     print(f"  job_id:         {job_id}")
@@ -194,11 +204,21 @@ def main() -> int:
     #
     # --keep-instance / --keep-s3 opt the user out of automatic cleanup:
     # a clean exit respects those flags; an abnormal exit (crash /
-    # signal) IGNORES them for EC2 (no billing leaks) but KEEPS S3
-    # staging so diagnostic artifacts (user-data.log under logs/)
-    # survive the crash path. Emergency Clear in the AWS tab mops up
-    # the staging once the user is done reading it.
-    state = {"cleaned": False, "exit_abnormal": True}
+    # signal) IGNORES them for EC2 (no billing leaks).
+    #
+    # For S3 on abnormal exit we need to balance two goals:
+    #  1. don't leak money — multi-GB inputs and partial outputs sit
+    #     in S3 at ~$0.023/GB-month until someone cleans up
+    #  2. don't lose diagnostic evidence — user-data.log is usually
+    #     the only way to understand what failed
+    #
+    # Strategy: attempt to download user-data.log locally BEFORE
+    # abnormal cleanup. If the local copy lands, we delete everything
+    # from S3 (local has the log, we're safe). If the local download
+    # fails, we keep only logs/ + _FAILED in S3 — a few KB of evidence
+    # versus multi-GB of redundant video. Either way, billing stops.
+    state: dict = {"cleaned": False, "exit_abnormal": True,
+                   "local_log_saved": False}
 
     def _cleanup(reason: str) -> None:
         if state["cleaned"]:
@@ -209,13 +229,32 @@ def main() -> int:
             print(f">>> leaving instance up (--keep-instance), reason={reason}",
                   flush=True)
             return
-        # On abnormal exit we keep S3 staging around so the user can
-        # read jobs/<id>/logs/user-data.log after the fact — losing
-        # the only diagnostic evidence on a crash defeats the point.
-        print(f">>> cleanup ({reason}) for job {job_id}"
-              + (" (S3 staging preserved for diagnostics)" if force else ""),
-              flush=True)
-        report = terminate_job(job_id, keep_s3=force)
+        # Best-effort last-ditch log grab for abnormal exits where
+        # the normal failure path didn't run (e.g. Ctrl-C before
+        # poll_until_done returned). Sets state["local_log_saved"].
+        if force and not state["local_log_saved"]:
+            try:
+                state["local_log_saved"] = download_user_data_log(
+                    s3_prefix, local_output_dir)
+            except Exception:
+                pass
+        # Pick the S3 cleanup mode:
+        #   - normal exit: full delete (unless --keep-s3)
+        #   - abnormal + local log saved: full delete (we've got it)
+        #   - abnormal + no local log: keep logs/ + _FAILED only
+        if not force:
+            mode = "all" if args.keep_s3 else "none"
+        elif state["local_log_saved"]:
+            mode = "none"
+        else:
+            mode = "logs"
+        note = {
+            "all": " (S3 staging preserved — --keep-s3)",
+            "logs": " (S3 inputs/outputs deleted, logs/ kept for diagnostics)",
+            "none": " (S3 staging deleted; local log preserved)" if force else "",
+        }[mode]
+        print(f">>> cleanup ({reason}) for job {job_id}{note}", flush=True)
+        report = terminate_job(job_id, keep_s3=mode)
         for action in report.actions:
             print(f"    {action.action:<11s} {action.kind:<13s} {action.id}",
                   flush=True)
@@ -312,7 +351,10 @@ def main() -> int:
         else:
             print(f"!!! Job did not complete (status={status}). "
                   f"Fetching user-data log.", file=sys.stderr)
-        download_user_data_log(s3_prefix, local_output_dir)
+        # Record whether the local log grab succeeded so _cleanup can
+        # delete S3 fully (local copy is safe) vs keep logs/ only.
+        state["local_log_saved"] = download_user_data_log(
+            s3_prefix, local_output_dir)
         return 2
     emit_stage("cloud:encode-remote", "done", 100.0)
 
@@ -321,7 +363,7 @@ def main() -> int:
     print(f">>> Syncing outputs to {local_output_dir}", flush=True)
     count = download_outputs(s3_prefix, local_output_dir, stage_key="cloud:download")
     print(f"    downloaded {count} files", flush=True)
-    download_user_data_log(s3_prefix, local_output_dir)
+    state["local_log_saved"] = download_user_data_log(s3_prefix, local_output_dir)
     emit_stage("cloud:download", "done", 100.0)
 
     # Maybe clean up S3 (atexit will pick up anything we leave behind
