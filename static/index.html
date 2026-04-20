@@ -90,6 +90,59 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .stage-bar-fill.stage-fill-done { background: #06d6a0; }
 .stage-bar-fill.stage-fill-failed { background: #ef476f; }
 
+/* --- AWS tab --- */
+.tab-aws { color: #ffa94d; }
+.tab-aws.active { color: #ffa94d; border-bottom-color: #ffa94d; }
+.aws-panel { border-top: 3px solid #ffa94d; }
+.aws-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+.aws-header-actions { display: flex; gap: 12px; align-items: center; }
+.aws-refresh-time { color: #666; font-size: 0.8rem; }
+.aws-auto-toggle { color: #888; font-size: 0.85rem; cursor: pointer; display: flex; gap: 6px; align-items: center; }
+.aws-auto-toggle input { width: auto; min-width: auto; }
+
+.aws-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 20px; }
+.aws-metric { background: #0f1b33; border: 1px solid #2a3a5e; border-radius: 6px; padding: 12px 14px; }
+.aws-metric-label { color: #888; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+.aws-metric-value { color: #e0e0e0; font-size: 1.4rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.aws-metric-value.warn { color: #ffa94d; }
+.aws-metric-value.ok { color: #06d6a0; }
+
+.aws-section { margin-bottom: 20px; }
+.aws-section h3 { color: #aac; font-size: 0.9rem; margin-bottom: 8px; font-weight: 600; }
+.aws-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; background: #0f1b33; border: 1px solid #2a3a5e; border-radius: 6px; overflow: hidden; }
+.aws-table th { text-align: left; padding: 8px 12px; color: #888; font-weight: 500; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 1px; border-bottom: 1px solid #2a3a5e; background: #0a1428; }
+.aws-table td { padding: 8px 12px; border-bottom: 1px solid #1e2a4a; font-family: 'SF Mono', Menlo, monospace; }
+.aws-table tr:last-child td { border-bottom: none; }
+.aws-table td.aws-state-running { color: #4cc9f0; }
+.aws-table td.aws-state-pending { color: #ffa94d; }
+.aws-table td.aws-state-terminated, .aws-table td.aws-state-cancelled { color: #666; }
+.aws-table td.aws-state-available { color: #ffa94d; font-weight: 600; }
+.aws-table .aws-row-action { color: #ef476f; cursor: pointer; font-weight: 600; }
+.aws-table .aws-row-action:hover { text-decoration: underline; }
+.aws-empty { color: #666; font-style: italic; padding: 10px; }
+
+.aws-danger { margin-top: 30px; border: 2px solid #ef476f; border-radius: 8px; padding: 16px 20px; background: rgba(239, 71, 111, 0.05); }
+.aws-danger h3 { color: #ef476f; margin-bottom: 8px; font-size: 1rem; }
+.aws-danger p { color: #aac; font-size: 0.85rem; margin-bottom: 12px; line-height: 1.5; }
+.aws-danger code { background: #1a2a4a; padding: 1px 6px; border-radius: 3px; color: #4cc9f0; font-size: 0.8rem; }
+.btn-danger { background: #ef476f; color: #fff; border: none; padding: 10px 20px; border-radius: 6px; font-weight: 600; cursor: pointer; }
+.btn-danger:hover:not(:disabled) { background: #d83d61; }
+.btn-danger:disabled { background: #444; color: #888; cursor: not-allowed; }
+.btn-small { background: #16213e; color: #e0e0e0; border: 1px solid #2a3a5e; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+.btn-small:hover { background: #1e2a4a; }
+.btn-secondary { background: #2a3a5e; color: #e0e0e0; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; }
+.btn-secondary:hover { background: #354869; }
+
+/* Modal */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+.modal { background: #16213e; border: 2px solid #ef476f; border-radius: 8px; padding: 24px; max-width: 480px; width: 90%; }
+.modal h3 { color: #ef476f; margin-bottom: 12px; }
+.modal p { color: #aac; font-size: 0.9rem; line-height: 1.5; margin-bottom: 12px; }
+.modal code { background: #1a2a4a; padding: 2px 6px; border-radius: 3px; color: #ffa94d; font-family: 'SF Mono', Menlo, monospace; }
+.modal-input { width: 100%; background: #0f1b33; border: 1px solid #2a3a5e; color: #e0e0e0; padding: 10px 12px; border-radius: 4px; font-family: 'SF Mono', Menlo, monospace; font-size: 0.95rem; margin-bottom: 16px; }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+.modal-result { margin-top: 16px; max-height: 240px; overflow-y: auto; background: #0a1428; border: 1px solid #2a3a5e; border-radius: 4px; padding: 10px 12px; font-family: 'SF Mono', Menlo, monospace; font-size: 0.8rem; }
+
 .output-dir { border-radius: 4px; cursor: pointer; border-bottom: 1px solid #0f3460; }
 .output-dir:hover { background: #1a2a4a; }
 .output-dir:last-child { border-bottom: none; }
@@ -159,6 +212,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
     <div class="tab active" onclick="switchTab('originals')">Originals</div>
     <div class="tab" onclick="switchTab('outputs')">Outputs</div>
     <div class="tab" onclick="switchTab('jobs')">Jobs</div>
+    <div class="tab tab-aws" onclick="switchTab('aws')">AWS ☁</div>
 </div>
 
 <!-- ENCODE TAB -->
@@ -295,6 +349,98 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
     </div>
 </div>
 
+<!-- AWS TAB -->
+<div id="tab-aws" class="tab-content">
+    <div class="panel aws-panel">
+        <div class="aws-header">
+            <h2>AWS Resources</h2>
+            <div class="aws-header-actions">
+                <span id="aws-last-refresh" class="aws-refresh-time"></span>
+                <label class="aws-auto-toggle">
+                    <input type="checkbox" id="aws-auto-refresh" checked>
+                    auto-refresh 30s
+                </label>
+                <button class="btn btn-small" onclick="refreshAws()">Refresh</button>
+            </div>
+        </div>
+
+        <div class="aws-summary" id="aws-summary">
+            <div class="aws-metric">
+                <div class="aws-metric-label">Running instances</div>
+                <div class="aws-metric-value" id="aws-running">—</div>
+            </div>
+            <div class="aws-metric">
+                <div class="aws-metric-label">Orphan volumes</div>
+                <div class="aws-metric-value" id="aws-orphans">—</div>
+            </div>
+            <div class="aws-metric">
+                <div class="aws-metric-label">S3 staged</div>
+                <div class="aws-metric-value" id="aws-s3-size">—</div>
+            </div>
+            <div class="aws-metric">
+                <div class="aws-metric-label">Est. hourly spend</div>
+                <div class="aws-metric-value" id="aws-hourly">—</div>
+            </div>
+            <div class="aws-metric">
+                <div class="aws-metric-label">Region</div>
+                <div class="aws-metric-value" id="aws-region">—</div>
+            </div>
+        </div>
+
+        <div class="aws-section">
+            <h3>EC2 Instances</h3>
+            <div id="aws-instances"></div>
+        </div>
+
+        <div class="aws-section">
+            <h3>Spot Requests</h3>
+            <div id="aws-spot-requests"></div>
+        </div>
+
+        <div class="aws-section">
+            <h3>EBS Volumes</h3>
+            <div id="aws-volumes"></div>
+        </div>
+
+        <div class="aws-section">
+            <h3>S3 Staging</h3>
+            <div id="aws-s3"></div>
+        </div>
+
+        <div class="aws-danger">
+            <h3>☢ Emergency Clear</h3>
+            <p>
+                Terminates every running instance, deletes every orphan volume,
+                cancels every spot request, and empties every S3 prefix that
+                this app has tagged <code>Application=encoder-app</code>.
+                <strong>Does not touch anything without that tag.</strong>
+            </p>
+            <button class="btn btn-danger" onclick="openClearModal()">Clear all AWS resources</button>
+        </div>
+    </div>
+</div>
+
+<!-- Emergency clear confirmation modal -->
+<div class="modal-overlay" id="clear-modal" style="display:none">
+    <div class="modal">
+        <h3>Emergency Clear</h3>
+        <p>
+            This will terminate every instance, cancel every spot request,
+            delete every orphan volume, and empty every S3 prefix tagged
+            <code>Application=encoder-app</code>.
+        </p>
+        <p>
+            Type <code>CLEAR AWS</code> to confirm:
+        </p>
+        <input type="text" id="clear-confirm-input" class="modal-input" autocomplete="off" spellcheck="false">
+        <div class="modal-actions">
+            <button class="btn btn-secondary" onclick="closeClearModal()">Cancel</button>
+            <button class="btn btn-danger" id="clear-confirm-btn" onclick="executeClear()" disabled>Clear everything</button>
+        </div>
+        <div id="clear-result" style="display:none"></div>
+    </div>
+</div>
+
 <div class="toast-container" id="toast-container"></div>
 
 <script>
@@ -385,8 +531,19 @@ function switchTab(name) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
     document.querySelector(`.tab-content#tab-${name}`).classList.add('active');
-    document.querySelectorAll('.tab')[['encode','outputs','jobs'].indexOf(name)].classList.add('active');
+    // Robust index lookup by onclick attr — earlier code used a hardcoded
+    // ['encode','outputs','jobs'] array that fell out of sync when the
+    // AWS tab was added.
+    const tabs = document.querySelectorAll('.tab');
+    for (const tab of tabs) {
+        const attr = tab.getAttribute('onclick') || '';
+        if (attr.includes(`switchTab('${name}')`)) {
+            tab.classList.add('active');
+            break;
+        }
+    }
     if (name === 'outputs') loadOutputs();
+    if (name === 'aws') refreshAws();
 }
 
 function formatSize(bytes) {
@@ -808,6 +965,264 @@ function connectSSE() {
     };
 }
 
+// --- AWS Resources tab ---
+
+let awsTimer = null;
+
+function formatBytes(n) {
+    if (!n) return '0 B';
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return n.toFixed(i === 0 ? 0 : 2) + ' ' + units[i];
+}
+
+function formatDuration(sec) {
+    if (!sec || sec < 60) return Math.round(sec || 0) + 's';
+    const m = Math.floor(sec / 60);
+    if (m < 60) return m + 'm';
+    const h = Math.floor(m / 60);
+    return h + 'h ' + (m % 60) + 'm';
+}
+
+async function refreshAws() {
+    const lastEl = document.getElementById('aws-last-refresh');
+    try {
+        const res = await fetch('/api/aws/inventory');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        renderAws(data);
+        if (lastEl) {
+            lastEl.textContent = 'updated ' + new Date().toLocaleTimeString();
+        }
+    } catch (e) {
+        if (lastEl) lastEl.textContent = 'refresh failed: ' + e.message;
+    }
+}
+
+function renderAws(data) {
+    // Summary
+    const s = data.summary || {};
+    const running = s.running_instances || 0;
+    const orphans = s.orphan_volumes || 0;
+    const hourly = s.estimated_hourly_usd || 0;
+
+    const runningEl = document.getElementById('aws-running');
+    runningEl.textContent = running;
+    runningEl.className = 'aws-metric-value' + (running > 0 ? ' warn' : ' ok');
+
+    const orphEl = document.getElementById('aws-orphans');
+    orphEl.textContent = orphans;
+    orphEl.className = 'aws-metric-value' + (orphans > 0 ? ' warn' : ' ok');
+
+    document.getElementById('aws-s3-size').textContent = formatBytes(s.total_s3_bytes || 0);
+    const hourlyEl = document.getElementById('aws-hourly');
+    hourlyEl.textContent = '$' + hourly.toFixed(2);
+    hourlyEl.className = 'aws-metric-value' + (hourly > 0 ? ' warn' : ' ok');
+    document.getElementById('aws-region').textContent = data.region || '—';
+
+    renderAwsInstances(data.instances || []);
+    renderAwsSpotRequests(data.spot_requests || []);
+    renderAwsVolumes(data.volumes || []);
+    renderAwsS3(data.s3_prefixes || []);
+}
+
+function renderAwsInstances(instances) {
+    const el = document.getElementById('aws-instances');
+    if (instances.length === 0) {
+        el.innerHTML = '<div class="aws-empty">No instances.</div>';
+        return;
+    }
+    const rows = instances.map(i => `
+        <tr>
+            <td>${escapeHtml(i.id)}</td>
+            <td>${escapeHtml(i.type || '')}</td>
+            <td>${escapeHtml(i.lifecycle || '')}</td>
+            <td class="aws-state-${i.state}">${escapeHtml(i.state || '')}</td>
+            <td>${escapeHtml(i.job_id || '—')}</td>
+            <td>${formatDuration(i.age_seconds || 0)}</td>
+            <td>$${(i.estimated_hourly_usd || 0).toFixed(3)}</td>
+            <td>${i.state === 'running' || i.state === 'pending'
+                ? `<span class="aws-row-action" onclick="cleanupJob('${escapeAttr(i.job_id || '')}','${escapeAttr(i.id)}')">terminate</span>`
+                : '—'}</td>
+        </tr>
+    `).join('');
+    el.innerHTML = `
+        <table class="aws-table">
+            <thead><tr>
+                <th>ID</th><th>Type</th><th>Lifecycle</th><th>State</th>
+                <th>Job</th><th>Age</th><th>$/hr</th><th></th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table>
+    `;
+}
+
+function renderAwsSpotRequests(reqs) {
+    const el = document.getElementById('aws-spot-requests');
+    if (reqs.length === 0) {
+        el.innerHTML = '<div class="aws-empty">No open spot requests.</div>';
+        return;
+    }
+    const rows = reqs.map(r => `
+        <tr>
+            <td>${escapeHtml(r.id)}</td>
+            <td class="aws-state-${r.state}">${escapeHtml(r.state || '')}</td>
+            <td>${escapeHtml(r.status || '')}</td>
+            <td>${escapeHtml(r.instance_id || '—')}</td>
+            <td>${escapeHtml(r.job_id || '—')}</td>
+        </tr>
+    `).join('');
+    el.innerHTML = `
+        <table class="aws-table">
+            <thead><tr>
+                <th>ID</th><th>State</th><th>Status</th><th>Instance</th><th>Job</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table>
+    `;
+}
+
+function renderAwsVolumes(volumes) {
+    const el = document.getElementById('aws-volumes');
+    if (volumes.length === 0) {
+        el.innerHTML = '<div class="aws-empty">No tagged volumes.</div>';
+        return;
+    }
+    const rows = volumes.map(v => `
+        <tr>
+            <td>${escapeHtml(v.id)}</td>
+            <td class="aws-state-${v.state}">${escapeHtml(v.state || '')}</td>
+            <td>${v.size_gib || 0} GiB</td>
+            <td>${escapeHtml(v.attached_to || 'unattached')}</td>
+            <td>${escapeHtml(v.job_id || '—')}</td>
+            <td>${v.is_orphan ? '⚠️ orphan' : 'ok'}</td>
+        </tr>
+    `).join('');
+    el.innerHTML = `
+        <table class="aws-table">
+            <thead><tr>
+                <th>ID</th><th>State</th><th>Size</th><th>Attached</th><th>Job</th><th></th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table>
+    `;
+}
+
+function renderAwsS3(prefixes) {
+    const el = document.getElementById('aws-s3');
+    if (prefixes.length === 0) {
+        el.innerHTML = '<div class="aws-empty">No S3 staging.</div>';
+        return;
+    }
+    const rows = prefixes.map(p => `
+        <tr>
+            <td>${escapeHtml(p.prefix)}</td>
+            <td>${formatBytes(p.size_bytes || 0)}</td>
+            <td>${p.object_count || 0}</td>
+            <td>${escapeHtml(p.job_id || '—')}</td>
+            <td>${p.job_id
+                ? `<span class="aws-row-action" onclick="cleanupJob('${escapeAttr(p.job_id)}','')">delete</span>`
+                : '—'}</td>
+        </tr>
+    `).join('');
+    el.innerHTML = `
+        <table class="aws-table">
+            <thead><tr>
+                <th>Prefix</th><th>Size</th><th>Objects</th><th>Job</th><th></th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table>
+    `;
+}
+
+async function cleanupJob(jobId, instanceHint) {
+    if (!jobId) {
+        alert('No JobId tag on ' + instanceHint + '; use Emergency Clear or tag it manually.');
+        return;
+    }
+    if (!confirm('Terminate all AWS resources for job ' + jobId + '?')) return;
+    try {
+        const res = await fetch('/api/aws/jobs/' + encodeURIComponent(jobId) + '/cleanup', { method: 'POST' });
+        if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
+        await refreshAws();
+    } catch (e) {
+        alert('Cleanup failed: ' + e.message);
+    }
+}
+
+function openClearModal() {
+    document.getElementById('clear-modal').style.display = 'flex';
+    const input = document.getElementById('clear-confirm-input');
+    input.value = '';
+    input.focus();
+    document.getElementById('clear-confirm-btn').disabled = true;
+    document.getElementById('clear-result').style.display = 'none';
+    input.oninput = () => {
+        document.getElementById('clear-confirm-btn').disabled = input.value !== 'CLEAR AWS';
+    };
+}
+
+function closeClearModal() {
+    document.getElementById('clear-modal').style.display = 'none';
+}
+
+async function executeClear() {
+    const btn = document.getElementById('clear-confirm-btn');
+    const input = document.getElementById('clear-confirm-input');
+    const result = document.getElementById('clear-result');
+    btn.disabled = true;
+    btn.textContent = 'Clearing…';
+    try {
+        const res = await fetch('/api/aws/clear', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ confirm: input.value })
+        });
+        const text = await res.text();
+        let report;
+        try { report = JSON.parse(text); } catch { report = null; }
+        result.style.display = 'block';
+        result.className = 'modal-result';
+        if (report && report.actions) {
+            const summary = Object.entries(report.summary || {})
+                .map(([k, v]) => k + '=' + v).join(' ');
+            const lines = [
+                'scope: ' + (report.scope || '?'),
+                'summary: ' + (summary || '(nothing to do)'),
+                '',
+                ...report.actions.map(a =>
+                    `${a.action.padEnd(11)} ${a.kind.padEnd(13)} ${a.id}${a.detail ? ' — ' + a.detail : ''}`)
+            ];
+            result.textContent = lines.join('\n');
+        } else {
+            result.textContent = text;
+        }
+        if (res.ok) {
+            btn.textContent = 'Done';
+            await refreshAws();
+        } else {
+            btn.textContent = 'Failed';
+            btn.disabled = false;
+        }
+    } catch (e) {
+        result.style.display = 'block';
+        result.textContent = 'Error: ' + e.message;
+        btn.textContent = 'Failed';
+        btn.disabled = false;
+    }
+}
+
+function startAwsAutoRefresh() {
+    const chk = document.getElementById('aws-auto-refresh');
+    const tick = () => {
+        if (chk.checked && document.querySelector('#tab-aws').classList.contains('active')) {
+            refreshAws();
+        }
+    };
+    awsTimer = setInterval(tick, 30000);
+}
+
 // --- Context Menu ---
 
 let ctxMenu = null;
@@ -1159,6 +1574,7 @@ function closePlayer(modal) {
 loadSources();
 connectSSE();
 setInterval(loadSources, 60000);
+startAwsAutoRefresh();
 </script>
 </body>
 </html>
