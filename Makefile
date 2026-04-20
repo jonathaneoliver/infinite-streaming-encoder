@@ -6,6 +6,12 @@ IMAGE_NAME ?= encoder
 CONTAINER_NAME ?= encoder
 PORT ?= 8080
 
+# GHCR publishing
+GHCR_IMAGE ?= ghcr.io/jonathaneoliver/encoder
+GHCR_USERNAME ?= jonathaneoliver
+PLATFORMS ?= linux/amd64,linux/arm64
+TAG ?= latest
+
 require-paths:
 	@: $${SOURCE_DIR:?SOURCE_DIR is not set — create a .env (see .env.example)}
 	@: $${OUTPUT_DIR:?OUTPUT_DIR is not set — create a .env (see .env.example)}
@@ -64,3 +70,23 @@ status:
 
 clean: stop
 	docker rmi $(IMAGE_NAME) 2>/dev/null || true
+
+# One-time setup for multi-arch push. Requires GHCR_PAT in the
+# environment (or .env) with write:packages scope.
+push-setup:
+	@: $${GHCR_PAT:?GHCR_PAT is not set — create a classic PAT with write:packages scope}
+	@echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin
+	@docker buildx inspect encoder-builder >/dev/null 2>&1 || \
+		docker buildx create --name encoder-builder --driver docker-container --use
+	@docker buildx use encoder-builder
+	@docker buildx inspect --bootstrap
+
+# Build + push the multi-arch image. Override TAG to publish alternate
+# tags, e.g. `make push TAG=v1.0.0` or `make push TAG=$(git rev-parse --short HEAD)`.
+push:
+	docker buildx build \
+		--platform $(PLATFORMS) \
+		--tag $(GHCR_IMAGE):$(TAG) \
+		--push \
+		.
+	@echo "Published $(GHCR_IMAGE):$(TAG) for $(PLATFORMS)"
