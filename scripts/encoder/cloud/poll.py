@@ -36,6 +36,25 @@ def _exists(bucket: str, key: str) -> bool:
     return True
 
 
+def read_failure_reason(s3_prefix: str) -> str | None:
+    """Read the body of <prefix>/_FAILED if it exists.
+
+    The remote user-data writes a human-readable line into the _FAILED
+    object — e.g. `SPOT INTERRUPTION: {"action":"terminate",...}` or
+    `FAILED at clip 'X': trap at line N`. Returning it lets the local
+    UI surface "spot interruption" vs a generic worker failure.
+    """
+    bucket, base_key = parse_s3_uri(s3_prefix.rstrip("/"))
+    try:
+        resp = s3_client().get_object(Bucket=bucket, Key=f"{base_key}/_FAILED")
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+    body = resp["Body"].read()
+    return body.decode("utf-8", errors="replace").strip() or None
+
+
 class _LogTailer:
     """Tracks byte offset into s3://<bucket>/<key> across poll ticks."""
 

@@ -89,10 +89,52 @@ mark_failed() {{
     # One last log sync so the failure reason is captured.
     aws s3 cp /var/log/cloud-encode.log {s3}/logs/user-data.log --region {region} 2>/dev/null || true
     kill $LOG_UPLOADER_PID 2>/dev/null || true
+    kill $SPOT_WATCHER_PID 2>/dev/null || true
     shutdown -h +1 "encode failed: $1"
     exit 1
 }}
 trap 'mark_failed "trap at line $LINENO"' ERR
+
+# Spot-interruption watcher: AWS publishes a 2-minute warning to the
+# instance-metadata service before reclaiming a spot instance. When we
+# see it we record a distinctive _FAILED body (so the local side
+# surfaces "spot interruption" rather than generic worker-failure),
+# rescue whatever's been produced so far with one last s3 sync of
+# /work/output, and flush the log. The remote bash's main process is
+# almost certainly killed by AWS's terminate signal before we get to
+# write this — so we race, but even partial recovery beats none.
+# IMDSv2 requires a session token first.
+(
+    while true; do
+        sleep 5
+        # Only poll once /work exists (i.e. we're past dnf install).
+        [ -d /work ] || continue
+        TOKEN=$(curl -s -X PUT --max-time 3 "http://169.254.169.254/latest/api/token" \\
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 300" 2>/dev/null) || continue
+        BODY=$(curl -s --max-time 3 \\
+            -H "X-aws-ec2-metadata-token: $TOKEN" \\
+            -o /tmp/spot-action.json -w "%{{http_code}}" \\
+            http://169.254.169.254/latest/meta-data/spot/instance-action 2>/dev/null)
+        if [ "$BODY" = "200" ]; then
+            ACTION=$(cat /tmp/spot-action.json)
+            echo "!!! SPOT INTERRUPTION detected at $(date -u +%FT%TZ): $ACTION"
+            # Rescue whatever encoded variants we have so far before AWS
+            # reclaims. `|| true` in case /work/output is empty or sync
+            # loses the race against the hypervisor.
+            aws s3 sync /work/output {s3}/output/ \\
+                --exclude '*_tmp/*' --exclude '*/abr_ladder_*/*' \\
+                --region {region} 2>/dev/null || true
+            # Distinctive body so poll.py can classify.
+            printf 'SPOT INTERRUPTION: %s\\n' "$ACTION" \\
+                | aws s3 cp - {s3}/_FAILED --region {region} || true
+            # Final log flush + clean up log uploader before AWS kills us.
+            aws s3 cp /var/log/cloud-encode.log {s3}/logs/user-data.log --region {region} 2>/dev/null || true
+            kill $LOG_UPLOADER_PID 2>/dev/null || true
+            exit 0
+        fi
+    done
+) &
+SPOT_WATCHER_PID=$!
 
 # Progress marker helpers — same `[[ENCODER-STAGE ...]]` format the
 # Python progress module uses, emitted as plain text so they land in
@@ -165,8 +207,9 @@ aws s3 sync /work/output {s3}/output/ \\
 
 echo "OK" | aws s3 cp - {s3}/_DONE --region {region}
 # Final log flush so the poll's last-tick fetch gets the tail of the
-# run (the 5s uploader may have just slept past the _DONE write).
+# run (the 2s uploader may have just slept past the _DONE write).
 aws s3 cp /var/log/cloud-encode.log {s3}/logs/user-data.log --region {region} 2>/dev/null || true
 kill $LOG_UPLOADER_PID 2>/dev/null || true
+kill $SPOT_WATCHER_PID 2>/dev/null || true
 shutdown -h +1 "encode complete"
 """

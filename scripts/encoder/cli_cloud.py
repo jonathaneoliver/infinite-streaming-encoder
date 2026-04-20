@@ -25,7 +25,7 @@ from encoder.cloud.arch import ARCH_PROFILES, DEFAULT_ARCH, profile_for
 from encoder.cloud.aws import AuthError, check_credentials, resolve_al2023_ami, region
 from encoder.cloud.cleanup import terminate_job
 from encoder.cloud.launch import LaunchError, LaunchSpec, launch
-from encoder.cloud.poll import poll_until_done
+from encoder.cloud.poll import poll_until_done, read_failure_reason
 from encoder.cloud.sync import (
     download_outputs, download_user_data_log, remove_staging, upload_inputs,
 )
@@ -299,8 +299,19 @@ def main() -> int:
 
     if status != "done":
         emit_stage("cloud:encode-remote", "failed", 0.0)
-        print(f"!!! Job did not complete (status={status}). Fetching user-data log.",
-              file=sys.stderr)
+        reason = None
+        if status == "failed":
+            reason = read_failure_reason(s3_prefix)
+        # Surface the reason in the log so it's visible on the job row
+        # without opening user-data.log. For spot interruptions the
+        # body starts with "SPOT INTERRUPTION:" which the UI can match
+        # on to show distinct styling if we want later.
+        if reason:
+            print(f"!!! Job did not complete (status={status}): {reason}",
+                  file=sys.stderr)
+        else:
+            print(f"!!! Job did not complete (status={status}). "
+                  f"Fetching user-data log.", file=sys.stderr)
         download_user_data_log(s3_prefix, local_output_dir)
         return 2
     emit_stage("cloud:encode-remote", "done", 100.0)
