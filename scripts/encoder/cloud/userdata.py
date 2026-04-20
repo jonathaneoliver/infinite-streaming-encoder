@@ -68,10 +68,13 @@ exec > /var/log/cloud-encode.log 2>&1
 # exits. Copies the whole log each tick — S3 PutObject semantics make
 # every tick a complete, visible object. The `2>/dev/null` hides the
 # "file not found" at t=0 before tee has written anything.
+# 2-second interval: keeps remote → S3 latency under the local tail
+# interval (also 2s) so the user sees progress updates in roughly
+# 2–4 seconds end-to-end during encode.
 (
     while true; do
         aws s3 cp /var/log/cloud-encode.log {s3}/logs/user-data.log --region {region} 2>/dev/null || true
-        sleep 5
+        sleep 2
     done
 ) &
 LOG_UPLOADER_PID=$!

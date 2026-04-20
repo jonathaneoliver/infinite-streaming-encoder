@@ -99,6 +99,7 @@ def poll_until_done(
     *,
     timeout_s: int,
     interval_s: int = 20,
+    log_tail_interval_s: int = 2,
 ) -> str:
     """Block until _DONE or _FAILED appears, or `timeout_s` elapses.
 
@@ -107,17 +108,27 @@ def poll_until_done(
       "failed"  — _FAILED was found
       "timeout" — neither marker appeared within timeout_s seconds
 
-    Also forwards any ENCODER-PLAN / ENCODER-STAGE lines appearing in
-    the remote log to stdout as a side-effect, so local-side progress
-    tracking stays in sync with whatever the remote Python pipeline
-    is reporting.
+    Two independent cadences:
+
+    - `log_tail_interval_s` (default 2s) — how often we fetch new
+      bytes of the remote log and forward any ENCODER-PLAN / -STAGE
+      markers to stdout. Tight so the UI's stages table updates
+      smoothly while the remote is actively encoding.
+
+    - `interval_s` (default 20s) — how often we HEAD the _DONE /
+      _FAILED markers. Those only flip once, at job completion, so
+      20s is plenty and keeps API-request volume low.
     """
     bucket, base_key = parse_s3_uri(s3_prefix.rstrip("/"))
     done_key = f"{base_key}/_DONE"
     failed_key = f"{base_key}/_FAILED"
     tailer = _LogTailer(bucket, f"{base_key}/logs/user-data.log")
 
+    # Number of log-tail ticks per completion-probe tick.
+    tails_per_probe = max(1, interval_s // log_tail_interval_s)
+
     elapsed = 0
+    tail_count = 0
     while elapsed < timeout_s:
         # Forward any new markers first, so the UI sees progress even
         # on the final iteration where _DONE has just appeared.
@@ -125,17 +136,21 @@ def poll_until_done(
         if new_text:
             _forward_markers(new_text)
 
-        if _exists(bucket, done_key):
-            # One more tail pass — the log may have the final stage
-            # transitions that landed between the last fetch and _DONE.
-            final = tailer.fetch_new()
-            if final:
-                _forward_markers(final)
-            return "done"
-        if _exists(bucket, failed_key):
-            return "failed"
-        time.sleep(interval_s)
-        elapsed += interval_s
-        print(f"    [{elapsed:4d}s] still encoding...", flush=True)
+        tail_count += 1
+        # Only check _DONE / _FAILED on every Nth tick — they're
+        # flip-once markers and don't need to be checked at 2s rate.
+        if tail_count >= tails_per_probe:
+            tail_count = 0
+            if _exists(bucket, done_key):
+                final = tailer.fetch_new()
+                if final:
+                    _forward_markers(final)
+                return "done"
+            if _exists(bucket, failed_key):
+                return "failed"
+            print(f"    [{elapsed:4d}s] still encoding...", flush=True)
+
+        time.sleep(log_tail_interval_s)
+        elapsed += log_tail_interval_s
 
     return "timeout"
