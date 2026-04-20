@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jonathaneoliver/encoder/internal/api"
+	"github.com/jonathaneoliver/encoder/internal/awswatch"
 	"github.com/jonathaneoliver/encoder/internal/encode"
 	"github.com/jonathaneoliver/encoder/internal/watcher"
 )
@@ -53,6 +55,14 @@ func main() {
 	defaultCodec := flag.String("default-codec", env("DEFAULT_CODEC", "both"), "default codec: h264, hevc, both")
 	defaultMaxRes := flag.String("default-max-res", env("DEFAULT_MAX_RES", ""), "default max resolution (empty = no limit)")
 	maxConcurrent := flag.Int("max-concurrent", intEnv("MAX_CONCURRENT", 1), "max concurrent encode jobs")
+	// AWS watchdog (issue #5 phase 5). Polls `encoder.cloud.inventory` on
+	// an interval; any instance older than the lifetime budget is flagged
+	// as a leak and, when AUTO_TERMINATE_STALE=true, force-terminated.
+	awsWatchInterval := flag.Duration("aws-watch-interval", 60*time.Second, "AWS inventory poll interval; 0 disables")
+	awsMaxLifetime := flag.Duration("aws-max-lifetime", 4*time.Hour, "terminate EC2 instances older than this")
+	awsAutoTerminate := flag.Bool("aws-auto-terminate-stale",
+		env("AUTO_TERMINATE_STALE", "true") == "true",
+		"force-terminate stale instances (false = warn-only)")
 	flag.Parse()
 
 	mgr := encode.NewManager(encode.ManagerConfig{
@@ -81,6 +91,12 @@ func main() {
 		log.Printf("watcher: monitoring %s every %s (target=%s codec=%s)",
 			*sourceDir, *watchInterval, *defaultTarget, *defaultCodec)
 	}
+
+	go awswatch.Run(context.Background(), awswatch.Config{
+		Interval:           *awsWatchInterval,
+		MaxLifetime:        *awsMaxLifetime,
+		AutoTerminateStale: *awsAutoTerminate,
+	})
 
 	srv := api.NewServer(mgr)
 

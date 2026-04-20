@@ -29,6 +29,21 @@ from encoder.cloud.sync import (
     download_outputs, download_user_data_log, remove_staging, upload_inputs,
 )
 from encoder.cloud.userdata import UserDataSpec, render as render_user_data
+from encoder.progress import Stage, emit_plan, emit_stage
+
+
+# Cloud encode has a fixed set of lifecycle stages the local side drives.
+# Until the remote (GHCR) image runs the new Python pipeline, the actual
+# per-variant encode on EC2 is opaque to us — it's represented as a single
+# "encode-remote" stage that ticks running → done only. Everything else
+# (upload, launch, download, cleanup) gets explicit transitions.
+_CLOUD_STAGES = [
+    Stage(key="cloud:upload",        label="upload inputs"),
+    Stage(key="cloud:launch",        label="launch EC2 instance"),
+    Stage(key="cloud:encode-remote", label="encode (remote)"),
+    Stage(key="cloud:download",      label="download outputs"),
+    Stage(key="cloud:cleanup",       label="cleanup S3 staging"),
+]
 
 
 def _env(key: str, fallback: str = "") -> str:
@@ -136,6 +151,10 @@ def main() -> int:
         print("(dry-run; exiting)")
         return 0
 
+    # Announce the lifecycle plan so the UI's stages table populates
+    # immediately. Each stage flips to running/done below.
+    emit_plan(_CLOUD_STAGES)
+
     # Register the teardown BEFORE any AWS state is created, so even a
     # crash in upload_inputs can't leave staging behind.
     #
@@ -174,7 +193,9 @@ def main() -> int:
     signal.signal(signal.SIGINT, _signal_handler)
 
     # Upload inputs
+    emit_stage("cloud:upload", "running", 0.0)
     upload_inputs(args.input, s3_prefix)
+    emit_stage("cloud:upload", "done", 100.0)
 
     # Render user-data
     user_data = render_user_data(UserDataSpec(
@@ -188,6 +209,7 @@ def main() -> int:
     ))
 
     # Launch
+    emit_stage("cloud:launch", "running", 0.0)
     try:
         result = launch(LaunchSpec(
             ami_id=ami_id,
@@ -202,6 +224,7 @@ def main() -> int:
             keep_instance=args.keep_instance,
         ))
     except LaunchError as e:
+        emit_stage("cloud:launch", "failed", 0.0)
         print(f"!!! {e}", file=sys.stderr)
         print(
             "    Spot capacity is tight region-wide. Try:\n"
@@ -210,6 +233,7 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    emit_stage("cloud:launch", "done", 100.0)
 
     print(f"    instance: {result.instance_id} "
           f"({result.instance_type} in {result.subnet_id})", flush=True)
@@ -223,23 +247,29 @@ def main() -> int:
 
     print(f">>> Waiting for completion marker at {s3_prefix}/_DONE "
           f"(timeout {poll_timeout}s for {len(args.input)} clip(s))", flush=True)
+    emit_stage("cloud:encode-remote", "running", 0.0)
     status = poll_until_done(s3_prefix, timeout_s=poll_timeout, interval_s=poll_interval)
 
     if status != "done":
+        emit_stage("cloud:encode-remote", "failed", 0.0)
         print(f"!!! Job did not complete (status={status}). Fetching user-data log.",
               file=sys.stderr)
         download_user_data_log(s3_prefix, local_output_dir)
         return 2
+    emit_stage("cloud:encode-remote", "done", 100.0)
 
     # Download outputs
+    emit_stage("cloud:download", "running", 0.0)
     print(f">>> Syncing outputs to {local_output_dir}", flush=True)
     count = download_outputs(s3_prefix, local_output_dir)
     print(f"    downloaded {count} files", flush=True)
     download_user_data_log(s3_prefix, local_output_dir)
+    emit_stage("cloud:download", "done", 100.0)
 
     # Maybe clean up S3 (atexit will pick up anything we leave behind
     # on an abnormal exit, but clean-exit S3 lifecycle is controlled
     # by --keep-s3 and the verified-download check).
+    emit_stage("cloud:cleanup", "running", 0.0)
     if args.keep_s3:
         print(f">>> Leaving S3 staging at {s3_prefix} (--keep-s3 set)", flush=True)
     elif count < 1:
@@ -249,6 +279,7 @@ def main() -> int:
         print(f">>> Cleaning up S3 staging at {s3_prefix} ({count} local files verified)",
               flush=True)
         remove_staging(s3_prefix)
+    emit_stage("cloud:cleanup", "done", 100.0)
 
     # We reached the end cleanly — flag this so the atexit cleanup
     # respects --keep-instance / --keep-s3 instead of forcing teardown.
