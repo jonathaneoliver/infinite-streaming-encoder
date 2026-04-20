@@ -351,7 +351,7 @@ def main() -> int:
     # S3 prefix instead, so no upload needed.
     emit_stage("cloud:upload", "running", 0.0)
     if args.resume_from_job_id:
-        print(f">>> Skipping upload (resuming from {resume_from_prefix})", flush=True)
+        print(f">>> Skipping upload (resuming from {s3_prefix})", flush=True)
     else:
         upload_inputs(args.input, s3_prefix, stage_key="cloud:upload")
     emit_stage("cloud:upload", "done", 100.0)
