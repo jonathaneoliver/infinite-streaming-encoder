@@ -65,9 +65,19 @@ def emit_stage(key: str, status: str, percent: float = 0.0) -> None:
 # ffmpeg progress parser
 # ---------------------------------------------------------------------------
 
-# Throttle how often we emit STAGE markers to avoid drowning the log
-# stream. ffmpeg ticks `-progress pipe:1` every ~0.5s by default.
-_MIN_EMIT_INTERVAL_S = 0.75
+# Throttle how often we emit STAGE markers. The driving constraint is
+# ffmpeg's own `-stats_period` (see _FFMPEG_STATS_PERIOD below); setting
+# this any tighter than that just means we process ticks as they arrive.
+# We intentionally keep it below the stats period so no tick gets
+# dropped — 0.2s against a 0.25s ffmpeg period leaves headroom.
+_MIN_EMIT_INTERVAL_S = 0.2
+
+# How often to ask ffmpeg to emit -progress output. Default is 0.5s,
+# which on fast encodes (several × realtime on short clips) means
+# each tick represents a big chunk of content and the UI progress
+# bar jumps in visible steps. 0.25s doubles the rate without
+# meaningfully increasing CPU or log volume.
+_FFMPEG_STATS_PERIOD = "0.25"
 
 
 def run_ffmpeg_with_progress(
@@ -93,7 +103,7 @@ def run_ffmpeg_with_progress(
 
     Raises `subprocess.CalledProcessError` if ffmpeg exits non-zero.
     """
-    full_cmd = [*cmd, "-progress", "pipe:1"]
+    full_cmd = [*cmd, "-progress", "pipe:1", "-stats_period", _FFMPEG_STATS_PERIOD]
 
     emit_stage(stage_key, "running", 0.0)
 
