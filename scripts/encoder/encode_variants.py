@@ -54,12 +54,19 @@ def _variant_path(output_dir: Path, codec: str, tier: Tier) -> Path:
 def _codec_specific_args(codec: str, target_kbps: int, k: int, preset: str) -> list[str]:
     maxrate_k = target_kbps  # placeholder — real value is set in build_ffmpeg_cmd
     if codec == "hevc":
+        # `pools=*` = use every host CPU for the x265 thread pool. The bash
+        # script had `pools=+`, which isn't a valid value — x265 silently
+        # skipped the pool ("No thread pool allocated"), leaving encodes on
+        # just the 3 default frame threads. Switch to `*` for actual
+        # parallelism. Revisit if MAX_CONCURRENT > 1: multiple jobs each
+        # grabbing all cores will thrash; at that point hard-code a count
+        # like pools=4 per encode.
         return [
             "-c:v", "libx265",
             "-preset", preset,
             "-threads", "0",
             "-x265-params",
-            f"keyint={k}:min-keyint={k}:scenecut=0:open-gop=0:pools=+:frame-threads=0",
+            f"keyint={k}:min-keyint={k}:scenecut=0:open-gop=0:pools=*:frame-threads=0",
             "-pix_fmt", "yuv420p",
         ]
     if codec == "h264":
