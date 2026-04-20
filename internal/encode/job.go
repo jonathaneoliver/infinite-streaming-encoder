@@ -166,6 +166,10 @@ type JobConfig struct {
 	Padding         string   `json:"padding"`
 	KeepMezzanine   bool     `json:"keep_mezzanine"`
 	ForceReencode   bool     `json:"force_reencode"`
+	// CPU architecture for cloud encodes: "intel" | "amd" | "graviton".
+	// Empty defaults to intel. Ignored for local encodes (which always
+	// run on the host's native architecture).
+	CpuArch string `json:"cpu_arch,omitempty"`
 }
 
 type StageProgress struct {
@@ -720,6 +724,12 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	}
 	if cfg.KeepMezzanine {
 		args = append(args, "--keep-mezzanine")
+	}
+	// CPU arch only makes sense for cloud encodes (local runs on the
+	// host's own architecture), and cli_local.py doesn't accept the
+	// flag. Gate by target so we don't hand an unknown arg to argparse.
+	if cfg.Target == TargetCloud && cfg.CpuArch != "" {
+		args = append(args, "--cpu-arch", cfg.CpuArch)
 	}
 	return args
 }

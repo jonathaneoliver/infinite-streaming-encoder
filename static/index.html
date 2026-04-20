@@ -247,6 +247,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="cloud">Cloud (AWS)</option>
                 </select>
             </div>
+            <div class="control-group" id="cpu-arch-group" style="display:none">
+                <label>CPU (cloud)</label>
+                <select id="cpu-arch">
+                    <option value="intel">Intel Xeon (c7i)</option>
+                    <option value="amd">AMD EPYC (c7a)</option>
+                    <option value="graviton">Graviton ARM (c7g)</option>
+                </select>
+            </div>
             <div class="control-group">
                 <label>Codec</label>
                 <select id="codec">
@@ -616,6 +624,10 @@ function onTargetChange() {
     const target = document.getElementById('target').value;
     document.getElementById('cloud-warning').style.display =
         target === 'cloud' ? 'block' : 'none';
+    // CPU arch only matters for cloud; hide it on local so the form
+    // doesn't suggest a setting that gets ignored.
+    document.getElementById('cpu-arch-group').style.display =
+        target === 'cloud' ? 'flex' : 'none';
 }
 
 // Before submitting a cloud encode, peek at the AWS inventory. If
@@ -661,7 +673,8 @@ async function startEncode() {
         gop_duration: document.getElementById('gop-duration').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
-        keep_mezzanine: document.getElementById('keep-mezzanine').checked
+        keep_mezzanine: document.getElementById('keep-mezzanine').checked,
+        cpu_arch: document.getElementById('cpu-arch').value
     };
 
     try {

@@ -21,6 +21,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from encoder.cloud.arch import ARCH_PROFILES, DEFAULT_ARCH, profile_for
 from encoder.cloud.aws import AuthError, check_credentials, resolve_al2023_ami, region
 from encoder.cloud.cleanup import terminate_job
 from encoder.cloud.launch import LaunchError, LaunchSpec, launch
@@ -91,6 +92,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", dest="dry_run")
     p.add_argument("--job-id", default=None, dest="job_id",
                    help="reuse an existing job id (e.g. to re-download)")
+    p.add_argument("--cpu-arch", default=None, dest="cpu_arch",
+                   choices=list(ARCH_PROFILES.keys()),
+                   help="CPU family for the EC2 worker (default: intel). "
+                        "Picks instance type + AMI arch together; the "
+                        "encoder image is multi-arch so both x86 and "
+                        "Graviton work.")
 
     # Remaining args get forwarded verbatim to create_abr_ladder.sh on the remote.
     return p
@@ -142,10 +149,16 @@ def main() -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    ami_id = resolve_al2023_ami(_env("AMI_ID") or None)
-    instance_type = _env("INSTANCE_TYPE", "c7i.8xlarge")
+    # CPU-architecture profile: picks the instance family + AMI arch
+    # together. Explicit INSTANCE_TYPE / INSTANCE_TYPE_FALLBACKS env
+    # vars still override the profile — useful for one-off test types
+    # or NUMA experiments.
+    arch_profile = profile_for(args.cpu_arch or _env("CPU_ARCH", DEFAULT_ARCH))
+
+    ami_id = resolve_al2023_ami(_env("AMI_ID") or None, ami_arch=arch_profile.ami_arch)
+    instance_type = _env("INSTANCE_TYPE", arch_profile.primary)
     instance_type_fallbacks = [
-        t for t in _env("INSTANCE_TYPE_FALLBACKS", "c7a.8xlarge,c6i.8xlarge").split(",")
+        t for t in _env("INSTANCE_TYPE_FALLBACKS", arch_profile.fallbacks).split(",")
         if t.strip()
     ]
     use_spot = _env("USE_SPOT", "true").lower() == "true"
@@ -158,7 +171,9 @@ def main() -> int:
     print(f"  s3 prefix:      {s3_prefix}")
     print(f"  output dir:     {local_output_dir}")
     print(f"  region:         {aws_region}")
+    print(f"  cpu arch:       {arch_profile.label} ({arch_profile.ami_arch})")
     print(f"  instance type:  {instance_type} ({'spot' if use_spot else 'on-demand'})")
+    print(f"  fallbacks:      {','.join(instance_type_fallbacks) or '(none)'}")
     print(f"  ami:            {ami_id}")
     docker_image = _env(
         "DOCKER_IMAGE", "ghcr.io/jonathaneoliver/encoder:latest",

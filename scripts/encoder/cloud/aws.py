@@ -86,10 +86,16 @@ def check_credentials() -> None:
         raise AuthError(f"AWS not authenticated in region {region()}: {e}") from e
 
 
-def resolve_al2023_ami(ami_id: str | None = None) -> str:
-    """Return the configured AMI, or auto-resolve the AL2023 latest via SSM."""
+def resolve_al2023_ami(ami_id: str | None = None, ami_arch: str = "x86_64") -> str:
+    """Return the configured AMI, or auto-resolve the AL2023 latest via SSM.
+
+    `ami_arch` is "x86_64" for Intel/AMD instance types or "arm64" for
+    Graviton. ARM instance types (c7g / c8g / c6g) WILL NOT BOOT on an
+    x86_64 AMI — the kernel won't match. Callers that pick a
+    non-default CPU architecture must pass the matching `ami_arch`.
+    """
     if ami_id:
         return ami_id
-    name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+    name = f"/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-{ami_arch}"
     resp = ssm_client().get_parameter(Name=name)
     return resp["Parameter"]["Value"]
