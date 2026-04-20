@@ -39,8 +39,23 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.Handle("GET /content/", http.StripPrefix("/content/", mediaFileServer(mgr.OutputDir)))
 	// Serve source files for direct playback
 	s.Mux.Handle("GET /sources/", http.StripPrefix("/sources/", mediaFileServer(mgr.SourceDir)))
-	s.Mux.Handle("GET /", http.FileServer(http.Dir("static")))
+	// The SPA is under active iteration; browser caches of index.html
+	// have bitten the user mid-session (new form fields silently not
+	// sent). Force revalidation so reloads always see current markup.
+	s.Mux.Handle("GET /", noCache(http.FileServer(http.Dir("static"))))
 	return s
+}
+
+// noCache wraps a handler so responses can't be cached by browsers.
+// Only applied to the SPA (index.html, JS bundle); media assets keep
+// their normal caching since they're immutable once written.
+func noCache(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		h.ServeHTTP(w, r)
+	})
 }
 
 type sourceFile struct {
