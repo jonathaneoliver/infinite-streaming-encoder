@@ -266,6 +266,115 @@ def sweep_all() -> CleanupReport:
 # CLI
 # ---------------------------------------------------------------------------
 
+def backfill_tags() -> CleanupReport:
+    """Add Application=encoder-app to resources tagged with JobId but missing App.
+
+    Pre-phase-1 launches set only JobId=<id> and Name=encode-<id>; they
+    wouldn't appear in inventory (scoped by Application) and wouldn't
+    be caught by sweep_all. This finds any EC2 instance/volume/spot
+    request carrying JobId + Name='encode-*' and adds the Application
+    tag. Safe to re-run — CreateTags is idempotent.
+
+    After this runs once, everything this tool has ever launched is
+    visible + cleanable via the normal inventory + sweep paths.
+    """
+    report = CleanupReport(scope="backfill")
+    ec2 = ec2_client()
+
+    def _retag(kind: str, ids: list[str], job_ids: list[str | None]) -> None:
+        if not ids:
+            return
+        try:
+            ec2.create_tags(
+                Resources=ids,
+                Tags=[{"Key": APP_TAG_KEY, "Value": APP_TAG_VALUE}],
+            )
+            for i, rid in enumerate(ids):
+                report.actions.append(ResourceAction(
+                    kind=kind, id=rid,
+                    job_id=job_ids[i] if i < len(job_ids) else None,
+                    action="deleted",  # co-opting the enum; a "tagged" value would be cleaner
+                    detail="backfilled Application=encoder-app",
+                ))
+        except ClientError as e:
+            for i, rid in enumerate(ids):
+                report.actions.append(ResourceAction(
+                    kind=kind, id=rid,
+                    job_id=job_ids[i] if i < len(job_ids) else None,
+                    action="failed", detail=str(e),
+                ))
+
+    # Instances: tagged with JobId (from the pre-phase-1 launcher) but
+    # NOT tagged Application yet.
+    try:
+        resp = ec2.describe_instances(
+            Filters=[{"Name": "tag-key", "Values": ["JobId"]}],
+        )
+    except ClientError as e:
+        report.actions.append(ResourceAction(
+            kind="instance", id="?", job_id=None,
+            action="failed", detail=f"describe_instances: {e}",
+        ))
+        return report
+
+    inst_ids: list[str] = []
+    inst_jobs: list[str | None] = []
+    for r in resp.get("Reservations", []):
+        for inst in r.get("Instances", []):
+            tags = inst.get("Tags", [])
+            if _tag_value(tags, APP_TAG_KEY) == APP_TAG_VALUE:
+                continue  # already good
+            inst_ids.append(inst["InstanceId"])
+            inst_jobs.append(_tag_value(tags, "JobId"))
+    _retag("instance", inst_ids, inst_jobs)
+
+    # Volumes: same logic.
+    try:
+        vol_resp = ec2.describe_volumes(
+            Filters=[{"Name": "tag-key", "Values": ["JobId"]}],
+        )
+    except ClientError as e:
+        report.actions.append(ResourceAction(
+            kind="volume", id="?", job_id=None,
+            action="failed", detail=f"describe_volumes: {e}",
+        ))
+        vol_resp = {"Volumes": []}
+
+    vol_ids: list[str] = []
+    vol_jobs: list[str | None] = []
+    for v in vol_resp.get("Volumes", []):
+        tags = v.get("Tags", [])
+        if _tag_value(tags, APP_TAG_KEY) == APP_TAG_VALUE:
+            continue
+        vol_ids.append(v["VolumeId"])
+        vol_jobs.append(_tag_value(tags, "JobId"))
+    _retag("volume", vol_ids, vol_jobs)
+
+    # Spot requests: ditto.
+    try:
+        sr_resp = ec2.describe_spot_instance_requests(
+            Filters=[{"Name": "tag-key", "Values": ["JobId"]}],
+        )
+    except ClientError as e:
+        report.actions.append(ResourceAction(
+            kind="spot_request", id="?", job_id=None,
+            action="failed", detail=f"describe_spot_instance_requests: {e}",
+        ))
+        sr_resp = {"SpotInstanceRequests": []}
+
+    sr_ids: list[str] = []
+    sr_jobs: list[str | None] = []
+    for r in sr_resp.get("SpotInstanceRequests", []):
+        tags = r.get("Tags", [])
+        if _tag_value(tags, APP_TAG_KEY) == APP_TAG_VALUE:
+            continue
+        sr_ids.append(r["SpotInstanceRequestId"])
+        sr_jobs.append(_tag_value(tags, "JobId"))
+    _retag("spot_request", sr_ids, sr_jobs)
+
+    return report
+
+
 def _main() -> int:
     import argparse
     p = argparse.ArgumentParser(prog="encoder.cloud.cleanup")
@@ -273,12 +382,17 @@ def _main() -> int:
     group.add_argument("--job-id", help="tear down one job's resources")
     group.add_argument("--sweep-all", action="store_true",
                        help="tear down every Application=encoder-app resource")
+    group.add_argument("--backfill-tags", action="store_true",
+                       help="add Application=encoder-app to resources already "
+                            "tagged with JobId (one-shot pre-phase-1 cleanup)")
     p.add_argument("--json", action="store_true",
                    help="print machine-readable JSON instead of a summary")
     args = p.parse_args()
 
     if args.sweep_all:
         report = sweep_all()
+    elif args.backfill_tags:
+        report = backfill_tags()
     else:
         report = terminate_job(args.job_id)
 
