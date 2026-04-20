@@ -48,6 +48,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/jobs/stream", s.streamJobs)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/cancel", s.cancelJob)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/retry", s.retryJob)
+	s.Mux.HandleFunc("POST /api/jobs/{id}/simulate-interrupt", s.simulateInterrupt)
 	// AWS inventory + cleanup (issue #5)
 	s.Mux.HandleFunc("GET /api/aws/inventory", s.awsInventory)
 	s.Mux.HandleFunc("POST /api/aws/clear", s.awsClearAll)
@@ -149,6 +150,45 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !s.Manager.Cancel(id) {
 		http.Error(w, "job not found", 404)
+		return
+	}
+	w.WriteHeader(204)
+}
+
+// simulateInterrupt drops an empty `_SIMULATE_INTERRUPT` sentinel
+// into the running job's S3 prefix. The remote user-data polls for
+// it every 5s and, on seeing it, invokes the same trigger_interrupt
+// bash path that a real spot reclaim hits — writes the distinctive
+// _FAILED body, rsyncs /work/tmp + /work/output, exits. Lets us
+// test the Retry + partial-file flow without waiting for AWS.
+func (s *Server) simulateInterrupt(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	job := s.Manager.GetJob(id)
+	if job == nil {
+		http.Error(w, "job not found", 404)
+		return
+	}
+	if job.Config.Target != encode.TargetCloud || job.Status != encode.StatusRunning {
+		http.Error(w, "job must be a running cloud job", 400)
+		return
+	}
+	bucket := os.Getenv("S3_BUCKET")
+	region := os.Getenv("AWS_REGION")
+	if bucket == "" {
+		http.Error(w, "S3_BUCKET not configured", 500)
+		return
+	}
+	cloudID := job.CloudJobID
+	if cloudID == "" {
+		http.Error(w, "cloud_job_id not yet known for this job", 409)
+		return
+	}
+	key := fmt.Sprintf("s3://%s/jobs/%s/_SIMULATE_INTERRUPT", bucket, cloudID)
+	cmd := exec.Command("aws", "s3", "cp", "-", key, "--region", region)
+	cmd.Stdin = strings.NewReader("")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to write sentinel: %s", strings.TrimSpace(string(out))), 500)
 		return
 	}
 	w.WriteHeader(204)

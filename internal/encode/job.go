@@ -235,6 +235,11 @@ type JobConfig struct {
 	// cli_local.py --resume-package-from /work/output skips variants
 	// it already finds there.
 	ResumeFromJobID string `json:"resume_from_job_id,omitempty"`
+	// SimulateInterruptAfterS is a test hook: when >0, the remote
+	// user-data schedules a synthetic spot-interrupt after this many
+	// seconds. Lets us exercise the Retry flow without waiting for a
+	// real AWS reclaim.
+	SimulateInterruptAfterS int `json:"simulate_interrupt_after_s,omitempty"`
 }
 
 type StageProgress struct {
@@ -952,6 +957,10 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	if cfg.Target == TargetCloud && cfg.ResumeFromJobID != "" {
 		args = append(args, "--resume-from-job-id", cfg.ResumeFromJobID)
 	}
+	if cfg.Target == TargetCloud && cfg.SimulateInterruptAfterS > 0 {
+		args = append(args, "--simulate-interrupt-after",
+			strconv.Itoa(cfg.SimulateInterruptAfterS))
+	}
 	return args
 }
 
@@ -1014,6 +1023,10 @@ func (cfg *JobConfig) cloudBatchArgs(sourceDir, outputDir string, filenames []st
 	}
 	if cfg.ResumeFromJobID != "" {
 		args = append(args, "--resume-from-job-id", cfg.ResumeFromJobID)
+	}
+	if cfg.SimulateInterruptAfterS > 0 {
+		args = append(args, "--simulate-interrupt-after",
+			strconv.Itoa(cfg.SimulateInterruptAfterS))
 	}
 	return args
 }

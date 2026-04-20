@@ -112,6 +112,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="pre-warm /work from a prior failed job's S3 "
                         "staging (skips upload + re-encodes only the "
                         "variants that didn't finish before)")
+    # Test-only: inject a fake spot interruption after N seconds so we
+    # can exercise the Retry flow without waiting for a real AWS
+    # reclaim. Identical code path to the IMDSv2 watcher; writes
+    # "SPOT INTERRUPTION:" to _FAILED, rsyncs /work/tmp + /work/output.
+    p.add_argument("--simulate-interrupt-after", type=int, default=0,
+                   dest="simulate_interrupt_after",
+                   help="simulate a spot interrupt on the remote after "
+                        "N seconds (test-only; 0 disables)")
 
     # Remaining args get forwarded verbatim to create_abr_ladder.sh on the remote.
     return p
@@ -274,6 +282,7 @@ def main() -> int:
         input_basenames=[p.name for p in args.input],
         encode_args=passthrough,
         resume_from_prefix=resume_from_prefix,
+        simulate_interrupt_after_s=args.simulate_interrupt_after,
     ))
 
     # Launch FIRST. Capacity failure / permissions / bad AMI all surface

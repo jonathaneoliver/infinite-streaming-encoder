@@ -86,6 +86,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .job-cancel:hover { text-decoration: underline; }
 .job-retry { cursor: pointer; color: #8cf; font-size: 0.8rem; margin-left: 12px; font-weight: 600; }
 .job-retry:hover { text-decoration: underline; }
+.job-simulate { cursor: pointer; color: #ffa94d; font-size: 0.8rem; margin-left: 12px; }
+.job-simulate:hover { text-decoration: underline; }
 .stages-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.8rem; }
 .stages-table td { padding: 3px 8px; vertical-align: middle; }
 .stages-table td.stage-label { color: #aac; white-space: nowrap; width: 35%; }
@@ -267,6 +269,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             </div>
             <div class="control-group" id="spot-group" style="display:none;align-self:center;padding-top:16px">
                 <label title="Spot is ~2.6× cheaper but AWS can reclaim with 2 min notice. Uncheck to use on-demand (guaranteed, no interruption)."><input type="checkbox" id="use-spot" checked style="width:auto;min-width:auto"> Use spot (cheaper)</label>
+            </div>
+            <div class="control-group" id="simulate-interrupt-group" style="display:none">
+                <label title="Test-only: tells the remote to trigger a synthetic spot interrupt after N seconds. Exercises the Retry flow without waiting for a real AWS reclaim. 0 = disabled.">Simulate interrupt (s)</label>
+                <input type="number" id="simulate-interrupt" min="0" max="3600" value="0" step="10" style="width:80px">
             </div>
             <div class="control-group">
                 <label>Codec</label>
@@ -677,6 +683,8 @@ function onTargetChange() {
         target === 'cloud' ? 'flex' : 'none';
     document.getElementById('spot-group').style.display =
         target === 'cloud' ? 'flex' : 'none';
+    document.getElementById('simulate-interrupt-group').style.display =
+        target === 'cloud' ? 'flex' : 'none';
 }
 
 // Before submitting a cloud encode, peek at the AWS inventory. If
@@ -759,6 +767,7 @@ async function startEncode(force = false) {
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         cpu_arch: document.getElementById('cpu-arch').value,
         use_spot: document.getElementById('use-spot').checked,
+        simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
         force_reencode: force
     };
 
@@ -1029,6 +1038,25 @@ function updateJobRow(row, j) {
         retryEl.remove();
     }
 
+    // Simulate-interrupt test action — running cloud jobs only, and
+    // only after the remote has announced its cloud_job_id (needed
+    // for the S3 sentinel path). Triggers the same interrupt code
+    // path a real spot reclaim would, so Retry testing is deterministic.
+    let simEl = actions.querySelector('.job-simulate');
+    const simulatable = j.status === 'running' &&
+                        j.config && j.config.target === 'cloud' &&
+                        j.cloud_job_id;
+    if (simulatable && !simEl) {
+        simEl = document.createElement('span');
+        simEl.className = 'job-simulate';
+        simEl.textContent = 'Simulate interrupt';
+        simEl.title = 'Drops a sentinel object in S3 so the remote triggers its spot-interrupt code path within ~5s.';
+        simEl.setAttribute('onclick', `simulateInterrupt('${j.id}')`);
+        actions.appendChild(simEl);
+    } else if (!simulatable && simEl) {
+        simEl.remove();
+    }
+
     // Per-file header — only visible for multi-file jobs once a file
     // has been announced by ENCODER-FILE (or by the Go loop for local).
     const fileEl = row.querySelector('.current-file');
@@ -1090,6 +1118,29 @@ async function cancelJob(id) {
         if (!res.ok) alert('Cancel failed: ' + res.status);
     } catch (e) {
         alert('Cancel failed: ' + e);
+    }
+}
+
+async function simulateInterrupt(id) {
+    const confirmed = await showDialog(
+        'Simulate spot interrupt',
+        'Trigger the full spot-interrupt code path on the remote (test only). The remote will rsync /work/tmp + /work/output to S3, write SPOT INTERRUPTION to _FAILED, and terminate. You can then click Retry to test the resume flow.',
+        [
+            { label: 'Cancel', value: false, class: 'btn-secondary' },
+            { label: 'Simulate', value: true, class: 'btn-danger' }
+        ]
+    );
+    if (!confirmed) return;
+    try {
+        const res = await fetch('/api/jobs/' + id + '/simulate-interrupt', { method: 'POST' });
+        if (!res.ok) {
+            const text = await res.text();
+            showToast('Simulate failed: ' + text, 'error');
+            return;
+        }
+        showToast('Sentinel written — remote will trigger interrupt in ~5s', 'success');
+    } catch (e) {
+        showToast('Simulate failed: ' + e, 'error');
     }
 }
 
@@ -1558,6 +1609,7 @@ async function forceReencode(fileName) {
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         cpu_arch: document.getElementById('cpu-arch').value,
         use_spot: document.getElementById('use-spot').checked,
+        simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
         force_reencode: true
     };
 
