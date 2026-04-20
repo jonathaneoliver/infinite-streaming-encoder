@@ -311,7 +311,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group" style="align-self:center;padding-top:16px">
                 <label><input type="checkbox" id="keep-mezzanine" style="width:auto;min-width:auto"> Keep mezzanine</label>
             </div>
-            <button class="btn btn-primary" id="encode-btn" onclick="startEncode()" oncontextmenu="event.preventDefault(); startEncode(true); return false;" title="Click: encode checked files (skips any already fully encoded). Right-click: force re-encode all checked files (archives existing outputs)." disabled>Start Encode</button>
+            <button class="btn btn-primary" id="encode-btn" onclick="startEncode(event.altKey)" oncontextmenu="event.preventDefault(); startEncode(true); return false;" title="Click: encode checked files (skips any already fully encoded). Alt/Option+click OR right-click: force re-encode all checked files (archives existing outputs)." disabled>Start Encode</button>
             </div>
         </fieldset>
     </div>
@@ -654,6 +654,28 @@ async function confirmCloudIfBilling() {
         );
     }
 }
+
+// Alt/Option held → re-label Start Encode as Force Encode and switch to
+// the danger style, so the destructive-ish variant is visually distinct
+// before the user clicks. keyup + blur restore the normal state.
+(function wireAltModifier() {
+    const btn = document.getElementById('encode-btn');
+    if (!btn) return;
+    const setForceMode = (on) => {
+        if (on) {
+            btn.textContent = 'Start Force Encode';
+            btn.classList.remove('btn-primary');
+            btn.classList.add('btn-danger');
+        } else {
+            btn.textContent = 'Start Encode';
+            btn.classList.remove('btn-danger');
+            btn.classList.add('btn-primary');
+        }
+    };
+    window.addEventListener('keydown', (e) => { if (e.key === 'Alt') setForceMode(true); });
+    window.addEventListener('keyup',   (e) => { if (e.key === 'Alt') setForceMode(false); });
+    window.addEventListener('blur',    () => setForceMode(false));
+})();
 
 async function startEncode(force = false) {
     const selected = Array.from(document.querySelectorAll('#file-list input:checked')).map(cb => cb.value);
