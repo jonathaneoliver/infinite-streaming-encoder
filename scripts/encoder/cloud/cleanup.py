@@ -208,13 +208,19 @@ def _delete_s3_prefix(bucket: str, prefix: str, report: CleanupReport,
 # Public entry points
 # ---------------------------------------------------------------------------
 
-def terminate_job(job_id: str) -> CleanupReport:
+def terminate_job(job_id: str, keep_s3: bool = False) -> CleanupReport:
     """Tear down one job's AWS footprint. Safe for atexit handlers.
 
     Order: terminate instances first (this frees attached EBS as long
     as DeleteOnTermination=True, which launch.py explicitly sets),
     then cancel any still-open spot request, then delete any orphaned
     volumes (shouldn't exist post-terminate, but defensive), then S3.
+
+    `keep_s3=True` skips the S3 prefix deletion. Useful on failures:
+    we still want to stop EC2 billing, but the remote's user-data.log
+    under `jobs/<id>/logs/user-data.log` is often the only diagnostic
+    evidence. The Emergency Clear button can tidy it up later once
+    the user has the answer they need.
     """
     report = CleanupReport(scope=f"job:{job_id}")
     ec2 = ec2_client()
@@ -227,6 +233,9 @@ def terminate_job(job_id: str) -> CleanupReport:
 
     orphan_volumes = _describe_app_volumes(ec2, job_id, only_orphans=True)
     _delete_volumes(ec2, orphan_volumes, report)
+
+    if keep_s3:
+        return report
 
     bucket = _s3_bucket_from_env()
     if bucket:

@@ -424,10 +424,45 @@ func (m *Manager) run(job *Job, startIdx int) {
 			job.Progress = "complete"
 		}
 	}
-	os.RemoveAll(jobTmpDir)
+	// On failure, preserve the job's tmp dir — it holds diagnostic
+	// artifacts like the remote user-data.log (for cloud jobs) and any
+	// partially-encoded variant MP4s (for local). Without this the
+	// atexit cleanup and RemoveAll conspire to destroy every trace of
+	// what went wrong before we can inspect it. On success everything's
+	// already been moved to OutputDir, so clearing tmp is safe.
+	if job.Status == StatusFailed {
+		m.preserveTmpForFailure(job, jobTmpDir)
+	} else {
+		os.RemoveAll(jobTmpDir)
+	}
 	m.removePersistedState(job.ID)
 	m.writeHistory(job)
 	m.notify(job)
+}
+
+// preserveTmpForFailure moves jobTmpDir to $TMP_DIR/failed/<job_id>/ so the
+// user can inspect user-data.log, half-encoded variant MP4s, etc. after
+// the job exits.
+func (m *Manager) preserveTmpForFailure(job *Job, jobTmpDir string) {
+	if _, err := os.Stat(jobTmpDir); os.IsNotExist(err) {
+		return
+	}
+	failedRoot := filepath.Join(m.TmpDir, "failed")
+	os.MkdirAll(failedRoot, 0755)
+	dst := filepath.Join(failedRoot, job.ID)
+	// Collision shouldn't happen (job IDs are monotonic epoch ms) but
+	// be defensive — rename the existing one out of the way.
+	if _, err := os.Stat(dst); err == nil {
+		_ = os.Rename(dst, dst+".old."+fmt.Sprint(time.Now().Unix()))
+	}
+	if err := os.Rename(jobTmpDir, dst); err != nil {
+		// Cross-device or permission issue — fall back to copy + remove.
+		if cpErr := copyDir(jobTmpDir, dst); cpErr == nil {
+			os.RemoveAll(jobTmpDir)
+		}
+	}
+	job.AppendLog(fmt.Sprintf(
+		"[preserved failure artifacts] %s", dst))
 }
 
 // finalizeCancelled handles the post-cancel bookkeeping: discard any partial

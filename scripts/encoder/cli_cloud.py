@@ -194,10 +194,10 @@ def main() -> int:
     #
     # --keep-instance / --keep-s3 opt the user out of automatic cleanup:
     # a clean exit respects those flags; an abnormal exit (crash /
-    # signal) IGNORES them and forces full teardown. The whole point of
-    # this safety layer is that crashes don't leak resources. If you
-    # genuinely want the instance preserved through a crash for
-    # forensics, don't launch it through this tool.
+    # signal) IGNORES them for EC2 (no billing leaks) but KEEPS S3
+    # staging so diagnostic artifacts (user-data.log under logs/)
+    # survive the crash path. Emergency Clear in the AWS tab mops up
+    # the staging once the user is done reading it.
     state = {"cleaned": False, "exit_abnormal": True}
 
     def _cleanup(reason: str) -> None:
@@ -209,11 +209,14 @@ def main() -> int:
             print(f">>> leaving instance up (--keep-instance), reason={reason}",
                   flush=True)
             return
-        print(f">>> cleanup ({reason}) for job {job_id}", flush=True)
-        report = terminate_job(job_id)
+        # On abnormal exit we keep S3 staging around so the user can
+        # read jobs/<id>/logs/user-data.log after the fact — losing
+        # the only diagnostic evidence on a crash defeats the point.
+        print(f">>> cleanup ({reason}) for job {job_id}"
+              + (" (S3 staging preserved for diagnostics)" if force else ""),
+              flush=True)
+        report = terminate_job(job_id, keep_s3=force)
         for action in report.actions:
-            # S3 on a clean keep-s3 exit is the user's call, but on a
-            # crash terminate_job deletes it anyway — safer default.
             print(f"    {action.action:<11s} {action.kind:<13s} {action.id}",
                   flush=True)
 
