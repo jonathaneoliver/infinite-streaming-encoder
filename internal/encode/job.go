@@ -25,6 +25,13 @@ func stripANSI(s string) string {
 var (
 	planMarkerRe  = regexp.MustCompile(`^\[\[ENCODER-PLAN (.+)\]\]$`)
 	stageMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=([0-9.]+)\]\]$`)
+	// ENCODER-FILE signals the start of a per-file encode within a
+	// multi-file job. Emitted by the Go server for local encodes (one
+	// worker per file) and by the remote userdata bash loop for cloud
+	// batches (one worker, many clips). Handling: archive the current
+	// Stages into StagesHistory (so end-of-job timing still has all
+	// phases), clear Stages, and stamp CurrentFile / FileIndex / TotalFiles.
+	fileMarkerRe = regexp.MustCompile(`^\[\[ENCODER-FILE index=(\d+) total=(\d+) name=(.+)\]\]$`)
 )
 
 // parseMarker returns true when the line was a recognised progress marker
@@ -114,7 +121,38 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Unlock()
 		return true
 	}
+	if m := fileMarkerRe.FindStringSubmatch(line); m != nil {
+		idx, _ := strconv.Atoi(m[1])
+		total, _ := strconv.Atoi(m[2])
+		j.startFile(strings.TrimSpace(m[3]), idx, total)
+		return true
+	}
 	return false
+}
+
+// startFile archives the current Stages (so end-of-job timing can still
+// show every phase that ran) and resets for a fresh file. Called from
+// parseMarker on [[ENCODER-FILE ...]], and directly by the local encode
+// loop before each worker launch.
+func (j *Job) startFile(name string, idx, total int) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.Stages) > 0 {
+		// Tag each archived stage with the file it belonged to so the
+		// timing table can group by file.
+		tagged := make([]StageProgress, len(j.Stages))
+		copy(tagged, j.Stages)
+		j.StagesHistory = append(j.StagesHistory, FileStages{
+			File:       j.CurrentFile,
+			FileIndex:  j.CurrentFileIndex,
+			TotalFiles: j.TotalFiles,
+			Stages:     tagged,
+		})
+	}
+	j.Stages = nil
+	j.CurrentFile = name
+	j.CurrentFileIndex = idx
+	j.TotalFiles = total
 }
 
 // splitLinesOrCR is a bufio.Scanner SplitFunc that emits a token on either
@@ -197,12 +235,33 @@ type Job struct {
 	// Stages is populated from [[ENCODER-PLAN]] + [[ENCODER-STAGE]]
 	// markers the Python orchestrator emits. Empty when the job hasn't
 	// reached the Python side yet (still queued, pre-run) or for old
-	// jobs that pre-date the marker format.
+	// jobs that pre-date the marker format. For multi-file jobs,
+	// Stages reflects ONLY the currently-processing file; finished
+	// files land in StagesHistory.
 	Stages []StageProgress `json:"stages,omitempty"`
+
+	// Per-file progress indicators. CurrentFile/FileIndex/TotalFiles
+	// populate on the first [[ENCODER-FILE]] marker (or the Go loop's
+	// direct call for local encodes). UI renders "File N of M: name"
+	// above the stages table.
+	CurrentFile      string `json:"current_file,omitempty"`
+	CurrentFileIndex int    `json:"current_file_index,omitempty"`
+	TotalFiles       int    `json:"total_files,omitempty"`
+
+	// StagesHistory holds the finished files' stages so end-of-job
+	// timing can show every phase that ran, not just the last file's.
+	StagesHistory []FileStages `json:"stages_history,omitempty"`
 
 	mu        sync.Mutex
 	logLines  []string
 	cancelled bool
+}
+
+type FileStages struct {
+	File       string          `json:"file"`
+	FileIndex  int             `json:"file_index"`
+	TotalFiles int             `json:"total_files"`
+	Stages     []StageProgress `json:"stages"`
 }
 
 func (j *Job) MarkCancelled() {
@@ -608,19 +667,51 @@ func (m *Manager) writeHistory(job *Job) {
 }
 
 func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
-	if len(job.Stages) == 0 {
+	if len(job.Stages) == 0 && len(job.StagesHistory) == 0 {
 		return
+	}
+
+	// Walk the history (finished files) + the current Stages (last file)
+	// as one sequence so the timing table covers the whole job, not
+	// just the last file.
+	type stageRow struct {
+		fileLabel string // "" for the current (only) file
+		stage     StageProgress
+	}
+	var rows []stageRow
+	for _, h := range job.StagesHistory {
+		label := h.File
+		if h.TotalFiles > 1 {
+			label = fmt.Sprintf("[%d/%d] %s", h.FileIndex, h.TotalFiles, h.File)
+		}
+		for _, s := range h.Stages {
+			rows = append(rows, stageRow{fileLabel: label, stage: s})
+		}
+	}
+	currentLabel := ""
+	if job.TotalFiles > 1 && job.CurrentFile != "" {
+		currentLabel = fmt.Sprintf("[%d/%d] %s", job.CurrentFileIndex, job.TotalFiles, job.CurrentFile)
+	}
+	for _, s := range job.Stages {
+		rows = append(rows, stageRow{fileLabel: currentLabel, stage: s})
 	}
 
 	// Also dump the same summary into the per-job log file so it's
 	// trivially greppable later.
 	var table strings.Builder
 	table.WriteString("\n### Stage timing\n\n")
-	table.WriteString("| Stage | Status | Started | Ended | Duration |\n")
-	table.WriteString("|-------|--------|---------|-------|----------|\n")
+	if job.TotalFiles > 1 {
+		table.WriteString("| File | Stage | Status | Started | Ended | Duration |\n")
+		table.WriteString("|------|-------|--------|---------|-------|----------|\n")
+	} else {
+		table.WriteString("| Stage | Status | Started | Ended | Duration |\n")
+		table.WriteString("|-------|--------|---------|-------|----------|\n")
+	}
 
 	var totalMeasured time.Duration
-	for _, s := range job.Stages {
+	var lastFileLabel string
+	for _, r := range rows {
+		s := r.stage
 		startStr, endStr, durStr := "—", "—", "—"
 		if s.StartedAt != nil {
 			startStr = s.StartedAt.Format("15:04:05")
@@ -634,10 +725,25 @@ func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
 				endStr = "(still running)"
 			}
 		}
-		table.WriteString(fmt.Sprintf(
-			"| %s | %s | %s | %s | %s |\n",
-			s.Label, s.Status, startStr, endStr, durStr,
-		))
+		if job.TotalFiles > 1 {
+			// Only print the file label when it changes — keeps the
+			// table less noisy.
+			displayed := r.fileLabel
+			if displayed == lastFileLabel {
+				displayed = ""
+			} else {
+				lastFileLabel = r.fileLabel
+			}
+			table.WriteString(fmt.Sprintf(
+				"| %s | %s | %s | %s | %s | %s |\n",
+				displayed, s.Label, s.Status, startStr, endStr, durStr,
+			))
+		} else {
+			table.WriteString(fmt.Sprintf(
+				"| %s | %s | %s | %s | %s |\n",
+				s.Label, s.Status, startStr, endStr, durStr,
+			))
+		}
 	}
 
 	// Totals row — includes both the sum of measured stage durations
@@ -645,13 +751,23 @@ func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
 	// noted) and the whole-job wall clock for reference.
 	if job.EndedAt != nil {
 		wall := job.EndedAt.Sub(job.StartedAt).Round(time.Second)
-		table.WriteString(fmt.Sprintf(
-			"| **total measured** |  |  |  | %s |\n",
-			totalMeasured.Round(100*time.Millisecond),
-		))
-		table.WriteString(fmt.Sprintf(
-			"| **wall clock** |  |  |  | %s |\n", wall,
-		))
+		if job.TotalFiles > 1 {
+			table.WriteString(fmt.Sprintf(
+				"|  | **total measured** |  |  |  | %s |\n",
+				totalMeasured.Round(100*time.Millisecond),
+			))
+			table.WriteString(fmt.Sprintf(
+				"|  | **wall clock** |  |  |  | %s |\n", wall,
+			))
+		} else {
+			table.WriteString(fmt.Sprintf(
+				"| **total measured** |  |  |  | %s |\n",
+				totalMeasured.Round(100*time.Millisecond),
+			))
+			table.WriteString(fmt.Sprintf(
+				"| **wall clock** |  |  |  | %s |\n", wall,
+			))
+		}
 	}
 
 	f.WriteString(table.String())
@@ -660,7 +776,13 @@ func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
 	logPath := filepath.Join(m.TmpDir, "logs", job.ID+".log")
 	if lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0644); err == nil {
 		lf.WriteString("\n=== Stage timing ===\n")
-		for _, s := range job.Stages {
+		var lastFL string
+		for _, r := range rows {
+			if r.fileLabel != "" && r.fileLabel != lastFL {
+				fmt.Fprintf(lf, "  --- %s ---\n", r.fileLabel)
+				lastFL = r.fileLabel
+			}
+			s := r.stage
 			dur := "—"
 			if s.StartedAt != nil && s.EndedAt != nil {
 				dur = s.EndedAt.Sub(*s.StartedAt).Round(100 * time.Millisecond).String()
@@ -856,12 +978,12 @@ func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int)
 		return m.encodeCloudBatch(job, tmpDir, script, startIdx)
 	}
 
-	for i := startIdx; i < len(job.Config.Files); i++ {
+	total := len(job.Config.Files)
+	for i := startIdx; i < total; i++ {
 		m.persistState(job, i)
 
 		f := job.Config.Files[i]
-		job.Progress = fmt.Sprintf("encoding %d/%d: %s", i+1, len(job.Config.Files), f)
-		m.notify(job)
+		job.Progress = fmt.Sprintf("encoding %d/%d: %s", i+1, total, f)
 
 		codec := job.Config.Codec
 		if !job.Config.ForceReencode {
@@ -871,6 +993,12 @@ func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int)
 				continue
 			}
 		}
+
+		// Archive finished stages + reset bars so the UI shows a clean
+		// slate for the next file. The worker's first ENCODER-PLAN
+		// rebuilds the rows.
+		job.startFile(f, i+1, total)
+		m.notify(job)
 
 		fileCfg := job.Config
 		fileCfg.Codec = codec

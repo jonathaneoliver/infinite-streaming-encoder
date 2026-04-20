@@ -166,10 +166,22 @@ for bn in {basenames}; do
 done
 stage remote:fetch-inputs done 100
 
+# Total clip count — used for the ENCODER-FILE marker so the UI can
+# render "File N of M: <name>" and reset its stage bars between clips.
+TOTAL_CLIPS=0
+for _bn in {basenames}; do TOTAL_CLIPS=$((TOTAL_CLIPS + 1)); done
+CLIP_IDX=0
+
 for bn in {basenames}; do
     CURRENT_CLIP="${{bn}}"
+    CLIP_IDX=$((CLIP_IDX + 1))
     stem="${{bn%.*}}"
     base="${{stem}}_p200"
+
+    # Per-clip boundary marker — local Go scanner archives the previous
+    # clip's stages and resets the UI bars. The per-clip docker run of
+    # cli_local.py below emits a fresh ENCODER-PLAN that populates them.
+    printf '[[ENCODER-FILE index=%d total=%d name=%s]]\\n' "$CLIP_IDX" "$TOTAL_CLIPS" "$bn"
 
     echo ">>> Encoding ${{bn}} -> /work/output/${{base}}_{{h264,hevc}}/"
     # The image's default ENTRYPOINT is the Go server (for local use);

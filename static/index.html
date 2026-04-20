@@ -878,6 +878,7 @@ function jobRowHtml(j) {
             </div>
             <div class="job-progress"></div>
             <div class="job-error" style="color:#ef476f;font-size:0.8rem;margin-top:4px;display:none"></div>
+            <div class="current-file" style="display:none;font-size:0.85rem;color:#8cf;margin-top:8px;font-weight:600"></div>
             <table class="stages-table" style="display:none"><tbody></tbody></table>
             <div class="job-actions">
                 <span class="log-toggle" onclick="toggleLog('${j.id}')">Show log</span>
@@ -951,6 +952,16 @@ function updateJobRow(row, j) {
         actions.appendChild(cancelEl);
     } else if (!cancellable && cancelEl) {
         cancelEl.remove();
+    }
+
+    // Per-file header — only visible for multi-file jobs once a file
+    // has been announced by ENCODER-FILE (or by the Go loop for local).
+    const fileEl = row.querySelector('.current-file');
+    if (j.total_files > 1 && j.current_file) {
+        fileEl.textContent = `File ${j.current_file_index} of ${j.total_files}: ${j.current_file}`;
+        fileEl.style.display = 'block';
+    } else {
+        fileEl.style.display = 'none';
     }
 
     updateStagesTable(row, j.stages);
