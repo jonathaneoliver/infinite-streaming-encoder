@@ -1095,12 +1095,12 @@ function updateJobRow(row, j) {
         cancelEl.remove();
     }
 
-    // Retry action — only meaningful for failed/cancelled cloud jobs
-    // with an S3 prefix we can resume from. Local jobs have nothing
-    // to reuse; resume only helps when prior state is on S3.
+    // Retry action — for both cloud and local failed/cancelled jobs.
+    // Cloud: resumes from S3 staging prefix. Local: picks up the
+    // per-clip work dir under TMPDIR, which survived the failure.
     let retryEl = actions.querySelector('.job-retry');
     const retryable = (j.status === 'failed' || j.status === 'cancelled') &&
-                      j.config && j.config.target === 'cloud';
+                      j.config && j.config.target;
     if (retryable && !retryEl) {
         retryEl = document.createElement('span');
         retryEl.className = 'job-retry';
@@ -1112,19 +1112,24 @@ function updateJobRow(row, j) {
         retryEl.remove();
     }
 
-    // Simulate-interrupt test action — running cloud jobs only, and
-    // only after the remote has announced its cloud_job_id (needed
-    // for the S3 sentinel path). Triggers the same interrupt code
-    // path a real spot reclaim would, so Retry testing is deterministic.
+    // Simulate-interrupt test action — running jobs only.
+    //   cloud: needs cloud_job_id so the S3 sentinel points at the
+    //          right prefix; triggers the remote's spot-interrupt
+    //          code path within ~5s
+    //   local: docker kill on the worker container (SIGKILL, so no
+    //          graceful cleanup — matches a real reclaim)
     let simEl = actions.querySelector('.job-simulate');
-    const simulatable = j.status === 'running' &&
-                        j.config && j.config.target === 'cloud' &&
-                        j.cloud_job_id;
+    const simulatable = j.status === 'running' && j.config && (
+        (j.config.target === 'cloud' && j.cloud_job_id) ||
+        j.config.target === 'local'
+    );
     if (simulatable && !simEl) {
         simEl = document.createElement('span');
         simEl.className = 'job-simulate';
         simEl.textContent = 'Simulate interrupt';
-        simEl.title = 'Drops a sentinel object in S3 so the remote triggers its spot-interrupt code path within ~5s.';
+        simEl.title = j.config.target === 'cloud'
+            ? 'Drops a sentinel object in S3 so the remote triggers its spot-interrupt code path within ~5s.'
+            : 'docker kill on the local worker (SIGKILL). In-flight variant encodes leave no .done sidecar; Retry picks up from completed ones.';
         simEl.setAttribute('onclick', `simulateInterrupt('${j.id}')`);
         actions.appendChild(simEl);
     } else if (!simulatable && simEl) {

@@ -187,8 +187,11 @@ stage() {{
 }}
 
 stage remote:install running
+echo ">>> dnf install docker"
 dnf install -y docker
+echo ">>> dnf done; enabling docker"
 systemctl enable --now docker
+echo ">>> docker enabled"
 stage remote:install done 100
 
 stage remote:ghcr-login running
@@ -246,6 +249,7 @@ for bn in {basenames}; do
     # complete ones. On a fresh job nothing's there; on a retry any
     # variant that was complete on the prior instance (rescued via
     # spot interrupt sync to S3, then re-downloaded here) gets reused.
+    echo ">>> starting cli_local.py for ${{bn}} (clip $CLIP_IDX of $TOTAL_CLIPS)"
     docker run --rm \\
         -v /work:/work \\
         -w /work/output \\
@@ -258,6 +262,7 @@ for bn in {basenames}; do
         --output-dir /work/output \\
         --output "${{base}}" \\
         {encode_args}
+    echo ">>> cli_local.py done for ${{bn}}"
 
     stage remote:sync-outputs running
     aws s3 sync /work/output {s3}/output/ \\

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/jonathaneoliver/encoder/internal/encode"
@@ -50,6 +51,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("POST /api/jobs/{id}/cancel", s.cancelJob)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/retry", s.retryJob)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/simulate-interrupt", s.simulateInterrupt)
+	s.Mux.HandleFunc("GET /api/jobs/{id}/workdir", s.jobWorkdir)
 	// AWS inventory + cleanup (issue #5)
 	s.Mux.HandleFunc("GET /api/aws/inventory", s.awsInventory)
 	s.Mux.HandleFunc("POST /api/aws/clear", s.awsClearAll)
@@ -156,12 +158,89 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 
-// simulateInterrupt drops an empty `_SIMULATE_INTERRUPT` sentinel
-// into the running job's S3 prefix. The remote user-data polls for
-// it every 5s and, on seeing it, invokes the same trigger_interrupt
-// bash path that a real spot reclaim hits — writes the distinctive
-// _FAILED body, rsyncs /work/tmp + /work/output, exits. Lets us
-// test the Retry + partial-file flow without waiting for AWS.
+// jobWorkdir lists files in cli_local.py's per-clip persistent work
+// dir ($TMP_DIR/encode_<stem>/) and flags each as complete (has a
+// matching .done sidecar) or partial. Lets the UI preview what a
+// Retry will reuse vs re-encode. Works for both local and cloud
+// encodes — cloud's /work/tmp is rsynced to/from S3, but during an
+// encode the same paths are mounted on the host.
+func (s *Server) jobWorkdir(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	job := s.Manager.GetJob(id)
+	if job == nil {
+		http.Error(w, "job not found", 404)
+		return
+	}
+	type workdirEntry struct {
+		Name     string `json:"name"`
+		Size     int64  `json:"size"`
+		Complete bool   `json:"complete"`
+	}
+	type workdirResp struct {
+		Stem    string         `json:"stem"`
+		Path    string         `json:"path"`
+		Entries []workdirEntry `json:"entries"`
+	}
+	// Use the first file's stem. Multi-file jobs each have their own
+	// work dir; if we're asked mid-job we could be partway through
+	// clip N, so pick the current one from CurrentFile if set.
+	var filename string
+	if job.CurrentFile != "" {
+		filename = job.CurrentFile
+	} else if len(job.Config.Files) > 0 {
+		filename = job.Config.Files[0]
+	}
+	if filename == "" {
+		writeJSON(w, workdirResp{})
+		return
+	}
+	stem := job.Config.OutputStem(filename)
+	dir := filepath.Join(s.Manager.TmpDir, "encode_"+stem)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		writeJSON(w, workdirResp{Stem: stem, Path: dir})
+		return
+	}
+	resp := workdirResp{Stem: stem, Path: dir}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".mp4") {
+			continue
+		}
+		info, _ := e.Info()
+		mp4 := filepath.Join(dir, e.Name())
+		complete := false
+		if marker, err := os.ReadFile(mp4 + ".done"); err == nil {
+			if recorded, perr := strconv.ParseInt(strings.TrimSpace(string(marker)), 10, 64); perr == nil {
+				if info != nil && recorded == info.Size() {
+					complete = true
+				}
+			}
+		}
+		size := int64(0)
+		if info != nil {
+			size = info.Size()
+		}
+		resp.Entries = append(resp.Entries, workdirEntry{
+			Name: e.Name(), Size: size, Complete: complete,
+		})
+	}
+	writeJSON(w, resp)
+}
+
+// simulateInterrupt fakes a mid-encode failure so the Retry flow
+// can be exercised without waiting for a real interrupt.
+//
+// Cloud jobs: writes an empty _SIMULATE_INTERRUPT sentinel to the
+// job's S3 prefix. The remote user-data polls for it every 5s and,
+// on seeing it, invokes the same trigger_interrupt bash path a real
+// spot reclaim hits — writes SPOT INTERRUPTION: to _FAILED, rsyncs
+// /work/tmp + /work/output, exits.
+//
+// Local jobs: docker kill on the worker container. SIGKILLs the
+// Python process before it can clean up, so any in-flight variant
+// has no .done sidecar written (exactly what happens on spot
+// interrupt) — cli_local.py's preflight sweep deletes those on
+// retry, leaving only the fully-complete files for reuse.
 func (s *Server) simulateInterrupt(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	job := s.Manager.GetJob(id)
@@ -169,28 +248,48 @@ func (s *Server) simulateInterrupt(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "job not found", 404)
 		return
 	}
-	if job.Config.Target != encode.TargetCloud || job.Status != encode.StatusRunning {
-		http.Error(w, "job must be a running cloud job", 400)
+	if job.Status != encode.StatusRunning {
+		http.Error(w, "job is not running", 400)
 		return
 	}
-	bucket := os.Getenv("S3_BUCKET")
-	region := os.Getenv("AWS_REGION")
-	if bucket == "" {
-		http.Error(w, "S3_BUCKET not configured", 500)
+	if job.Config.Target == encode.TargetCloud {
+		bucket := os.Getenv("S3_BUCKET")
+		region := os.Getenv("AWS_REGION")
+		if bucket == "" {
+			http.Error(w, "S3_BUCKET not configured", 500)
+			return
+		}
+		cloudID := job.CloudJobID
+		if cloudID == "" {
+			http.Error(w, "cloud_job_id not yet known for this job", 409)
+			return
+		}
+		key := fmt.Sprintf("s3://%s/jobs/%s/_SIMULATE_INTERRUPT", bucket, cloudID)
+		cmd := exec.Command("aws", "s3", "cp", "-", key, "--region", region)
+		cmd.Stdin = strings.NewReader("")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to write sentinel: %s", strings.TrimSpace(string(out))), 500)
+			return
+		}
+		w.WriteHeader(204)
 		return
 	}
-	cloudID := job.CloudJobID
-	if cloudID == "" {
-		http.Error(w, "cloud_job_id not yet known for this job", 409)
-		return
-	}
-	key := fmt.Sprintf("s3://%s/jobs/%s/_SIMULATE_INTERRUPT", bucket, cloudID)
-	cmd := exec.Command("aws", "s3", "cp", "-", key, "--region", region)
-	cmd.Stdin = strings.NewReader("")
-	out, err := cmd.CombinedOutput()
+	// Local: find and SIGKILL the worker container(s) for this job.
+	out, err := exec.Command("docker", "ps",
+		"--filter", "label=encoder.job_id="+id,
+		"--format", "{{.Names}}").Output()
 	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to write sentinel: %s", strings.TrimSpace(string(out))), 500)
+		http.Error(w, "docker ps failed: "+err.Error(), 500)
 		return
+	}
+	names := strings.Fields(string(out))
+	if len(names) == 0 {
+		http.Error(w, "no running worker container for this job", 404)
+		return
+	}
+	for _, name := range names {
+		exec.Command("docker", "kill", name).Run()
 	}
 	w.WriteHeader(204)
 }
@@ -224,6 +323,10 @@ func (s *Server) retryJob(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.ResumeFromJobID = prior
 	}
+	// Local resume is automatic: cli_local.py's per-clip work dir
+	// lives at TMPDIR/encode_<stem>/ on the host filesystem, so
+	// variants + mezzanine from a prior partial run are still there
+	// when the new worker starts. No config plumbing needed.
 	job := s.Manager.Submit(cfg)
 	writeJSON(w, job)
 }

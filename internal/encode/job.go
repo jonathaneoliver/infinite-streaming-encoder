@@ -1224,6 +1224,12 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 		"-v", m.HostSourceDir + ":" + m.SourceDir + ":ro",
 		"-v", m.HostOutputDir + ":" + m.OutputDir,
 		"-v", m.HostTmpDir + ":" + m.TmpDir,
+		// Pin TMPDIR to the mounted host tmp so cli_local.py's per-clip
+		// work dir (at TMPDIR/encode_<stem>/) persists across worker
+		// container lifetimes. That's what makes local Retry reuse
+		// prior mezzanines / variants — the work_dir is on the host
+		// filesystem, not inside the ephemeral container layer.
+		"-e", "TMPDIR=" + m.TmpDir,
 		"--entrypoint", script,
 	}
 	// Cloud jobs drive AWS from inside the worker; pass the credentials

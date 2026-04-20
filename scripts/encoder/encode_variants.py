@@ -21,7 +21,7 @@ from encoder.ladder import (
     Tier,
     resolve_bitrate,
 )
-from encoder.progress import run_ffmpeg_with_progress
+from encoder.progress import emit_stage, run_ffmpeg_with_progress
 
 
 def variant_stage_key(codec: str, tier_name: str) -> str:
@@ -231,6 +231,10 @@ def encode_all(
             if _is_complete(out):
                 print(f"[resume] skipping {codec} {tier.name} "
                       f"— already complete ({out.name})", flush=True)
+                # Emit stage marker so the UI flips this variant's bar
+                # from pending → done at 100% immediately, rather than
+                # leaving it at pending forever.
+                emit_stage(variant_stage_key(codec, tier.name), "done", 100.0)
                 outputs.append(out)
                 continue
             outputs.append(encode_variant(ctx, codec, tier, overrides[codec]))

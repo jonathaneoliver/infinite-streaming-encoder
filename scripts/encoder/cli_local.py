@@ -232,6 +232,11 @@ def run_full(args: argparse.Namespace) -> int:
     # completion below).
     work_dir = _TMP_ROOT / f"encode_{stem}"
     work_dir.mkdir(parents=True, exist_ok=True)
+    # Preflight: sweep out partially-encoded files left over from a
+    # prior interrupt. A file without a matching .done sidecar (or
+    # whose .done size disagrees with the file) is partial — keeping
+    # it around wastes disk and can confuse the next ffmpeg pass.
+    _sweep_partials(work_dir)
     try:
         mezz_path = work_dir / "mezzanine.mp4"
 
@@ -242,6 +247,7 @@ def run_full(args: argparse.Namespace) -> int:
         if _is_complete(mezz_path):
             print(f"[phase 2] reusing mezzanine from prior run "
                   f"({mezz_path.name})", flush=True)
+            emit_stage("mezzanine", "done", 100.0)
         else:
             print("[phase 2] creating mezzanine...", flush=True)
             # Duration for progress calc: source duration, capped by --time.
@@ -306,6 +312,7 @@ def run_full(args: argparse.Namespace) -> int:
             if _is_complete(audio_path):
                 print(f"[phase 4] reusing audio from prior run "
                       f"({audio_path.name})", flush=True)
+                emit_stage("audio", "done", 100.0)
             else:
                 print("[phase 4] creating audio mezzanine...", flush=True)
                 create_audio(
@@ -384,6 +391,35 @@ def run_full(args: argparse.Namespace) -> int:
 
     print("[done]", flush=True)
     return 0
+
+
+def _sweep_partials(work_dir: Path) -> None:
+    """Delete .mp4 files without a matching .done sidecar, and orphan
+    .done sidecars without a backing .mp4 — leaves only the clean
+    complete-pair files for the retry to reuse."""
+    removed = []
+    for mp4 in work_dir.glob("*.mp4"):
+        if not _is_complete(mp4):
+            marker = mp4.with_suffix(mp4.suffix + ".done")
+            try:
+                mp4.unlink()
+                if marker.is_file():
+                    marker.unlink()
+                removed.append(mp4.name)
+            except OSError:
+                pass
+    for marker in work_dir.glob("*.mp4.done"):
+        # Orphan markers: sidecar without a corresponding .mp4
+        mp4 = marker.with_suffix("")  # .mp4.done -> .mp4
+        if not mp4.is_file():
+            try:
+                marker.unlink()
+                removed.append(marker.name)
+            except OSError:
+                pass
+    if removed:
+        print(f"[preflight] cleared partial/orphan files: "
+              f"{', '.join(removed)}", flush=True)
 
 
 def _is_complete(mp4: Path) -> bool:
