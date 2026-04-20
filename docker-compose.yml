@@ -26,7 +26,7 @@ services:
       - HOST_TMP_DIR=${TMP_DIR}
       - HOST_AWS_DIR=${HOME}/.aws
       - ENCODER_IMAGE=${ENCODER_IMAGE:-encoder:latest}
-      - DOCKER_IMAGE=${DOCKER_IMAGE:-ghcr.io/jonathaneoliver/infinite-streaming:latest}
+      - DOCKER_IMAGE=${DOCKER_IMAGE:-ghcr.io/jonathaneoliver/encoder:latest}
       - AUTO_WATCH=${AUTO_WATCH:-true}
       - DEFAULT_TARGET=${DEFAULT_TARGET:-local}
       - DEFAULT_CODEC=${DEFAULT_CODEC:-both}
