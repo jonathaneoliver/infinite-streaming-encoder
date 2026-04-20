@@ -196,6 +196,8 @@ def _parse_dash(mpd_path: Path) -> dict[str, Any]:
         content_type = adaptation_set.get("contentType", "video")
         as_width = adaptation_set.get("width")
         as_height = adaptation_set.get("height")
+        # DASH frameRate is either a float ("30") or a rational ("30000/1001").
+        as_framerate = adaptation_set.get("frameRate")
 
         for rep in adaptation_set.findall(".//mpd:Representation", _NS):
             seg_list = rep.find("mpd:SegmentList", _NS)
@@ -210,6 +212,7 @@ def _parse_dash(mpd_path: Path) -> dict[str, Any]:
                 "mime_type": rep.get("mimeType", ""),
                 "width": rep.get("width") or as_width,
                 "height": rep.get("height") or as_height,
+                "frame_rate": rep.get("frameRate") or as_framerate,
                 "init_segment": (
                     seg_list.find("mpd:Initialization", _NS).get("sourceURL")
                     if seg_list.find("mpd:Initialization", _NS) is not None
@@ -219,6 +222,24 @@ def _parse_dash(mpd_path: Path) -> dict[str, Any]:
                 "timescale": int(seg_list.get("timescale", 1)),
             })
     return {"duration": duration_sec, "representations": representations}
+
+
+def _parse_frame_rate(fr: str | None) -> float | None:
+    """Convert a DASH frameRate attribute to a float.
+
+    Accepts "30", "30000/1001", or anything parseable as a number.
+    Returns None if the input is missing or malformed.
+    """
+    if not fr:
+        return None
+    try:
+        if "/" in fr:
+            num, _, den = fr.partition("/")
+            n, d = float(num), float(den)
+            return n / d if d else None
+        return float(fr)
+    except ValueError:
+        return None
 
 
 def _extract_segments(seg_list: ET.Element) -> list[dict[str, Any]]:
@@ -353,6 +374,14 @@ def _write_master(dash_info: dict[str, Any], output_dir: Path) -> Path:
 
     lines += ["", "# Video variants"]
 
+    # Audio codec string for the CODECS attribute. When an AUDIO group is
+    # referenced from EXT-X-STREAM-INF, HLS requires CODECS to list every
+    # codec that appears in the combined rendition — not just the video
+    # one. Players (especially Safari/AVFoundation) decode the audio
+    # track using this string; omitting it has made players misinterpret
+    # audio bytes as video NAL units in practice.
+    audio_codec = audio_reps[0].get("codecs") if audio_reps else ""
+
     for rep in video_reps:
         res_name = _resolution_name(rep["width"], rep["height"])
         variant_dir = output_dir / res_name.lower()
@@ -365,15 +394,22 @@ def _write_master(dash_info: dict[str, Any], output_dir: Path) -> Path:
             bandwidth = _average_bandwidth(rep, output_dir) + audio_avg
         average = _average_bandwidth(rep, output_dir) + audio_avg
 
+        codecs = rep["codecs"]
+        if audio_codec:
+            codecs = f"{codecs},{audio_codec}"
+
         stream_info = f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}"
         if average > 0:
             stream_info += f",AVERAGE-BANDWIDTH={average}"
         if rep["width"] and rep["height"]:
             stream_info += f",RESOLUTION={rep['width']}x{rep['height']}"
-        stream_info += f',CODECS="{rep["codecs"]}"'
+        stream_info += f',CODECS="{codecs}"'
         if audio_reps:
             stream_info += ',AUDIO="audio"'
-        stream_info += ",FRAME-RATE=25.000"
+
+        fps = _parse_frame_rate(rep.get("frame_rate"))
+        if fps is not None:
+            stream_info += f",FRAME-RATE={fps:.3f}"
 
         lines.append(stream_info)
         lines.append(f"{res_name.lower()}/playlist.m3u8")
