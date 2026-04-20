@@ -355,7 +355,21 @@ def run_full(args: argparse.Namespace) -> int:
 
 def run_resume(args: argparse.Namespace) -> int:
     resume_dir = Path(args.resume_package_from)
+    # If the resume directory doesn't exist (or exists but has no
+    # completed variant MP4s), there's nothing to skip — fall through
+    # to a full encode. This is the cloud-retry case where the prior
+    # run got spot-interrupted before any variant finished: the remote
+    # pre-warmed /work from the dead instance's S3, but /work/output
+    # is empty (or only had partial files that lack .done markers).
+    if not resume_dir.is_dir():
+        print(f">>> resume: {resume_dir} missing; running full encode",
+              flush=True)
+        return run_full(args)
     inventory = discover(resume_dir)
+    if not inventory.available:
+        print(">>> resume: no complete variants found under "
+              f"{resume_dir}; running full encode", flush=True)
+        return run_full(args)
     codec_selection = resolve_codec_selection(inventory, args.codec or None)
 
     # Use the union of tiers available across the selected codecs.
