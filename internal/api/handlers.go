@@ -15,10 +15,14 @@ import (
 type Server struct {
 	Manager *encode.Manager
 	Mux     *http.ServeMux
+	// Version is stamped by cmd/server from the -ldflags-injected
+	// main.version. Surfaced at /api/version for the SPA's About tab.
+	Version string
 }
 
 func NewServer(mgr *encode.Manager) *Server {
 	s := &Server{Manager: mgr, Mux: http.NewServeMux()}
+	s.Mux.HandleFunc("GET /api/version", s.getVersion)
 	s.Mux.HandleFunc("GET /api/sources", s.listSources)
 	s.Mux.HandleFunc("GET /api/outputs", s.listOutputs)
 	s.Mux.HandleFunc("GET /api/outputs/{name}", s.listOutputContents)
@@ -56,6 +60,10 @@ func noCache(h http.Handler) http.Handler {
 		w.Header().Set("Expires", "0")
 		h.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) getVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]string{"version": s.Version})
 }
 
 type sourceFile struct {

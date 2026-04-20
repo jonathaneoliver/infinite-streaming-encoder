@@ -15,6 +15,11 @@ import (
 	"github.com/jonathaneoliver/encoder/internal/watcher"
 )
 
+// Version is stamped at build time via `-ldflags "-X main.version=..."`.
+// The Makefile reads ./VERSION and injects it; unstamped builds (plain
+// `go build`) fall back to "dev".
+var version = "dev"
+
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -99,8 +104,9 @@ func main() {
 	})
 
 	srv := api.NewServer(mgr)
+	srv.Version = version
 
-	log.Printf("encoder server listening on %s", *addr)
+	log.Printf("encoder server %s listening on %s", version, *addr)
 	log.Printf("  source: %s", *sourceDir)
 	log.Printf("  output: %s", *outputDir)
 	log.Printf("  tmp: %s", *tmpDir)

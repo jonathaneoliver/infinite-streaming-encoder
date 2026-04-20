@@ -97,6 +97,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 /* --- AWS tab --- */
 .tab-aws { color: #ffa94d; }
 .tab-aws.active { color: #ffa94d; border-bottom-color: #ffa94d; }
+.about-list { display: grid; grid-template-columns: max-content 1fr; gap: 8px 20px; margin: 0; }
+.about-list dt { color: #aac; font-weight: 600; }
+.about-list dd { margin: 0; color: #eee; font-variant-numeric: tabular-nums; }
 .aws-panel { border-top: 3px solid #ffa94d; }
 .aws-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .aws-header-actions { display: flex; gap: 12px; align-items: center; }
@@ -217,6 +220,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
     <div class="tab" onclick="switchTab('outputs')">Outputs</div>
     <div class="tab" onclick="switchTab('jobs')">Jobs</div>
     <div class="tab tab-aws" onclick="switchTab('aws')">AWS ☁</div>
+    <div class="tab" onclick="switchTab('about')" style="margin-left:auto">About</div>
 </div>
 
 <!-- ENCODE TAB -->
@@ -434,6 +438,19 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             </p>
             <button class="btn btn-danger" onclick="openClearModal()">Clear all AWS resources</button>
         </div>
+    </div>
+</div>
+
+<!-- ABOUT TAB -->
+<div id="tab-about" class="tab-content">
+    <div class="panel">
+        <h2>About</h2>
+        <dl class="about-list">
+            <dt>Version</dt>
+            <dd id="about-version">—</dd>
+            <dt>Source</dt>
+            <dd><a href="https://github.com/jonathaneoliver/Encoder" target="_blank" rel="noopener">github.com/jonathaneoliver/Encoder</a></dd>
+        </dl>
     </div>
 </div>
 
@@ -1682,6 +1699,18 @@ loadSources();
 connectSSE();
 setInterval(loadSources, 60000);
 startAwsAutoRefresh();
+loadVersion();
+
+async function loadVersion() {
+    try {
+        const res = await fetch('/api/version');
+        if (!res.ok) return;
+        const j = await res.json();
+        const v = j.version || 'dev';
+        const el = document.getElementById('about-version');
+        if (el) el.textContent = v;
+    } catch (e) { /* offline — leave "—" */ }
+}
 </script>
 </body>
 </html>

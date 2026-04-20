@@ -6,11 +6,16 @@ IMAGE_NAME ?= encoder
 CONTAINER_NAME ?= encoder
 PORT ?= 8080
 
+# Single source of truth: ./VERSION. Embedded into the Go binary via
+# -ldflags and stamped on every image tag we publish to GHCR.
+VERSION := $(shell cat VERSION 2>/dev/null || echo dev)
+
 # GHCR publishing
 GHCR_IMAGE ?= ghcr.io/jonathaneoliver/encoder
 GHCR_USERNAME ?= jonathaneoliver
 PLATFORMS ?= linux/amd64,linux/arm64
-TAG ?= latest
+
+.PHONY: require-paths build run stop restart logs shell status clean push push-setup version
 
 require-paths:
 	@: $${SOURCE_DIR:?SOURCE_DIR is not set — create a .env (see .env.example)}
@@ -18,7 +23,10 @@ require-paths:
 	@: $${TMP_DIR:?TMP_DIR is not set — create a .env (see .env.example)}
 
 build:
-	docker build -t $(IMAGE_NAME) .
+	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE_NAME) .
+
+version:
+	@echo $(VERSION)
 
 run: require-paths build
 	docker run --rm -d \
@@ -81,12 +89,15 @@ push-setup:
 	@docker buildx use encoder-builder
 	@docker buildx inspect --bootstrap
 
-# Build + push the multi-arch image. Override TAG to publish alternate
-# tags, e.g. `make push TAG=v1.0.0` or `make push TAG=$(git rev-parse --short HEAD)`.
+# Build + push the multi-arch image, tagged as both `latest` and the
+# current VERSION. Also stamps the version into the Go binary via
+# --build-arg VERSION so /api/version reflects what's pulled.
 push:
 	docker buildx build \
 		--platform $(PLATFORMS) \
-		--tag $(GHCR_IMAGE):$(TAG) \
+		--build-arg VERSION=$(VERSION) \
+		--tag $(GHCR_IMAGE):latest \
+		--tag $(GHCR_IMAGE):$(VERSION) \
 		--push \
 		.
-	@echo "Published $(GHCR_IMAGE):$(TAG) for $(PLATFORMS)"
+	@echo "Published $(GHCR_IMAGE):latest and :$(VERSION) for $(PLATFORMS)"

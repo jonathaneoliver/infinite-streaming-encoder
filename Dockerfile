@@ -1,9 +1,10 @@
 FROM golang:1.22-alpine AS builder
+ARG VERSION=dev
 WORKDIR /build
 COPY go.mod .
 COPY cmd/ cmd/
 COPY internal/ internal/
-RUN CGO_ENABLED=0 go build -o /encoder ./cmd/server
+RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /encoder ./cmd/server
 
 FROM python:3.12-slim
 
