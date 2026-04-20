@@ -104,6 +104,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-spot", action="store_true", dest="no_spot",
                    help="use on-demand EC2 instead of spot (guaranteed "
                         "uptime; ~2.6× cost)")
+    # Resume a prior failed job's work. cli_cloud.py assigns this run
+    # a fresh job id for its own tagging/cleanup, but user-data pulls
+    # inputs/mezzanines/completed-variants from the prior prefix.
+    p.add_argument("--resume-from-job-id", default=None,
+                   dest="resume_from_job_id",
+                   help="pre-warm /work from a prior failed job's S3 "
+                        "staging (skips upload + re-encodes only the "
+                        "variants that didn't finish before)")
 
     # Remaining args get forwarded verbatim to create_abr_ladder.sh on the remote.
     return p
@@ -204,21 +212,14 @@ def main() -> int:
     #
     # --keep-instance / --keep-s3 opt the user out of automatic cleanup:
     # a clean exit respects those flags; an abnormal exit (crash /
-    # signal) IGNORES them for EC2 (no billing leaks).
-    #
-    # For S3 on abnormal exit we need to balance two goals:
-    #  1. don't leak money — multi-GB inputs and partial outputs sit
-    #     in S3 at ~$0.023/GB-month until someone cleans up
-    #  2. don't lose diagnostic evidence — user-data.log is usually
-    #     the only way to understand what failed
-    #
-    # Strategy: attempt to download user-data.log locally BEFORE
-    # abnormal cleanup. If the local copy lands, we delete everything
-    # from S3 (local has the log, we're safe). If the local download
-    # fails, we keep only logs/ + _FAILED in S3 — a few KB of evidence
-    # versus multi-GB of redundant video. Either way, billing stops.
-    state: dict = {"cleaned": False, "exit_abnormal": True,
-                   "local_log_saved": False}
+    # signal) IGNORES them for EC2 (no billing leaks) but KEEPS ALL
+    # S3 staging so the UI's Retry action can resume from prior work:
+    # prior inputs, prior mezzanines (under tmp/), and any variants
+    # the remote managed to finish (under output/) are all still
+    # there. A background GC in the Go server deletes failed-job
+    # prefixes whose _FAILED marker is >1h old, so cost isn't
+    # unbounded — just deferred enough for retries to land.
+    state: dict = {"cleaned": False, "exit_abnormal": True}
 
     def _cleanup(reason: str) -> None:
         if state["cleaned"]:
@@ -229,29 +230,18 @@ def main() -> int:
             print(f">>> leaving instance up (--keep-instance), reason={reason}",
                   flush=True)
             return
-        # Best-effort last-ditch log grab for abnormal exits where
-        # the normal failure path didn't run (e.g. Ctrl-C before
-        # poll_until_done returned). Sets state["local_log_saved"].
-        if force and not state["local_log_saved"]:
-            try:
-                state["local_log_saved"] = download_user_data_log(
-                    s3_prefix, local_output_dir)
-            except Exception:
-                pass
         # Pick the S3 cleanup mode:
         #   - normal exit: full delete (unless --keep-s3)
-        #   - abnormal + local log saved: full delete (we've got it)
-        #   - abnormal + no local log: keep logs/ + _FAILED only
+        #   - abnormal exit: keep everything (enables retry; the
+        #     background GC will reap it after 1h)
         if not force:
             mode = "all" if args.keep_s3 else "none"
-        elif state["local_log_saved"]:
-            mode = "none"
         else:
-            mode = "logs"
+            mode = "all"
         note = {
-            "all": " (S3 staging preserved — --keep-s3)",
-            "logs": " (S3 inputs/outputs deleted, logs/ kept for diagnostics)",
-            "none": " (S3 staging deleted; local log preserved)" if force else "",
+            "all": " (S3 staging preserved — retry-ready)" if force else
+                   " (S3 staging preserved — --keep-s3)",
+            "none": "",
         }[mode]
         print(f">>> cleanup ({reason}) for job {job_id}{note}", flush=True)
         report = terminate_job(job_id, keep_s3=mode)
@@ -271,6 +261,10 @@ def main() -> int:
     # Render user-data before launch — it's local-only (no network)
     # and the InstanceId we're about to launch needs the full
     # script baked in via user-data at RunInstances time.
+    resume_from_prefix = ""
+    if args.resume_from_job_id:
+        resume_from_prefix = f"s3://{s3_bucket}/jobs/{args.resume_from_job_id}"
+        print(f"  resuming from:  {resume_from_prefix}")
     user_data = render_user_data(UserDataSpec(
         s3_prefix=s3_prefix,
         aws_region=aws_region,
@@ -279,6 +273,7 @@ def main() -> int:
         docker_image=docker_image,
         input_basenames=[p.name for p in args.input],
         encode_args=passthrough,
+        resume_from_prefix=resume_from_prefix,
     ))
 
     # Launch FIRST. Capacity failure / permissions / bad AMI all surface
@@ -322,8 +317,14 @@ def main() -> int:
     # (wall-clock wise) with the remote's boot + dnf + docker pull,
     # so on typical residential uplinks this finishes well before the
     # remote attempts to `aws s3 cp` the inputs into /work/input.
+    #
+    # Skipped on resume: user-data pulls inputs from the prior job's
+    # S3 prefix instead, so no upload needed.
     emit_stage("cloud:upload", "running", 0.0)
-    upload_inputs(args.input, s3_prefix, stage_key="cloud:upload")
+    if args.resume_from_job_id:
+        print(f">>> Skipping upload (resuming from {resume_from_prefix})", flush=True)
+    else:
+        upload_inputs(args.input, s3_prefix, stage_key="cloud:upload")
     emit_stage("cloud:upload", "done", 100.0)
 
     # Poll for completion

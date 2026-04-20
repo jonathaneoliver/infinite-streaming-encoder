@@ -62,6 +62,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .status-cancelled { color: #ffa94d; }
 .status-done { color: #06d6a0; }
 .status-failed { color: #ef476f; }
+.status-spot-terminated { color: #ffa94d; }
 
 .no-files { color: #666; font-style: italic; padding: 20px; text-align: center; }
 .col-header { display: flex; padding: 6px 12px; border-bottom: 1px solid #333; margin-bottom: 4px; font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing: 1px; }
@@ -83,6 +84,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .log-toggle { cursor: pointer; color: #4361ee; font-size: 0.8rem; margin-top: 4px; }
 .job-cancel { cursor: pointer; color: #ef476f; font-size: 0.8rem; margin-left: 12px; }
 .job-cancel:hover { text-decoration: underline; }
+.job-retry { cursor: pointer; color: #8cf; font-size: 0.8rem; margin-left: 12px; font-weight: 600; }
+.job-retry:hover { text-decoration: underline; }
 .stages-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.8rem; }
 .stages-table td { padding: 3px 8px; vertical-align: middle; }
 .stages-table td.stage-label { color: #aac; white-space: nowrap; width: 35%; }
@@ -975,8 +978,15 @@ function updateStagesTable(row, stages) {
 
 function updateJobRow(row, j) {
     const status = row.querySelector('.job-status');
-    status.className = 'job-status status-' + j.status;
-    status.textContent = j.status.toUpperCase();
+    // Distinct badge for spot-interrupt failures — amber instead of
+    // generic red, since this failure mode is expected and retryable.
+    if (j.status === 'failed' && j.failure_reason === 'spot_interrupted') {
+        status.className = 'job-status status-spot-terminated';
+        status.textContent = 'SPOT TERMINATED';
+    } else {
+        status.className = 'job-status status-' + j.status;
+        status.textContent = j.status.toUpperCase();
+    }
     row.querySelector('.job-progress').textContent = j.progress || '';
 
     const err = row.querySelector('.job-error');
@@ -987,8 +997,9 @@ function updateJobRow(row, j) {
         err.style.display = 'none';
     }
 
-    // Cancel action — only render while cancellable.
     const actions = row.querySelector('.job-actions');
+
+    // Cancel action — only render while cancellable.
     let cancelEl = actions.querySelector('.job-cancel');
     const cancellable = j.status === 'queued' || j.status === 'running';
     if (cancellable && !cancelEl) {
@@ -999,6 +1010,23 @@ function updateJobRow(row, j) {
         actions.appendChild(cancelEl);
     } else if (!cancellable && cancelEl) {
         cancelEl.remove();
+    }
+
+    // Retry action — only meaningful for failed/cancelled cloud jobs
+    // with an S3 prefix we can resume from. Local jobs have nothing
+    // to reuse; resume only helps when prior state is on S3.
+    let retryEl = actions.querySelector('.job-retry');
+    const retryable = (j.status === 'failed' || j.status === 'cancelled') &&
+                      j.config && j.config.target === 'cloud';
+    if (retryable && !retryEl) {
+        retryEl = document.createElement('span');
+        retryEl.className = 'job-retry';
+        retryEl.textContent = 'Retry';
+        retryEl.title = 'Resume from prior S3 staging — skips upload and already-completed variants.';
+        retryEl.setAttribute('onclick', `retryJob('${j.id}')`);
+        actions.appendChild(retryEl);
+    } else if (!retryable && retryEl) {
+        retryEl.remove();
     }
 
     // Per-file header — only visible for multi-file jobs once a file
@@ -1062,6 +1090,30 @@ async function cancelJob(id) {
         if (!res.ok) alert('Cancel failed: ' + res.status);
     } catch (e) {
         alert('Cancel failed: ' + e);
+    }
+}
+
+async function retryJob(id) {
+    const confirmed = await showDialog(
+        'Retry job',
+        'Resume from this job\'s S3 staging? Already-completed variants will be skipped; partial files (not marked .done) will be re-encoded.',
+        [
+            { label: 'Cancel', value: false, class: 'btn-secondary' },
+            { label: 'Retry', value: true, class: 'btn-primary' }
+        ]
+    );
+    if (!confirmed) return;
+    try {
+        const res = await fetch('/api/jobs/' + id + '/retry', { method: 'POST' });
+        if (!res.ok) {
+            const text = await res.text();
+            showToast('Retry failed: ' + text, 'error');
+            return;
+        }
+        showToast('Retry submitted — resuming from prior S3 staging', 'success');
+        switchTab('jobs');
+    } catch (e) {
+        showToast('Retry failed: ' + e, 'error');
     }
 }
 

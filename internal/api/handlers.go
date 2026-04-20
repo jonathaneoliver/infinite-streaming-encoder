@@ -47,6 +47,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/jobs/{id}/logs", s.jobLogs)
 	s.Mux.HandleFunc("GET /api/jobs/stream", s.streamJobs)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/cancel", s.cancelJob)
+	s.Mux.HandleFunc("POST /api/jobs/{id}/retry", s.retryJob)
 	// AWS inventory + cleanup (issue #5)
 	s.Mux.HandleFunc("GET /api/aws/inventory", s.awsInventory)
 	s.Mux.HandleFunc("POST /api/aws/clear", s.awsClearAll)
@@ -151,6 +152,39 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(204)
+}
+
+// retryJob submits a new job with the same config as `id`, wired to
+// resume from that job's S3 staging (inputs, mezzanines, completed
+// variants). Only meaningful for cloud failures — local encodes have
+// no shared staging to reuse.
+func (s *Server) retryJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	orig := s.Manager.GetJob(id)
+	if orig == nil {
+		http.Error(w, "job not found", 404)
+		return
+	}
+	if orig.Status != encode.StatusFailed && orig.Status != encode.StatusCancelled {
+		http.Error(w, "job is not in a retryable state", 400)
+		return
+	}
+	cfg := orig.Config
+	cfg.ForceReencode = true
+	if cfg.Target == encode.TargetCloud {
+		// The JobID used as the S3 prefix by cli_cloud.py isn't the
+		// Manager's internal ID — it's the timestamp-based one the
+		// Python tool computes itself. We stash that into Job.CloudJobID
+		// when the remote plan prints job_id:<X>; fall back to the
+		// manager ID (close enough for new-style jobs).
+		prior := orig.CloudJobID
+		if prior == "" {
+			prior = orig.ID
+		}
+		cfg.ResumeFromJobID = prior
+	}
+	job := s.Manager.Submit(cfg)
+	writeJSON(w, job)
 }
 
 func (s *Server) jobLogs(w http.ResponseWriter, r *http.Request) {

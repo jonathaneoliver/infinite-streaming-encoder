@@ -38,6 +38,13 @@ class UserDataSpec:
     docker_image: str
     input_basenames: list[str]
     encode_args: list[str]    # passthrough flags for create_abr_ladder.sh
+    # Resume from a prior failed job's S3 staging. When set, the remote
+    # pre-warms /work with the prior inputs, mezzanines (tmp/), and any
+    # completed variants (output/) before the encode loop — so phase 2
+    # mezzanine writes land on reused media and cli_local.py's
+    # --resume-package-from detects existing variant MP4s and skips
+    # those tiers. Empty string = fresh encode.
+    resume_from_prefix: str = ""
 
 
 def render(spec: UserDataSpec) -> str:
@@ -49,6 +56,7 @@ def render(spec: UserDataSpec) -> str:
     pat = shlex.quote(spec.ghcr_pat)
     user = shlex.quote(spec.ghcr_username)
     image = shlex.quote(spec.docker_image)
+    resume_prefix = shlex.quote(spec.resume_from_prefix)
 
     # Triple-brace blocks in f-strings would be awkward; compose plainly.
     return f"""#!/bin/bash
@@ -118,11 +126,17 @@ trap 'mark_failed "trap at line $LINENO"' ERR
         if [ "$BODY" = "200" ]; then
             ACTION=$(cat /tmp/spot-action.json)
             echo "!!! SPOT INTERRUPTION detected at $(date -u +%FT%TZ): $ACTION"
-            # Rescue whatever encoded variants we have so far before AWS
-            # reclaims. `|| true` in case /work/output is empty or sync
-            # loses the race against the hypervisor.
+            # Rescue whatever we have so far before AWS reclaims.
+            # Syncs two things: completed variants (for a future retry
+            # to skip them) and the mezzanines under /work/tmp (also
+            # reusable on retry — saves the 30-60s stream-copy phase).
+            # `|| true` in case /work is empty or sync loses the race
+            # against the hypervisor.
             aws s3 sync /work/output {s3}/output/ \\
                 --exclude '*_tmp/*' --exclude '*/abr_ladder_*/*' \\
+                --region {region} 2>/dev/null || true
+            aws s3 sync /work/tmp {s3}/tmp/ \\
+                --exclude '*.log' --exclude '*/abr_ladder_*/*' \\
                 --region {region} 2>/dev/null || true
             # Distinctive body so poll.py can classify.
             printf 'SPOT INTERRUPTION: %s\\n' "$ACTION" \\
@@ -160,10 +174,24 @@ stage remote:pull done 100
 
 mkdir -p /work/input /work/output /work/tmp
 
+RESUME_FROM={resume_prefix}
+
+# Resume path: pull inputs from the prior job's S3 prefix. They were
+# already uploaded before the failed run; no need to re-upload. Then
+# seed /work/tmp and /work/output with whatever that instance
+# rsynced before it died — mezzanines and completed variants that
+# cli_local.py's --resume-package-from will detect and skip.
 stage remote:fetch-inputs running
-for bn in {basenames}; do
-    aws s3 cp {s3}/input/${{bn}} /work/input/${{bn}} --region {region}
-done
+if [ -n "$RESUME_FROM" ]; then
+    echo ">>> Resuming from $RESUME_FROM; pulling prior inputs/tmp/output"
+    aws s3 sync "$RESUME_FROM/input/" /work/input/ --region {region}
+    aws s3 sync "$RESUME_FROM/tmp/"   /work/tmp/   --region {region} || true
+    aws s3 sync "$RESUME_FROM/output/" /work/output/ --region {region} || true
+else
+    for bn in {basenames}; do
+        aws s3 cp {s3}/input/${{bn}} /work/input/${{bn}} --region {region}
+    done
+fi
 stage remote:fetch-inputs done 100
 
 # Total clip count — used for the ENCODER-FILE marker so the UI can
@@ -192,6 +220,16 @@ for bn in {basenames}; do
     # The container's own stdout carries the per-variant ENCODER-STAGE
     # markers from cli_local.py → they flow through docker → our
     # /var/log/cloud-encode.log → S3 → local poll tail.
+    # On resume, hand cli_local.py a --resume-package-from that points
+    # at /work/output; its resume.py scans for {codec}_{res}.mp4 and
+    # skips the corresponding variant tiers. --resume-package-from is
+    # a no-op when the target dir is empty, so it's safe to always pass
+    # on the resume path.
+    RESUME_ARG=""
+    if [ -n "$RESUME_FROM" ]; then
+        RESUME_ARG="--resume-package-from /work/output"
+    fi
+
     docker run --rm \\
         -v /work:/work \\
         -w /work/output \\
@@ -203,6 +241,7 @@ for bn in {basenames}; do
         --input "/work/input/${{bn}}" \\
         --output-dir /work/output \\
         --output "${{base}}" \\
+        $RESUME_ARG \\
         {encode_args}
 
     stage remote:sync-outputs running

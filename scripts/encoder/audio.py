@@ -117,4 +117,11 @@ def create_audio(spec: AudioSpec, stage_key: str = "audio",
 
     if not spec.output_path.is_file() or spec.output_path.stat().st_size == 0:
         raise AudioError(f"audio not produced: {spec.output_path}")
+    # Completion marker so resume can distinguish a finished audio.mp4
+    # from one rsynced mid-write on spot interrupt.
+    size = spec.output_path.stat().st_size
+    marker = spec.output_path.with_suffix(spec.output_path.suffix + ".done")
+    tmp = marker.with_suffix(marker.suffix + ".tmp")
+    tmp.write_text(f"{size}\n")
+    tmp.rename(marker)
     return spec.output_path

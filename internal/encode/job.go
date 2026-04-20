@@ -25,6 +25,11 @@ func stripANSI(s string) string {
 var (
 	planMarkerRe  = regexp.MustCompile(`^\[\[ENCODER-PLAN (.+)\]\]$`)
 	stageMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=([0-9.]+)\]\]$`)
+	// Cloud cli_cloud.py prints its computed S3 job id in the plan
+	// header (`  job_id:         20260420T203910Z-1`). That's the prefix
+	// under `s3://.../jobs/` — we capture it so the retry endpoint can
+	// point at the right prior staging.
+	cloudJobIDRe = regexp.MustCompile(`^\s+job_id:\s+(\S+)\s*$`)
 	// ENCODER-FILE signals the start of a per-file encode within a
 	// multi-file job. Emitted by the Go server for local encodes (one
 	// worker per file) and by the remote userdata bash loop for cloud
@@ -127,6 +132,18 @@ func (j *Job) parseMarker(line string) bool {
 		j.startFile(strings.TrimSpace(m[3]), idx, total)
 		return true
 	}
+	// Non-consuming matches: capture sideband info but still let the
+	// line flow into the raw log buffer (return false).
+	if m := cloudJobIDRe.FindStringSubmatch(line); m != nil {
+		j.mu.Lock()
+		j.CloudJobID = m[1]
+		j.mu.Unlock()
+	}
+	if strings.Contains(line, "SPOT INTERRUPTION") {
+		j.mu.Lock()
+		j.FailureReason = "spot_interrupted"
+		j.mu.Unlock()
+	}
 	return false
 }
 
@@ -212,6 +229,12 @@ type JobConfig struct {
 	// so `omitempty` works and an unset value lets cli_cloud.py apply
 	// its env-var default (USE_SPOT=true). Ignored for local encodes.
 	UseSpot *bool `json:"use_spot,omitempty"`
+	// ResumeFromJobID points at a prior failed job whose S3 staging
+	// (inputs, mezzanines, completed variants) should be reused. The
+	// remote user-data pre-warms /work from that prefix, and
+	// cli_local.py --resume-package-from /work/output skips variants
+	// it already finds there.
+	ResumeFromJobID string `json:"resume_from_job_id,omitempty"`
 }
 
 type StageProgress struct {
@@ -255,6 +278,16 @@ type Job struct {
 	// StagesHistory holds the finished files' stages so end-of-job
 	// timing can show every phase that ran, not just the last file's.
 	StagesHistory []FileStages `json:"stages_history,omitempty"`
+
+	// CloudJobID is the timestamp-based id cli_cloud.py uses for its
+	// S3 prefix (e.g. 20260420T203910Z-1). Captured from the plan
+	// header so the Retry flow can point resume_from_job_id at the
+	// right s3://.../jobs/<X>/ prefix. Empty for local or old jobs.
+	CloudJobID string `json:"cloud_job_id,omitempty"`
+
+	// FailureReason categorises why a failed job failed, for UI
+	// styling. Today: "spot_interrupted" | "" (generic).
+	FailureReason string `json:"failure_reason,omitempty"`
 
 	mu        sync.Mutex
 	logLines  []string
@@ -916,6 +949,9 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	if cfg.Target == TargetCloud && cfg.UseSpot != nil && !*cfg.UseSpot {
 		args = append(args, "--no-spot")
 	}
+	if cfg.Target == TargetCloud && cfg.ResumeFromJobID != "" {
+		args = append(args, "--resume-from-job-id", cfg.ResumeFromJobID)
+	}
 	return args
 }
 
@@ -975,6 +1011,9 @@ func (cfg *JobConfig) cloudBatchArgs(sourceDir, outputDir string, filenames []st
 	}
 	if cfg.UseSpot != nil && !*cfg.UseSpot {
 		args = append(args, "--no-spot")
+	}
+	if cfg.ResumeFromJobID != "" {
+		args = append(args, "--resume-from-job-id", cfg.ResumeFromJobID)
 	}
 	return args
 }

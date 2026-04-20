@@ -13,7 +13,8 @@ returns a structured view the orchestrator can turn into a plan.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from encoder.ladder import LADDER, Tier
@@ -22,13 +23,39 @@ from encoder.ladder import LADDER, Tier
 SUPPORTED_CODECS = ("hevc", "h264", "av1")
 
 
+def _is_complete(mp4: Path) -> bool:
+    """A variant MP4 is 'complete' iff it has a matching .done sidecar
+    whose recorded size equals the current file size.
+
+    The sidecar is written atomically (encode_variants._write_done_marker)
+    after ffmpeg exits successfully and the file is mux'd. A file rsynced
+    mid-write — most commonly by the spot-interrupt rescue sync — will
+    have no .done marker (or a stale one pointing at a different size),
+    and is treated as incomplete so retry re-encodes it instead of
+    producing corrupt output.
+    """
+    if not mp4.is_file() or mp4.stat().st_size == 0:
+        return False
+    marker = mp4.with_suffix(mp4.suffix + ".done")
+    if not marker.is_file():
+        return False
+    try:
+        recorded = int(marker.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    return recorded == mp4.stat().st_size
+
+
 @dataclass(frozen=True)
 class ResumeInventory:
-    # Codec → list of tiers that have non-empty MP4s in the resume dir.
-    # Only codecs with at least one tier present appear here.
+    # Codec → list of tiers that have complete (size-verified) MP4s.
+    # Only codecs with at least one complete tier appear here.
     available: dict[str, list[Tier]]
-    # True if `<dir>/audio.mp4` exists and is non-empty.
+    # True if `<dir>/audio.mp4` is complete (has a matching .done).
     has_audio: bool
+    # Partial files detected (MP4 exists but no/mismatched .done). Kept
+    # so callers can log a summary — "3 of 6 variants reused, 1 partial".
+    partial: list[str] = field(default_factory=list)
 
     def codecs(self) -> list[str]:
         return list(self.available.keys())
@@ -41,28 +68,50 @@ class ResumeError(RuntimeError):
 def discover(resume_dir: Path) -> ResumeInventory:
     """Return which codecs/tiers are reusable from `resume_dir`.
 
-    Empty files count as absent — bash checks `-s` (size > 0) on the
-    MP4s before including them, and we match that. Raises `ResumeError`
-    if the directory itself doesn't exist.
+    Only counts files with a matching `.done` sidecar whose recorded
+    size matches the MP4 — see `_is_complete`. Prints a summary line
+    noting any partials found (the resume orchestrator re-encodes
+    those instead of reusing them). Raises `ResumeError` if the
+    directory itself doesn't exist.
     """
     resume_dir = Path(resume_dir)
     if not resume_dir.is_dir():
         raise ResumeError(f"resume directory not found: {resume_dir}")
 
     available: dict[str, list[Tier]] = {}
+    partial: list[str] = []
     for codec in SUPPORTED_CODECS:
         tiers_for_codec: list[Tier] = []
         for tier in LADDER:
             candidate = resume_dir / f"{codec}_{tier.name}.mp4"
-            if candidate.is_file() and candidate.stat().st_size > 0:
+            if not candidate.is_file() or candidate.stat().st_size == 0:
+                continue
+            if _is_complete(candidate):
                 tiers_for_codec.append(tier)
+            else:
+                partial.append(f"{codec}_{tier.name}.mp4")
         if tiers_for_codec:
             available[codec] = tiers_for_codec
 
     audio_path = resume_dir / "audio.mp4"
-    has_audio = audio_path.is_file() and audio_path.stat().st_size > 0
+    if audio_path.is_file() and audio_path.stat().st_size > 0:
+        if _is_complete(audio_path):
+            has_audio = True
+        else:
+            has_audio = False
+            partial.append("audio.mp4")
+    else:
+        has_audio = False
 
-    return ResumeInventory(available=available, has_audio=has_audio)
+    if partial:
+        # Visible so the user sees why a retry still re-encodes some
+        # variants — typically these are the ones that were mid-encode
+        # when spot interrupted.
+        print(f"    resume: {len(partial)} partial file(s) will be re-encoded: "
+              f"{', '.join(partial)}", file=sys.stderr, flush=True)
+
+    return ResumeInventory(available=available, has_audio=has_audio,
+                           partial=partial)
 
 
 def resolve_codec_selection(

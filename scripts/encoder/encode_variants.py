@@ -173,7 +173,23 @@ def encode_variant(
 
     if not out_path.is_file():
         raise EncodeError(f"encode produced no output: {out_path}")
+    # Atomic completion marker: a sibling file named <out>.done whose
+    # body is the MP4's final byte size. Resume logic (resume.discover)
+    # only counts variants with a matching .done sidecar, so a file
+    # rsynced mid-write (e.g. during spot interrupt) stays flagged as
+    # partial and gets re-encoded instead of silently producing a
+    # corrupted output on retry.
+    _write_done_marker(out_path)
     return out_path
+
+
+def _write_done_marker(path: Path) -> None:
+    """Write `<path>.done` atomically with the source file's size."""
+    size = path.stat().st_size
+    marker = path.with_suffix(path.suffix + ".done")
+    tmp = marker.with_suffix(marker.suffix + ".tmp")
+    tmp.write_text(f"{size}\n")
+    tmp.rename(marker)
 
 
 def codec_list(selection: str) -> list[str]:
