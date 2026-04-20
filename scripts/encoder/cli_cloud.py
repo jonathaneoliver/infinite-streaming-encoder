@@ -33,13 +33,18 @@ from encoder.progress import Stage, emit_plan, emit_stage
 
 
 # Cloud encode has a fixed set of lifecycle stages. Local side drives
-# upload/launch/download/cleanup. Remote side (user-data bash) drives
+# launch/upload/download/cleanup. Remote side (user-data bash) drives
 # the `remote:*` stages via marker emits so the user can see where
 # time is going — crucial for deciding whether to parallelise multiple
 # encodes (e.g. "is pull dominating wall-clock?" → pre-warm the image).
+#
+# Launch comes before upload so a capacity / permissions failure never
+# wastes an upload cycle. The remote's boot + dnf install + docker
+# pull takes 60-120s, giving the local uploader plenty of runway to
+# finish before the EC2 instance tries to fetch inputs.
 _CLOUD_STAGES = [
-    Stage(key="cloud:upload",        label="upload inputs (local → S3)"),
     Stage(key="cloud:launch",        label="launch EC2 instance"),
+    Stage(key="cloud:upload",        label="upload inputs (local → S3)"),
     Stage(key="remote:install",      label="install docker on EC2"),
     Stage(key="remote:ghcr-login",   label="login to GHCR"),
     Stage(key="remote:pull",         label="docker pull encoder image"),
@@ -206,14 +211,9 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
 
-    # Upload inputs — sync.upload_inputs emits running/percent ticks
-    # when given a stage_key; we book-end with explicit running(0) and
-    # done(100) so the stage is visible even for skip-all-files reruns.
-    emit_stage("cloud:upload", "running", 0.0)
-    upload_inputs(args.input, s3_prefix, stage_key="cloud:upload")
-    emit_stage("cloud:upload", "done", 100.0)
-
-    # Render user-data
+    # Render user-data before launch — it's local-only (no network)
+    # and the InstanceId we're about to launch needs the full
+    # script baked in via user-data at RunInstances time.
     user_data = render_user_data(UserDataSpec(
         s3_prefix=s3_prefix,
         aws_region=aws_region,
@@ -224,7 +224,12 @@ def main() -> int:
         encode_args=passthrough,
     ))
 
-    # Launch
+    # Launch FIRST. Capacity failure / permissions / bad AMI all surface
+    # here; if launch bails we exit before uploading anything, so
+    # nothing hits S3 on a doomed job. The remote instance takes
+    # 60-120s to boot + dnf install + docker pull before it tries to
+    # fetch inputs from S3, which is comfortably more runway than an
+    # input upload needs on typical residential links.
     emit_stage("cloud:launch", "running", 0.0)
     try:
         result = launch(LaunchSpec(
@@ -255,6 +260,14 @@ def main() -> int:
           f"({result.instance_type} in {result.subnet_id})", flush=True)
     # The atexit handler registered above already knows how to tear
     # down by job_id; it will find this instance via the JobId tag.
+
+    # Upload inputs now that we have a live instance. Runs in parallel
+    # (wall-clock wise) with the remote's boot + dnf + docker pull,
+    # so on typical residential uplinks this finishes well before the
+    # remote attempts to `aws s3 cp` the inputs into /work/input.
+    emit_stage("cloud:upload", "running", 0.0)
+    upload_inputs(args.input, s3_prefix, stage_key="cloud:upload")
+    emit_stage("cloud:upload", "done", 100.0)
 
     # Poll for completion
     poll_timeout_per_clip = int(_env("POLL_TIMEOUT_PER_CLIP", "3600"))
