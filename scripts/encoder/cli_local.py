@@ -47,7 +47,13 @@ MIN_WIDTH = 640
 MIN_HEIGHT = 360
 
 # Shared filesystem root for intermediates. Worker container has /tmp.
-_TMP_ROOT = Path(os.environ.get("ENCODER_TMP_ROOT", "/tmp"))
+# Respect TMPDIR so per-clip work dirs land on the same filesystem as
+# output_dir (avoids EXDEV on Shaka Packager's rename), and so on cloud
+# encodes our persistent `encode_<stem>/` dir lives under /work/tmp —
+# which the user-data syncs to S3 on spot interrupt and back on retry.
+_TMP_ROOT = Path(os.environ.get("TMPDIR")
+                  or os.environ.get("ENCODER_TMP_ROOT")
+                  or "/tmp")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -218,24 +224,40 @@ def run_full(args: argparse.Namespace) -> int:
         want_fmp4=want_fmp4, want_ts=want_ts,
     )
 
-    with tempfile.TemporaryDirectory(prefix="abr_", dir=_TMP_ROOT) as raw_work:
-        work_dir = Path(raw_work)
+    # Per-clip persistent work dir. Lives under $ENCODER_TMP_ROOT /
+    # $TMPDIR so on cloud encodes it maps to /work/tmp — which the
+    # user-data rsyncs to S3 on spot interrupt and back down on
+    # retry. Variant MP4s, the mezzanine, and audio.mp4 all land
+    # here and survive across retries (cleaned up on successful
+    # completion below).
+    work_dir = _TMP_ROOT / f"encode_{stem}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
         mezz_path = work_dir / "mezzanine.mp4"
 
-        print("[phase 2] creating mezzanine...", flush=True)
-        # Duration for progress calc: source duration, capped by --time.
-        mezz_expected_duration = info.duration_s
-        if args.time_limit_s is not None and args.time_limit_s > 0:
-            mezz_expected_duration = min(mezz_expected_duration, args.time_limit_s)
-        create_mezzanine(
-            MezzanineSpec(
-                input_path=input_path,
-                output_path=mezz_path,
-                time_limit_s=args.time_limit_s,
-            ),
-            stage_key="mezzanine",
-            duration_s=mezz_expected_duration,
-        )
+        # Skip phase 2 if a complete mezzanine is already present —
+        # happens on retry after a prior interrupt. Size-checked via
+        # the .done sidecar, so a partial rsync of mezzanine.mp4
+        # doesn't falsely skip.
+        if _is_complete(mezz_path):
+            print(f"[phase 2] reusing mezzanine from prior run "
+                  f"({mezz_path.name})", flush=True)
+        else:
+            print("[phase 2] creating mezzanine...", flush=True)
+            # Duration for progress calc: source duration, capped by --time.
+            mezz_expected_duration = info.duration_s
+            if args.time_limit_s is not None and args.time_limit_s > 0:
+                mezz_expected_duration = min(mezz_expected_duration, args.time_limit_s)
+            create_mezzanine(
+                MezzanineSpec(
+                    input_path=input_path,
+                    output_path=mezz_path,
+                    time_limit_s=args.time_limit_s,
+                ),
+                stage_key="mezzanine",
+                duration_s=mezz_expected_duration,
+            )
+            _write_done(mezz_path)
 
         # Re-probe after the time limit might have truncated duration.
         mezz_info = probe(mezz_path)
@@ -280,16 +302,21 @@ def run_full(args: argparse.Namespace) -> int:
         print(f"[phase 3] done in {time.monotonic() - t0:.1f}s", flush=True)
 
         if info.has_audio:
-            print("[phase 4] creating audio mezzanine...", flush=True)
-            create_audio(
-                AudioSpec(
-                    mezzanine_path=mezz_path,
-                    output_path=work_dir / "audio.mp4",
-                    padding_s=audio_pad_s,
-                ),
-                stage_key="audio",
-                duration_s=effective_duration_s + audio_pad_s,
-            )
+            audio_path = work_dir / "audio.mp4"
+            if _is_complete(audio_path):
+                print(f"[phase 4] reusing audio from prior run "
+                      f"({audio_path.name})", flush=True)
+            else:
+                print("[phase 4] creating audio mezzanine...", flush=True)
+                create_audio(
+                    AudioSpec(
+                        mezzanine_path=mezz_path,
+                        output_path=audio_path,
+                        padding_s=audio_pad_s,
+                    ),
+                    stage_key="audio",
+                    duration_s=effective_duration_s + audio_pad_s,
+                )
 
         for codec in codecs:
             pkg_dir = _codec_package_dir(args.output_dir, stem, codec)
@@ -345,8 +372,42 @@ def run_full(args: argparse.Namespace) -> int:
                     if src.is_file():
                         shutil.copy(src, mezzanine_out / src.name)
 
+        # Successful end: work_dir is no longer needed for retry.
+        shutil.rmtree(work_dir, ignore_errors=True)
+    except BaseException:
+        # Any failure (encode error, Ctrl-C, uncaught exception) leaves
+        # work_dir in place — the cloud's user-data syncs it to S3, and
+        # a retry's sync pulls it back so we skip work that's already
+        # done. Cleanup on abandoned local runs happens via TMP_DIR
+        # normal hygiene (or user rm).
+        raise
+
     print("[done]", flush=True)
     return 0
+
+
+def _is_complete(mp4: Path) -> bool:
+    """True iff mp4 exists and has a matching .done sidecar whose
+    recorded size equals the current file size. Matches
+    resume._is_complete but duplicated to avoid an import chain."""
+    if not mp4.is_file() or mp4.stat().st_size == 0:
+        return False
+    marker = mp4.with_suffix(mp4.suffix + ".done")
+    if not marker.is_file():
+        return False
+    try:
+        return int(marker.read_text().strip()) == mp4.stat().st_size
+    except (OSError, ValueError):
+        return False
+
+
+def _write_done(path: Path) -> None:
+    """Atomically write `<path>.done` with the source file's size."""
+    size = path.stat().st_size
+    marker = path.with_suffix(path.suffix + ".done")
+    tmp = marker.with_suffix(marker.suffix + ".tmp")
+    tmp.write_text(f"{size}\n")
+    tmp.rename(marker)
 
 
 # ---------------------------------------------------------------------------

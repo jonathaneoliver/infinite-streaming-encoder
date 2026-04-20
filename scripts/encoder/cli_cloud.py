@@ -22,7 +22,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from encoder.cloud.arch import ARCH_PROFILES, DEFAULT_ARCH, profile_for
-from encoder.cloud.aws import AuthError, check_credentials, resolve_al2023_ami, region
+from encoder.cloud.aws import (
+    AuthError, check_credentials, resolve_al2023_ami, region, s3_client,
+)
 from encoder.cloud.cleanup import terminate_job
 from encoder.cloud.launch import LaunchError, LaunchSpec, launch
 from encoder.cloud.poll import poll_until_done, read_failure_reason
@@ -155,7 +157,18 @@ def main() -> int:
             parser.error(f"input file not found: {p}")
     _reject_duplicate_basenames(args.input)
 
-    job_id = args.job_id or _default_job_id()
+    # When resuming, reuse the prior job's S3 prefix verbatim — prior
+    # inputs, mezzanines, and any completed variants are already at
+    # s3://bucket/jobs/<prior>/. The retry adds to that same prefix
+    # (new variants land in output/ with .done sidecars), so a chain
+    # of retries accumulates completed work in one place instead of
+    # copying between prefixes. Clean exit of the retry deletes the
+    # whole prefix; abnormal exit keeps it for the next retry; the
+    # 1h awswatch GC catches anything abandoned.
+    if args.resume_from_job_id:
+        job_id = args.resume_from_job_id
+    else:
+        job_id = args.job_id or _default_job_id()
     s3_bucket = _require("S3_BUCKET")
     subnet_id = _require("SUBNET_ID")
     security_group_id = _require("SECURITY_GROUP_ID")
@@ -266,13 +279,21 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
 
+    # On resume, clear the prior run's flip-once markers so the local
+    # poller doesn't immediately see a stale _FAILED / _DONE from the
+    # previous attempt and decide this one's already over.
+    if args.resume_from_job_id:
+        print(f"  resuming from:  s3://{s3_bucket}/jobs/{job_id}")
+        s3 = s3_client()
+        for marker in ("_FAILED", "_DONE", "_SIMULATE_INTERRUPT"):
+            try:
+                s3.delete_object(Bucket=s3_bucket, Key=f"jobs/{job_id}/{marker}")
+            except Exception:
+                pass
+
     # Render user-data before launch — it's local-only (no network)
     # and the InstanceId we're about to launch needs the full
     # script baked in via user-data at RunInstances time.
-    resume_from_prefix = ""
-    if args.resume_from_job_id:
-        resume_from_prefix = f"s3://{s3_bucket}/jobs/{args.resume_from_job_id}"
-        print(f"  resuming from:  {resume_from_prefix}")
     user_data = render_user_data(UserDataSpec(
         s3_prefix=s3_prefix,
         aws_region=aws_region,
@@ -281,7 +302,6 @@ def main() -> int:
         docker_image=docker_image,
         input_basenames=[p.name for p in args.input],
         encode_args=passthrough,
-        resume_from_prefix=resume_from_prefix,
         simulate_interrupt_after_s=args.simulate_interrupt_after,
     ))
 

@@ -223,5 +223,29 @@ def encode_all(
     outputs: list[Path] = []
     for tier in tiers:
         for codec in codecs:
+            out = _variant_path(ctx.output_dir, codec, tier)
+            # Skip variants that are already fully encoded — the .done
+            # sidecar's size must match the MP4's current size, so a
+            # file rsynced mid-write (common after spot interrupt)
+            # doesn't trigger a false skip.
+            if _is_complete(out):
+                print(f"[resume] skipping {codec} {tier.name} "
+                      f"— already complete ({out.name})", flush=True)
+                outputs.append(out)
+                continue
             outputs.append(encode_variant(ctx, codec, tier, overrides[codec]))
     return outputs
+
+
+def _is_complete(mp4: Path) -> bool:
+    """Matches resume._is_complete — duplicated to avoid a circular import
+    (resume imports ladder; encode_variants imports ladder via ffprobe)."""
+    if not mp4.is_file() or mp4.stat().st_size == 0:
+        return False
+    marker = mp4.with_suffix(mp4.suffix + ".done")
+    if not marker.is_file():
+        return False
+    try:
+        return int(marker.read_text().strip()) == mp4.stat().st_size
+    except (OSError, ValueError):
+        return False

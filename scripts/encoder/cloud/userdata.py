@@ -38,13 +38,6 @@ class UserDataSpec:
     docker_image: str
     input_basenames: list[str]
     encode_args: list[str]    # passthrough flags for create_abr_ladder.sh
-    # Resume from a prior failed job's S3 staging. When set, the remote
-    # pre-warms /work with the prior inputs, mezzanines (tmp/), and any
-    # completed variants (output/) before the encode loop — so phase 2
-    # mezzanine writes land on reused media and cli_local.py's
-    # --resume-package-from detects existing variant MP4s and skips
-    # those tiers. Empty string = fresh encode.
-    resume_from_prefix: str = ""
     # Test hook: if > 0, the remote schedules a simulated spot
     # interruption after this many seconds. Identical code path to
     # a real interrupt (writes "SPOT INTERRUPTION:" to _FAILED, rsyncs
@@ -62,7 +55,6 @@ def render(spec: UserDataSpec) -> str:
     pat = shlex.quote(spec.ghcr_pat)
     user = shlex.quote(spec.ghcr_username)
     image = shlex.quote(spec.docker_image)
-    resume_prefix = shlex.quote(spec.resume_from_prefix)
     simulate_s = int(spec.simulate_interrupt_after_s)
 
     # Triple-brace blocks in f-strings would be awkward; compose plainly.
@@ -209,24 +201,18 @@ stage remote:pull done 100
 
 mkdir -p /work/input /work/output /work/tmp
 
-RESUME_FROM={resume_prefix}
-
-# Resume path: pull inputs from the prior job's S3 prefix. They were
-# already uploaded before the failed run; no need to re-upload. Then
-# seed /work/tmp and /work/output with whatever that instance
-# rsynced before it died — mezzanines and completed variants that
-# cli_local.py's --resume-package-from will detect and skip.
+# Fetch inputs from our own prefix. On a fresh job the local side
+# uploaded them before launch; on a retry the prior run's inputs
+# are still there (same prefix). Then opportunistically sync tmp/
+# (mezzanines rescued by a prior spot interrupt) and output/ (any
+# completed variants with their .done sidecars). Both are no-ops on
+# a fresh job — the prefixes simply don't exist yet.
 stage remote:fetch-inputs running
-if [ -n "$RESUME_FROM" ]; then
-    echo ">>> Resuming from $RESUME_FROM; pulling prior inputs/tmp/output"
-    aws s3 sync "$RESUME_FROM/input/" /work/input/ --region {region}
-    aws s3 sync "$RESUME_FROM/tmp/"   /work/tmp/   --region {region} || true
-    aws s3 sync "$RESUME_FROM/output/" /work/output/ --region {region} || true
-else
-    for bn in {basenames}; do
-        aws s3 cp {s3}/input/${{bn}} /work/input/${{bn}} --region {region}
-    done
-fi
+for bn in {basenames}; do
+    aws s3 cp {s3}/input/${{bn}} /work/input/${{bn}} --region {region}
+done
+aws s3 sync {s3}/tmp/    /work/tmp/    --region {region} 2>/dev/null || true
+aws s3 sync {s3}/output/ /work/output/ --region {region} 2>/dev/null || true
 stage remote:fetch-inputs done 100
 
 # Total clip count — used for the ENCODER-FILE marker so the UI can
@@ -255,16 +241,11 @@ for bn in {basenames}; do
     # The container's own stdout carries the per-variant ENCODER-STAGE
     # markers from cli_local.py → they flow through docker → our
     # /var/log/cloud-encode.log → S3 → local poll tail.
-    # On resume, hand cli_local.py a --resume-package-from that points
-    # at /work/output; its resume.py scans for the per-variant MP4s
-    # (named by codec and tier) and skips the corresponding variant
-    # tiers. --resume-package-from is a no-op when the target dir is
-    # empty, so it's safe to always pass on the resume path.
-    RESUME_ARG=""
-    if [ -n "$RESUME_FROM" ]; then
-        RESUME_ARG="--resume-package-from /work/output"
-    fi
-
+    # cli_local.py's encode_all() checks for a matching `.done` sidecar
+    # on each expected variant output file and skips re-encoding the
+    # complete ones. On a fresh job nothing's there; on a retry any
+    # variant that was complete on the prior instance (rescued via
+    # spot interrupt sync to S3, then re-downloaded here) gets reused.
     docker run --rm \\
         -v /work:/work \\
         -w /work/output \\
@@ -276,7 +257,6 @@ for bn in {basenames}; do
         --input "/work/input/${{bn}}" \\
         --output-dir /work/output \\
         --output "${{base}}" \\
-        $RESUME_ARG \\
         {encode_args}
 
     stage remote:sync-outputs running
