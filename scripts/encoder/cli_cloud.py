@@ -32,16 +32,21 @@ from encoder.cloud.userdata import UserDataSpec, render as render_user_data
 from encoder.progress import Stage, emit_plan, emit_stage
 
 
-# Cloud encode has a fixed set of lifecycle stages the local side drives.
-# Until the remote (GHCR) image runs the new Python pipeline, the actual
-# per-variant encode on EC2 is opaque to us — it's represented as a single
-# "encode-remote" stage that ticks running → done only. Everything else
-# (upload, launch, download, cleanup) gets explicit transitions.
+# Cloud encode has a fixed set of lifecycle stages. Local side drives
+# upload/launch/download/cleanup. Remote side (user-data bash) drives
+# the `remote:*` stages via marker emits so the user can see where
+# time is going — crucial for deciding whether to parallelise multiple
+# encodes (e.g. "is pull dominating wall-clock?" → pre-warm the image).
 _CLOUD_STAGES = [
-    Stage(key="cloud:upload",        label="upload inputs"),
+    Stage(key="cloud:upload",        label="upload inputs (local → S3)"),
     Stage(key="cloud:launch",        label="launch EC2 instance"),
-    Stage(key="cloud:encode-remote", label="encode (remote)"),
-    Stage(key="cloud:download",      label="download outputs"),
+    Stage(key="remote:install",      label="install docker on EC2"),
+    Stage(key="remote:ghcr-login",   label="login to GHCR"),
+    Stage(key="remote:pull",         label="docker pull encoder image"),
+    Stage(key="remote:fetch-inputs", label="fetch inputs (S3 → EC2)"),
+    Stage(key="cloud:encode-remote", label="encode loop (remote)"),
+    Stage(key="remote:sync-outputs", label="sync outputs (EC2 → S3)"),
+    Stage(key="cloud:download",      label="download outputs (S3 → local)"),
     Stage(key="cloud:cleanup",       label="cleanup S3 staging"),
 ]
 

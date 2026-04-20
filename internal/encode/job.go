@@ -41,11 +41,24 @@ func (j *Job) parseMarker(line string) bool {
 			return false
 		}
 		j.mu.Lock()
-		j.Stages = make([]StageProgress, len(desc))
-		for i, d := range desc {
-			j.Stages[i] = StageProgress{
-				Key: d.Key, Label: d.Label, Status: "pending", Percent: 0,
+		// MERGE semantics: existing rows keep their status/percent (so
+		// the remote's PLAN can't wipe cloud:upload's "done" state when
+		// the local orchestrator finished it earlier). Any key in the
+		// new plan that we haven't seen before is APPENDED at the end
+		// — preserving the existing order so rows don't jump around
+		// in the UI mid-job.
+		existing := make(map[string]bool, len(j.Stages))
+		for _, s := range j.Stages {
+			existing[s.Key] = true
+		}
+		for _, d := range desc {
+			if existing[d.Key] {
+				continue
 			}
+			j.Stages = append(j.Stages, StageProgress{
+				Key: d.Key, Label: d.Label, Status: "pending", Percent: 0,
+			})
+			existing[d.Key] = true
 		}
 		j.mu.Unlock()
 		return true
@@ -53,9 +66,22 @@ func (j *Job) parseMarker(line string) bool {
 	if m := stageMarkerRe.FindStringSubmatch(line); m != nil {
 		key, status := m[1], m[2]
 		percent, _ := strconv.ParseFloat(m[3], 64)
+		now := time.Now()
 		j.mu.Lock()
 		for i := range j.Stages {
 			if j.Stages[i].Key == key {
+				// Stamp StartedAt the first time the stage goes running;
+				// stamp EndedAt when it settles done/failed. This is
+				// conservative — a stage going running → pending wouldn't
+				// clear StartedAt, which is fine for timing analysis.
+				if j.Stages[i].StartedAt == nil && status == "running" {
+					t := now
+					j.Stages[i].StartedAt = &t
+				}
+				if j.Stages[i].EndedAt == nil && (status == "done" || status == "failed") {
+					t := now
+					j.Stages[i].EndedAt = &t
+				}
 				j.Stages[i].Status = status
 				j.Stages[i].Percent = percent
 				break
@@ -123,6 +149,12 @@ type StageProgress struct {
 	Label   string  `json:"label"`
 	Status  string  `json:"status"` // pending | running | done | failed
 	Percent float64 `json:"percent"`
+	// Timestamps of state transitions. StartedAt is set the first time
+	// the stage sees `status=running`; EndedAt is set when it reaches
+	// a terminal state (done|failed). Used to build the end-of-job
+	// timing summary so the user can see where the wall-clock went.
+	StartedAt *time.Time `json:"started_at,omitempty"`
+	EndedAt   *time.Time `json:"ended_at,omitempty"`
 }
 
 type Job struct {
@@ -480,7 +512,79 @@ func (m *Manager) writeHistory(job *Job) {
 		fmt.Fprintf(f, "- **Error:** %s\n", job.Error)
 	}
 	fmt.Fprintf(f, "- **Log:** [%s.log](logs/%s.log)\n", job.ID, job.ID)
+
+	// Timing summary — per-stage wall-clock, so the user can see
+	// where the job's total duration went. Particularly useful for
+	// cloud jobs: how long was spent on boot vs docker pull vs
+	// encode vs S3 sync — informs parallelisation decisions when
+	// running multiple encodes.
+	m.writeTimingSummary(f, job)
+
 	fmt.Fprintf(f, "\n---\n\n")
+}
+
+func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
+	if len(job.Stages) == 0 {
+		return
+	}
+
+	// Also dump the same summary into the per-job log file so it's
+	// trivially greppable later.
+	var table strings.Builder
+	table.WriteString("\n### Stage timing\n\n")
+	table.WriteString("| Stage | Status | Started | Ended | Duration |\n")
+	table.WriteString("|-------|--------|---------|-------|----------|\n")
+
+	var totalMeasured time.Duration
+	for _, s := range job.Stages {
+		startStr, endStr, durStr := "—", "—", "—"
+		if s.StartedAt != nil {
+			startStr = s.StartedAt.Format("15:04:05")
+			if s.EndedAt != nil {
+				endStr = s.EndedAt.Format("15:04:05")
+				dur := s.EndedAt.Sub(*s.StartedAt).Round(100 * time.Millisecond)
+				durStr = dur.String()
+				totalMeasured += dur
+			} else {
+				// Still running at job end (unusual — log it anyway).
+				endStr = "(still running)"
+			}
+		}
+		table.WriteString(fmt.Sprintf(
+			"| %s | %s | %s | %s | %s |\n",
+			s.Label, s.Status, startStr, endStr, durStr,
+		))
+	}
+
+	// Totals row — includes both the sum of measured stage durations
+	// (which may double-count parallel stages if any — unlikely but
+	// noted) and the whole-job wall clock for reference.
+	if job.EndedAt != nil {
+		wall := job.EndedAt.Sub(job.StartedAt).Round(time.Second)
+		table.WriteString(fmt.Sprintf(
+			"| **total measured** |  |  |  | %s |\n",
+			totalMeasured.Round(100*time.Millisecond),
+		))
+		table.WriteString(fmt.Sprintf(
+			"| **wall clock** |  |  |  | %s |\n", wall,
+		))
+	}
+
+	f.WriteString(table.String())
+
+	// Echo into the per-job log file for quick greppability.
+	logPath := filepath.Join(m.TmpDir, "logs", job.ID+".log")
+	if lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+		lf.WriteString("\n=== Stage timing ===\n")
+		for _, s := range job.Stages {
+			dur := "—"
+			if s.StartedAt != nil && s.EndedAt != nil {
+				dur = s.EndedAt.Sub(*s.StartedAt).Round(100 * time.Millisecond).String()
+			}
+			fmt.Fprintf(lf, "  %-30s %-8s %s\n", s.Label, s.Status, dur)
+		}
+		lf.Close()
+	}
 }
 
 func defaultVal(v, d string) string {

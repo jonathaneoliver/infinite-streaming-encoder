@@ -91,16 +91,35 @@ mark_failed() {{
 }}
 trap 'mark_failed "trap at line $LINENO"' ERR
 
+# Progress marker helpers — same `[[ENCODER-STAGE ...]]` format the
+# Python progress module uses, emitted as plain text so they land in
+# the log the local poller is tailing. The local Go server parses them
+# and updates Job.Stages.
+stage() {{
+    # stage <key> <status> [percent]
+    printf '[[ENCODER-STAGE key=%s status=%s percent=%s]]\\n' "$1" "$2" "${{3:-0.0}}"
+}}
+
+stage remote:install running
 dnf install -y docker
 systemctl enable --now docker
+stage remote:install done 100
 
+stage remote:ghcr-login running
 echo {pat} | docker login ghcr.io -u {user} --password-stdin
+stage remote:ghcr-login done 100
+
+stage remote:pull running
 docker pull {image}
+stage remote:pull done 100
 
 mkdir -p /work/input /work/output /work/tmp
+
+stage remote:fetch-inputs running
 for bn in {basenames}; do
     aws s3 cp {s3}/input/${{bn}} /work/input/${{bn}} --region {region}
 done
+stage remote:fetch-inputs done 100
 
 for bn in {basenames}; do
     CURRENT_CLIP="${{bn}}"
@@ -113,6 +132,9 @@ for bn in {basenames}; do
     # worker containers use. TMPDIR is pinned on the same filesystem
     # as output_dir so Shaka Packager's temp→rename step doesn't
     # cross a Docker overlay boundary (EXDEV).
+    # The container's own stdout carries the per-variant ENCODER-STAGE
+    # markers from cli_local.py → they flow through docker → our
+    # /var/log/cloud-encode.log → S3 → local poll tail.
     docker run --rm \\
         -v /work:/work \\
         -w /work/output \\
@@ -126,9 +148,11 @@ for bn in {basenames}; do
         --output "${{base}}" \\
         {encode_args}
 
+    stage remote:sync-outputs running
     aws s3 sync /work/output {s3}/output/ \\
         --exclude '*_tmp/*' --exclude '*/abr_ladder_*/*' \\
         --region {region}
+    stage remote:sync-outputs done 100
 done
 CURRENT_CLIP="<post-loop>"
 
