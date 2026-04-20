@@ -367,7 +367,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <span id="aws-last-refresh" class="aws-refresh-time"></span>
                 <label class="aws-auto-toggle">
                     <input type="checkbox" id="aws-auto-refresh" checked>
-                    auto-refresh 30s
+                    auto-refresh 10s
                 </label>
                 <button class="btn btn-small" onclick="refreshAws()">Refresh</button>
             </div>
@@ -1267,7 +1267,7 @@ function startAwsAutoRefresh() {
             refreshAws();
         }
     };
-    awsTimer = setInterval(tick, 30000);
+    awsTimer = setInterval(tick, 10000);
 }
 
 // --- Context Menu ---
