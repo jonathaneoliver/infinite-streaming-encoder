@@ -85,9 +85,15 @@ def run_ffmpeg_with_progress(
     to the container's stdout and the Go scanner. stdout is captured
     so the Go scanner never sees the raw key=value `-progress` output.
 
+    We keep `-stats` enabled (i.e. do NOT pass `-nostats`) — the log
+    viewer relies on those \r-separated frame= lines to show live
+    encode detail. The structured STAGE markers flow through a
+    different channel (stdout → Python → emit_stage), so enabling
+    -stats doesn't double-report anything.
+
     Raises `subprocess.CalledProcessError` if ffmpeg exits non-zero.
     """
-    full_cmd = [*cmd, "-progress", "pipe:1", "-nostats"]
+    full_cmd = [*cmd, "-progress", "pipe:1"]
 
     emit_stage(stage_key, "running", 0.0)
 
