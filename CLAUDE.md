@@ -89,7 +89,7 @@ Supporting modules (all stdlib-only except `cloud/*` which uses boto3):
 
 Hardware encoding (VideoToolbox `--force-hardware`) was intentionally dropped in the rewrite — it only works on macOS hosts, not Linux workers.
 
-The EC2 user-data itself is still bash (it runs on the remote instance) — `cloud/userdata.py` renders it as a template string. The remote still calls `/generate_abr/create_abr_ladder.sh` from the `ghcr.io/jonathaneoliver/infinite-streaming` image; replacing that remote image with the Python one is a separate concern.
+The EC2 user-data itself is still bash (it runs on the remote instance) — `cloud/userdata.py` renders it as a template string. The remote pulls the same `ghcr.io/jonathaneoliver/encoder:latest` image the local server builds from `Dockerfile`, so local and cloud encodes share the Python pipeline end-to-end. The image's default entrypoint (`python3 -m encoder.cli_local`) accepts the CLI surface the user-data passes, so no `--entrypoint` override is needed.
 
 **`static/index.html`** — a single self-contained HTML file (vanilla JS, no build step). Served directly by the Go file server. It polls `/api/jobs/stream` for live updates and plays HLS via hls.js pointed at `/content/<dir>/<playlist>.m3u8`.
 

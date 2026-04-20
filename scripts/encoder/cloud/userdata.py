@@ -9,12 +9,14 @@ The remote script:
 
   1. Installs Docker + AWS CLI from AL2023's dnf repos
   2. Logs in to GHCR with the baked-in PAT
-  3. Pulls the infinite-streaming image
+  3. Pulls the configured worker image (default: ghcr.io/jonathaneoliver/encoder:latest —
+     the same image this tool builds locally, so local and cloud
+     encodes share the Python pipeline + every fix made to it)
   4. Downloads every input clip from S3 to /work/input/
-  5. Runs create_abr_ladder.sh inside the pulled image per clip
-     (still bash on the remote — that image hasn't been rebuilt with
-     the Python orchestrator yet; rebuilding + pushing to GHCR is a
-     separate concern)
+  5. Runs `python3 -m encoder.cli_local` (the image's default
+     entrypoint) per clip. That emits ENCODER-PLAN + ENCODER-STAGE
+     markers to the remote log, which the local poller tails out of
+     the S3 log mirror so the Jobs UI sees per-variant progress.
   6. Incrementally rsyncs /work/output/ to s3://.../output/
   7. Writes _DONE (or _FAILED on trap) and shuts down
 
@@ -79,13 +81,19 @@ for bn in {basenames}; do
     base="${{stem}}_p200"
 
     echo ">>> Encoding ${{bn}} -> /work/output/${{base}}_{{h264,hevc}}/"
+    # The image's default ENTRYPOINT is the Go server (for local use);
+    # we override to Python here to run the same pipeline the local
+    # worker containers use. TMPDIR is pinned on the same filesystem
+    # as output_dir so Shaka Packager's temp→rename step doesn't
+    # cross a Docker overlay boundary (EXDEV).
     docker run --rm \\
         -v /work:/work \\
         -w /work/output \\
         -e TMPDIR=/work/tmp \\
-        -e TMPDIR_OUTPUT=/work/tmp \\
-        --entrypoint /generate_abr/create_abr_ladder.sh \\
+        -e PYTHONPATH=/app/scripts \\
+        --entrypoint python3 \\
         {image} \\
+        -m encoder.cli_local \\
         --input "/work/input/${{bn}}" \\
         --output-dir /work/output \\
         --output "${{base}}" \\

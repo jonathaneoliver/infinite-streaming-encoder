@@ -142,7 +142,7 @@ def main() -> int:
     print(f"  instance type:  {instance_type} ({'spot' if use_spot else 'on-demand'})")
     print(f"  ami:            {ami_id}")
     docker_image = _env(
-        "DOCKER_IMAGE", "ghcr.io/jonathaneoliver/infinite-streaming:latest",
+        "DOCKER_IMAGE", "ghcr.io/jonathaneoliver/encoder:latest",
     )
     print(f"  image:          {docker_image}")
     print(f"  encode args:    {' '.join(passthrough) if passthrough else '<none>'}")

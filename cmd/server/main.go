@@ -40,7 +40,7 @@ func main() {
 	outputDir := flag.String("output-dir", env("OUTPUT_DIR", "/media/dynamic_content"), "encode output directory")
 	tmpDir := flag.String("tmp-dir", env("TMP_DIR", "/media/tmp"), "temporary directory for in-progress encodes")
 	scriptsDir := flag.String("scripts-dir", env("SCRIPTS_DIR", "/scripts"), "directory containing encode scripts")
-	dockerImage := flag.String("docker-image", env("DOCKER_IMAGE", "ghcr.io/jonathaneoliver/infinite-streaming:latest"), "Docker image for local encoding")
+	dockerImage := flag.String("docker-image", env("DOCKER_IMAGE", "ghcr.io/jonathaneoliver/encoder:latest"), "Docker image used for remote (EC2) encodes")
 	// Host-side paths for bind-mounting into sibling worker containers.
 	// `docker run -v` from inside a container resolves paths against the
 	// host daemon, so the in-container paths above aren't usable there.
