@@ -311,7 +311,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group" style="align-self:center;padding-top:16px">
                 <label><input type="checkbox" id="keep-mezzanine" style="width:auto;min-width:auto"> Keep mezzanine</label>
             </div>
-            <button class="btn btn-primary" id="encode-btn" onclick="startEncode()" disabled>Start Encode</button>
+            <button class="btn btn-primary" id="encode-btn" onclick="startEncode()" oncontextmenu="event.preventDefault(); startEncode(true); return false;" title="Click: encode checked files (skips any already fully encoded). Right-click: force re-encode all checked files (archives existing outputs)." disabled>Start Encode</button>
             </div>
         </fieldset>
     </div>
@@ -655,12 +655,24 @@ async function confirmCloudIfBilling() {
     }
 }
 
-async function startEncode() {
+async function startEncode(force = false) {
     const selected = Array.from(document.querySelectorAll('#file-list input:checked')).map(cb => cb.value);
     if (selected.length === 0) return;
 
     const target = document.getElementById('target').value;
     if (target === 'cloud' && !await confirmCloudIfBilling()) return;
+
+    if (force) {
+        const confirmed = await showDialog(
+            'Force Re-encode',
+            `Re-encode ${selected.length} file${selected.length === 1 ? '' : 's'} with current settings? Existing encodes will be moved to the archive directory.`,
+            [
+                { label: 'Cancel', value: false, class: 'btn-secondary' },
+                { label: 'Re-encode All', value: true, class: 'btn-danger' }
+            ]
+        );
+        if (!confirmed) return;
+    }
 
     const body = {
         files: selected,
@@ -674,7 +686,8 @@ async function startEncode() {
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
-        cpu_arch: document.getElementById('cpu-arch').value
+        cpu_arch: document.getElementById('cpu-arch').value,
+        force_reencode: force
     };
 
     try {
@@ -689,7 +702,7 @@ async function startEncode() {
             return;
         }
         selectNone();
-        showToast('Encode started', 'success');
+        showToast(force ? 'Re-encode started — previous output archived' : 'Encode started', 'success');
         switchTab('jobs');
     } catch (e) {
         showToast('Error: ' + e.message, 'error');
