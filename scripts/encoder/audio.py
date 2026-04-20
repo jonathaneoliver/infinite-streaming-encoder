@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from encoder.ffprobe import probe
+from encoder.progress import run_ffmpeg_with_progress
 
 
 # Codecs Shaka Packager can multiplex without transcoding.
@@ -99,14 +100,18 @@ def build_ffmpeg_cmd(spec: AudioSpec, source_codec: str) -> list[str]:
     return cmd
 
 
-def create_audio(spec: AudioSpec) -> Path:
+def create_audio(spec: AudioSpec, stage_key: str = "audio",
+                 duration_s: float = 0.0) -> Path:
     """Run the audio extraction/transcode. Returns the output path."""
     spec.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     source_codec = detect_source_codec(spec.mezzanine_path)
     cmd = build_ffmpeg_cmd(spec, source_codec)
     try:
-        subprocess.run(cmd, check=True)
+        if duration_s > 0:
+            run_ffmpeg_with_progress(cmd, duration_s, stage_key)
+        else:
+            subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
         raise AudioError(f"audio extraction failed ({e.returncode})") from e
 

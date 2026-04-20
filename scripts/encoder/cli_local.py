@@ -28,7 +28,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from encoder.audio import AudioSpec, create_audio
-from encoder.encode_variants import EncodeContext, encode_all
+from encoder.encode_variants import EncodeContext, encode_all, variant_stage_key
 from encoder.ffprobe import ProbeError, probe
 from encoder.hls import (
     TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls, generate_ts_hls,
@@ -39,6 +39,7 @@ from encoder.ladder import (
 from encoder.mezzanine import MezzanineSpec, create_mezzanine
 from encoder.packager import PackageSpec, package
 from encoder.padding import multi_duration_lcm, plan_padding
+from encoder.progress import Stage, emit_plan, emit_stage
 from encoder.resume import discover, resolve_codec_selection
 
 # Matches bash's minimum.
@@ -132,6 +133,36 @@ def _codec_list(selection: str) -> list[str]:
     return [selection]
 
 
+def _emit_plan(
+    *,
+    tiers: list[Tier],
+    codecs: list[str],
+    has_audio: bool,
+    want_fmp4: bool,
+    want_ts: bool,
+) -> None:
+    """Announce every stage the pipeline will visit, in display order."""
+    stages: list[Stage] = [Stage(key="mezzanine", label="mezzanine")]
+    for tier in tiers:
+        for codec in codecs:
+            stages.append(Stage(
+                key=variant_stage_key(codec, tier.name),
+                label=f"encode {codec} {tier.name}",
+            ))
+    if has_audio:
+        stages.append(Stage(key="audio", label="audio"))
+    for codec in codecs:
+        stages.append(Stage(key=f"package:{codec}", label=f"package {codec}"))
+        if want_fmp4:
+            stages.append(Stage(key=f"fragments:{codec}",
+                                label=f"fragments {codec}"))
+            stages.append(Stage(key=f"hls:{codec}", label=f"HLS {codec}"))
+        if want_ts:
+            stages.append(Stage(key=f"hls-ts:{codec}",
+                                label=f"HLS TS {codec}"))
+    emit_plan(stages)
+
+
 # ---------------------------------------------------------------------------
 # Normal (non-resume) pipeline
 # ---------------------------------------------------------------------------
@@ -171,25 +202,45 @@ def run_full(args: argparse.Namespace) -> int:
     stem = _output_stem(input_path, args.output)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Pre-compute the tier/codec plan so we can announce all stages up front
+    # and the UI can render a fully-laid-out table before any encode starts.
+    tiers = select_tiers(args.max_res, info.width)
+    if not tiers:
+        print("Error: no tiers fit this source resolution", file=sys.stderr)
+        return 1
+
+    codecs = _codec_list(args.codec)
+    want_fmp4 = args.hls_format in ("fmp4", "both")
+    want_ts = args.hls_format in ("ts", "both")
+
+    _emit_plan(
+        tiers=tiers, codecs=codecs, has_audio=info.has_audio,
+        want_fmp4=want_fmp4, want_ts=want_ts,
+    )
+
     with tempfile.TemporaryDirectory(prefix="abr_", dir=_TMP_ROOT) as raw_work:
         work_dir = Path(raw_work)
         mezz_path = work_dir / "mezzanine.mp4"
 
         print("[phase 2] creating mezzanine...", flush=True)
-        create_mezzanine(MezzanineSpec(
-            input_path=input_path,
-            output_path=mezz_path,
-            time_limit_s=args.time_limit_s,
-        ))
+        # Duration for progress calc: source duration, capped by --time.
+        mezz_expected_duration = info.duration_s
+        if args.time_limit_s is not None and args.time_limit_s > 0:
+            mezz_expected_duration = min(mezz_expected_duration, args.time_limit_s)
+        create_mezzanine(
+            MezzanineSpec(
+                input_path=input_path,
+                output_path=mezz_path,
+                time_limit_s=args.time_limit_s,
+            ),
+            stage_key="mezzanine",
+            duration_s=mezz_expected_duration,
+        )
 
         # Re-probe after the time limit might have truncated duration.
         mezz_info = probe(mezz_path)
         effective_duration_s = mezz_info.duration_s or info.duration_s
 
-        tiers = select_tiers(args.max_res, info.width)
-        if not tiers:
-            print("Error: no tiers fit this source resolution", file=sys.stderr)
-            return 1
         print(f"[phase 2b] tiers: {[t.name for t in tiers]}", flush=True)
 
         pad_boundary = multi_duration_lcm(
@@ -230,18 +281,20 @@ def run_full(args: argparse.Namespace) -> int:
 
         if info.has_audio:
             print("[phase 4] creating audio mezzanine...", flush=True)
-            create_audio(AudioSpec(
-                mezzanine_path=mezz_path,
-                output_path=work_dir / "audio.mp4",
-                padding_s=audio_pad_s,
-            ))
+            create_audio(
+                AudioSpec(
+                    mezzanine_path=mezz_path,
+                    output_path=work_dir / "audio.mp4",
+                    padding_s=audio_pad_s,
+                ),
+                stage_key="audio",
+                duration_s=effective_duration_s + audio_pad_s,
+            )
 
-        want_fmp4 = args.hls_format in ("fmp4", "both")
-        want_ts = args.hls_format in ("ts", "both")
-
-        for codec in _codec_list(args.codec):
+        for codec in codecs:
             pkg_dir = _codec_package_dir(args.output_dir, stem, codec)
             print(f"[phase 5] packaging {codec} → {pkg_dir.name}", flush=True)
+            emit_stage(f"package:{codec}", "running", 0.0)
             package(PackageSpec(
                 tmp_dir=work_dir,
                 output_dir=pkg_dir,
@@ -251,19 +304,25 @@ def run_full(args: argparse.Namespace) -> int:
                 partial_duration_s=args.partial_duration_s,
                 include_audio=info.has_audio,
             ))
+            emit_stage(f"package:{codec}", "done", 100.0)
 
             if want_fmp4:
                 print(f"[phase 6] fragment sidecars for {codec}...", flush=True)
+                emit_stage(f"fragments:{codec}", "running", 0.0)
                 count = generate_byteranges_sidecars(pkg_dir)
+                emit_stage(f"fragments:{codec}", "done", 100.0)
                 print(f"[phase 6] wrote {count} byteranges sidecars", flush=True)
 
                 print(f"[phase 7] fMP4 HLS playlists for {codec}...", flush=True)
+                emit_stage(f"hls:{codec}", "running", 0.0)
                 generate_fmp4_hls(pkg_dir)
+                emit_stage(f"hls:{codec}", "done", 100.0)
 
             if want_ts:
                 ts_dir = _ts_package_dir(args.output_dir, stem, codec)
                 print(f"[phase 7b] TS HLS for {codec} → {ts_dir.name}",
                       flush=True)
+                emit_stage(f"hls-ts:{codec}", "running", 0.0)
                 generate_ts_hls(TsHlsSpec(
                     tmp_dir=work_dir,
                     ts_output_dir=ts_dir,
@@ -272,6 +331,7 @@ def run_full(args: argparse.Namespace) -> int:
                     segment_duration_s=args.segment_duration_s,
                     include_audio=info.has_audio,
                 ))
+                emit_stage(f"hls-ts:{codec}", "done", 100.0)
 
         if args.keep_mezzanine:
             mezzanine_out = args.output_dir / f"{stem}_mezzanine"

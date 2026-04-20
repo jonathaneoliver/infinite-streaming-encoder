@@ -28,6 +28,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .file-count { color: #666; font-size: 0.8rem; margin-left: 12px; }
 
 .controls { display: flex; gap: 16px; flex-wrap: wrap; align-items: end; margin-top: 16px; }
+.encode-options { border: 1px solid #2a3a5e; border-radius: 6px; padding: 16px 16px 18px; margin-top: 20px; background: #0f1b33; }
+.encode-options > legend { padding: 0 8px; color: #888; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; }
+.encode-options > .controls { margin-top: 0; }
 .control-group { display: flex; flex-direction: column; gap: 4px; }
 .control-group label { font-size: 0.75rem; color: #888; text-transform: uppercase; letter-spacing: 1px; }
 .control-group select, .control-group input {
@@ -76,6 +79,16 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .log-toggle { cursor: pointer; color: #4361ee; font-size: 0.8rem; margin-top: 4px; }
 .job-cancel { cursor: pointer; color: #ef476f; font-size: 0.8rem; margin-left: 12px; }
 .job-cancel:hover { text-decoration: underline; }
+.stages-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.8rem; }
+.stages-table td { padding: 3px 8px; vertical-align: middle; }
+.stages-table td.stage-label { color: #aac; white-space: nowrap; width: 35%; }
+.stages-table td.stage-bar { width: 55%; }
+.stages-table td.stage-pct { color: #888; white-space: nowrap; text-align: right; font-variant-numeric: tabular-nums; width: 10%; }
+.stages-table tr.stage-pending { opacity: 0.45; }
+.stage-bar-track { height: 6px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
+.stage-bar-fill { height: 100%; background: #4361ee; transition: width 0.3s ease; }
+.stage-bar-fill.stage-fill-done { background: #06d6a0; }
+.stage-bar-fill.stage-fill-failed { background: #ef476f; }
 
 .output-dir { border-radius: 4px; cursor: pointer; border-bottom: 1px solid #0f3460; }
 .output-dir:hover { background: #1a2a4a; }
@@ -161,7 +174,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="no-files">Loading...</div>
         </div>
 
-        <div class="controls">
+        <fieldset class="encode-options">
+            <legend>Encoding Options</legend>
+            <div class="controls">
             <div class="control-group">
                 <label>Target</label>
                 <select id="target">
@@ -226,7 +241,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <label><input type="checkbox" id="keep-mezzanine" style="width:auto;min-width:auto"> Keep mezzanine</label>
             </div>
             <button class="btn btn-primary" id="encode-btn" onclick="startEncode()" disabled>Start Encode</button>
-        </div>
+            </div>
+        </fieldset>
     </div>
 </div>
 
@@ -594,6 +610,104 @@ async function loadOutputDetail(name) {
 
 // --- Jobs ---
 
+// Which job log viewers are currently expanded. Persists across SSE
+// updates so a new log line doesn't collapse an open viewer.
+const openLogs = new Set();
+
+function jobRowHtml(j) {
+    return `
+        <div class="job" id="job-${j.id}">
+            <div class="job-header">
+                <div>
+                    <span class="job-files">${escapeHtml((j.config.files || []).join(', '))}</span>
+                    <span class="job-meta"> — ${j.config.target} / ${j.config.codec}${j.config.max_res ? ' / ' + j.config.max_res : ''}</span>
+                </div>
+                <span class="job-status status-${j.status}">${j.status.toUpperCase()}</span>
+            </div>
+            <div class="job-progress"></div>
+            <div class="job-error" style="color:#ef476f;font-size:0.8rem;margin-top:4px;display:none"></div>
+            <table class="stages-table" style="display:none"><tbody></tbody></table>
+            <div class="job-actions">
+                <span class="log-toggle" onclick="toggleLog('${j.id}')">Show log</span>
+            </div>
+            <div class="log-viewer" id="log-${j.id}" style="display:none"></div>
+        </div>
+    `;
+}
+
+function updateStagesTable(row, stages) {
+    const table = row.querySelector('.stages-table');
+    const tbody = table.querySelector('tbody');
+    if (!stages || stages.length === 0) {
+        table.style.display = 'none';
+        return;
+    }
+    table.style.display = '';
+
+    // Rebuild the tbody only when the set of rows changed (typically
+    // only once per job, when the first [[ENCODER-PLAN]] marker arrives).
+    const wantKeys = stages.map(s => s.key).join(',');
+    if (tbody.dataset.keys !== wantKeys) {
+        tbody.innerHTML = stages.map(s => `
+            <tr data-stage-key="${escapeHtml(s.key)}">
+                <td class="stage-label">${escapeHtml(s.label)}</td>
+                <td class="stage-bar"><div class="stage-bar-track"><div class="stage-bar-fill"></div></div></td>
+                <td class="stage-pct"></td>
+            </tr>
+        `).join('');
+        tbody.dataset.keys = wantKeys;
+    }
+
+    // Per-tick update: fill width, colour, and numeric pct.
+    for (const s of stages) {
+        const tr = tbody.querySelector(`tr[data-stage-key="${s.key}"]`);
+        if (!tr) continue;
+        tr.className = 'stage-' + s.status;
+        const fill = tr.querySelector('.stage-bar-fill');
+        fill.style.width = s.percent.toFixed(1) + '%';
+        fill.className = 'stage-bar-fill';
+        if (s.status === 'done')   fill.classList.add('stage-fill-done');
+        if (s.status === 'failed') fill.classList.add('stage-fill-failed');
+        tr.querySelector('.stage-pct').textContent =
+            s.status === 'pending' ? '—' : s.percent.toFixed(0) + '%';
+    }
+}
+
+function updateJobRow(row, j) {
+    const status = row.querySelector('.job-status');
+    status.className = 'job-status status-' + j.status;
+    status.textContent = j.status.toUpperCase();
+    row.querySelector('.job-progress').textContent = j.progress || '';
+
+    const err = row.querySelector('.job-error');
+    if (j.error) {
+        err.textContent = j.error;
+        err.style.display = 'block';
+    } else {
+        err.style.display = 'none';
+    }
+
+    // Cancel action — only render while cancellable.
+    const actions = row.querySelector('.job-actions');
+    let cancelEl = actions.querySelector('.job-cancel');
+    const cancellable = j.status === 'queued' || j.status === 'running';
+    if (cancellable && !cancelEl) {
+        cancelEl = document.createElement('span');
+        cancelEl.className = 'job-cancel';
+        cancelEl.textContent = 'Cancel';
+        cancelEl.setAttribute('onclick', `cancelJob('${j.id}')`);
+        actions.appendChild(cancelEl);
+    } else if (!cancellable && cancelEl) {
+        cancelEl.remove();
+    }
+
+    updateStagesTable(row, j.stages);
+
+    // If the log viewer is open, refresh its content so the user sees
+    // new lines without having to close + reopen.
+    if (openLogs.has(j.id)) refreshLog(j.id);
+}
+
 function renderJobs() {
     const list = document.getElementById('jobs-list');
     const sorted = Object.values(jobs).sort((a, b) =>
@@ -603,25 +717,32 @@ function renderJobs() {
         list.innerHTML = '<div class="no-files">No jobs yet</div>';
         return;
     }
+    // Replace the "no jobs" placeholder on the first real render.
+    if (list.querySelector('.no-files')) list.innerHTML = '';
 
-    list.innerHTML = sorted.map(j => `
-        <div class="job">
-            <div class="job-header">
-                <div>
-                    <span class="job-files">${(j.config.files || []).join(', ')}</span>
-                    <span class="job-meta"> — ${j.config.target} / ${j.config.codec}${j.config.max_res ? ' / ' + j.config.max_res : ''}</span>
-                </div>
-                <span class="status-${j.status}">${j.status.toUpperCase()}</span>
-            </div>
-            <div class="job-progress">${escapeHtml(j.progress || '')}</div>
-            ${j.error ? '<div style="color:#ef476f;font-size:0.8rem;margin-top:4px">' + escapeHtml(j.error) + '</div>' : ''}
-            <div>
-                <span class="log-toggle" onclick="toggleLog('${j.id}')">Show log</span>
-                ${(j.status === 'queued' || j.status === 'running') ? `<span class="job-cancel" onclick="cancelJob('${j.id}')">Cancel</span>` : ''}
-            </div>
-            <div class="log-viewer" id="log-${j.id}"></div>
-        </div>
-    `).join('');
+    // Upsert each job into the list, preserving existing DOM (and the
+    // log viewer's open state) for rows that already exist.
+    const seen = new Set();
+    for (const j of sorted) {
+        seen.add(j.id);
+        let row = document.getElementById('job-' + j.id);
+        if (!row) {
+            const tmp = document.createElement('div');
+            tmp.innerHTML = jobRowHtml(j);
+            row = tmp.firstElementChild;
+            list.prepend(row);
+        }
+        updateJobRow(row, j);
+    }
+
+    // Drop any rows whose job is no longer in the set.
+    for (const row of [...list.querySelectorAll('.job')]) {
+        const id = row.id.replace(/^job-/, '');
+        if (!seen.has(id)) {
+            openLogs.delete(id);
+            row.remove();
+        }
+    }
 }
 
 async function cancelJob(id) {
@@ -646,19 +767,29 @@ function escapeAttr(s) {
 
 async function toggleLog(id) {
     const el = document.getElementById('log-' + id);
-    if (el.style.display === 'block') {
+    if (openLogs.has(id)) {
+        openLogs.delete(id);
         el.style.display = 'none';
         return;
     }
+    openLogs.add(id);
+    el.style.display = 'block';
+    await refreshLog(id);
+}
+
+async function refreshLog(id) {
+    const el = document.getElementById('log-' + id);
+    if (!el) return;
+    // Preserve the user's scroll position — only auto-stick to the
+    // bottom if they were already at the bottom when the fetch fired.
+    const stick = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     try {
         const res = await fetch('/api/jobs/' + id + '/logs');
         const lines = await res.json();
         el.textContent = (lines || []).join('\n');
-        el.style.display = 'block';
-        el.scrollTop = el.scrollHeight;
+        if (stick) el.scrollTop = el.scrollHeight;
     } catch (e) {
         el.textContent = 'Failed to load log';
-        el.style.display = 'block';
     }
 }
 

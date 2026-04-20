@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,53 @@ var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\[\?[0-9;]*[a-zA-Z]|\
 
 func stripANSI(s string) string {
 	return ansiRe.ReplaceAllString(s, "")
+}
+
+// Markers the Python orchestrator emits for structured progress. See
+// scripts/encoder/progress.py for the producer side.
+var (
+	planMarkerRe  = regexp.MustCompile(`^\[\[ENCODER-PLAN (.+)\]\]$`)
+	stageMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=([0-9.]+)\]\]$`)
+)
+
+// parseMarker returns true when the line was a recognised progress marker
+// (and was applied to the job), so the caller can skip appending it to
+// the raw log buffer.
+func (j *Job) parseMarker(line string) bool {
+	if m := planMarkerRe.FindStringSubmatch(line); m != nil {
+		type stageDesc struct {
+			Key   string `json:"key"`
+			Label string `json:"label"`
+		}
+		var desc []stageDesc
+		if err := json.Unmarshal([]byte(m[1]), &desc); err != nil {
+			return false
+		}
+		j.mu.Lock()
+		j.Stages = make([]StageProgress, len(desc))
+		for i, d := range desc {
+			j.Stages[i] = StageProgress{
+				Key: d.Key, Label: d.Label, Status: "pending", Percent: 0,
+			}
+		}
+		j.mu.Unlock()
+		return true
+	}
+	if m := stageMarkerRe.FindStringSubmatch(line); m != nil {
+		key, status := m[1], m[2]
+		percent, _ := strconv.ParseFloat(m[3], 64)
+		j.mu.Lock()
+		for i := range j.Stages {
+			if j.Stages[i].Key == key {
+				j.Stages[i].Status = status
+				j.Stages[i].Percent = percent
+				break
+			}
+		}
+		j.mu.Unlock()
+		return true
+	}
+	return false
 }
 
 // splitLinesOrCR is a bufio.Scanner SplitFunc that emits a token on either
@@ -70,14 +118,27 @@ type JobConfig struct {
 	ForceReencode   bool     `json:"force_reencode"`
 }
 
+type StageProgress struct {
+	Key     string  `json:"key"`
+	Label   string  `json:"label"`
+	Status  string  `json:"status"` // pending | running | done | failed
+	Percent float64 `json:"percent"`
+}
+
 type Job struct {
-	ID        string    `json:"id"`
-	Config    JobConfig `json:"config"`
-	Status    JobStatus `json:"status"`
-	StartedAt time.Time `json:"started_at"`
+	ID        string     `json:"id"`
+	Config    JobConfig  `json:"config"`
+	Status    JobStatus  `json:"status"`
+	StartedAt time.Time  `json:"started_at"`
 	EndedAt   *time.Time `json:"ended_at,omitempty"`
-	Progress  string    `json:"progress"`
-	Error     string    `json:"error,omitempty"`
+	Progress  string     `json:"progress"`
+	Error     string     `json:"error,omitempty"`
+
+	// Stages is populated from [[ENCODER-PLAN]] + [[ENCODER-STAGE]]
+	// markers the Python orchestrator emits. Empty when the job hasn't
+	// reached the Python side yet (still queued, pre-run) or for old
+	// jobs that pre-date the marker format.
+	Stages []StageProgress `json:"stages,omitempty"`
 
 	mu        sync.Mutex
 	logLines  []string
@@ -726,6 +787,13 @@ func (m *Manager) attachAndWait(job *Job, name string) error {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
+			continue
+		}
+		// Structured progress markers update Job.Stages and are suppressed
+		// from the log buffer so the viewer stays readable. Anything else
+		// (ffmpeg stats, x265 info, package logs) goes through unchanged.
+		if job.parseMarker(line) {
+			m.notify(job)
 			continue
 		}
 		job.AppendLog(line)

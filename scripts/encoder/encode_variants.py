@@ -21,6 +21,12 @@ from encoder.ladder import (
     Tier,
     resolve_bitrate,
 )
+from encoder.progress import run_ffmpeg_with_progress
+
+
+def variant_stage_key(codec: str, tier_name: str) -> str:
+    """Stable stage key the Go server uses to identify a single variant."""
+    return f"encode:{codec}:{tier_name}"
 
 
 # Tag values written in the MP4 so players pick the right parser.
@@ -154,7 +160,11 @@ def encode_variant(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        subprocess.run(cmd, check=True)
+        run_ffmpeg_with_progress(
+            cmd,
+            duration_s=ctx.content_duration_s + ctx.padding_duration_s,
+            stage_key=variant_stage_key(codec, tier.name),
+        )
     except subprocess.CalledProcessError as e:
         raise EncodeError(
             f"encode failed: {codec} {tier.name} @ {target_kbps}kbps "
