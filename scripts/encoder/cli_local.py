@@ -247,7 +247,7 @@ def run_full(args: argparse.Namespace) -> int:
         if _is_complete(mezz_path):
             print(f"[phase 2] reusing mezzanine from prior run "
                   f"({mezz_path.name})", flush=True)
-            emit_stage("mezzanine", "done", 100.0)
+            emit_stage("mezzanine", "skipped", 100.0)
         else:
             print("[phase 2] creating mezzanine...", flush=True)
             # Duration for progress calc: source duration, capped by --time.
@@ -312,7 +312,7 @@ def run_full(args: argparse.Namespace) -> int:
             if _is_complete(audio_path):
                 print(f"[phase 4] reusing audio from prior run "
                       f"({audio_path.name})", flush=True)
-                emit_stage("audio", "done", 100.0)
+                emit_stage("audio", "skipped", 100.0)
             else:
                 print("[phase 4] creating audio mezzanine...", flush=True)
                 create_audio(

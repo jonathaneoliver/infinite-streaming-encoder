@@ -231,10 +231,12 @@ def encode_all(
             if _is_complete(out):
                 print(f"[resume] skipping {codec} {tier.name} "
                       f"— already complete ({out.name})", flush=True)
-                # Emit stage marker so the UI flips this variant's bar
-                # from pending → done at 100% immediately, rather than
-                # leaving it at pending forever.
-                emit_stage(variant_stage_key(codec, tier.name), "done", 100.0)
+                # Emit "skipped" so the UI flips this variant's bar to
+                # the distinct reused-style (gray hash pattern + "reused"
+                # label) rather than the green done-style it'd get from
+                # a fresh encode. Makes it obvious at a glance which
+                # stages were picked up from the prior run.
+                emit_stage(variant_stage_key(codec, tier.name), "skipped", 100.0)
                 outputs.append(out)
                 continue
             outputs.append(encode_variant(ctx, codec, tier, overrides[codec]))

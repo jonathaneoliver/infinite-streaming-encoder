@@ -352,9 +352,10 @@ def main() -> int:
     emit_stage("cloud:upload", "running", 0.0)
     if args.resume_from_job_id:
         print(f">>> Skipping upload (resuming from {s3_prefix})", flush=True)
+        emit_stage("cloud:upload", "skipped", 100.0)
     else:
         upload_inputs(args.input, s3_prefix, stage_key="cloud:upload")
-    emit_stage("cloud:upload", "done", 100.0)
+        emit_stage("cloud:upload", "done", 100.0)
 
     # Poll for completion
     poll_timeout_per_clip = int(_env("POLL_TIMEOUT_PER_CLIP", "3600"))
