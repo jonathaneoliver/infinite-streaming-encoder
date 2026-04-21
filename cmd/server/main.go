@@ -102,9 +102,10 @@ func main() {
 	}
 
 	go awswatch.Run(context.Background(), awswatch.Config{
-		Interval:           *awsWatchInterval,
-		MaxLifetime:        *awsMaxLifetime,
-		AutoTerminateStale: *awsAutoTerminate,
+		Interval:            *awsWatchInterval,
+		MaxLifetime:         *awsMaxLifetime,
+		AutoTerminateStale:  *awsAutoTerminate,
+		FailedStagingMaxAge: 1 * time.Hour,
 	})
 
 	srv := api.NewServer(mgr)

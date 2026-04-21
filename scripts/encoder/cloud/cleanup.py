@@ -274,6 +274,61 @@ def terminate_job(job_id: str, keep_s3: "bool | str" = False) -> CleanupReport:
     return report
 
 
+def gc_failed_staging(max_age_s: int = 3600) -> CleanupReport:
+    """Delete S3 staging for failed jobs whose _FAILED marker is older
+    than `max_age_s` seconds.
+
+    Called on an interval from the Go awswatch goroutine. Gives the
+    Retry UI a recovery window (default 1h) during which the prior
+    inputs + mezzanines + completed variants stay on S3; after that
+    the prefix is reaped to keep storage cost bounded.
+
+    Only touches prefixes that contain a `_FAILED` object — a still-
+    running or successful (`_DONE`) job is skipped regardless of age.
+    """
+    import time as _time
+
+    report = CleanupReport(scope=f"gc_failed_staging:{max_age_s}s")
+    bucket = _s3_bucket_from_env()
+    if not bucket:
+        return report
+    s3 = s3_client()
+
+    now = _time.time()
+    paginator = s3.get_paginator("list_objects_v2")
+    try:
+        # List one level under jobs/ so we see every job's _FAILED marker
+        # without pulling the full object list across every prefix.
+        for page in paginator.paginate(Bucket=bucket, Prefix="jobs/",
+                                        Delimiter="/"):
+            for cp in page.get("CommonPrefixes", []):
+                prefix = cp["Prefix"]  # "jobs/<id>/"
+                job_id = prefix.rstrip("/").split("/")[-1]
+                failed_key = f"{prefix}_FAILED"
+                try:
+                    head = s3.head_object(Bucket=bucket, Key=failed_key)
+                except ClientError as e:
+                    code = e.response.get("Error", {}).get("Code", "")
+                    if code in ("404", "NoSuchKey", "NotFound"):
+                        continue  # not failed — nothing to GC
+                    report.actions.append(ResourceAction(
+                        kind="s3_prefix",
+                        id=f"s3://{bucket}/{prefix}",
+                        job_id=job_id, action="failed", detail=str(e),
+                    ))
+                    continue
+                age = now - head["LastModified"].timestamp()
+                if age < max_age_s:
+                    continue
+                _delete_s3_prefix(bucket, prefix, report, job_id)
+    except ClientError as e:
+        report.actions.append(ResourceAction(
+            kind="s3_prefix", id=f"s3://{bucket}/jobs/",
+            job_id=None, action="failed", detail=str(e),
+        ))
+    return report
+
+
 def sweep_all() -> CleanupReport:
     """Tear down every Application=encoder-app resource.
 
@@ -425,6 +480,11 @@ def _main() -> int:
     group.add_argument("--backfill-tags", action="store_true",
                        help="add Application=encoder-app to resources already "
                             "tagged with JobId (one-shot pre-phase-1 cleanup)")
+    group.add_argument("--gc-failed-staging", action="store_true",
+                       help="delete S3 staging for failed jobs whose _FAILED "
+                            "marker is older than --max-age-s")
+    p.add_argument("--max-age-s", type=int, default=3600,
+                   help="age threshold for --gc-failed-staging (default 3600)")
     p.add_argument("--json", action="store_true",
                    help="print machine-readable JSON instead of a summary")
     args = p.parse_args()
@@ -433,6 +493,8 @@ def _main() -> int:
         report = sweep_all()
     elif args.backfill_tags:
         report = backfill_tags()
+    elif args.gc_failed_staging:
+        report = gc_failed_staging(max_age_s=args.max_age_s)
     else:
         report = terminate_job(args.job_id)
 

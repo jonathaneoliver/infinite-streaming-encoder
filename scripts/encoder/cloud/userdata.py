@@ -38,6 +38,12 @@ class UserDataSpec:
     docker_image: str
     input_basenames: list[str]
     encode_args: list[str]    # passthrough flags for create_abr_ladder.sh
+    # Test hook: if > 0, the remote schedules a simulated spot
+    # interruption after this many seconds. Identical code path to
+    # a real interrupt (writes "SPOT INTERRUPTION:" to _FAILED, rsyncs
+    # /work/tmp and /work/output, exits). Lets us exercise the Retry
+    # flow deterministically without waiting for a real AWS interrupt.
+    simulate_interrupt_after_s: int = 0
 
 
 def render(spec: UserDataSpec) -> str:
@@ -49,6 +55,7 @@ def render(spec: UserDataSpec) -> str:
     pat = shlex.quote(spec.ghcr_pat)
     user = shlex.quote(spec.ghcr_username)
     image = shlex.quote(spec.docker_image)
+    simulate_s = int(spec.simulate_interrupt_after_s)
 
     # Triple-brace blocks in f-strings would be awkward; compose plainly.
     return f"""#!/bin/bash
@@ -95,14 +102,30 @@ mark_failed() {{
 }}
 trap 'mark_failed "trap at line $LINENO"' ERR
 
+# Shared interrupt path — called by the real spot-interruption watcher
+# and by the test-simulation timer. Writes the distinctive _FAILED
+# body, rsyncs /work/tmp + /work/output to S3, flushes the log, kills
+# the encode and exits. The remote bash's main process is almost
+# certainly killed by AWS's terminate signal before we finish — so
+# we race, but even partial recovery beats none.
+trigger_interrupt() {{
+    ACTION_BODY="$1"
+    echo "!!! SPOT INTERRUPTION detected at $(date -u +%FT%TZ): $ACTION_BODY"
+    aws s3 sync /work/output {s3}/output/ \\
+        --exclude '*_tmp/*' --exclude '*/abr_ladder_*/*' \\
+        --region {region} 2>/dev/null || true
+    aws s3 sync /work/tmp {s3}/tmp/ \\
+        --exclude '*.log' --exclude '*/abr_ladder_*/*' \\
+        --region {region} 2>/dev/null || true
+    printf 'SPOT INTERRUPTION: %s\\n' "$ACTION_BODY" \\
+        | aws s3 cp - {s3}/_FAILED --region {region} || true
+    aws s3 cp /var/log/cloud-encode.log {s3}/logs/user-data.log --region {region} 2>/dev/null || true
+    kill $LOG_UPLOADER_PID 2>/dev/null || true
+    exit 0
+}}
+
 # Spot-interruption watcher: AWS publishes a 2-minute warning to the
-# instance-metadata service before reclaiming a spot instance. When we
-# see it we record a distinctive _FAILED body (so the local side
-# surfaces "spot interruption" rather than generic worker-failure),
-# rescue whatever's been produced so far with one last s3 sync of
-# /work/output, and flush the log. The remote bash's main process is
-# almost certainly killed by AWS's terminate signal before we get to
-# write this — so we race, but even partial recovery beats none.
+# instance-metadata service before reclaiming a spot instance.
 # IMDSv2 requires a session token first.
 (
     while true; do
@@ -116,25 +139,43 @@ trap 'mark_failed "trap at line $LINENO"' ERR
             -o /tmp/spot-action.json -w "%{{http_code}}" \\
             http://169.254.169.254/latest/meta-data/spot/instance-action 2>/dev/null)
         if [ "$BODY" = "200" ]; then
-            ACTION=$(cat /tmp/spot-action.json)
-            echo "!!! SPOT INTERRUPTION detected at $(date -u +%FT%TZ): $ACTION"
-            # Rescue whatever encoded variants we have so far before AWS
-            # reclaims. `|| true` in case /work/output is empty or sync
-            # loses the race against the hypervisor.
-            aws s3 sync /work/output {s3}/output/ \\
-                --exclude '*_tmp/*' --exclude '*/abr_ladder_*/*' \\
-                --region {region} 2>/dev/null || true
-            # Distinctive body so poll.py can classify.
-            printf 'SPOT INTERRUPTION: %s\\n' "$ACTION" \\
-                | aws s3 cp - {s3}/_FAILED --region {region} || true
-            # Final log flush + clean up log uploader before AWS kills us.
-            aws s3 cp /var/log/cloud-encode.log {s3}/logs/user-data.log --region {region} 2>/dev/null || true
-            kill $LOG_UPLOADER_PID 2>/dev/null || true
-            exit 0
+            trigger_interrupt "$(cat /tmp/spot-action.json)"
         fi
     done
 ) &
 SPOT_WATCHER_PID=$!
+
+# Test-mode simulated interrupt. Runs entirely alongside the real
+# watcher — if AWS reclaims first, the real watcher fires; otherwise
+# this one fires after SIMULATE_AFTER_S seconds with a synthetic
+# action body that's still prefixed "SPOT INTERRUPTION:" so the local
+# UI surfaces the amber badge identically.
+SIMULATE_AFTER_S={simulate_s}
+if [ "$SIMULATE_AFTER_S" -gt 0 ]; then
+    (
+        sleep "$SIMULATE_AFTER_S"
+        trigger_interrupt '{{"action":"terminate","time":"simulated","source":"test"}}'
+    ) &
+    SIMULATED_INTERRUPT_PID=$!
+fi
+
+# On-demand simulated interrupt via S3 sentinel. The local UI writes
+# an empty object at <s3>/_SIMULATE_INTERRUPT when the user clicks
+# "Simulate interrupt" on a running job; we poll for it every 5s and
+# trigger the same interrupt path. Lets testing happen at any point
+# in the encode, not just a preset delay.
+(
+    while true; do
+        sleep 5
+        [ -d /work ] || continue
+        if aws s3 ls {s3}/_SIMULATE_INTERRUPT --region {region} 2>/dev/null \\
+                | grep -q '_SIMULATE_INTERRUPT'; then
+            aws s3 rm {s3}/_SIMULATE_INTERRUPT --region {region} 2>/dev/null || true
+            trigger_interrupt '{{"action":"terminate","time":"simulated","source":"ui-button"}}'
+        fi
+    done
+) &
+UI_INTERRUPT_WATCHER_PID=$!
 
 # Progress marker helpers — same `[[ENCODER-STAGE ...]]` format the
 # Python progress module uses, emitted as plain text so they land in
@@ -146,8 +187,11 @@ stage() {{
 }}
 
 stage remote:install running
+echo ">>> dnf install docker"
 dnf install -y docker
+echo ">>> dnf done; enabling docker"
 systemctl enable --now docker
+echo ">>> docker enabled"
 stage remote:install done 100
 
 stage remote:ghcr-login running
@@ -160,10 +204,18 @@ stage remote:pull done 100
 
 mkdir -p /work/input /work/output /work/tmp
 
+# Fetch inputs from our own prefix. On a fresh job the local side
+# uploaded them before launch; on a retry the prior run's inputs
+# are still there (same prefix). Then opportunistically sync tmp/
+# (mezzanines rescued by a prior spot interrupt) and output/ (any
+# completed variants with their .done sidecars). Both are no-ops on
+# a fresh job — the prefixes simply don't exist yet.
 stage remote:fetch-inputs running
 for bn in {basenames}; do
     aws s3 cp {s3}/input/${{bn}} /work/input/${{bn}} --region {region}
 done
+aws s3 sync {s3}/tmp/    /work/tmp/    --region {region} 2>/dev/null || true
+aws s3 sync {s3}/output/ /work/output/ --region {region} 2>/dev/null || true
 stage remote:fetch-inputs done 100
 
 # Total clip count — used for the ENCODER-FILE marker so the UI can
@@ -192,6 +244,12 @@ for bn in {basenames}; do
     # The container's own stdout carries the per-variant ENCODER-STAGE
     # markers from cli_local.py → they flow through docker → our
     # /var/log/cloud-encode.log → S3 → local poll tail.
+    # cli_local.py's encode_all() checks for a matching `.done` sidecar
+    # on each expected variant output file and skips re-encoding the
+    # complete ones. On a fresh job nothing's there; on a retry any
+    # variant that was complete on the prior instance (rescued via
+    # spot interrupt sync to S3, then re-downloaded here) gets reused.
+    echo ">>> starting cli_local.py for ${{bn}} (clip $CLIP_IDX of $TOTAL_CLIPS)"
     docker run --rm \\
         -v /work:/work \\
         -w /work/output \\
@@ -204,6 +262,7 @@ for bn in {basenames}; do
         --output-dir /work/output \\
         --output "${{base}}" \\
         {encode_args}
+    echo ">>> cli_local.py done for ${{bn}}"
 
     stage remote:sync-outputs running
     aws s3 sync /work/output {s3}/output/ \\
