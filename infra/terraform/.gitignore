@@ -1,0 +1,15 @@
+# Terraform state lives in S3 (configured in versions.tf) — local
+# scratch files shouldn't be checked in.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+crash.log
+crash.*.log
+
+# Plan output
+*.tfplan
+
+# Variable overrides with secrets
+*.auto.tfvars
+*.tfvars
