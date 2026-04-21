@@ -66,11 +66,81 @@ def _build_candidate_types(primary: str, fallbacks: list[str]) -> list[str]:
     return out
 
 
+def _rank_subnets_by_capacity(
+    ec2, subnets: list[str], types: list[str], primary_subnet: str,
+) -> list[str]:
+    """Reorder `subnets` so AZs with more spot capacity come first.
+
+    Calls DescribeSpotPlacementScores (AWS's "capacity-optimized"
+    backing data) with our candidate instance types, gets a per-AZ
+    score 1-10 (higher = more available capacity = lower expected
+    interrupt rate). Maps AZ IDs back to our subnets via
+    DescribeSubnets and sorts.
+
+    The primary_subnet keeps tie-breaker priority so small score
+    variations don't override explicit user choice. Fails open:
+    any API error (permissions, throttling) falls through to the
+    input order unchanged — we still encode, just without the
+    capacity hint.
+    """
+    try:
+        scores = ec2.describe_spot_placement_scores(
+            InstanceTypes=types,
+            TargetCapacity=1,
+            SingleAvailabilityZone=True,
+        ).get("SpotPlacementScores", [])
+    except ClientError as e:
+        print(f"    (spot-placement-scores unavailable: "
+              f"{e.response.get('Error', {}).get('Code', '?')} — "
+              f"using static order)", flush=True)
+        return subnets
+
+    # Map AZ-id → score. The API returns AvailabilityZoneId
+    # (e.g. "usw2-az1") but our subnets are in AvailabilityZone
+    # names (e.g. "us-west-2a"); DescribeSubnets gives both.
+    az_score: dict[str, int] = {}
+    for s in scores:
+        az_id = s.get("AvailabilityZoneId")
+        if az_id:
+            az_score[az_id] = s.get("Score", 0)
+    if not az_score:
+        return subnets
+
+    subnet_info = ec2.describe_subnets(SubnetIds=subnets).get("Subnets", [])
+    by_id = {s["SubnetId"]: s for s in subnet_info}
+
+    def rank_key(sn: str) -> tuple[int, int]:
+        info = by_id.get(sn, {})
+        az_id = info.get("AvailabilityZoneId", "")
+        score = az_score.get(az_id, 0)
+        # Higher score first; ties break by primary-first.
+        return (-score, 0 if sn == primary_subnet else 1)
+
+    ranked = sorted(subnets, key=rank_key)
+    top = ranked[0]
+    if top != primary_subnet and by_id:
+        az_id = by_id.get(top, {}).get("AvailabilityZoneId", "?")
+        print(f"    spot placement: preferring {top} (az={az_id}, "
+              f"score={az_score.get(az_id, 0)}/10) over primary", flush=True)
+    return ranked
+
+
 def launch(spec: LaunchSpec) -> LaunchResult:
     ec2 = ec2_client()
 
     subnets = [spec.primary_subnet_id] + _other_default_subnets(spec.primary_subnet_id)
     types = _build_candidate_types(spec.instance_type, spec.instance_type_fallbacks)
+
+    # Capacity-optimized ordering: ask AWS which AZs have the most
+    # available spot capacity for our candidate types, and try those
+    # first. Same decision AWS makes internally for Spot-Fleet's
+    # AllocationStrategy=capacity-optimized; we apply it client-side
+    # so we can keep using run_instances without migrating to
+    # CreateFleet + launch templates.
+    if spec.use_spot:
+        subnets = _rank_subnets_by_capacity(
+            ec2, subnets, types, spec.primary_subnet_id,
+        )
 
     shutdown_behavior = "stop" if spec.keep_instance else "terminate"
     user_data_b64 = base64.b64encode(spec.user_data.encode("utf-8")).decode("ascii")
