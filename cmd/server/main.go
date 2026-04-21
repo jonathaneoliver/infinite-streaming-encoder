@@ -58,6 +58,7 @@ func main() {
 	hostTmpDir := flag.String("host-tmp-dir", env("HOST_TMP_DIR", ""), "host path for TmpDir")
 	hostAWSDir := flag.String("host-aws-dir", env("HOST_AWS_DIR", ""), "host path for ~/.aws (cloud jobs only)")
 	encoderImage := flag.String("encoder-image", env("ENCODER_IMAGE", "encoder:latest"), "image used for worker containers")
+	stateMachineArn := flag.String("state-machine-arn", env("STATE_MACHINE_ARN", ""), "Step Functions state machine ARN for the cloud-batch target (empty disables that target)")
 	autoWatch := flag.Bool("auto-watch", env("AUTO_WATCH", "true") == "true", "auto-encode new files in source dir")
 	watchInterval := flag.Duration("watch-interval", 30*time.Second, "filesystem watch polling interval")
 	defaultTarget := flag.String("default-target", env("DEFAULT_TARGET", "local"), "default encode target: cloud or local")
@@ -75,17 +76,18 @@ func main() {
 	flag.Parse()
 
 	mgr := encode.NewManager(encode.ManagerConfig{
-		SourceDir:     *sourceDir,
-		OutputDir:     *outputDir,
-		TmpDir:        *tmpDir,
-		ScriptsDir:    *scriptsDir,
-		DockerImage:   *dockerImage,
-		HostSourceDir: *hostSourceDir,
-		HostOutputDir: *hostOutputDir,
-		HostTmpDir:    *hostTmpDir,
-		HostAWSDir:    *hostAWSDir,
-		EncoderImage:  *encoderImage,
-		MaxConcurrent: *maxConcurrent,
+		SourceDir:       *sourceDir,
+		OutputDir:       *outputDir,
+		TmpDir:          *tmpDir,
+		ScriptsDir:      *scriptsDir,
+		DockerImage:     *dockerImage,
+		HostSourceDir:   *hostSourceDir,
+		HostOutputDir:   *hostOutputDir,
+		HostTmpDir:      *hostTmpDir,
+		HostAWSDir:      *hostAWSDir,
+		EncoderImage:    *encoderImage,
+		StateMachineArn: *stateMachineArn,
+		MaxConcurrent:   *maxConcurrent,
 	})
 	mgr.Reconcile()
 

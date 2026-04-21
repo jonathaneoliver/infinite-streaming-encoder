@@ -277,7 +277,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <label>Target</label>
                 <select id="target" onchange="onTargetChange()">
                     <option value="local">Local</option>
-                    <option value="cloud">Cloud (AWS)</option>
+                    <option value="cloud">Cloud (EC2 spot — legacy)</option>
+                    <option value="cloud-batch">Cloud (AWS Batch)</option>
                 </select>
             </div>
             <div class="control-group" id="cpu-arch-group" style="display:none">
@@ -696,16 +697,19 @@ function renderSources() {
 
 function onTargetChange() {
     const target = document.getElementById('target').value;
+    const isAnyCloud = target === 'cloud' || target === 'cloud-batch';
     document.getElementById('cloud-warning').style.display =
-        target === 'cloud' ? 'block' : 'none';
-    // CPU arch only matters for cloud; hide it on local so the form
-    // doesn't suggest a setting that gets ignored.
+        isAnyCloud ? 'block' : 'none';
+    // CPU arch, spot toggle, and simulate-interrupt are knobs only
+    // the legacy cloud (EC2-spot-per-job) target honours. Batch picks
+    // capacity from its compute environment's allocation strategy.
+    const isLegacy = target === 'cloud';
     document.getElementById('cpu-arch-group').style.display =
-        target === 'cloud' ? 'flex' : 'none';
+        isLegacy ? 'flex' : 'none';
     document.getElementById('spot-group').style.display =
-        target === 'cloud' ? 'flex' : 'none';
+        isLegacy ? 'flex' : 'none';
     document.getElementById('simulate-interrupt-group').style.display =
-        target === 'cloud' ? 'flex' : 'none';
+        isLegacy ? 'flex' : 'none';
 }
 
 // Before submitting a cloud encode, peek at the AWS inventory. If
@@ -760,7 +764,7 @@ async function startEncode(force = false) {
     if (selected.length === 0) return;
 
     const target = document.getElementById('target').value;
-    if (target === 'cloud' && !await confirmCloudIfBilling()) return;
+    if ((target === 'cloud' || target === 'cloud-batch') && !await confirmCloudIfBilling()) return;
 
     if (force) {
         const confirmed = await showDialog(
@@ -999,7 +1003,7 @@ function renderLadderTable(ladder) {
 const openLogs = new Set();
 
 function jobRowHtml(j) {
-    const cloudBadge = j.config.target === 'cloud'
+    const cloudBadge = (j.config.target === 'cloud' || j.config.target === 'cloud-batch')
         ? `<span class="job-cloud-badge" onclick="switchTab('aws')" title="Click to view AWS resources">☁ cloud</span>`
         : '';
     return `

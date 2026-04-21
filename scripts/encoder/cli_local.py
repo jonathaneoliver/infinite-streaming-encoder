@@ -516,6 +516,14 @@ def run_resume(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    # Batch job definitions invoke us as
+    # `python -m encoder.cli_local phase <name> ...`. Dispatch to the
+    # phase handler before argparse gets hold of local-encode flags
+    # that don't apply in the Batch context.
+    if len(sys.argv) >= 2 and sys.argv[1] == "phase":
+        from encoder.cli_phase import main as phase_main
+        return phase_main(sys.argv[2:])
+
     args = build_parser().parse_args()
     if args.resume_package_from:
         return run_resume(args)

@@ -194,8 +194,9 @@ func splitLinesOrCR(data []byte, atEOF bool) (advance int, token []byte, err err
 type Target string
 
 const (
-	TargetCloud Target = "cloud"
-	TargetLocal Target = "local"
+	TargetCloud      Target = "cloud"
+	TargetLocal      Target = "local"
+	TargetCloudBatch Target = "cloud-batch"
 )
 
 type JobStatus string
@@ -357,6 +358,11 @@ type Manager struct {
 	// Image used for detached worker containers.
 	EncoderImage string
 
+	// State Machine ARN for the cloud-batch target. Empty when no
+	// Batch infrastructure is deployed yet (the cloud-batch target
+	// then errors cleanly at submit time).
+	StateMachineArn string
+
 	sem         chan struct{}
 	subscribers []chan *Job
 	subMu       sync.Mutex
@@ -372,8 +378,9 @@ type ManagerConfig struct {
 	HostOutputDir string
 	HostTmpDir    string
 	HostAWSDir    string
-	EncoderImage  string
-	MaxConcurrent int
+	EncoderImage    string
+	StateMachineArn string
+	MaxConcurrent   int
 }
 
 func NewManager(cfg ManagerConfig) *Manager {
@@ -385,17 +392,18 @@ func NewManager(cfg ManagerConfig) *Manager {
 	}
 	os.MkdirAll(cfg.TmpDir, 0755)
 	return &Manager{
-		SourceDir:     cfg.SourceDir,
-		OutputDir:     cfg.OutputDir,
-		TmpDir:        cfg.TmpDir,
-		ScriptsDir:    cfg.ScriptsDir,
-		DockerImage:   cfg.DockerImage,
-		HostSourceDir: cfg.HostSourceDir,
-		HostOutputDir: cfg.HostOutputDir,
-		HostTmpDir:    cfg.HostTmpDir,
-		HostAWSDir:    cfg.HostAWSDir,
-		EncoderImage:  cfg.EncoderImage,
-		sem:           make(chan struct{}, cfg.MaxConcurrent),
+		SourceDir:       cfg.SourceDir,
+		OutputDir:       cfg.OutputDir,
+		TmpDir:          cfg.TmpDir,
+		ScriptsDir:      cfg.ScriptsDir,
+		DockerImage:     cfg.DockerImage,
+		HostSourceDir:   cfg.HostSourceDir,
+		HostOutputDir:   cfg.HostOutputDir,
+		HostTmpDir:      cfg.HostTmpDir,
+		HostAWSDir:      cfg.HostAWSDir,
+		EncoderImage:    cfg.EncoderImage,
+		StateMachineArn: cfg.StateMachineArn,
+		sem:             make(chan struct{}, cfg.MaxConcurrent),
 	}
 }
 
@@ -1052,6 +1060,9 @@ func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int)
 	if job.Config.Target == TargetCloud {
 		return m.encodeCloudBatch(job, tmpDir, script, startIdx)
 	}
+	if job.Config.Target == TargetCloudBatch {
+		return m.encodeCloudBatchSFN(job, tmpDir, startIdx)
+	}
 
 	total := len(job.Config.Files)
 	for i := startIdx; i < total; i++ {
@@ -1136,6 +1147,149 @@ func (m *Manager) encodeCloudBatch(job *Job, tmpDir, script string, startIdx int
 		return fmt.Errorf("cloud batch: %w", err)
 	}
 	return nil
+}
+
+// encodeCloudBatchSFN drives the AWS Batch + Step Functions pipeline
+// defined under infra/terraform/. For each input file:
+//   1. Upload to s3://bucket/jobs/<go-job-id>-<idx>/input/<clip>
+//   2. Build state-machine input JSON (s3_input, s3_prefix, variants[])
+//   3. `cli_batch.py submit` -> prints execution ARN
+//   4. `cli_batch.py poll` -> blocks, emits ENCODER-STAGE markers
+//      until SUCCEEDED/FAILED, then downloads output_*/ trees into
+//      the job's tmpDir for moveTmpToOutput to pick up
+//
+// Spot interrupts are handled inside the state machine's retry
+// policies — Batch reruns the failing phase on fresh capacity. The
+// Go side only cares about the terminal SUCCEEDED / FAILED outcome.
+func (m *Manager) encodeCloudBatchSFN(job *Job, tmpDir string, startIdx int) error {
+	if m.StateMachineArn == "" {
+		return fmt.Errorf("STATE_MACHINE_ARN not configured; can't submit cloud-batch jobs")
+	}
+	bucket := os.Getenv("S3_BUCKET")
+	if bucket == "" {
+		return fmt.Errorf("S3_BUCKET not configured")
+	}
+
+	total := len(job.Config.Files)
+	for i := startIdx; i < total; i++ {
+		m.persistState(job, i)
+
+		f := job.Config.Files[i]
+		job.Progress = fmt.Sprintf("cloud-batch %d/%d: %s", i+1, total, f)
+		job.startFile(f, i+1, total)
+		m.notify(job)
+
+		if err := m.runOneCloudBatchSFN(job, tmpDir, f, bucket); err != nil {
+			return fmt.Errorf("%s: %w", f, err)
+		}
+	}
+	return nil
+}
+
+// runOneCloudBatchSFN submits + polls a single clip's state-machine
+// execution. Shells out to cli_batch.py for both phases (rather than
+// importing an AWS SDK for Go) to keep AWS usage in one language.
+func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string) error {
+	// Unique S3 prefix per (manager-job, file-index) so retries of
+	// the same Go job can reuse the prefix (input doesn't re-upload).
+	prefix := fmt.Sprintf("jobs/%s-%s", job.ID, strings.TrimSuffix(filename, filepath.Ext(filename)))
+	s3Prefix := fmt.Sprintf("s3://%s/%s", bucket, prefix)
+	s3Input := fmt.Sprintf("%s/input/%s", s3Prefix, filename)
+
+	// Upload the clip (skip if already present via aws CLI's size check).
+	job.AppendLog(fmt.Sprintf("[cloud-batch] uploading %s → %s", filename, s3Input))
+	localSrc := filepath.Join(m.SourceDir, filename)
+	upload := exec.Command("aws", "s3", "cp", localSrc, s3Input, "--only-show-errors")
+	upload.Env = os.Environ()
+	if out, err := upload.CombinedOutput(); err != nil {
+		return fmt.Errorf("aws s3 cp: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	// Build the state-machine input document.
+	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Codec, job.Config.MaxRes)
+	inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
+	if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
+		return fmt.Errorf("write input json: %w", err)
+	}
+
+	// Submit.
+	submit := exec.Command("python3", "-m", "encoder.cli_batch", "submit",
+		"--state-machine-arn", m.StateMachineArn,
+		"--input-json", inputPath)
+	submit.Env = os.Environ()
+	out, err := submit.Output()
+	if err != nil {
+		return fmt.Errorf("cli_batch submit: %w", err)
+	}
+	execArn := strings.TrimSpace(string(out))
+	job.AppendLog(fmt.Sprintf("[cloud-batch] execution ARN: %s", execArn))
+
+	// Poll + stream progress back into the job log.
+	poll := exec.Command("python3", "-m", "encoder.cli_batch", "poll",
+		"--execution-arn", execArn,
+		"--s3-prefix", s3Prefix,
+		"--local-dir", filepath.Join(tmpDir, job.Config.OutputStem(filename)))
+	poll.Env = os.Environ()
+	stdout, err := poll.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	poll.Stderr = os.Stderr
+	if err := poll.Start(); err != nil {
+		return err
+	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := stripANSI(scanner.Text())
+		if !job.parseMarker(line) {
+			job.AppendLog(line)
+		}
+		m.notify(job)
+	}
+	if err := poll.Wait(); err != nil {
+		return fmt.Errorf("cli_batch poll: %w", err)
+	}
+	return nil
+}
+
+// buildSFNInput renders the JSON doc the state machine expects. Picks
+// which (codec, tier) combinations to fan out over based on the
+// JobConfig's Codec + MaxRes.
+func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string) string {
+	tiers := []string{"360p", "540p", "720p", "1080p", "1440p", "2160p"}
+	if maxRes != "" {
+		for i, t := range tiers {
+			if t == maxRes {
+				tiers = tiers[:i+1]
+				break
+			}
+		}
+	}
+	codecs := []string{"h264", "hevc"}
+	switch codecSel {
+	case "h264":
+		codecs = []string{"h264"}
+	case "hevc":
+		codecs = []string{"hevc"}
+	}
+	type variant struct {
+		Codec string `json:"codec"`
+		Tier  string `json:"tier"`
+	}
+	var variants []variant
+	for _, c := range codecs {
+		for _, t := range tiers {
+			variants = append(variants, variant{Codec: c, Tier: t})
+		}
+	}
+	doc := map[string]any{
+		"s3_input":  s3Input,
+		"s3_prefix": s3Prefix,
+		"variants":  variants,
+	}
+	b, _ := json.Marshal(doc)
+	return string(b)
 }
 
 // resolveCodec checks which codecs are already encoded in OutputDir and returns

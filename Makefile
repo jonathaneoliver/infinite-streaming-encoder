@@ -67,6 +67,7 @@ run: require-paths build
 		-e INSTANCE_PROFILE=$(INSTANCE_PROFILE) \
 		-e INSTANCE_TYPE=$(INSTANCE_TYPE) \
 		-e GHCR_PAT=$(GHCR_PAT) \
+		-e STATE_MACHINE_ARN=$(STATE_MACHINE_ARN) \
 		$(IMAGE_NAME)
 	@echo "Encoder running at http://localhost:$(PORT)"
 
