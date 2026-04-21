@@ -84,7 +84,7 @@ def _rank_subnets_by_capacity(
     capacity hint.
     """
     try:
-        scores = ec2.describe_spot_placement_scores(
+        scores = ec2.get_spot_placement_scores(
             InstanceTypes=types,
             TargetCapacity=1,
             SingleAvailabilityZone=True,
@@ -93,6 +93,13 @@ def _rank_subnets_by_capacity(
         print(f"    (spot-placement-scores unavailable: "
               f"{e.response.get('Error', {}).get('Code', '?')} — "
               f"using static order)", flush=True)
+        return subnets
+    except Exception as e:
+        # Guard against SDK-level quirks (old boto3 version missing the
+        # method, etc.). Any failure falls through to the static order
+        # so the encode still runs.
+        print(f"    (spot-placement-scores skipped: {e} — using static order)",
+              flush=True)
         return subnets
 
     # Map AZ-id → score. The API returns AvailabilityZoneId
