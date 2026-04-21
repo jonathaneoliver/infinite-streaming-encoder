@@ -7,15 +7,20 @@ CONTAINER_NAME ?= encoder
 PORT ?= 8080
 
 # Single source of truth: ./VERSION. Embedded into the Go binary via
-# -ldflags and stamped on every image tag we publish to GHCR.
+# -ldflags and stamped on every image tag we publish to GHCR. The
+# short git SHA is stamped too, so the About tab can tell you exactly
+# which commit the local binary AND the cloud image were built from
+# — critical when VERSION hasn't bumped but you've been iterating on
+# cloud code.
 VERSION := $(shell cat VERSION 2>/dev/null || echo dev)
+GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
 # GHCR publishing
 GHCR_IMAGE ?= ghcr.io/jonathaneoliver/encoder
 GHCR_USERNAME ?= jonathaneoliver
 PLATFORMS ?= linux/amd64,linux/arm64
 
-.PHONY: require-paths build run stop restart logs shell status clean push push-setup version
+.PHONY: require-paths build run stop restart logs shell status clean push push-setup cloud-push version
 
 require-paths:
 	@: $${SOURCE_DIR:?SOURCE_DIR is not set — create a .env (see .env.example)}
@@ -23,10 +28,13 @@ require-paths:
 	@: $${TMP_DIR:?TMP_DIR is not set — create a .env (see .env.example)}
 
 build:
-	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE_NAME) .
+	docker build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_SHA=$(GIT_SHA) \
+		-t $(IMAGE_NAME) .
 
 version:
-	@echo $(VERSION)
+	@echo $(VERSION) $(GIT_SHA)
 
 run: require-paths build
 	docker run --rm -d \
@@ -89,15 +97,34 @@ push-setup:
 	@docker buildx use encoder-builder
 	@docker buildx inspect --bootstrap
 
-# Build + push the multi-arch image, tagged as both `latest` and the
-# current VERSION. Also stamps the version into the Go binary via
-# --build-arg VERSION so /api/version reflects what's pulled.
+# Full multi-arch release push. Use when cutting a release (bumping
+# VERSION) or when you've touched something Graviton-specific.
+# Publishes three tags: latest, $(VERSION), and $(GIT_SHA).
 push:
 	docker buildx build \
 		--platform $(PLATFORMS) \
 		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_SHA=$(GIT_SHA) \
 		--tag $(GHCR_IMAGE):latest \
 		--tag $(GHCR_IMAGE):$(VERSION) \
+		--tag $(GHCR_IMAGE):$(GIT_SHA) \
 		--push \
 		.
-	@echo "Published $(GHCR_IMAGE):latest and :$(VERSION) for $(PLATFORMS)"
+	@echo "Published $(GHCR_IMAGE):latest :$(VERSION) :$(GIT_SHA) for $(PLATFORMS)"
+
+# Fast iterative push for cloud-feature work. Single-arch (linux/amd64,
+# matches the default c7i instance family), so no 5-10 minute ARM QEMU
+# build. Useful when you're debugging the cloud pipeline and want the
+# next EC2 launch to pick up your changes. Publishes :latest + commit
+# SHA tags; skips the :$(VERSION) tag so release tags stay multi-arch.
+# If you need Graviton after iterating, finish with `make push`.
+cloud-push:
+	docker buildx build \
+		--platform linux/amd64 \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_SHA=$(GIT_SHA) \
+		--tag $(GHCR_IMAGE):latest \
+		--tag $(GHCR_IMAGE):$(GIT_SHA) \
+		--push \
+		.
+	@echo "Published $(GHCR_IMAGE):latest :$(GIT_SHA) (linux/amd64 only)"

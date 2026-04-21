@@ -15,10 +15,14 @@ import (
 	"github.com/jonathaneoliver/encoder/internal/watcher"
 )
 
-// Version is stamped at build time via `-ldflags "-X main.version=..."`.
-// The Makefile reads ./VERSION and injects it; unstamped builds (plain
-// `go build`) fall back to "dev".
-var version = "dev"
+// Version + gitSha are stamped at build time via
+// `-ldflags "-X main.version=... -X main.gitSha=..."`. The Makefile
+// reads ./VERSION and `git rev-parse --short HEAD`; unstamped builds
+// (plain `go build`) fall back to the defaults below.
+var (
+	version = "dev"
+	gitSha  = "unknown"
+)
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -98,15 +102,18 @@ func main() {
 	}
 
 	go awswatch.Run(context.Background(), awswatch.Config{
-		Interval:           *awsWatchInterval,
-		MaxLifetime:        *awsMaxLifetime,
-		AutoTerminateStale: *awsAutoTerminate,
+		Interval:            *awsWatchInterval,
+		MaxLifetime:         *awsMaxLifetime,
+		AutoTerminateStale:  *awsAutoTerminate,
+		FailedStagingMaxAge: 1 * time.Hour,
 	})
 
 	srv := api.NewServer(mgr)
 	srv.Version = version
+	srv.GitSha = gitSha
+	srv.CloudImage = *dockerImage
 
-	log.Printf("encoder server %s listening on %s", version, *addr)
+	log.Printf("encoder server %s (%s) listening on %s", version, gitSha, *addr)
 	log.Printf("  source: %s", *sourceDir)
 	log.Printf("  output: %s", *outputDir)
 	log.Printf("  tmp: %s", *tmpDir)

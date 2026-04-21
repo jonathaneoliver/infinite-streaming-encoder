@@ -7,32 +7,51 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/jonathaneoliver/encoder/internal/encode"
+	"github.com/jonathaneoliver/encoder/internal/imageinfo"
 )
 
 type Server struct {
 	Manager *encode.Manager
 	Mux     *http.ServeMux
-	// Version is stamped by cmd/server from the -ldflags-injected
-	// main.version. Surfaced at /api/version for the SPA's About tab.
-	Version string
+	// Version + GitSha are stamped by cmd/server from -ldflags-injected
+	// main.version / main.gitSha. CloudImage is the DOCKER_IMAGE env var
+	// — what the EC2 worker user-data pulls on job start. The About tab
+	// pulls the image's OCI labels from GHCR to compare local vs cloud.
+	Version    string
+	GitSha     string
+	CloudImage string
+
+	imageInfo *imageinfo.Client
 }
 
 func NewServer(mgr *encode.Manager) *Server {
-	s := &Server{Manager: mgr, Mux: http.NewServeMux()}
+	s := &Server{
+		Manager: mgr,
+		Mux:     http.NewServeMux(),
+		imageInfo: imageinfo.NewClient(
+			os.Getenv("GHCR_USERNAME"),
+			os.Getenv("GHCR_PAT"),
+		),
+	}
 	s.Mux.HandleFunc("GET /api/version", s.getVersion)
 	s.Mux.HandleFunc("GET /api/sources", s.listSources)
 	s.Mux.HandleFunc("GET /api/outputs", s.listOutputs)
 	s.Mux.HandleFunc("GET /api/outputs/{name}", s.listOutputContents)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/playlists", s.listPlaylists)
+	s.Mux.HandleFunc("GET /api/outputs/{name}/ladder", s.ladder)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/logs", s.outputLogs)
 	s.Mux.HandleFunc("POST /api/encode", s.startEncode)
 	s.Mux.HandleFunc("GET /api/jobs", s.listJobs)
 	s.Mux.HandleFunc("GET /api/jobs/{id}/logs", s.jobLogs)
 	s.Mux.HandleFunc("GET /api/jobs/stream", s.streamJobs)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/cancel", s.cancelJob)
+	s.Mux.HandleFunc("POST /api/jobs/{id}/retry", s.retryJob)
+	s.Mux.HandleFunc("POST /api/jobs/{id}/simulate-interrupt", s.simulateInterrupt)
+	s.Mux.HandleFunc("GET /api/jobs/{id}/workdir", s.jobWorkdir)
 	// AWS inventory + cleanup (issue #5)
 	s.Mux.HandleFunc("GET /api/aws/inventory", s.awsInventory)
 	s.Mux.HandleFunc("POST /api/aws/clear", s.awsClearAll)
@@ -63,7 +82,17 @@ func noCache(h http.Handler) http.Handler {
 }
 
 func (s *Server) getVersion(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]string{"version": s.Version})
+	out := map[string]any{
+		"local": map[string]string{
+			"version":  s.Version,
+			"revision": s.GitSha,
+		},
+		"cloud_image": s.CloudImage,
+	}
+	if s.CloudImage != "" {
+		out["cloud"] = s.imageInfo.Get(r.Context(), s.CloudImage)
+	}
+	writeJSON(w, out)
 }
 
 type sourceFile struct {
@@ -127,6 +156,179 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(204)
+}
+
+// jobWorkdir lists files in cli_local.py's per-clip persistent work
+// dir ($TMP_DIR/encode_<stem>/) and flags each as complete (has a
+// matching .done sidecar) or partial. Lets the UI preview what a
+// Retry will reuse vs re-encode. Works for both local and cloud
+// encodes — cloud's /work/tmp is rsynced to/from S3, but during an
+// encode the same paths are mounted on the host.
+func (s *Server) jobWorkdir(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	job := s.Manager.GetJob(id)
+	if job == nil {
+		http.Error(w, "job not found", 404)
+		return
+	}
+	type workdirEntry struct {
+		Name     string `json:"name"`
+		Size     int64  `json:"size"`
+		Complete bool   `json:"complete"`
+	}
+	type workdirResp struct {
+		Stem    string         `json:"stem"`
+		Path    string         `json:"path"`
+		Entries []workdirEntry `json:"entries"`
+	}
+	// Use the first file's stem. Multi-file jobs each have their own
+	// work dir; if we're asked mid-job we could be partway through
+	// clip N, so pick the current one from CurrentFile if set.
+	var filename string
+	if job.CurrentFile != "" {
+		filename = job.CurrentFile
+	} else if len(job.Config.Files) > 0 {
+		filename = job.Config.Files[0]
+	}
+	if filename == "" {
+		writeJSON(w, workdirResp{})
+		return
+	}
+	stem := job.Config.OutputStem(filename)
+	dir := filepath.Join(s.Manager.TmpDir, "encode_"+stem)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		writeJSON(w, workdirResp{Stem: stem, Path: dir})
+		return
+	}
+	resp := workdirResp{Stem: stem, Path: dir}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".mp4") {
+			continue
+		}
+		info, _ := e.Info()
+		mp4 := filepath.Join(dir, e.Name())
+		complete := false
+		if marker, err := os.ReadFile(mp4 + ".done"); err == nil {
+			if recorded, perr := strconv.ParseInt(strings.TrimSpace(string(marker)), 10, 64); perr == nil {
+				if info != nil && recorded == info.Size() {
+					complete = true
+				}
+			}
+		}
+		size := int64(0)
+		if info != nil {
+			size = info.Size()
+		}
+		resp.Entries = append(resp.Entries, workdirEntry{
+			Name: e.Name(), Size: size, Complete: complete,
+		})
+	}
+	writeJSON(w, resp)
+}
+
+// simulateInterrupt fakes a mid-encode failure so the Retry flow
+// can be exercised without waiting for a real interrupt.
+//
+// Cloud jobs: writes an empty _SIMULATE_INTERRUPT sentinel to the
+// job's S3 prefix. The remote user-data polls for it every 5s and,
+// on seeing it, invokes the same trigger_interrupt bash path a real
+// spot reclaim hits — writes SPOT INTERRUPTION: to _FAILED, rsyncs
+// /work/tmp + /work/output, exits.
+//
+// Local jobs: docker kill on the worker container. SIGKILLs the
+// Python process before it can clean up, so any in-flight variant
+// has no .done sidecar written (exactly what happens on spot
+// interrupt) — cli_local.py's preflight sweep deletes those on
+// retry, leaving only the fully-complete files for reuse.
+func (s *Server) simulateInterrupt(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	job := s.Manager.GetJob(id)
+	if job == nil {
+		http.Error(w, "job not found", 404)
+		return
+	}
+	if job.Status != encode.StatusRunning {
+		http.Error(w, "job is not running", 400)
+		return
+	}
+	if job.Config.Target == encode.TargetCloud {
+		bucket := os.Getenv("S3_BUCKET")
+		region := os.Getenv("AWS_REGION")
+		if bucket == "" {
+			http.Error(w, "S3_BUCKET not configured", 500)
+			return
+		}
+		cloudID := job.CloudJobID
+		if cloudID == "" {
+			http.Error(w, "cloud_job_id not yet known for this job", 409)
+			return
+		}
+		key := fmt.Sprintf("s3://%s/jobs/%s/_SIMULATE_INTERRUPT", bucket, cloudID)
+		cmd := exec.Command("aws", "s3", "cp", "-", key, "--region", region)
+		cmd.Stdin = strings.NewReader("")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to write sentinel: %s", strings.TrimSpace(string(out))), 500)
+			return
+		}
+		w.WriteHeader(204)
+		return
+	}
+	// Local: find and SIGKILL the worker container(s) for this job.
+	out, err := exec.Command("docker", "ps",
+		"--filter", "label=encoder.job_id="+id,
+		"--format", "{{.Names}}").Output()
+	if err != nil {
+		http.Error(w, "docker ps failed: "+err.Error(), 500)
+		return
+	}
+	names := strings.Fields(string(out))
+	if len(names) == 0 {
+		http.Error(w, "no running worker container for this job", 404)
+		return
+	}
+	for _, name := range names {
+		exec.Command("docker", "kill", name).Run()
+	}
+	w.WriteHeader(204)
+}
+
+// retryJob submits a new job with the same config as `id`, wired to
+// resume from that job's S3 staging (inputs, mezzanines, completed
+// variants). Only meaningful for cloud failures — local encodes have
+// no shared staging to reuse.
+func (s *Server) retryJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	orig := s.Manager.GetJob(id)
+	if orig == nil {
+		http.Error(w, "job not found", 404)
+		return
+	}
+	if orig.Status != encode.StatusFailed && orig.Status != encode.StatusCancelled {
+		http.Error(w, "job is not in a retryable state", 400)
+		return
+	}
+	cfg := orig.Config
+	cfg.ForceReencode = true
+	if cfg.Target == encode.TargetCloud {
+		// The JobID used as the S3 prefix by cli_cloud.py isn't the
+		// Manager's internal ID — it's the timestamp-based one the
+		// Python tool computes itself. We stash that into Job.CloudJobID
+		// when the remote plan prints job_id:<X>; fall back to the
+		// manager ID (close enough for new-style jobs).
+		prior := orig.CloudJobID
+		if prior == "" {
+			prior = orig.ID
+		}
+		cfg.ResumeFromJobID = prior
+	}
+	// Local resume is automatic: cli_local.py's per-clip work dir
+	// lives at TMPDIR/encode_<stem>/ on the host filesystem, so
+	// variants + mezzanine from a prior partial run are still there
+	// when the new worker starts. No config plumbing needed.
+	job := s.Manager.Submit(cfg)
+	writeJSON(w, job)
 }
 
 func (s *Server) jobLogs(w http.ResponseWriter, r *http.Request) {

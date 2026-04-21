@@ -62,6 +62,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .status-cancelled { color: #ffa94d; }
 .status-done { color: #06d6a0; }
 .status-failed { color: #ef476f; }
+.status-spot-terminated { color: #ffa94d; }
 
 .no-files { color: #666; font-style: italic; padding: 20px; text-align: center; }
 .col-header { display: flex; padding: 6px 12px; border-bottom: 1px solid #333; margin-bottom: 4px; font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing: 1px; }
@@ -83,6 +84,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .log-toggle { cursor: pointer; color: #4361ee; font-size: 0.8rem; margin-top: 4px; }
 .job-cancel { cursor: pointer; color: #ef476f; font-size: 0.8rem; margin-left: 12px; }
 .job-cancel:hover { text-decoration: underline; }
+.job-retry { cursor: pointer; color: #8cf; font-size: 0.8rem; margin-left: 12px; font-weight: 600; }
+.job-retry:hover { text-decoration: underline; }
+.job-simulate { cursor: pointer; color: #ffa94d; font-size: 0.8rem; margin-left: 12px; }
+.job-simulate:hover { text-decoration: underline; }
 .stages-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.8rem; }
 .stages-table td { padding: 3px 8px; vertical-align: middle; }
 .stages-table td.stage-label { color: #aac; white-space: nowrap; width: 35%; }
@@ -93,13 +98,37 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .stage-bar-fill { height: 100%; background: #4361ee; transition: width 0.3s ease; }
 .stage-bar-fill.stage-fill-done { background: #06d6a0; }
 .stage-bar-fill.stage-fill-failed { background: #ef476f; }
+.stage-bar-fill.stage-fill-skipped { background: repeating-linear-gradient(45deg, #555 0 6px, #444 6px 12px); }
+.stage-skipped { opacity: 0.7; }
+.stage-skipped .stage-label::after { content: ' (reused)'; color: #888; font-size: 0.75rem; font-style: italic; }
 
 /* --- AWS tab --- */
 .tab-aws { color: #ffa94d; }
 .tab-aws.active { color: #ffa94d; border-bottom-color: #ffa94d; }
+.ladder-panel { background: #181826; border: 1px solid #2a2a3a; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; }
+.ladder-title { font-size: 0.9rem; color: #8cf; font-weight: 600; margin-bottom: 8px; }
+.ladder-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.ladder-table th { text-align: left; color: #aac; font-weight: 600; padding: 6px 10px 6px 0; border-bottom: 1px solid #2a2a3a; }
+.ladder-table td { padding: 6px 10px 6px 0; vertical-align: middle; color: #eee; border-bottom: 1px solid #1f1f2e; }
+.ladder-table tbody tr:last-child td { border-bottom: none; }
+.ladder-res { font-weight: 600; color: #8cf; }
+.ladder-dim { color: #888; font-variant-numeric: tabular-nums; }
+.ladder-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ladder-bar-cell { width: 30%; }
+.ladder-bar-track { display: inline-block; vertical-align: middle; position: relative; width: calc(100% - 50px); height: 10px; background: #2a2a3a; border-radius: 3px; overflow: visible; }
+.ladder-bar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px 0 0 3px; }
+.ladder-bar-overshoot { position: absolute; left: 100%; top: -1px; bottom: -1px; background: repeating-linear-gradient(45deg, #ef476f, #ef476f 4px, #b83450 4px, #b83450 8px); border-radius: 0 3px 3px 0; opacity: 0.85; }
+.ladder-bar-good { background: #3aa76d; }
+.ladder-bar-warn { background: #f0c274; }
+.ladder-bar-bad { background: #ef476f; }
+.ladder-bar-empty { background: #444; }
+.ladder-bar-label { display: inline-block; width: 44px; text-align: right; margin-left: 6px; font-variant-numeric: tabular-nums; color: #aac; vertical-align: middle; }
 .about-list { display: grid; grid-template-columns: max-content 1fr; gap: 8px 20px; margin: 0; }
 .about-list dt { color: #aac; font-weight: 600; }
 .about-list dd { margin: 0; color: #eee; font-variant-numeric: tabular-nums; }
+.about-subhead { color: #8cf; font-size: 0.95rem; margin: 0 0 8px 0; font-weight: 600; }
+.about-drift { background: #ef476f; color: #fff; padding: 2px 8px; border-radius: 10px; font-size: 0.7rem; margin-left: 8px; vertical-align: middle; }
+.about-match { background: #3aa76d; color: #fff; padding: 2px 8px; border-radius: 10px; font-size: 0.7rem; margin-left: 8px; vertical-align: middle; }
 .aws-panel { border-top: 3px solid #ffa94d; }
 .aws-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .aws-header-actions { display: flex; gap: 12px; align-items: center; }
@@ -258,6 +287,13 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="amd">AMD EPYC (c7a)</option>
                     <option value="graviton">Graviton ARM (c7g)</option>
                 </select>
+            </div>
+            <div class="control-group" id="spot-group" style="display:none;align-self:center;padding-top:16px">
+                <label title="Spot is ~2.6× cheaper but AWS can reclaim with 2 min notice. Uncheck to use on-demand (guaranteed, no interruption)."><input type="checkbox" id="use-spot" checked style="width:auto;min-width:auto"> Use spot (cheaper)</label>
+            </div>
+            <div class="control-group" id="simulate-interrupt-group" style="display:none">
+                <label title="Test-only: tells the remote to trigger a synthetic spot interrupt after N seconds. Exercises the Retry flow without waiting for a real AWS reclaim. 0 = disabled.">Simulate interrupt (s)</label>
+                <input type="number" id="simulate-interrupt" min="0" max="3600" value="0" step="10" style="width:80px">
             </div>
             <div class="control-group">
                 <label>Codec</label>
@@ -445,10 +481,30 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 <div id="tab-about" class="tab-content">
     <div class="panel">
         <h2>About</h2>
+
+        <h3 class="about-subhead">Local server <span id="about-drift-badge" style="display:none"></span></h3>
         <dl class="about-list">
             <dt>Version</dt>
-            <dd id="about-version">—</dd>
-            <dt>Source</dt>
+            <dd id="about-local-version">—</dd>
+            <dt>Commit</dt>
+            <dd id="about-local-sha">—</dd>
+        </dl>
+
+        <h3 class="about-subhead" style="margin-top:18px">Cloud worker image</h3>
+        <dl class="about-list">
+            <dt>Image</dt>
+            <dd id="about-cloud-image">—</dd>
+            <dt>Version</dt>
+            <dd id="about-cloud-version">—</dd>
+            <dt>Commit</dt>
+            <dd id="about-cloud-sha">—</dd>
+            <dt>Digest</dt>
+            <dd id="about-cloud-digest" style="font-family:monospace;font-size:0.75rem">—</dd>
+        </dl>
+
+        <h3 class="about-subhead" style="margin-top:18px">Source</h3>
+        <dl class="about-list">
+            <dt>Repository</dt>
             <dd><a href="https://github.com/jonathaneoliver/Encoder" target="_blank" rel="noopener">github.com/jonathaneoliver/Encoder</a></dd>
         </dl>
     </div>
@@ -578,6 +634,7 @@ function switchTab(name) {
     }
     if (name === 'outputs') loadOutputs();
     if (name === 'aws') refreshAws();
+    if (name === 'about') loadVersion();
 }
 
 function formatSize(bytes) {
@@ -644,6 +701,10 @@ function onTargetChange() {
     // CPU arch only matters for cloud; hide it on local so the form
     // doesn't suggest a setting that gets ignored.
     document.getElementById('cpu-arch-group').style.display =
+        target === 'cloud' ? 'flex' : 'none';
+    document.getElementById('spot-group').style.display =
+        target === 'cloud' ? 'flex' : 'none';
+    document.getElementById('simulate-interrupt-group').style.display =
         target === 'cloud' ? 'flex' : 'none';
 }
 
@@ -726,6 +787,8 @@ async function startEncode(force = false) {
         padding: document.getElementById('padding').value,
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         cpu_arch: document.getElementById('cpu-arch').value,
+        use_spot: document.getElementById('use-spot').checked,
+        simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
         force_reencode: force
     };
 
@@ -847,8 +910,12 @@ function renderResBadges(d) {
 
 async function loadOutputDetail(name) {
     try {
-        const res = await fetch('/api/outputs/' + encodeURIComponent(name));
-        const files = await res.json();
+        const [filesRes, ladderRes] = await Promise.all([
+            fetch('/api/outputs/' + encodeURIComponent(name)),
+            fetch('/api/outputs/' + encodeURIComponent(name) + '/ladder'),
+        ]);
+        const files = await filesRes.json();
+        const ladder = ladderRes.ok ? await ladderRes.json() : null;
         const list = document.getElementById('outputs-list');
 
         document.getElementById('outputs-header').innerHTML = `
@@ -861,7 +928,7 @@ async function loadOutputDetail(name) {
             return;
         }
 
-        list.innerHTML = files.map(f => `
+        list.innerHTML = renderLadderTable(ladder) + files.map(f => `
             <div class="output-file">
                 <span class="output-file-icon">${f.dir ? '&#128193;' : '&#128196;'}</span>
                 <span class="output-file-name">${escapeHtml(f.name)}</span>
@@ -871,6 +938,58 @@ async function loadOutputDetail(name) {
     } catch (e) {
         document.getElementById('outputs-list').innerHTML = '<div class="no-files">Failed to load directory</div>';
     }
+}
+
+// Ladder matrix: one row per tier with target vs actual bitrate + size.
+// The delta bar visualizes actual/target — >100% means the encoder
+// overshot its budget (x265 commonly does at low targets). Keeps the
+// view compact: 4 columns fit inside the outputs list width.
+function renderLadderTable(ladder) {
+    if (!ladder || !ladder.tiers || ladder.tiers.length === 0) return '';
+    const rows = ladder.tiers.map(t => {
+        const ratio = t.target_kbps > 0 ? (t.actual_kbps / t.target_kbps) : 0;
+        const pct = Math.min(150, Math.round(ratio * 100));
+        // Bar colour: green ≤110%, amber 110-125%, red >125%
+        const cls = ratio === 0 ? 'ladder-bar-empty'
+                  : ratio <= 1.10 ? 'ladder-bar-good'
+                  : ratio <= 1.25 ? 'ladder-bar-warn'
+                  : 'ladder-bar-bad';
+        const actualDisp = t.actual_kbps > 0 ? t.actual_kbps.toLocaleString() : '—';
+        return `
+            <tr>
+                <td class="ladder-res">${t.res}</td>
+                <td class="ladder-dim">${t.width}×${t.height}</td>
+                <td class="ladder-num">${t.target_kbps.toLocaleString()} k</td>
+                <td class="ladder-num">${actualDisp} k</td>
+                <td class="ladder-bar-cell">
+                    <div class="ladder-bar-track">
+                        <div class="ladder-bar-fill ${cls}" style="width:${Math.min(100, pct)}%"></div>
+                        ${pct > 100 ? `<div class="ladder-bar-overshoot" style="width:${Math.min(50, pct - 100)}%"></div>` : ''}
+                    </div>
+                    <span class="ladder-bar-label">${ratio === 0 ? '—' : (ratio * 100).toFixed(0) + '%'}</span>
+                </td>
+                <td class="ladder-num">${formatSize(t.size_bytes)}</td>
+            </tr>
+        `;
+    }).join('');
+    return `
+        <div class="ladder-panel">
+            <div class="ladder-title">ABR ladder — ${ladder.codec.toUpperCase()}</div>
+            <table class="ladder-table">
+                <thead>
+                    <tr>
+                        <th>Tier</th>
+                        <th>Dim</th>
+                        <th>Target</th>
+                        <th>Actual</th>
+                        <th>Budget usage</th>
+                        <th>Size</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>
+    `;
 }
 
 // --- Jobs ---
@@ -936,17 +1055,27 @@ function updateStagesTable(row, stages) {
         const fill = tr.querySelector('.stage-bar-fill');
         fill.style.width = s.percent.toFixed(1) + '%';
         fill.className = 'stage-bar-fill';
-        if (s.status === 'done')   fill.classList.add('stage-fill-done');
-        if (s.status === 'failed') fill.classList.add('stage-fill-failed');
+        if (s.status === 'done')    fill.classList.add('stage-fill-done');
+        if (s.status === 'failed')  fill.classList.add('stage-fill-failed');
+        if (s.status === 'skipped') fill.classList.add('stage-fill-skipped');
         tr.querySelector('.stage-pct').textContent =
-            s.status === 'pending' ? '—' : s.percent.toFixed(0) + '%';
+            s.status === 'pending' ? '—'
+            : s.status === 'skipped' ? 'reused'
+            : s.percent.toFixed(0) + '%';
     }
 }
 
 function updateJobRow(row, j) {
     const status = row.querySelector('.job-status');
-    status.className = 'job-status status-' + j.status;
-    status.textContent = j.status.toUpperCase();
+    // Distinct badge for spot-interrupt failures — amber instead of
+    // generic red, since this failure mode is expected and retryable.
+    if (j.status === 'failed' && j.failure_reason === 'spot_interrupted') {
+        status.className = 'job-status status-spot-terminated';
+        status.textContent = 'SPOT TERMINATED';
+    } else {
+        status.className = 'job-status status-' + j.status;
+        status.textContent = j.status.toUpperCase();
+    }
     row.querySelector('.job-progress').textContent = j.progress || '';
 
     const err = row.querySelector('.job-error');
@@ -957,8 +1086,9 @@ function updateJobRow(row, j) {
         err.style.display = 'none';
     }
 
-    // Cancel action — only render while cancellable.
     const actions = row.querySelector('.job-actions');
+
+    // Cancel action — only render while cancellable.
     let cancelEl = actions.querySelector('.job-cancel');
     const cancellable = j.status === 'queued' || j.status === 'running';
     if (cancellable && !cancelEl) {
@@ -969,6 +1099,47 @@ function updateJobRow(row, j) {
         actions.appendChild(cancelEl);
     } else if (!cancellable && cancelEl) {
         cancelEl.remove();
+    }
+
+    // Retry action — for both cloud and local failed/cancelled jobs.
+    // Cloud: resumes from S3 staging prefix. Local: picks up the
+    // per-clip work dir under TMPDIR, which survived the failure.
+    let retryEl = actions.querySelector('.job-retry');
+    const retryable = (j.status === 'failed' || j.status === 'cancelled') &&
+                      j.config && j.config.target;
+    if (retryable && !retryEl) {
+        retryEl = document.createElement('span');
+        retryEl.className = 'job-retry';
+        retryEl.textContent = 'Retry';
+        retryEl.title = 'Resume from prior S3 staging — skips upload and already-completed variants.';
+        retryEl.setAttribute('onclick', `retryJob('${j.id}')`);
+        actions.appendChild(retryEl);
+    } else if (!retryable && retryEl) {
+        retryEl.remove();
+    }
+
+    // Simulate-interrupt test action — running jobs only.
+    //   cloud: needs cloud_job_id so the S3 sentinel points at the
+    //          right prefix; triggers the remote's spot-interrupt
+    //          code path within ~5s
+    //   local: docker kill on the worker container (SIGKILL, so no
+    //          graceful cleanup — matches a real reclaim)
+    let simEl = actions.querySelector('.job-simulate');
+    const simulatable = j.status === 'running' && j.config && (
+        (j.config.target === 'cloud' && j.cloud_job_id) ||
+        j.config.target === 'local'
+    );
+    if (simulatable && !simEl) {
+        simEl = document.createElement('span');
+        simEl.className = 'job-simulate';
+        simEl.textContent = 'Simulate interrupt';
+        simEl.title = j.config.target === 'cloud'
+            ? 'Drops a sentinel object in S3 so the remote triggers its spot-interrupt code path within ~5s.'
+            : 'docker kill on the local worker (SIGKILL). In-flight variant encodes leave no .done sidecar; Retry picks up from completed ones.';
+        simEl.setAttribute('onclick', `simulateInterrupt('${j.id}')`);
+        actions.appendChild(simEl);
+    } else if (!simulatable && simEl) {
+        simEl.remove();
     }
 
     // Per-file header — only visible for multi-file jobs once a file
@@ -1032,6 +1203,53 @@ async function cancelJob(id) {
         if (!res.ok) alert('Cancel failed: ' + res.status);
     } catch (e) {
         alert('Cancel failed: ' + e);
+    }
+}
+
+async function simulateInterrupt(id) {
+    const confirmed = await showDialog(
+        'Simulate spot interrupt',
+        'Trigger the full spot-interrupt code path on the remote (test only). The remote will rsync /work/tmp + /work/output to S3, write SPOT INTERRUPTION to _FAILED, and terminate. You can then click Retry to test the resume flow.',
+        [
+            { label: 'Cancel', value: false, class: 'btn-secondary' },
+            { label: 'Simulate', value: true, class: 'btn-danger' }
+        ]
+    );
+    if (!confirmed) return;
+    try {
+        const res = await fetch('/api/jobs/' + id + '/simulate-interrupt', { method: 'POST' });
+        if (!res.ok) {
+            const text = await res.text();
+            showToast('Simulate failed: ' + text, 'error');
+            return;
+        }
+        showToast('Sentinel written — remote will trigger interrupt in ~5s', 'success');
+    } catch (e) {
+        showToast('Simulate failed: ' + e, 'error');
+    }
+}
+
+async function retryJob(id) {
+    const confirmed = await showDialog(
+        'Retry job',
+        'Resume from this job\'s S3 staging? Already-completed variants will be skipped; partial files (not marked .done) will be re-encoded.',
+        [
+            { label: 'Cancel', value: false, class: 'btn-secondary' },
+            { label: 'Retry', value: true, class: 'btn-primary' }
+        ]
+    );
+    if (!confirmed) return;
+    try {
+        const res = await fetch('/api/jobs/' + id + '/retry', { method: 'POST' });
+        if (!res.ok) {
+            const text = await res.text();
+            showToast('Retry failed: ' + text, 'error');
+            return;
+        }
+        showToast('Retry submitted — resuming from prior S3 staging', 'success');
+        switchTab('jobs');
+    } catch (e) {
+        showToast('Retry failed: ' + e, 'error');
     }
 }
 
@@ -1475,6 +1693,8 @@ async function forceReencode(fileName) {
         padding: document.getElementById('padding').value,
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         cpu_arch: document.getElementById('cpu-arch').value,
+        use_spot: document.getElementById('use-spot').checked,
+        simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
         force_reencode: true
     };
 
@@ -1706,10 +1926,40 @@ async function loadVersion() {
         const res = await fetch('/api/version');
         if (!res.ok) return;
         const j = await res.json();
-        const v = j.version || 'dev';
-        const el = document.getElementById('about-version');
-        if (el) el.textContent = v;
-    } catch (e) { /* offline — leave "—" */ }
+        const local = j.local || {};
+        const cloud = j.cloud || {};
+
+        document.getElementById('about-local-version').textContent = local.version || 'dev';
+        document.getElementById('about-local-sha').textContent = local.revision || 'unknown';
+
+        document.getElementById('about-cloud-image').textContent = j.cloud_image || '(not configured)';
+        if (cloud.error) {
+            document.getElementById('about-cloud-version').textContent = '(' + cloud.error + ')';
+            document.getElementById('about-cloud-sha').textContent = '—';
+            document.getElementById('about-cloud-digest').textContent = '—';
+        } else {
+            document.getElementById('about-cloud-version').textContent = cloud.version || '—';
+            document.getElementById('about-cloud-sha').textContent = cloud.revision || '—';
+            document.getElementById('about-cloud-digest').textContent = cloud.digest || '—';
+        }
+
+        // Drift badge — local vs cloud commit. Fires on mismatch so the
+        // user knows the next cloud encode won't match what they've
+        // been testing locally.
+        const badge = document.getElementById('about-drift-badge');
+        if (local.revision && cloud.revision && !cloud.error) {
+            if (local.revision === cloud.revision) {
+                badge.className = 'about-match';
+                badge.textContent = 'in sync with cloud';
+            } else {
+                badge.className = 'about-drift';
+                badge.textContent = 'drifted — cloud is ' + cloud.revision;
+            }
+            badge.style.display = 'inline-block';
+        } else {
+            badge.style.display = 'none';
+        }
+    } catch (e) { /* offline — leave defaults */ }
 }
 </script>
 </body>

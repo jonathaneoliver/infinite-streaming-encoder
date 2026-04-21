@@ -25,6 +25,11 @@ func stripANSI(s string) string {
 var (
 	planMarkerRe  = regexp.MustCompile(`^\[\[ENCODER-PLAN (.+)\]\]$`)
 	stageMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=([0-9.]+)\]\]$`)
+	// Cloud cli_cloud.py prints its computed S3 job id in the plan
+	// header (`  job_id:         20260420T203910Z-1`). That's the prefix
+	// under `s3://.../jobs/` — we capture it so the retry endpoint can
+	// point at the right prior staging.
+	cloudJobIDRe = regexp.MustCompile(`^\s+job_id:\s+(\S+)\s*$`)
 	// ENCODER-FILE signals the start of a per-file encode within a
 	// multi-file job. Emitted by the Go server for local encodes (one
 	// worker per file) and by the remote userdata bash loop for cloud
@@ -127,6 +132,18 @@ func (j *Job) parseMarker(line string) bool {
 		j.startFile(strings.TrimSpace(m[3]), idx, total)
 		return true
 	}
+	// Non-consuming matches: capture sideband info but still let the
+	// line flow into the raw log buffer (return false).
+	if m := cloudJobIDRe.FindStringSubmatch(line); m != nil {
+		j.mu.Lock()
+		j.CloudJobID = m[1]
+		j.mu.Unlock()
+	}
+	if strings.Contains(line, "SPOT INTERRUPTION") {
+		j.mu.Lock()
+		j.FailureReason = "spot_interrupted"
+		j.mu.Unlock()
+	}
 	return false
 }
 
@@ -208,6 +225,21 @@ type JobConfig struct {
 	// Empty defaults to intel. Ignored for local encodes (which always
 	// run on the host's native architecture).
 	CpuArch string `json:"cpu_arch,omitempty"`
+	// UseSpot controls EC2 purchasing mode for cloud encodes. Pointer
+	// so `omitempty` works and an unset value lets cli_cloud.py apply
+	// its env-var default (USE_SPOT=true). Ignored for local encodes.
+	UseSpot *bool `json:"use_spot,omitempty"`
+	// ResumeFromJobID points at a prior failed job whose S3 staging
+	// (inputs, mezzanines, completed variants) should be reused. The
+	// remote user-data pre-warms /work from that prefix, and
+	// cli_local.py --resume-package-from /work/output skips variants
+	// it already finds there.
+	ResumeFromJobID string `json:"resume_from_job_id,omitempty"`
+	// SimulateInterruptAfterS is a test hook: when >0, the remote
+	// user-data schedules a synthetic spot-interrupt after this many
+	// seconds. Lets us exercise the Retry flow without waiting for a
+	// real AWS reclaim.
+	SimulateInterruptAfterS int `json:"simulate_interrupt_after_s,omitempty"`
 }
 
 type StageProgress struct {
@@ -251,6 +283,16 @@ type Job struct {
 	// StagesHistory holds the finished files' stages so end-of-job
 	// timing can show every phase that ran, not just the last file's.
 	StagesHistory []FileStages `json:"stages_history,omitempty"`
+
+	// CloudJobID is the timestamp-based id cli_cloud.py uses for its
+	// S3 prefix (e.g. 20260420T203910Z-1). Captured from the plan
+	// header so the Retry flow can point resume_from_job_id at the
+	// right s3://.../jobs/<X>/ prefix. Empty for local or old jobs.
+	CloudJobID string `json:"cloud_job_id,omitempty"`
+
+	// FailureReason categorises why a failed job failed, for UI
+	// styling. Today: "spot_interrupted" | "" (generic).
+	FailureReason string `json:"failure_reason,omitempty"`
 
 	mu        sync.Mutex
 	logLines  []string
@@ -581,17 +623,30 @@ func (m *Manager) Cancel(id string) bool {
 		return true
 	}
 
-	// Graceful stop runs in the background so the UI's POST returns
-	// immediately and the Cancel action feels instant. `docker stop
-	// --time 30` sends SIGTERM, waits up to 30s for the container to
-	// exit, then SIGKILLs if it didn't. boto3 TerminateInstances +
-	// CancelSpotInstanceRequests typically complete in 2-5s, so the
-	// budget is generous. After stop, `docker rm` cleans up the
-	// container record so runFileContainer's reattach-if-exists path
-	// can't pick it up on a subsequent retry.
+	// Stop strategy differs by target:
+	//
+	//   cloud: `docker stop --time 30` (SIGTERM + 30s grace). The
+	//   Python process inside has a SIGTERM handler that calls
+	//   terminate_job() to release the EC2 instance + spot request;
+	//   that typically completes in 2-5s, so 30s is generous.
+	//
+	//   local: `docker kill` (SIGKILL, immediate). There's no cloud
+	//   cleanup to run, and a graceful stop doesn't help anyway —
+	//   cli_local.py blocks in subprocess.run(ffmpeg) so its SIGTERM
+	//   handler (if any) can't fire until ffmpeg exits, which is
+	//   exactly the thing Cancel is trying to interrupt. SIGKILL to
+	//   PID 1 terminates the container and all children at once.
+	cancelMode := "stop"
+	if job.Config.Target == TargetLocal {
+		cancelMode = "kill"
+	}
 	go func() {
 		for _, name := range names {
-			exec.Command("docker", "stop", "--time", "30", name).Run()
+			if cancelMode == "kill" {
+				exec.Command("docker", "kill", name).Run()
+			} else {
+				exec.Command("docker", "stop", "--time", "30", name).Run()
+			}
 			exec.Command("docker", "rm", name).Run()
 		}
 	}()
@@ -909,6 +964,16 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	if cfg.Target == TargetCloud && cfg.CpuArch != "" {
 		args = append(args, "--cpu-arch", cfg.CpuArch)
 	}
+	if cfg.Target == TargetCloud && cfg.UseSpot != nil && !*cfg.UseSpot {
+		args = append(args, "--no-spot")
+	}
+	if cfg.Target == TargetCloud && cfg.ResumeFromJobID != "" {
+		args = append(args, "--resume-from-job-id", cfg.ResumeFromJobID)
+	}
+	if cfg.Target == TargetCloud && cfg.SimulateInterruptAfterS > 0 {
+		args = append(args, "--simulate-interrupt-after",
+			strconv.Itoa(cfg.SimulateInterruptAfterS))
+	}
 	return args
 }
 
@@ -965,6 +1030,16 @@ func (cfg *JobConfig) cloudBatchArgs(sourceDir, outputDir string, filenames []st
 	}
 	if cfg.CpuArch != "" {
 		args = append(args, "--cpu-arch", cfg.CpuArch)
+	}
+	if cfg.UseSpot != nil && !*cfg.UseSpot {
+		args = append(args, "--no-spot")
+	}
+	if cfg.ResumeFromJobID != "" {
+		args = append(args, "--resume-from-job-id", cfg.ResumeFromJobID)
+	}
+	if cfg.SimulateInterruptAfterS > 0 {
+		args = append(args, "--simulate-interrupt-after",
+			strconv.Itoa(cfg.SimulateInterruptAfterS))
 	}
 	return args
 }
@@ -1162,6 +1237,12 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 		"-v", m.HostSourceDir + ":" + m.SourceDir + ":ro",
 		"-v", m.HostOutputDir + ":" + m.OutputDir,
 		"-v", m.HostTmpDir + ":" + m.TmpDir,
+		// Pin TMPDIR to the mounted host tmp so cli_local.py's per-clip
+		// work dir (at TMPDIR/encode_<stem>/) persists across worker
+		// container lifetimes. That's what makes local Retry reuse
+		// prior mezzanines / variants — the work_dir is on the host
+		// filesystem, not inside the ephemeral container layer.
+		"-e", "TMPDIR=" + m.TmpDir,
 		"--entrypoint", script,
 	}
 	// Cloud jobs drive AWS from inside the worker; pass the credentials

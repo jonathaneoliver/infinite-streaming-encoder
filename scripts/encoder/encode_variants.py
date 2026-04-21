@@ -21,7 +21,7 @@ from encoder.ladder import (
     Tier,
     resolve_bitrate,
 )
-from encoder.progress import run_ffmpeg_with_progress
+from encoder.progress import emit_stage, run_ffmpeg_with_progress
 
 
 def variant_stage_key(codec: str, tier_name: str) -> str:
@@ -173,7 +173,23 @@ def encode_variant(
 
     if not out_path.is_file():
         raise EncodeError(f"encode produced no output: {out_path}")
+    # Atomic completion marker: a sibling file named <out>.done whose
+    # body is the MP4's final byte size. Resume logic (resume.discover)
+    # only counts variants with a matching .done sidecar, so a file
+    # rsynced mid-write (e.g. during spot interrupt) stays flagged as
+    # partial and gets re-encoded instead of silently producing a
+    # corrupted output on retry.
+    _write_done_marker(out_path)
     return out_path
+
+
+def _write_done_marker(path: Path) -> None:
+    """Write `<path>.done` atomically with the source file's size."""
+    size = path.stat().st_size
+    marker = path.with_suffix(path.suffix + ".done")
+    tmp = marker.with_suffix(marker.suffix + ".tmp")
+    tmp.write_text(f"{size}\n")
+    tmp.rename(marker)
 
 
 def codec_list(selection: str) -> list[str]:
@@ -207,5 +223,35 @@ def encode_all(
     outputs: list[Path] = []
     for tier in tiers:
         for codec in codecs:
+            out = _variant_path(ctx.output_dir, codec, tier)
+            # Skip variants that are already fully encoded — the .done
+            # sidecar's size must match the MP4's current size, so a
+            # file rsynced mid-write (common after spot interrupt)
+            # doesn't trigger a false skip.
+            if _is_complete(out):
+                print(f"[resume] skipping {codec} {tier.name} "
+                      f"— already complete ({out.name})", flush=True)
+                # Emit "skipped" so the UI flips this variant's bar to
+                # the distinct reused-style (gray hash pattern + "reused"
+                # label) rather than the green done-style it'd get from
+                # a fresh encode. Makes it obvious at a glance which
+                # stages were picked up from the prior run.
+                emit_stage(variant_stage_key(codec, tier.name), "skipped", 100.0)
+                outputs.append(out)
+                continue
             outputs.append(encode_variant(ctx, codec, tier, overrides[codec]))
     return outputs
+
+
+def _is_complete(mp4: Path) -> bool:
+    """Matches resume._is_complete — duplicated to avoid a circular import
+    (resume imports ladder; encode_variants imports ladder via ffprobe)."""
+    if not mp4.is_file() or mp4.stat().st_size == 0:
+        return False
+    marker = mp4.with_suffix(mp4.suffix + ".done")
+    if not marker.is_file():
+        return False
+    try:
+        return int(marker.read_text().strip()) == mp4.stat().st_size
+    except (OSError, ValueError):
+        return False

@@ -164,15 +164,22 @@ def download_outputs(s3_prefix: str, local_dir: Path,
     return count
 
 
-def download_user_data_log(s3_prefix: str, local_dir: Path) -> None:
-    """Fetch the remote instance's user-data.log (best-effort)."""
+def download_user_data_log(s3_prefix: str, local_dir: Path) -> bool:
+    """Fetch the remote instance's user-data.log (best-effort).
+
+    Returns True iff the file was successfully downloaded locally.
+    Callers use the return value to decide whether S3 staging can be
+    fully deleted (local copy is safe) or needs its logs/ prefix
+    retained (local copy missing — only diagnostic evidence is in S3).
+    """
     bucket, base_key = parse_s3_uri(s3_prefix.rstrip("/"))
     key = f"{base_key}/logs/user-data.log"
     local_dir.mkdir(parents=True, exist_ok=True)
     try:
         s3_client().download_file(bucket, key, str(local_dir / "user-data.log"))
+        return True
     except ClientError:
-        pass
+        return False
 
 
 def remove_staging(s3_prefix: str) -> None:

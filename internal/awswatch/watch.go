@@ -20,6 +20,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -32,6 +33,11 @@ type Config struct {
 	// When true, stale instances are force-terminated via
 	// encoder.cloud.cleanup. When false, we only log warnings.
 	AutoTerminateStale bool
+	// S3 staging prefix retention for FAILED jobs — prefixes whose
+	// _FAILED marker is older than this get garbage-collected. Gives
+	// the Retry UI a runway to resume from prior work without letting
+	// staging accumulate indefinitely. Zero disables.
+	FailedStagingMaxAge time.Duration
 }
 
 type inventoryDoc struct {
@@ -83,7 +89,14 @@ func runCheck(cfg Config) {
 		return
 	}
 	if inv.Summary.RunningInstances == 0 && inv.Summary.OrphanVolumes == 0 {
-		return // quiet when there's nothing to report
+		// Quiet — but still run the staging GC since failed prefixes
+		// aren't reflected in the inventory summary.
+		if cfg.FailedStagingMaxAge > 0 {
+			if err := gcFailedStaging(cfg.FailedStagingMaxAge); err != nil {
+				log.Printf("awswatch: gc_failed_staging failed: %v", err)
+			}
+		}
+		return
 	}
 
 	log.Printf("awswatch: %d running, %d orphan volumes, ~$%.2f/hr",
@@ -113,6 +126,49 @@ func runCheck(cfg Config) {
 			log.Printf("awswatch: terminate failed for %s: %v", label, err)
 		}
 	}
+
+	// GC S3 staging for failed jobs past their retention window.
+	// Runs every tick; the Python side cheaply skips prefixes without
+	// a _FAILED marker, so this is idempotent and low-cost.
+	if cfg.FailedStagingMaxAge > 0 {
+		if err := gcFailedStaging(cfg.FailedStagingMaxAge); err != nil {
+			log.Printf("awswatch: gc_failed_staging failed: %v", err)
+		}
+	}
+}
+
+func gcFailedStaging(maxAge time.Duration) error {
+	args := []string{
+		"-m", "encoder.cloud.cleanup", "--json",
+		"--gc-failed-staging",
+		"--max-age-s", strconv.Itoa(int(maxAge.Seconds())),
+	}
+	cmd := exec.Command("python3", args...)
+	cmd.Env = os.Environ()
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return &pyError{module: "cleanup", code: ee.ExitCode(),
+				stderr: strings.TrimSpace(string(ee.Stderr))}
+		}
+		return err
+	}
+	// Only log when something was actually deleted — keeps the
+	// happy-path quiet.
+	var doc struct {
+		Actions []struct {
+			Action string `json:"action"`
+			ID     string `json:"id"`
+		} `json:"actions"`
+	}
+	if json.Unmarshal(out, &doc) == nil {
+		for _, a := range doc.Actions {
+			if a.Action == "deleted" {
+				log.Printf("awswatch: gc staged %s", a.ID)
+			}
+		}
+	}
+	return nil
 }
 
 func fetchInventory() (*inventoryDoc, error) {

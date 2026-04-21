@@ -1,14 +1,26 @@
 FROM golang:1.22-alpine AS builder
 ARG VERSION=dev
+ARG GIT_SHA=unknown
 WORKDIR /build
 COPY go.mod .
 COPY cmd/ cmd/
 COPY internal/ internal/
-RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /encoder ./cmd/server
+RUN CGO_ENABLED=0 go build \
+    -ldflags "-X main.version=${VERSION} -X main.gitSha=${GIT_SHA}" \
+    -o /encoder ./cmd/server
 
 FROM python:3.12-slim
 
 ARG TARGETARCH
+ARG VERSION=dev
+ARG GIT_SHA=unknown
+
+# OCI labels let the SPA's About tab query the registry (GHCR) and
+# report the cloud image's version + commit SHA alongside the local
+# binary's, so the user can see when the two have drifted.
+LABEL org.opencontainers.image.version="${VERSION}"
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+LABEL org.opencontainers.image.source="https://github.com/jonathaneoliver/Encoder"
 
 # OS packages: encoding toolchain + CA certs + fonts for drawtext burn-ins.
 RUN apt-get update && apt-get install -y --no-install-recommends \

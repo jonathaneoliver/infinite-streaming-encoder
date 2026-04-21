@@ -178,24 +178,42 @@ def _s3_bucket_from_env() -> str | None:
 
 
 def _delete_s3_prefix(bucket: str, prefix: str, report: CleanupReport,
-                      job_id: str | None) -> None:
-    """Recursively delete every object under prefix. Does nothing if empty."""
+                      job_id: str | None, keep_logs: bool = False) -> None:
+    """Recursively delete every object under prefix. Does nothing if empty.
+
+    When `keep_logs=True`, objects under `<prefix>logs/` and the
+    `<prefix>_FAILED` marker are skipped — the idea is to drop the
+    expensive stuff (multi-GB inputs and partial outputs) while
+    preserving the kilobyte-scale evidence the user needs to debug.
+    """
     s3 = s3_client()
     paginator = s3.get_paginator("list_objects_v2")
     total = 0
+    logs_prefix = f"{prefix}logs/"
+    failed_marker = f"{prefix}_FAILED"
     try:
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             contents = page.get("Contents", [])
             if not contents:
                 continue
-            keys = [{"Key": obj["Key"]} for obj in contents]
+            keys = []
+            for obj in contents:
+                key = obj["Key"]
+                if keep_logs and (key.startswith(logs_prefix) or key == failed_marker):
+                    continue
+                keys.append({"Key": key})
+            if not keys:
+                continue
             s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
             total += len(keys)
         if total > 0:
+            detail = f"{total} object(s)"
+            if keep_logs:
+                detail += " (kept logs/ + _FAILED)"
             report.actions.append(ResourceAction(
                 kind="s3_prefix", id=f"s3://{bucket}/{prefix}",
                 job_id=job_id,
-                action="deleted", detail=f"{total} object(s)",
+                action="deleted", detail=detail,
             ))
     except ClientError as e:
         report.actions.append(ResourceAction(
@@ -208,7 +226,7 @@ def _delete_s3_prefix(bucket: str, prefix: str, report: CleanupReport,
 # Public entry points
 # ---------------------------------------------------------------------------
 
-def terminate_job(job_id: str, keep_s3: bool = False) -> CleanupReport:
+def terminate_job(job_id: str, keep_s3: "bool | str" = False) -> CleanupReport:
     """Tear down one job's AWS footprint. Safe for atexit handlers.
 
     Order: terminate instances first (this frees attached EBS as long
@@ -216,11 +234,15 @@ def terminate_job(job_id: str, keep_s3: bool = False) -> CleanupReport:
     then cancel any still-open spot request, then delete any orphaned
     volumes (shouldn't exist post-terminate, but defensive), then S3.
 
-    `keep_s3=True` skips the S3 prefix deletion. Useful on failures:
-    we still want to stop EC2 billing, but the remote's user-data.log
-    under `jobs/<id>/logs/user-data.log` is often the only diagnostic
-    evidence. The Emergency Clear button can tidy it up later once
-    the user has the answer they need.
+    `keep_s3` controls staging cleanup:
+
+      - False / "none"  — delete everything under jobs/<id>/
+      - True / "all"    — keep everything (legacy fail-open behaviour)
+      - "logs"          — delete inputs + partial outputs but KEEP
+                          logs/ and the _FAILED marker. Preferred for
+                          failed jobs: you keep the ~KB of diagnostic
+                          evidence but drop the GB-scale video data
+                          that makes S3 storage expensive.
     """
     report = CleanupReport(scope=f"job:{job_id}")
     ec2 = ec2_client()
@@ -234,12 +256,76 @@ def terminate_job(job_id: str, keep_s3: bool = False) -> CleanupReport:
     orphan_volumes = _describe_app_volumes(ec2, job_id, only_orphans=True)
     _delete_volumes(ec2, orphan_volumes, report)
 
-    if keep_s3:
+    # Normalise keep_s3 into one of: "none" | "logs" | "all".
+    if keep_s3 is True:
+        mode = "all"
+    elif keep_s3 is False:
+        mode = "none"
+    else:
+        mode = keep_s3  # string caller passed through
+
+    if mode == "all":
         return report
 
     bucket = _s3_bucket_from_env()
     if bucket:
-        _delete_s3_prefix(bucket, f"jobs/{job_id}/", report, job_id)
+        _delete_s3_prefix(bucket, f"jobs/{job_id}/", report, job_id,
+                          keep_logs=(mode == "logs"))
+    return report
+
+
+def gc_failed_staging(max_age_s: int = 3600) -> CleanupReport:
+    """Delete S3 staging for failed jobs whose _FAILED marker is older
+    than `max_age_s` seconds.
+
+    Called on an interval from the Go awswatch goroutine. Gives the
+    Retry UI a recovery window (default 1h) during which the prior
+    inputs + mezzanines + completed variants stay on S3; after that
+    the prefix is reaped to keep storage cost bounded.
+
+    Only touches prefixes that contain a `_FAILED` object — a still-
+    running or successful (`_DONE`) job is skipped regardless of age.
+    """
+    import time as _time
+
+    report = CleanupReport(scope=f"gc_failed_staging:{max_age_s}s")
+    bucket = _s3_bucket_from_env()
+    if not bucket:
+        return report
+    s3 = s3_client()
+
+    now = _time.time()
+    paginator = s3.get_paginator("list_objects_v2")
+    try:
+        # List one level under jobs/ so we see every job's _FAILED marker
+        # without pulling the full object list across every prefix.
+        for page in paginator.paginate(Bucket=bucket, Prefix="jobs/",
+                                        Delimiter="/"):
+            for cp in page.get("CommonPrefixes", []):
+                prefix = cp["Prefix"]  # "jobs/<id>/"
+                job_id = prefix.rstrip("/").split("/")[-1]
+                failed_key = f"{prefix}_FAILED"
+                try:
+                    head = s3.head_object(Bucket=bucket, Key=failed_key)
+                except ClientError as e:
+                    code = e.response.get("Error", {}).get("Code", "")
+                    if code in ("404", "NoSuchKey", "NotFound"):
+                        continue  # not failed — nothing to GC
+                    report.actions.append(ResourceAction(
+                        kind="s3_prefix",
+                        id=f"s3://{bucket}/{prefix}",
+                        job_id=job_id, action="failed", detail=str(e),
+                    ))
+                    continue
+                age = now - head["LastModified"].timestamp()
+                if age < max_age_s:
+                    continue
+                _delete_s3_prefix(bucket, prefix, report, job_id)
+    except ClientError as e:
+        report.actions.append(ResourceAction(
+            kind="s3_prefix", id=f"s3://{bucket}/jobs/",
+            job_id=None, action="failed", detail=str(e),
+        ))
     return report
 
 
@@ -394,6 +480,11 @@ def _main() -> int:
     group.add_argument("--backfill-tags", action="store_true",
                        help="add Application=encoder-app to resources already "
                             "tagged with JobId (one-shot pre-phase-1 cleanup)")
+    group.add_argument("--gc-failed-staging", action="store_true",
+                       help="delete S3 staging for failed jobs whose _FAILED "
+                            "marker is older than --max-age-s")
+    p.add_argument("--max-age-s", type=int, default=3600,
+                   help="age threshold for --gc-failed-staging (default 3600)")
     p.add_argument("--json", action="store_true",
                    help="print machine-readable JSON instead of a summary")
     args = p.parse_args()
@@ -402,6 +493,8 @@ def _main() -> int:
         report = sweep_all()
     elif args.backfill_tags:
         report = backfill_tags()
+    elif args.gc_failed_staging:
+        report = gc_failed_staging(max_age_s=args.max_age_s)
     else:
         report = terminate_job(args.job_id)
 
