@@ -281,13 +281,19 @@ def main() -> int:
 
     # On resume, clear the prior run's flip-once markers so the local
     # poller doesn't immediately see a stale _FAILED / _DONE from the
-    # previous attempt and decide this one's already over.
+    # previous attempt and decide this one's already over. Also wipe
+    # the prior user-data.log — if we leave it, the local _LogTailer
+    # starts tailing from byte 0 of the old run's log and replays
+    # every STAGE marker from that run into this one's UI, making the
+    # retry look like it resurrected the prior state. The remote will
+    # rewrite the log from scratch anyway.
     if args.resume_from_job_id:
         print(f"  resuming from:  s3://{s3_bucket}/jobs/{job_id}")
         s3 = s3_client()
-        for marker in ("_FAILED", "_DONE", "_SIMULATE_INTERRUPT"):
+        for key in ("_FAILED", "_DONE", "_SIMULATE_INTERRUPT",
+                    "logs/user-data.log"):
             try:
-                s3.delete_object(Bucket=s3_bucket, Key=f"jobs/{job_id}/{marker}")
+                s3.delete_object(Bucket=s3_bucket, Key=f"jobs/{job_id}/{key}")
             except Exception:
                 pass
 
