@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
-"""Cloud encode entry point (Python replacement for cloud_encode.sh).
+"""[DEPRECATED] Legacy cloud encode — one EC2 spot instance per job
+via boto3 run_instances.
 
-Flow:
+Superseded by the AWS Batch + Step Functions path in cli_batch.py +
+infra/terraform/. This module stays until that path is verified
+end-to-end in a live AWS account (tracked in the follow-up "delete
+legacy cloud target" issue); after that it'll be removed along with
+cloud/launch.py, cloud/userdata.py, cloud/arch.py, and the awswatch
+EC2 inventory plumbing.
+
+Flow (legacy):
   1. Preflight: AWS credentials OK, GHCR_PAT set, AMI resolved
   2. Upload inputs (size-idempotent) to s3://$S3_BUCKET/jobs/$JOB_ID/input/
   3. Render user-data bash script with safely-quoted args
