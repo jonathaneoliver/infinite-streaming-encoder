@@ -101,6 +101,18 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .stage-bar-fill.stage-fill-skipped { background: repeating-linear-gradient(45deg, #555 0 6px, #444 6px 12px); }
 .stage-skipped { opacity: 0.7; }
 .stage-skipped .stage-label::after { content: ' (reused)'; color: #888; font-size: 0.75rem; font-style: italic; }
+/* Chunk grid: one cell per encode chunk of a variant, so the parallel
+   fan-out is visible at a glance. Colours match the stage-bar palette. */
+.chunk-grid { display: flex; flex-wrap: wrap; gap: 2px; align-items: center; }
+.chunk-cell { width: 11px; height: 11px; border-radius: 2px; background: #1a2a4a; }
+.chunk-cell.chunk-running { background: #4361ee; animation: chunkpulse 1s ease-in-out infinite; }
+.chunk-cell.chunk-done { background: #06d6a0; }
+.chunk-cell.chunk-failed { background: #ef476f; }
+@keyframes chunkpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.chunk-concat { margin-left: 7px; color: #667; font-size: 0.85rem; line-height: 1; }
+.chunk-concat.concat-running { color: #4361ee; }
+.chunk-concat.concat-done { color: #06d6a0; }
+.chunk-concat.concat-failed { color: #ef476f; }
 
 /* --- AWS tab --- */
 .tab-aws { color: #ffa94d; }
@@ -1037,6 +1049,41 @@ function jobRowHtml(j) {
     `;
 }
 
+// Match a per-chunk encode stage key: encode:<codec>:<tier>:chunk<N>.
+const CHUNK_KEY_RE = /^encode:([^:]+):([^:]+):chunk(\d+)$/;
+// Match the per-variant concat stage key: concat:<codec>:<tier>.
+const CONCAT_KEY_RE = /^concat:([^:]+):([^:]+)$/;
+
+// Fold the flat stage list into display rows: normal stages pass through,
+// but per-chunk encode stages for one (codec, tier) collapse into a single
+// grid row (with the matching concat stage as the join indicator), so a
+// job with 12 variants x N chunks stays readable.
+function groupStagesForDisplay(stages) {
+    const rows = [];
+    const groupIndex = {};   // "codec:tier" -> rows[] index
+    for (const s of stages) {
+        const cm = CHUNK_KEY_RE.exec(s.key);
+        if (cm) {
+            const gk = cm[1] + ':' + cm[2];
+            if (!(gk in groupIndex)) {
+                groupIndex[gk] = rows.length;
+                rows.push({ kind: 'chunks', codec: cm[1], tier: cm[2],
+                            cells: [], concat: null });
+            }
+            rows[groupIndex[gk]].cells.push({ key: s.key, index: +cm[3], s });
+            continue;
+        }
+        const nm = CONCAT_KEY_RE.exec(s.key);
+        if (nm && (nm[1] + ':' + nm[2]) in groupIndex) {
+            rows[groupIndex[nm[1] + ':' + nm[2]]].concat = s;
+            continue;
+        }
+        rows.push({ kind: 'stage', s });
+    }
+    for (const r of rows) if (r.kind === 'chunks') r.cells.sort((a, b) => a.index - b.index);
+    return rows;
+}
+
 function updateStagesTable(row, stages) {
     const table = row.querySelector('.stages-table');
     const tbody = table.querySelector('tbody');
@@ -1046,35 +1093,67 @@ function updateStagesTable(row, stages) {
     }
     table.style.display = '';
 
-    // Rebuild the tbody only when the set of rows changed (typically
-    // only once per job, when the first [[ENCODER-PLAN]] marker arrives).
-    const wantKeys = stages.map(s => s.key).join(',');
-    if (tbody.dataset.keys !== wantKeys) {
-        tbody.innerHTML = stages.map(s => `
-            <tr data-stage-key="${escapeHtml(s.key)}">
-                <td class="stage-label">${escapeHtml(s.label)}</td>
-                <td class="stage-bar"><div class="stage-bar-track"><div class="stage-bar-fill"></div></div></td>
-                <td class="stage-pct"></td>
-            </tr>
-        `).join('');
-        tbody.dataset.keys = wantKeys;
+    const rows = groupStagesForDisplay(stages);
+    // Structural signature: rebuild the tbody only when the row set changes.
+    const sig = rows.map(r => r.kind === 'chunks'
+        ? 'c:' + r.codec + ':' + r.tier + ':' + r.cells.length + (r.concat ? ':j' : '')
+        : r.s.key).join(',');
+    if (tbody.dataset.sig !== sig) {
+        tbody.innerHTML = rows.map(r => {
+            if (r.kind === 'stage') {
+                return `<tr data-stage-key="${escapeHtml(r.s.key)}">
+                    <td class="stage-label">${escapeHtml(r.s.label)}</td>
+                    <td class="stage-bar"><div class="stage-bar-track"><div class="stage-bar-fill"></div></div></td>
+                    <td class="stage-pct"></td></tr>`;
+            }
+            const cells = r.cells.map(c =>
+                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" title="chunk ${c.index}"></span>`).join('');
+            const concat = r.concat
+                ? `<span class="chunk-concat" data-stage-key="${escapeHtml(r.concat.key)}" title="concat / join">&#8904;</span>` : '';
+            return `<tr data-chunk-group="${escapeHtml(r.codec + ':' + r.tier)}">
+                <td class="stage-label">encode ${escapeHtml(r.codec)} ${escapeHtml(r.tier)}</td>
+                <td class="stage-bar"><div class="chunk-grid">${cells}${concat}</div></td>
+                <td class="stage-pct chunk-count"></td></tr>`;
+        }).join('');
+        tbody.dataset.sig = sig;
     }
 
-    // Per-tick update: fill width, colour, and numeric pct.
-    for (const s of stages) {
-        const tr = tbody.querySelector(`tr[data-stage-key="${s.key}"]`);
+    // Per-tick update.
+    for (const r of rows) {
+        if (r.kind === 'stage') {
+            const s = r.s;
+            const tr = tbody.querySelector(`tr[data-stage-key="${s.key}"]`);
+            if (!tr) continue;
+            tr.className = 'stage-' + s.status;
+            const fill = tr.querySelector('.stage-bar-fill');
+            fill.style.width = s.percent.toFixed(1) + '%';
+            fill.className = 'stage-bar-fill';
+            if (s.status === 'done')    fill.classList.add('stage-fill-done');
+            if (s.status === 'failed')  fill.classList.add('stage-fill-failed');
+            if (s.status === 'skipped') fill.classList.add('stage-fill-skipped');
+            tr.querySelector('.stage-pct').textContent =
+                s.status === 'pending' ? '—'
+                : s.status === 'skipped' ? 'reused'
+                : s.percent.toFixed(0) + '%';
+            continue;
+        }
+        // Chunk group: colour each cell by its chunk's status.
+        const tr = tbody.querySelector(`tr[data-chunk-group="${r.codec + ':' + r.tier}"]`);
         if (!tr) continue;
-        tr.className = 'stage-' + s.status;
-        const fill = tr.querySelector('.stage-bar-fill');
-        fill.style.width = s.percent.toFixed(1) + '%';
-        fill.className = 'stage-bar-fill';
-        if (s.status === 'done')    fill.classList.add('stage-fill-done');
-        if (s.status === 'failed')  fill.classList.add('stage-fill-failed');
-        if (s.status === 'skipped') fill.classList.add('stage-fill-skipped');
-        tr.querySelector('.stage-pct').textContent =
-            s.status === 'pending' ? '—'
-            : s.status === 'skipped' ? 'reused'
-            : s.percent.toFixed(0) + '%';
+        let done = 0;
+        for (const c of r.cells) {
+            const cell = tr.querySelector(`.chunk-cell[data-chunk-key="${c.key}"]`);
+            if (!cell) continue;
+            cell.className = 'chunk-cell' + (c.s.status === 'pending' ? '' : ' chunk-' + c.s.status);
+            if (c.s.status === 'done' || c.s.status === 'skipped') done++;
+        }
+        if (r.concat) {
+            const el = tr.querySelector('.chunk-concat');
+            if (el) el.className = 'chunk-concat' + (r.concat.status === 'pending' ? '' : ' concat-' + r.concat.status);
+        }
+        const joined = r.concat && (r.concat.status === 'done');
+        tr.querySelector('.chunk-count').textContent =
+            joined ? 'joined' : `${done}/${r.cells.length}`;
     }
 }
 
