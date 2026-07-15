@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,37 @@ import (
 	"sync"
 	"time"
 )
+
+// chunkDurationSeconds mirrors scripts/encoder/chunking.DEFAULT_CHUNK_DURATION_S.
+// The control plane computes chunk_count the same way the Python phase does
+// (from the same clip duration) so the two never disagree.
+const chunkDurationSeconds = 30.0
+
+// chunkCountForDuration mirrors chunking.chunk_count: ceil(dur/30), min 1.
+func chunkCountForDuration(durationS float64) int {
+	if durationS <= 0 {
+		return 1
+	}
+	n := int(math.Ceil(durationS/chunkDurationSeconds - 1e-6))
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// probeDurationSeconds shells out to ffprobe (baked into the worker image) to
+// read a clip's duration. On any failure it returns an error and callers fall
+// back to a single whole-clip chunk.
+func probeDurationSeconds(path string) (float64, error) {
+	cmd := exec.Command("ffprobe", "-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+}
 
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\[\?[0-9;]*[a-zA-Z]|\x1b[()][0-9A-B]|\x1b\][^\x07]*\x07|\r`)
 
@@ -1217,7 +1249,18 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 	}
 
 	// Build the state-machine input document.
-	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Codec, job.Config.MaxRes, job.Config.TwoPass)
+	// Probe the source duration to plan chunks. ffprobe runs in the worker
+	// image; if it's unavailable (e.g. local dev), fall back to a single
+	// whole-clip chunk so the pipeline still works.
+	nChunks := 1
+	if durationS, err := probeDurationSeconds(localSrc); err != nil {
+		job.AppendLog(fmt.Sprintf("[cloud-batch] ffprobe failed (%v); encoding %s as one chunk", err, filename))
+	} else {
+		nChunks = chunkCountForDuration(durationS)
+		job.AppendLog(fmt.Sprintf("[cloud-batch] %s: %.1fs → %d chunk(s)", filename, durationS, nChunks))
+	}
+
+	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Codec, job.Config.MaxRes, job.Config.TwoPass, nChunks)
 	inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 	if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 		return fmt.Errorf("write input json: %w", err)
@@ -1267,7 +1310,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 // buildSFNInput renders the JSON doc the state machine expects. Picks
 // which (codec, tier) combinations to fan out over based on the
 // JobConfig's Codec + MaxRes.
-func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool) string {
+func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nChunks int) string {
 	tiers := []string{"360p", "540p", "720p", "1080p", "1440p", "2160p"}
 	if maxRes != "" {
 		for i, t := range tiers {
@@ -1294,10 +1337,23 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool) str
 			variants = append(variants, variant{Codec: c, Tier: t})
 		}
 	}
+	// chunk_indices drives the state machine's inner Map: each variant fans
+	// out one encode job per chunk index, then a concat-variant job joins
+	// them. A single-chunk clip (nChunks == 1) still flows through this path —
+	// chunk 0 covers the whole clip and concat is a passthrough — so there's
+	// no special case. Same for all variants (they share the clip duration).
+	if nChunks < 1 {
+		nChunks = 1
+	}
+	chunkIndices := make([]int, nChunks)
+	for i := range chunkIndices {
+		chunkIndices[i] = i
+	}
 	doc := map[string]any{
-		"s3_input":  s3Input,
-		"s3_prefix": s3Prefix,
-		"variants":  variants,
+		"s3_input":      s3Input,
+		"s3_prefix":     s3Prefix,
+		"variants":      variants,
+		"chunk_indices": chunkIndices,
 		// Injected as the TWO_PASS env var on each variant job by the
 		// state machine's EncodeVariant task (see definition.json.tpl).
 		// String, not bool, so it drops straight into a container env value.

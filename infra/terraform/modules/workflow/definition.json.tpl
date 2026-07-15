@@ -68,7 +68,7 @@
           "StartAt": "Variants",
           "States": {
             "Variants": {
-              "Comment": "Fan out across (codec, tier). 12 variants for h264+hevc x 6 tiers. Batch queue depth caps real parallelism.",
+              "Comment": "Fan out across (codec, tier); each variant fans out again across chunks, then concats. 12 variants x N chunks. Batch queue depth caps real parallelism.",
               "Type": "Map",
               "ItemsPath": "$.variants",
               "MaxConcurrency": 12,
@@ -76,28 +76,67 @@
                 "codec.$": "$$.Map.Item.Value.codec",
                 "tier.$": "$$.Map.Item.Value.tier",
                 "s3_prefix.$": "$.s3_prefix",
-                "two_pass.$": "$.two_pass"
+                "two_pass.$": "$.two_pass",
+                "chunk_indices.$": "$.chunk_indices"
               },
               "ItemProcessor": {
-                "StartAt": "EncodeVariant",
+                "StartAt": "EncodeChunks",
                 "States": {
-                  "EncodeVariant": {
+                  "EncodeChunks": {
+                    "Comment": "One encode job per chunk index, concurrent across chunks. A single-chunk clip runs one job (chunk 0 = whole clip).",
+                    "Type": "Map",
+                    "ItemsPath": "$.chunk_indices",
+                    "ItemSelector": {
+                      "codec.$": "$.codec",
+                      "tier.$": "$.tier",
+                      "s3_prefix.$": "$.s3_prefix",
+                      "two_pass.$": "$.two_pass",
+                      "chunk_index.$": "$$.Map.Item.Value"
+                    },
+                    "ItemProcessor": {
+                      "StartAt": "EncodeChunk",
+                      "States": {
+                        "EncodeChunk": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::batch:submitJob.sync",
+                          "Parameters": {
+                            "JobName.$": "States.Format('var-{}-{}-c{}-{}', $.codec, $.tier, $.chunk_index, $$.Execution.Name)",
+                            "JobQueue": "${job_queue_arn}",
+                            "JobDefinition": "${variant_def}",
+                            "Parameters": {
+                              "codec.$": "$.codec",
+                              "tier.$": "$.tier",
+                              "chunk_index.$": "States.Format('{}', $.chunk_index)",
+                              "s3_mezz.$": "$.s3_prefix",
+                              "s3_out.$": "$.s3_prefix"
+                            },
+                            "ContainerOverrides": {
+                              "Environment": [
+                                { "Name": "TWO_PASS", "Value.$": "$.two_pass" }
+                              ]
+                            }
+                          },
+                          "End": true
+                        }
+                      }
+                    },
+                    "ResultPath": "$.chunk_results",
+                    "Next": "ConcatVariant"
+                  },
+                  "ConcatVariant": {
+                    "Comment": "Join the variant's chunk encodes into the whole variant (stream copy).",
                     "Type": "Task",
                     "Resource": "arn:aws:states:::batch:submitJob.sync",
                     "Parameters": {
-                      "JobName.$": "States.Format('var-{}-{}-{}', $.codec, $.tier, $$.Execution.Name)",
+                      "JobName.$": "States.Format('concat-{}-{}-{}', $.codec, $.tier, $$.Execution.Name)",
                       "JobQueue": "${job_queue_arn}",
-                      "JobDefinition": "${variant_def}",
+                      "JobDefinition": "${concat_def}",
                       "Parameters": {
                         "codec.$": "$.codec",
                         "tier.$": "$.tier",
                         "s3_mezz.$": "$.s3_prefix",
+                        "s3_chunks.$": "$.s3_prefix",
                         "s3_out.$": "$.s3_prefix"
-                      },
-                      "ContainerOverrides": {
-                        "Environment": [
-                          { "Name": "TWO_PASS", "Value.$": "$.two_pass" }
-                        ]
                       }
                     },
                     "End": true
