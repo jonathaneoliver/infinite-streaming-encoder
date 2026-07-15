@@ -1,0 +1,48 @@
+# LocalStack (community edition) for offline testing of the Batch phase
+# pipeline against a real S3 API — no AWS account, no spend.
+#
+# Community edition emulates S3 only here; AWS Batch + Step Functions are
+# Pro-gated, so this harness drives the phase containers by hand in DAG
+# order (see smoke_test.sh) rather than through a state machine. That
+# still exercises the real code path each Batch job runs:
+#   python3 -m encoder.cli_local phase <name> --s3-... (+ --two-pass)
+# plus the S3 download/upload + .done sidecar logic end to end.
+#
+#   docker compose -f infra/localstack/docker-compose.yml up -d
+#   ./infra/localstack/smoke_test.sh
+#   docker compose -f infra/localstack/docker-compose.yml down
+services:
+  localstack:
+    # Community image (S3 only) by default. For Batch + Step Functions,
+    # set in .env (see .env.example):
+    #   LOCALSTACK_IMAGE=localstack/localstack-pro:3
+    #   LOCALSTACK_AUTH_TOKEN=<your token from app.localstack.cloud>
+    #   LOCALSTACK_SERVICES=s3,batch,stepfunctions,iam,logs,ecr
+    image: ${LOCALSTACK_IMAGE:-localstack/localstack:3}
+    container_name: encoder-localstack
+    ports:
+      - "4566:4566"          # edge port (all services)
+    environment:
+      - SERVICES=${LOCALSTACK_SERVICES:-s3}
+      # Empty on community (ignored); your Pro token enables Batch + SFN.
+      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN:-}
+      - DEBUG=0
+      # Batch runs jobs as local Docker containers — needs the host socket.
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      # Required for Pro Batch (launches sibling containers); harmless on community.
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - encoder-localstack
+    healthcheck:
+      # LocalStack exposes an init/health endpoint on the edge port.
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+networks:
+  # Named so the phase containers launched by smoke_test.sh can attach and
+  # reach the S3 endpoint as http://encoder-localstack:4566.
+  encoder-localstack:
+    name: encoder-localstack
