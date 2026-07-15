@@ -56,6 +56,10 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/aws/inventory", s.awsInventory)
 	s.Mux.HandleFunc("POST /api/aws/clear", s.awsClearAll)
 	s.Mux.HandleFunc("POST /api/aws/jobs/{id}/cleanup", s.awsCleanupJob)
+	// Cloud-batch release controls (Step Functions executions + Batch jobs).
+	s.Mux.HandleFunc("POST /api/aws/executions/stop", s.awsStopExecution)
+	s.Mux.HandleFunc("POST /api/aws/batch-jobs/terminate", s.awsTerminateBatchJob)
+	s.Mux.HandleFunc("POST /api/aws/batch/stop-all", s.awsBatchStopAll)
 	// Serve encode logs
 	s.Mux.Handle("GET /logs/", http.StripPrefix("/logs/", http.FileServer(http.Dir(filepath.Join(mgr.TmpDir, "logs")))))
 	// Serve encoded output files (segments, manifests) for HLS.js playback
@@ -794,6 +798,63 @@ func (s *Server) awsCleanupJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := runPythonCloud("cleanup", "--job-id", id)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+// awsStopExecution stops one Step Functions execution (aborts its Batch jobs).
+func (s *Server) awsStopExecution(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Arn string `json:"arn"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Arn == "" {
+		http.Error(w, `bad request: {"arn": "..."} required`, 400)
+		return
+	}
+	// Guard against arg injection: execution ARNs are a fixed shape.
+	if !strings.HasPrefix(body.Arn, "arn:aws:states:") {
+		http.Error(w, "invalid execution arn", 400)
+		return
+	}
+	out, err := runPythonCloud("batch_admin", "stop-execution", "--arn", body.Arn)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+// awsTerminateBatchJob terminates one Batch job.
+func (s *Server) awsTerminateBatchJob(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
+		http.Error(w, `bad request: {"id": "..."} required`, 400)
+		return
+	}
+	if strings.ContainsAny(body.ID, "/\\ ") {
+		http.Error(w, "invalid job id", 400)
+		return
+	}
+	out, err := runPythonCloud("batch_admin", "terminate-job", "--id", body.ID)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+// awsBatchStopAll stops every running execution and terminates every active
+// Batch job — the cloud-batch equivalent of the legacy "clear all" sweep.
+func (s *Server) awsBatchStopAll(w http.ResponseWriter, r *http.Request) {
+	out, err := runPythonCloud("batch_admin", "stop-all")
 	if err != nil {
 		http.Error(w, err.Error(), 502)
 		return

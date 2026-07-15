@@ -38,7 +38,8 @@ from typing import Any
 from botocore.exceptions import ClientError
 
 from encoder.cloud.aws import (
-    APP_TAG_KEY, APP_TAG_VALUE, app_tag_filter, ec2_client, region, s3_client,
+    APP_TAG_KEY, APP_TAG_VALUE, app_tag_filter, batch_client, ec2_client,
+    region, s3_client, sfn_client,
 )
 
 
@@ -226,6 +227,77 @@ def _s3_prefix_inventory(bucket: str | None) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Cloud-batch: Step Functions executions + Batch jobs
+#
+# These are the controllable units of a cloud-batch run. Stopping an execution
+# aborts its jobs, and terminating jobs lets the Batch compute environment
+# scale its spot instances back to zero — so surfacing (and releasing) these in
+# the AWS tab is what stops a run from quietly burning money.
+# ---------------------------------------------------------------------------
+
+# Non-terminal Batch job statuses worth showing (they hold or want capacity).
+_ACTIVE_BATCH_STATUSES = ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING")
+
+
+def _executions() -> list[dict[str, Any]]:
+    """Running + recently-finished executions of the encoder state machine.
+    Scoped to STATE_MACHINE_ARN; empty when the cloud-batch target isn't
+    configured."""
+    arn = os.environ.get("STATE_MACHINE_ARN")
+    if not arn:
+        return []
+    sfn = sfn_client()
+    out: list[dict[str, Any]] = []
+    try:
+        # Running first (the ones that cost money), then a few recent for context.
+        seen = set()
+        for status in ("RUNNING", None):
+            kwargs = {"stateMachineArn": arn, "maxResults": 20}
+            if status:
+                kwargs["statusFilter"] = status
+            for ex in sfn.list_executions(**kwargs).get("executions", []):
+                if ex["executionArn"] in seen:
+                    continue
+                seen.add(ex["executionArn"])
+                out.append({
+                    "arn": ex["executionArn"],
+                    "name": ex["name"],
+                    "status": ex["status"],
+                    "started_at": ex.get("startDate").isoformat() if ex.get("startDate") else None,
+                    "age_seconds": _age_seconds(ex.get("startDate")),
+                })
+    except ClientError as e:
+        return [{"error": str(e)}]
+    # Running on top, then most-recent.
+    out.sort(key=lambda e: (e.get("status") != "RUNNING", e.get("age_seconds", 0)))
+    return out[:25]
+
+
+def _batch_jobs() -> list[dict[str, Any]]:
+    """Active jobs on the encoder Batch queue (any non-terminal status)."""
+    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    batch = batch_client()
+    out: list[dict[str, Any]] = []
+    try:
+        for status in _ACTIVE_BATCH_STATUSES:
+            for j in batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", []):
+                created = j.get("createdAt")  # epoch millis
+                out.append({
+                    "id": j["jobId"],
+                    "name": j.get("jobName", ""),
+                    "status": j.get("status", status),
+                    "created_at": created,
+                    "age_seconds": (
+                        (datetime.now(timezone.utc).timestamp() - created / 1000.0)
+                        if created else 0.0
+                    ),
+                })
+    except ClientError as e:
+        return [{"error": str(e)}]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Public entry
 # ---------------------------------------------------------------------------
 
@@ -241,10 +313,15 @@ def collect() -> dict[str, Any]:
     bucket = os.environ.get("S3_BUCKET") or None
     s3_prefixes = _s3_prefix_inventory(bucket)
 
+    executions = _executions()
+    batch_jobs = _batch_jobs()
+
     running_instances = [i for i in instances if i["state"] == "running"]
     orphan_volumes = [v for v in volumes if v["is_orphan"]]
     total_s3_bytes = sum(p.get("size_bytes", 0) for p in s3_prefixes)
     hourly_total = sum(i["estimated_hourly_usd"] for i in running_instances)
+    running_executions = [e for e in executions if e.get("status") == "RUNNING"]
+    active_batch_jobs = [j for j in batch_jobs if not j.get("error")]
 
     return {
         "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -255,11 +332,15 @@ def collect() -> dict[str, Any]:
         "spot_requests": spot_requests,
         "volumes": volumes,
         "s3_prefixes": s3_prefixes,
+        "executions": executions,
+        "batch_jobs": batch_jobs,
         "summary": {
             "running_instances": len(running_instances),
             "orphan_volumes": len(orphan_volumes),
             "total_s3_bytes": total_s3_bytes,
             "estimated_hourly_usd": round(hourly_total, 4),
+            "running_executions": len(running_executions),
+            "active_batch_jobs": len(active_batch_jobs),
         },
     }
 

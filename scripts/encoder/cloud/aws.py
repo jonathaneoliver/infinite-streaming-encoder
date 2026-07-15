@@ -74,6 +74,14 @@ def sts_client():
     return boto3.client("sts", region_name=region())
 
 
+def sfn_client():
+    return boto3.client("stepfunctions", region_name=region())
+
+
+def batch_client():
+    return boto3.client("batch", region_name=region())
+
+
 class AuthError(RuntimeError):
     """STS preflight couldn't confirm authenticated credentials."""
 
