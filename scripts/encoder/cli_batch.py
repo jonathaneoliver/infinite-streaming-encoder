@@ -30,14 +30,23 @@ except ImportError:  # pragma: no cover
     boto3 = None  # type: ignore
 
 
+def _region() -> str | None:
+    """Target region from the environment. Passed explicitly to every client
+    because the server container mounts ~/.aws (whose default region may point
+    elsewhere) and botocore's default resolution can prefer that config file
+    over the AWS_REGION env var — which then rejects a state-machine ARN in a
+    different region."""
+    return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+
+
 def _sfn():
     if boto3 is None:
         raise RuntimeError("boto3 required for cli_batch")
-    return boto3.client("stepfunctions")
+    return boto3.client("stepfunctions", region_name=_region())
 
 
 def _s3():
-    return boto3.client("s3")
+    return boto3.client("s3", region_name=_region())
 
 
 # Step Function step name → ENCODER-STAGE key. These match the labels

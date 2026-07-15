@@ -77,15 +77,17 @@ def _s3():
     # the client at it and force path-style addressing — virtual-host style
     # would rewrite the host to <bucket>.<endpoint>, which doesn't resolve on
     # a docker network. Unset in production, so this is a no-op there.
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
     endpoint = os.environ.get("S3_ENDPOINT_URL")
     if endpoint:
         from botocore.config import Config
         return boto3.client(
             "s3",
             endpoint_url=endpoint,
+            region_name=region,
             config=Config(s3={"addressing_style": "path"}),
         )
-    return boto3.client("s3")
+    return boto3.client("s3", region_name=region)
 
 
 def _parse(uri: str) -> tuple[str, str]:
