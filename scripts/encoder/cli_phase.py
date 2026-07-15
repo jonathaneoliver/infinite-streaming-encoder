@@ -72,6 +72,18 @@ _GOP_DURATION_S = 1.0
 def _s3():
     if boto3 is None:
         raise RuntimeError("boto3 not installed — required for phase commands")
+    # Local testing hook: when S3_ENDPOINT_URL is set (e.g. LocalStack), point
+    # the client at it and force path-style addressing — virtual-host style
+    # would rewrite the host to <bucket>.<endpoint>, which doesn't resolve on
+    # a docker network. Unset in production, so this is a no-op there.
+    endpoint = os.environ.get("S3_ENDPOINT_URL")
+    if endpoint:
+        from botocore.config import Config
+        return boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            config=Config(s3={"addressing_style": "path"}),
+        )
     return boto3.client("s3")
 
 
@@ -142,6 +154,11 @@ def _prepare_work_dir() -> Path:
         shutil.rmtree(_WORK_DIR)
     _WORK_DIR.mkdir(parents=True, exist_ok=True)
     return _WORK_DIR
+
+
+def _env_flag(name: str) -> bool:
+    """Truthy-string env var → bool. Accepts 1/true/yes (any case)."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
 
 def _tier_by_name(name: str) -> Tier:
@@ -216,6 +233,10 @@ def phase_variant(args: argparse.Namespace) -> int:
         gop_duration_s=_GOP_DURATION_S,
         content_duration_s=info.duration_s,
         padding_duration_s=0.0,
+        # Two-pass is enabled per-execution: the Step Function injects
+        # TWO_PASS via containerOverrides (see buildSFNInput), and the
+        # --two-pass flag covers direct/local invocation of this phase.
+        two_pass=args.two_pass or _env_flag("TWO_PASS"),
     )
 
     out_path = encode_variant(ctx, args.codec, tier)
@@ -419,6 +440,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    choices=("360p", "540p", "720p", "1080p", "1440p", "2160p"))
     v.add_argument("--s3-mezz", required=True, dest="s3_mezz")
     v.add_argument("--s3-out", required=True, dest="s3_out")
+    v.add_argument("--two-pass", action="store_true", dest="two_pass",
+                   help="two-pass software encode (also honors TWO_PASS env)")
     v.set_defaults(fn=phase_variant)
 
     a = sub.add_parser("audio")

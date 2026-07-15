@@ -46,6 +46,23 @@ class EncodeContext:
     content_duration_s: float   # pre-padding duration, for PADDING label enable
     padding_duration_s: float   # 0.0 = no padding applied
     maxrate_percent: int = DEFAULT_MAXRATE_PERCENT
+    # Two-pass software encode for libx264/libx265 (ports smashing #965).
+    # Single-pass capped VBR distributes bits with only a lookahead
+    # window, so on complex content the achieved average can fall short
+    # of the -b:v target — which drags the real bitrate below the
+    # advertised AVERAGE-BANDWIDTH and packs the ladder rungs together.
+    # Two-pass fixes it: pass 1 profiles scene complexity into a stats
+    # file (output discarded via the null muxer), pass 2 distributes bits
+    # to hit the average accurately while the SAME maxrate/bufsize VBV
+    # keeps peaks flat. Roughly doubles encode time. Ignored for av1
+    # (libsvtav1) — matches bash, which only two-passes the x26x encoders.
+    #
+    # Note vs smashing: the undershoot there was ~17% and acute because
+    # its VBV bufsize was 0.25x target. This repo runs a looser VBV
+    # (BUFSIZE_MULTIPLIER=2, maxrate 124%), so single-pass drift is
+    # milder here; two-pass is still the accurate-average path and keeps
+    # behaviour aligned with the bash pipeline.
+    two_pass: bool = False
 
 
 class EncodeError(RuntimeError):
@@ -57,7 +74,26 @@ def _variant_path(output_dir: Path, codec: str, tier: Tier) -> Path:
     return output_dir / f"{codec}_{tier.name}.mp4"
 
 
-def _codec_specific_args(codec: str, target_kbps: int, k: int, preset: str) -> list[str]:
+def _pass_suffix(pass_num: int | None, stats_path: Path | None) -> str:
+    """`:pass=N:stats=PATH` appended to an x26x param string for two-pass,
+    or empty for single-pass. Shared by the h264/hevc branches so both
+    passes reuse the SAME base params (a divergence between passes would
+    invalidate the pass-1 stats)."""
+    if pass_num is None:
+        return ""
+    if stats_path is None:
+        raise EncodeError("two-pass encode requires a stats_path")
+    return f":pass={pass_num}:stats={stats_path}"
+
+
+def _codec_specific_args(
+    codec: str,
+    target_kbps: int,
+    k: int,
+    preset: str,
+    pass_num: int | None = None,
+    stats_path: Path | None = None,
+) -> list[str]:
     maxrate_k = target_kbps  # placeholder — real value is set in build_ffmpeg_cmd
     if codec == "hevc":
         # `pools=*` = use every host CPU for the x265 thread pool. The bash
@@ -72,7 +108,8 @@ def _codec_specific_args(codec: str, target_kbps: int, k: int, preset: str) -> l
             "-preset", preset,
             "-threads", "0",
             "-x265-params",
-            f"keyint={k}:min-keyint={k}:scenecut=0:open-gop=0:pools=*:frame-threads=0",
+            f"keyint={k}:min-keyint={k}:scenecut=0:open-gop=0:pools=*:frame-threads=0"
+            + _pass_suffix(pass_num, stats_path),
             "-pix_fmt", "yuv420p",
         ]
     if codec == "h264":
@@ -81,7 +118,8 @@ def _codec_specific_args(codec: str, target_kbps: int, k: int, preset: str) -> l
             "-preset", preset,
             "-threads", "0",
             "-x264-params",
-            f"keyint={k}:min-keyint={k}:scenecut=0:open-gop=0",
+            f"keyint={k}:min-keyint={k}:scenecut=0:open-gop=0"
+            + _pass_suffix(pass_num, stats_path),
             "-pix_fmt", "yuv420p",
         ]
     if codec == "av1":
@@ -96,17 +134,33 @@ def _codec_specific_args(codec: str, target_kbps: int, k: int, preset: str) -> l
     raise EncodeError(f"unsupported codec: {codec}")
 
 
+def _stats_path(output_dir: Path, codec: str, tier: Tier) -> Path:
+    """ffmpeg two-pass stats log for a variant. Lives beside the output in
+    the ephemeral work dir; ffmpeg also writes a `<log>.mbtree` sibling."""
+    return output_dir / f"{codec}_{tier.name}_2pass.log"
+
+
 def build_ffmpeg_cmd(
     ctx: EncodeContext,
     codec: str,
     tier: Tier,
     target_kbps: int,
     bitrate_override: dict[str, int],
+    pass_num: int | None = None,
 ) -> list[str]:
     """Return the ffmpeg argv for a single variant encode.
 
     Kept separate from the subprocess call so callers/tests can
     inspect the command without spawning ffmpeg.
+
+    `pass_num` selects the encoding mode:
+      - None  → single-pass (default).
+      - 1     → two-pass analysis: same filter + rate control, but the
+                encode is muxed to the null sink (`-f null -`) so only the
+                stats file is produced. No -tag:v / fragmentation.
+      - 2     → two-pass final: identical to single-pass output but reads
+                the pass-1 stats to hit the target average accurately.
+    Only valid for h264/hevc; av1 always single-passes.
     """
     k = keyint(ctx.fps, ctx.gop_duration_s)
     maxrate_k = int(target_kbps * ctx.maxrate_percent / 100)
@@ -123,25 +177,32 @@ def build_ffmpeg_cmd(
     ))
 
     out_path = _variant_path(ctx.output_dir, codec, tier)
+    stats_path = _stats_path(ctx.output_dir, codec, tier) if pass_num else None
 
     cmd = [
         "ffmpeg", "-y",
         "-i", str(ctx.mezzanine_path),
         "-vf", filter_str,
     ]
-    cmd += _codec_specific_args(codec, target_kbps, k, tier.preset)
+    cmd += _codec_specific_args(codec, target_kbps, k, tier.preset,
+                                pass_num=pass_num, stats_path=stats_path)
     cmd += [
         "-b:v", f"{target_kbps}k",
         "-maxrate", f"{maxrate_k}k",
         "-bufsize", f"{bufsize_k}k",
-        "-tag:v", _VIDEO_TAGS[codec],
-        "-an",
-        "-movflags", "empty_moov+default_base_moof",
-        "-frag_duration", str(_FRAG_DURATION_US),
-        str(out_path),
-        "-loglevel", "warning",
-        "-stats",
     ]
+    if pass_num == 1:
+        # Analysis pass: discard the muxed output, keep only the stats.
+        cmd += ["-an", "-f", "null", "-"]
+    else:
+        cmd += [
+            "-tag:v", _VIDEO_TAGS[codec],
+            "-an",
+            "-movflags", "empty_moov+default_base_moof",
+            "-frag_duration", str(_FRAG_DURATION_US),
+            str(out_path),
+        ]
+    cmd += ["-loglevel", "warning", "-stats"]
     return cmd
 
 
@@ -154,17 +215,39 @@ def encode_variant(
     """Encode one (codec, tier) combination. Returns the output path."""
     bitrate_override = bitrate_override or {}
     target_kbps = resolve_bitrate(tier, codec, bitrate_override)
-    cmd = build_ffmpeg_cmd(ctx, codec, tier, target_kbps, bitrate_override)
 
     out_path = _variant_path(ctx.output_dir, codec, tier)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    stage_key = variant_stage_key(codec, tier.name)
+    total_duration_s = ctx.content_duration_s + ctx.padding_duration_s
+    # av1 (libsvtav1) has no two-pass path here — bash never two-passed it.
+    two_pass = ctx.two_pass and codec in ("h264", "hevc")
+
     try:
-        run_ffmpeg_with_progress(
-            cmd,
-            duration_s=ctx.content_duration_s + ctx.padding_duration_s,
-            stage_key=variant_stage_key(codec, tier.name),
-        )
+        if two_pass:
+            # Pass 1 profiles complexity into the stats file (output
+            # discarded); pass 2 reads it to hit the target average.
+            # Both passes reuse the same filter + rate control.
+            run_ffmpeg_with_progress(
+                build_ffmpeg_cmd(ctx, codec, tier, target_kbps,
+                                 bitrate_override, pass_num=1),
+                duration_s=total_duration_s,
+                stage_key=stage_key,
+            )
+            run_ffmpeg_with_progress(
+                build_ffmpeg_cmd(ctx, codec, tier, target_kbps,
+                                 bitrate_override, pass_num=2),
+                duration_s=total_duration_s,
+                stage_key=stage_key,
+            )
+        else:
+            run_ffmpeg_with_progress(
+                build_ffmpeg_cmd(ctx, codec, tier, target_kbps,
+                                 bitrate_override),
+                duration_s=total_duration_s,
+                stage_key=stage_key,
+            )
     except subprocess.CalledProcessError as e:
         raise EncodeError(
             f"encode failed: {codec} {tier.name} @ {target_kbps}kbps "

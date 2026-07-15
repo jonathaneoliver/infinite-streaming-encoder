@@ -222,6 +222,11 @@ type JobConfig struct {
 	Padding         string   `json:"padding"`
 	KeepMezzanine   bool     `json:"keep_mezzanine"`
 	ForceReencode   bool     `json:"force_reencode"`
+	// TwoPass enables a two-pass software encode (libx264/libx265) for an
+	// accurate target average bitrate. ~2x encode time; no-op for av1.
+	// Applies to both targets: local passes --two-pass to cli_local.py,
+	// cloud injects TWO_PASS into the variant jobs via the SFN input.
+	TwoPass bool `json:"two_pass,omitempty"`
 	// CPU architecture for cloud encodes: "intel" | "amd" | "graviton".
 	// Empty defaults to intel. Ignored for local encodes (which always
 	// run on the host's native architecture).
@@ -966,6 +971,9 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	if cfg.KeepMezzanine {
 		args = append(args, "--keep-mezzanine")
 	}
+	if cfg.TwoPass {
+		args = append(args, "--two-pass")
+	}
 	// CPU arch only makes sense for cloud encodes (local runs on the
 	// host's own architecture), and cli_local.py doesn't accept the
 	// flag. Gate by target so we don't hand an unknown arg to argparse.
@@ -1035,6 +1043,9 @@ func (cfg *JobConfig) cloudBatchArgs(sourceDir, outputDir string, filenames []st
 	}
 	if cfg.KeepMezzanine {
 		args = append(args, "--keep-mezzanine")
+	}
+	if cfg.TwoPass {
+		args = append(args, "--two-pass")
 	}
 	if cfg.CpuArch != "" {
 		args = append(args, "--cpu-arch", cfg.CpuArch)
@@ -1206,7 +1217,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 	}
 
 	// Build the state-machine input document.
-	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Codec, job.Config.MaxRes)
+	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Codec, job.Config.MaxRes, job.Config.TwoPass)
 	inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 	if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 		return fmt.Errorf("write input json: %w", err)
@@ -1256,7 +1267,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 // buildSFNInput renders the JSON doc the state machine expects. Picks
 // which (codec, tier) combinations to fan out over based on the
 // JobConfig's Codec + MaxRes.
-func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string) string {
+func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool) string {
 	tiers := []string{"360p", "540p", "720p", "1080p", "1440p", "2160p"}
 	if maxRes != "" {
 		for i, t := range tiers {
@@ -1287,6 +1298,10 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string) string {
 		"s3_input":  s3Input,
 		"s3_prefix": s3Prefix,
 		"variants":  variants,
+		// Injected as the TWO_PASS env var on each variant job by the
+		// state machine's EncodeVariant task (see definition.json.tpl).
+		// String, not bool, so it drops straight into a container env value.
+		"two_pass": strconv.FormatBool(twoPass),
 	}
 	b, _ := json.Marshal(doc)
 	return string(b)

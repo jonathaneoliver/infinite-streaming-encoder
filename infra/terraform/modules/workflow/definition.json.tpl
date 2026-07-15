@@ -72,6 +72,12 @@
               "Type": "Map",
               "ItemsPath": "$.variants",
               "MaxConcurrency": 12,
+              "ItemSelector": {
+                "codec.$": "$$.Map.Item.Value.codec",
+                "tier.$": "$$.Map.Item.Value.tier",
+                "s3_prefix.$": "$.s3_prefix",
+                "two_pass.$": "$.two_pass"
+              },
               "ItemProcessor": {
                 "StartAt": "EncodeVariant",
                 "States": {
@@ -87,6 +93,11 @@
                         "tier.$": "$.tier",
                         "s3_mezz.$": "$.s3_prefix",
                         "s3_out.$": "$.s3_prefix"
+                      },
+                      "ContainerOverrides": {
+                        "Environment": [
+                          { "Name": "TWO_PASS", "Value.$": "$.two_pass" }
+                        ]
                       }
                     },
                     "End": true
