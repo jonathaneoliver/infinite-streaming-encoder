@@ -13,3 +13,4 @@ crash.*.log
 # Variable overrides with secrets
 *.auto.tfvars
 *.tfvars
+backend_override.tf

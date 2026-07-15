@@ -28,12 +28,6 @@ resource "aws_iam_role_policy_attachment" "spot_fleet_tagging" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole"
 }
 
-# Instance profile wraps the instance_role_arn we got from the iam
-# module — Batch wants the profile name, not the bare role.
-data "aws_iam_role" "instance" {
-  name = reverse(split("/", var.instance_role_arn))[0]
-}
-
 resource "aws_batch_compute_environment" "spot_graviton" {
   compute_environment_name = "encoder-spot-graviton"
   type                     = "MANAGED"
@@ -56,7 +50,7 @@ resource "aws_batch_compute_environment" "spot_graviton" {
     subnets            = var.subnet_ids
     security_group_ids = [var.security_group_id]
 
-    instance_role      = data.aws_iam_role.instance.arn
+    instance_role      = var.instance_profile_arn
     spot_iam_fleet_role = aws_iam_role.spot_fleet.arn
 
     # Bid at on-demand price — spot is always cheaper; this is a

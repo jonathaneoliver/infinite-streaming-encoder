@@ -13,8 +13,8 @@ variable "security_group_id" {
   type        = string
 }
 
-variable "instance_role_arn" {
-  description = "IAM role ARN for the EC2 instances (wrapped in an instance profile)."
+variable "instance_profile_arn" {
+  description = "IAM instance profile ARN for the EC2 instances. Batch's instance_role field wants the profile ARN, not the bare role ARN."
   type        = string
 }
 

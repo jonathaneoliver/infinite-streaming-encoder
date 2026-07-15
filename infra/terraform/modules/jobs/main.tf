@@ -50,10 +50,14 @@ locals {
       },
       {
         action    = "RETRY"
-        on_exit_code = 1   # generic ffmpeg transient
+        on_exit_code = "1"   # generic ffmpeg transient
       },
       {
-        action = "EXIT"
+        # Catch-all: everything else exits without retry. AWS requires
+        # every evaluate_on_exit to carry at least one condition, so the
+        # "*" glob stands in for "any exit code".
+        action    = "EXIT"
+        on_exit_code = "*"
       },
     ]
   }

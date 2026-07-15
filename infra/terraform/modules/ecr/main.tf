@@ -35,13 +35,10 @@ resource "aws_ecr_lifecycle_policy" "encoder_worker" {
   })
 }
 
-# Pull-through cache so images pulled under the `dockerhub/` prefix
-# resolve to Docker Hub transparently. First pull mirrors into ECR,
-# subsequent pulls serve from cache via the VPC endpoint. Only
-# actually useful if a future base image lives on Docker Hub; our
-# own image builds FROM python:3.12-slim already hit Docker Hub at
-# `docker build` time on the host, not inside Batch.
-resource "aws_ecr_pull_through_cache_rule" "dockerhub" {
-  ecr_repository_prefix = "dockerhub"
-  upstream_registry_url = "registry-1.docker.io"
-}
+# (Removed) A Docker Hub pull-through cache rule used to live here, but
+# AWS now requires a Secrets Manager credential for the Docker Hub upstream
+# ("UnsupportedUpstreamRegistryException: requires authentication"). It was
+# never on the critical path — Batch workers pull encoder-worker:<tag>
+# directly, and our image builds FROM python:3.12-slim on the host at
+# `docker build` time, not inside Batch. Re-add with a credential secret if
+# a future base image needs to be mirrored.
