@@ -66,7 +66,7 @@ module "iam" {
 module "compute" {
   source            = "./modules/compute"
   vpc_id            = module.network.vpc_id
-  subnet_ids        = module.network.private_subnet_ids
+  subnet_ids        = module.network.subnet_ids
   security_group_id = module.network.batch_sg_id
   instance_role_arn = module.iam.instance_role_arn
   max_vcpus         = var.compute_max_vcpus

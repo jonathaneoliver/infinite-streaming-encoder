@@ -23,7 +23,7 @@ infra/terraform/
 ├── outputs.tf              # ECR URL, queue ARN, state machine ARN
 ├── versions.tf             # provider pin + S3 backend
 └── modules/
-    ├── network/            # VPC, private subnets, S3+ECR+Logs endpoints
+    ├── network/            # VPC, public subnets, IGW, free S3 gateway endpoint
     ├── ecr/                # repo + Docker Hub pull-through cache
     ├── iam/                # instance / task / execution / workflow roles
     ├── compute/            # Batch compute env (spot, Graviton) + queue
@@ -158,15 +158,17 @@ Designed to cost ~nothing when idle:
 | S3 staging | bounded | `jobs/` auto-expires after `staging_retention_days` (default **7d**); incomplete multipart uploads swept after 3d |
 | ECR | bounded | Lifecycle keeps the last 10 images |
 | CloudWatch Logs | bounded | 14-day retention on both log groups |
-| **VPC interface endpoints** | **~$22/mo** | ecr.api + ecr.dkr + logs, ~$0.01/hr **each, always on** (the S3 endpoint is a free Gateway type) |
-| NAT gateway | — | none (endpoints are used instead — cheaper than a NAT) |
+| **VPC networking** | **$0** | Public subnets + internet gateway + a free S3 **Gateway** endpoint. No NAT gateway, no interface endpoints. |
 
-**The only non-zero idle cost is the 3 interface VPC endpoints (~$22/mo).** They
-let private-subnet Batch workers reach ECR/Logs without a NAT gateway (which
-would be pricier). If the stack sits idle for long stretches, the cheapest
-option is to `terraform destroy` between campaigns, or to switch workers to
-public subnets (no endpoints, no NAT → $0 idle) at a small security-posture
-cost. For steady use, leave them — they're cheaper than the alternatives.
+**Idle cost is effectively $0.** Workers run in **public subnets** with
+auto-assigned public IPs and reach ECR/Logs over the internet gateway (S3 via
+the free gateway endpoint), so there are no always-on interface endpoints
+(~$22/mo) and no NAT gateway (~$32/mo). The trade-off is that spot workers sit
+on public subnets — but they're ephemeral, behind an **egress-only** security
+group (no inbound), so exposure is minimal. If your security policy forbids
+public-subnet compute, switch the network module back to private subnets +
+interface endpoints (and accept the ~$22/mo standing cost), or `terraform
+destroy` between campaigns.
 
 **S3 hygiene:** every job stages inputs, mezzanine, per-chunk intermediates,
 joined variants and packaged output under `s3://<s3_bucket>/jobs/<id>/`. With
