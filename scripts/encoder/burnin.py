@@ -36,6 +36,26 @@ class BurninContext:
     encoder_label: str        # e.g. "SW"
     content_duration_s: float # for PADDING-label enable expression
     padding_duration_s: float # 0 → no PADDING label at all
+    # Absolute start offset of this encode within the full content. 0 for a
+    # whole-clip encode; the chunk's start_s when encoding a single chunk, so
+    # the burnt-in timecode stays continuous across concatenated chunks.
+    timecode_start_s: float = 0.0
+
+
+def format_timecode(start_s: float, fps: Fraction) -> str:
+    """SMPTE-ish HH:MM:SS:FF (colons escaped for drawtext) for `start_s`.
+
+    start_s=0 yields "00\\:00\\:00\\:00", matching the pre-chunking constant,
+    so whole-clip encodes are unchanged.
+    """
+    fps_int = max(1, round(float(fps)))
+    total_frames = round(start_s * float(fps))
+    frames = total_frames % fps_int
+    total_seconds = total_frames // fps_int
+    ss = total_seconds % 60
+    mm = (total_seconds // 60) % 60
+    hh = total_seconds // 3600
+    return rf"{hh:02d}\:{mm:02d}\:{ss:02d}\:{frames:02d}"
 
 
 def _escape(text: str) -> str:
@@ -99,7 +119,7 @@ def build_filter(ctx: BurninContext) -> str:
         _drawtext(
             "", fontsize=tier.fontsize_tc, color="yellow", box_opacity=1.0,
             x=tier.burnin_x, y=y_tc,
-            timecode=INITIAL_TIMECODE, rate=ctx.fps,
+            timecode=format_timecode(ctx.timecode_start_s, ctx.fps), rate=ctx.fps,
         ),
         _drawtext(
             ctx.rate_label, fontsize=tier.fontsize_label, color="cyan",

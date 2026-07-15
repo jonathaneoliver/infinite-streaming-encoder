@@ -36,7 +36,8 @@ import sys
 from pathlib import Path
 
 from encoder.audio import AudioSpec, create_audio
-from encoder.encode_variants import EncodeContext, encode_variant
+from encoder.chunking import DEFAULT_CHUNK_DURATION_S, chunk_count, plan_chunks
+from encoder.encode_variants import EncodeContext, concat_chunks, encode_variant
 from encoder.ffprobe import probe
 from encoder.hls import (
     TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls,
@@ -239,10 +240,64 @@ def phase_variant(args: argparse.Namespace) -> int:
         two_pass=args.two_pass or _env_flag("TWO_PASS"),
     )
 
-    out_path = encode_variant(ctx, args.codec, tier)
+    # Chunked mode: encode only chunk `--chunk-index` of the variant. The
+    # chunk plan is derived from the mezzanine's own duration, so it matches
+    # whatever the concat phase computes from the same mezzanine. Whole-clip
+    # mode (no --chunk-index) is unchanged.
+    chunk = None
+    if args.chunk_index is not None:
+        chunks = plan_chunks(info.duration_s, DEFAULT_CHUNK_DURATION_S,
+                             _SEGMENT_DURATION_S)
+        if args.chunk_index >= len(chunks):
+            print(f"error: chunk-index {args.chunk_index} out of range "
+                  f"(clip has {len(chunks)} chunk(s))", file=sys.stderr)
+            return 1
+        chunk = chunks[args.chunk_index]
+        print(f"[phase variant] chunk {chunk.index}/{len(chunks)}: "
+              f"[{chunk.start_s:.0f}s, {chunk.end_s:.0f}s)", flush=True)
+
+    out_path = encode_variant(ctx, args.codec, tier, chunk=chunk)
+
+    # out_path.name is {codec}_{tier}.mp4 whole-clip, or
+    # {codec}_{tier}_chunkNNN.mp4 for a chunk — upload under the same name.
+    out_uri = args.s3_out.rstrip("/") + f"/{out_path.name}"
+    print(f"[phase variant] uploading {out_uri}", flush=True)
+    _upload_with_done(out_path, out_uri)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# concat-variant — join a variant's chunk encodes into the whole variant.
+# Runs after the chunk array job for one (codec, tier) completes.
+# ---------------------------------------------------------------------------
+
+def phase_concat_variant(args: argparse.Namespace) -> int:
+    work = _prepare_work_dir()
+    tier = _tier_by_name(args.tier)
+
+    # Derive the chunk count from the mezzanine duration — the same source
+    # the variant phase used to plan chunks, so the two never disagree.
+    mezz_uri = args.s3_mezz.rstrip("/") + "/mezzanine.mp4"
+    mezz_local = work / "mezzanine.mp4"
+    if not _download_if_complete(mezz_uri, mezz_local):
+        print("error: mezzanine.done missing or size mismatch", file=sys.stderr)
+        return 1
+    n_chunks = chunk_count(probe(mezz_local).duration_s, DEFAULT_CHUNK_DURATION_S)
+
+    # Pull every chunk file down (verifying its .done sidecar).
+    for i in range(n_chunks):
+        name = f"{args.codec}_{args.tier}_chunk{i:03d}.mp4"
+        uri = args.s3_chunks.rstrip("/") + f"/{name}"
+        if not _download_if_complete(uri, work / name):
+            print(f"error: chunk {name} missing or incomplete at {uri}",
+                  file=sys.stderr)
+            return 1
+
+    out_path = concat_chunks(work, args.codec, tier, n_chunks)
 
     out_uri = args.s3_out.rstrip("/") + f"/{args.codec}_{args.tier}.mp4"
-    print(f"[phase variant] uploading {out_uri}", flush=True)
+    print(f"[phase concat-variant] joined {n_chunks} chunk(s) → {out_uri}",
+          flush=True)
     _upload_with_done(out_path, out_uri)
     return 0
 
@@ -442,7 +497,21 @@ def _build_parser() -> argparse.ArgumentParser:
     v.add_argument("--s3-out", required=True, dest="s3_out")
     v.add_argument("--two-pass", action="store_true", dest="two_pass",
                    help="two-pass software encode (also honors TWO_PASS env)")
+    v.add_argument("--chunk-index", type=int, default=None, dest="chunk_index",
+                   help="encode only this 0-based chunk of the variant "
+                        "(Batch array index); omit for a whole-clip encode")
     v.set_defaults(fn=phase_variant)
+
+    cv = sub.add_parser("concat-variant")
+    cv.add_argument("--codec", required=True, choices=("h264", "hevc", "av1"))
+    cv.add_argument("--tier", required=True,
+                    choices=("360p", "540p", "720p", "1080p", "1440p", "2160p"))
+    cv.add_argument("--s3-mezz", required=True, dest="s3_mezz",
+                    help="prefix holding mezzanine.mp4 (used to derive chunk count)")
+    cv.add_argument("--s3-chunks", required=True, dest="s3_chunks",
+                    help="prefix holding the {codec}_{tier}_chunkNNN.mp4 files")
+    cv.add_argument("--s3-out", required=True, dest="s3_out")
+    cv.set_defaults(fn=phase_concat_variant)
 
     a = sub.add_parser("audio")
     a.add_argument("--s3-mezz", required=True, dest="s3_mezz")
