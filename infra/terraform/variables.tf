@@ -25,3 +25,16 @@ variable "compute_max_vcpus" {
   type        = number
   default     = 32
 }
+
+variable "staging_retention_days" {
+  description = <<EOT
+Days before staged job data under s3://<s3_bucket>/jobs/ is auto-expired.
+The pipeline writes inputs, mezzanine, chunk intermediates, joined variants
+and packaged output there; outputs are synced back to the local OUTPUT_DIR,
+so S3 is staging only. This lifecycle rule is the safety net that bounds S3
+cost even if a job crashes mid-run and orphans chunk files. Give failed jobs
+enough runway to debug / resume before cleanup.
+EOT
+  type    = number
+  default = 7
+}

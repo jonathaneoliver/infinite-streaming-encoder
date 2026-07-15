@@ -18,6 +18,37 @@ locals {
   region     = var.region
 }
 
+# Auto-expire staged job data so S3 doesn't accumulate forever. The encoder
+# writes everything under jobs/<id>/ (inputs, mezzanine, chunk intermediates,
+# joined variants, packaged output); with chunking a long clip can leave
+# thousands of chunk objects. Outputs are synced back to the local OUTPUT_DIR,
+# so S3 is staging only — safe to expire. This is the cost safety net; the app
+# can still delete a prefix eagerly on success on top of this.
+#
+# NOTE: var.s3_bucket is created outside this stack (a prerequisite) and must
+# exist before apply. This manages only its jobs/ lifecycle, nothing else.
+resource "aws_s3_bucket_lifecycle_configuration" "staging" {
+  bucket = var.s3_bucket
+
+  rule {
+    id     = "expire-job-staging"
+    status = "Enabled"
+
+    filter {
+      prefix = "jobs/"
+    }
+
+    expiration {
+      days = var.staging_retention_days
+    }
+
+    # Failed multipart uploads bill silently until aborted — sweep them.
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 3
+    }
+  }
+}
+
 module "network" {
   source = "./modules/network"
   region = local.region
