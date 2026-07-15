@@ -96,19 +96,77 @@ def cmd_submit(args: argparse.Namespace) -> int:
 # poll
 # ---------------------------------------------------------------------------
 
-def _translate_events(events: list[dict], seen: set[int]) -> None:
-    """Translate new Step Functions history events into ENCODER-STAGE
-    markers. Keeps track of event ids we've already emitted against
-    so repeat polls don't double-emit.
+def _chunk_identity(input_json: str) -> tuple[str, str, int] | None:
+    """(codec, tier, chunk_index) from an EncodeChunk state's input, or None."""
+    try:
+        d = json.loads(input_json)
+        codec, tier, ci = d.get("codec"), d.get("tier"), d.get("chunk_index")
+        if codec and tier and ci is not None:
+            return codec, tier, int(ci)
+    except (ValueError, TypeError):
+        pass
+    return None
 
-    Event kinds we care about:
-      TaskStateEntered  → step started → emit running 0%
-      TaskSucceeded     → emit done 100%
-      TaskFailed        → emit failed 0%
-      MapStateEntered / MapIterationStarted → each variant becomes
-        encode:<codec>:<tier>. The iteration's parameters contain
-        codec + tier.
+
+def _concat_identity(input_json: str) -> tuple[str, str] | None:
+    """(codec, tier) from a ConcatVariant state's input, or None."""
+    try:
+        d = json.loads(input_json)
+        codec, tier = d.get("codec"), d.get("tier")
+        if codec and tier:
+            return codec, tier
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _translate_events(events: list[dict], seen: set[int]) -> None:
+    """Translate Step Functions history events into ENCODER-STAGE markers.
+    `seen` tracks already-emitted event ids so repeat polls don't double-emit.
+
+    Fixed phases (Mezzanine / Audio / Package* / Hls* / Byteranges*) map by
+    state name via _STEP_TO_STAGE. The variant fan-out is a nested Map — an
+    inner Map of EncodeChunk tasks per (codec, tier), then a ConcatVariant —
+    so each chunk becomes `encode:<codec>:<tier>:chunk<N>` (which the UI groups
+    into the per-variant chunk grid) and the join becomes `concat:<codec>:<tier>`.
+
+    A state's codec/tier/chunk_index live in its *entered* event's input; the
+    *exited* event carries no input, so we index every EncodeChunk/ConcatVariant
+    enter by event id and, for an exit, walk previousEventId back to its enter.
+    The full history is passed each poll, so those maps are always complete.
     """
+    by_id = {e["id"]: e for e in events}
+
+    # Index enter events (they carry the input with codec/tier/chunk_index).
+    chunk_enter: dict[int, tuple[str, str, int]] = {}
+    concat_enter: dict[int, tuple[str, str]] = {}
+    for e in events:
+        if e["type"] != "TaskStateEntered":
+            continue
+        det = e.get("stateEnteredEventDetails", {})
+        name, inp = det.get("name", ""), det.get("input", "{}")
+        if name == "EncodeChunk":
+            idn = _chunk_identity(inp)
+            if idn:
+                chunk_enter[e["id"]] = idn
+        elif name == "ConcatVariant":
+            idn = _concat_identity(inp)
+            if idn:
+                concat_enter[e["id"]] = idn
+
+    def _enter_of(exit_ev: dict, table: dict) -> tuple | None:
+        """Follow previousEventId from an exit event back to its matching
+        enter (whose identity is in `table`). Bounded walk."""
+        cur = exit_ev
+        for _ in range(64):
+            pid = cur.get("previousEventId")
+            if pid is None or pid not in by_id:
+                return None
+            if pid in table:
+                return table[pid]
+            cur = by_id[pid]
+        return None
+
     for ev in events:
         if ev["id"] in seen:
             continue
@@ -116,41 +174,40 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
         etype = ev["type"]
 
         if etype == "TaskStateEntered":
-            step = ev.get("stateEnteredEventDetails", {}).get("name", "")
-            key = _STEP_TO_STAGE.get(step)
+            name = ev.get("stateEnteredEventDetails", {}).get("name", "")
+            key = _STEP_TO_STAGE.get(name)
             if key:
                 _emit_stage(key, "running", 0.0)
+            elif name == "EncodeChunk":
+                idn = chunk_enter.get(ev["id"])
+                if idn:
+                    c, t, ci = idn
+                    _emit_stage(f"encode:{c}:{t}:chunk{ci}", "running", 0.0)
+            elif name == "ConcatVariant":
+                idn = concat_enter.get(ev["id"])
+                if idn:
+                    c, t = idn
+                    _emit_stage(f"concat:{c}:{t}", "running", 0.0)
 
-        elif etype in ("TaskSucceeded", "TaskStateExited"):
-            step = ev.get("stateExitedEventDetails", {}).get("name", "")
-            key = _STEP_TO_STAGE.get(step)
+        elif etype == "TaskStateExited":
+            name = ev.get("stateExitedEventDetails", {}).get("name", "")
+            key = _STEP_TO_STAGE.get(name)
             if key:
                 _emit_stage(key, "done", 100.0)
+            elif name == "EncodeChunk":
+                idn = _enter_of(ev, chunk_enter)
+                if idn:
+                    c, t, ci = idn
+                    _emit_stage(f"encode:{c}:{t}:chunk{ci}", "done", 100.0)
+            elif name == "ConcatVariant":
+                idn = _enter_of(ev, concat_enter)
+                if idn:
+                    c, t = idn
+                    _emit_stage(f"concat:{c}:{t}", "done", 100.0)
 
         elif etype == "TaskFailed":
-            # Task-type events don't always carry stateEnteredEventDetails;
-            # fall back to the most recent task-state we saw (best effort).
-            fail = ev.get("taskFailedEventDetails", {})
-            cause = fail.get("cause", "")[:200]
+            cause = ev.get("taskFailedEventDetails", {}).get("cause", "")[:200]
             print(f"!!! Step failure: {cause}", file=sys.stderr, flush=True)
-
-        elif etype == "MapIterationStarted":
-            params = ev.get("mapIterationStartedEventDetails", {})
-            index = params.get("index")
-            # The actual variant codec/tier lives in the iteration's
-            # input (MapRunStarted or TaskStateEntered for EncodeVariant);
-            # not directly on this event. We'll catch the inner task.
-
-        elif etype == "TaskStateEntered" and \
-                ev.get("stateEnteredEventDetails", {}).get("name") == "EncodeVariant":
-            inp = ev["stateEnteredEventDetails"].get("input", "{}")
-            try:
-                data = json.loads(inp)
-                codec = data.get("codec"); tier = data.get("tier")
-                if codec and tier:
-                    _emit_stage(f"encode:{codec}:{tier}", "running", 0.0)
-            except Exception:
-                pass
 
 
 def _download_outputs(s3_prefix: str, local_dir: Path) -> int:
@@ -186,12 +243,24 @@ def cmd_poll(args: argparse.Namespace) -> int:
     print(f">>> Polling execution {args.execution_arn}", flush=True)
     elapsed = 0
     while elapsed < timeout_s:
-        # Stream new history events first so the UI gets per-step
-        # updates even on the terminal tick.
-        hist = sfn.get_execution_history(
-            executionArn=args.execution_arn, maxResults=200, reverseOrder=False,
-        )
-        _translate_events(hist.get("events", []), seen)
+        # Stream new history events first so the UI gets per-step updates even
+        # on the terminal tick. Paginate the full history — a chunked job has
+        # far more than one page of events (12 variants x N chunks x several
+        # events each), and _translate_events needs them all to correlate each
+        # chunk's exit back to its enter.
+        events: list[dict] = []
+        token: str | None = None
+        while True:
+            kwargs = dict(executionArn=args.execution_arn, maxResults=1000,
+                          reverseOrder=False)
+            if token:
+                kwargs["nextToken"] = token
+            hist = sfn.get_execution_history(**kwargs)
+            events.extend(hist.get("events", []))
+            token = hist.get("nextToken")
+            if not token:
+                break
+        _translate_events(events, seen)
 
         desc = sfn.describe_execution(executionArn=args.execution_arn)
         status = desc["status"]
