@@ -38,7 +38,7 @@ from encoder.cloud.timing import (
 _TIER_VCPU = {
     "360p": 2, "540p": 2,
     "720p": 4, "1080p": 4,
-    "1440p": 8, "2160p": 8,
+    "1440p": 4, "2160p": 4,
 }
 # Batch job name: var-<codec>-<tier>-c<chunk>-<exec>
 _JOBNAME_RE = re.compile(r"^var-([^-]+)-([^-]+)-c(\d+)-")

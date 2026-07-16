@@ -1449,7 +1449,11 @@ func variantResources(tier string) (vcpu, memory string) {
 	case "720p", "1080p":
 		return "4", "8192"
 	default: // 1440p, 2160p
-		return "8", "16384"
+		// Measured: libx265 at 4K keeps only ~2.9 cores busy, so 8 vCPU sat
+		// ~37% idle-but-reserved. 4 vCPU / 8 GiB matches the c7g 1:2 ratio,
+		// so two 4K chunks pack onto one instance — ~same speed, half the
+		// machines. Bump back up if a heavier preset OOMs at 8 GiB.
+		return "4", "8192"
 	}
 }
 
