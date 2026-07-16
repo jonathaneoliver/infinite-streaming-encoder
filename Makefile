@@ -129,3 +129,52 @@ cloud-push:
 		--push \
 		.
 	@echo "Published $(GHCR_IMAGE):latest :$(GIT_SHA) (linux/amd64 only)"
+
+# ---------------------------------------------------------------------------
+# Cloud-batch deploy (AWS Batch + Step Functions). Replaces the manual
+# "build → ECR push → tofu plan/apply → restart" dance we were doing by hand.
+# AWS_REGION / S3_BUCKET / STATE_MACHINE_ARN come from .env like everything else.
+# ---------------------------------------------------------------------------
+AWS_REGION ?= us-west-2
+TF_DIR := infra/terraform
+# ECR repo URL for the Batch worker image — resolved from tofu state, or set
+# in .env to override. ECR_REGISTRY is the host part (for docker login).
+ECR_REPO ?= $(shell cd $(TF_DIR) && tofu output -raw ecr_repo_url 2>/dev/null)
+ECR_REGISTRY = $(firstword $(subst /, ,$(ECR_REPO)))
+
+.PHONY: ecr-login ecr-push infra-init infra-plan infra-apply infra-destroy deploy timing
+
+ecr-login:
+	@: $${ECR_REPO:?ECR_REPO empty — run `make infra-apply` first, or set it in .env}
+	aws ecr get-login-password --region $(AWS_REGION) | \
+	  docker login --username AWS --password-stdin $(ECR_REGISTRY)
+
+ecr-push: ecr-login   ## build arm64 (Graviton) + push the worker image to ECR
+	docker buildx build --platform linux/arm64 \
+		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(GIT_SHA) \
+		--tag $(ECR_REPO):latest --tag $(ECR_REPO):$(GIT_SHA) --push .
+	@echo "Pushed $(ECR_REPO):latest :$(GIT_SHA) (linux/arm64)"
+
+infra-init:           ## tofu init (local backend override, if present)
+	cd $(TF_DIR) && tofu init
+
+infra-plan:           ## tofu plan -> tf.plan (review before infra-apply)
+	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu plan -out=tf.plan
+
+infra-apply:          ## apply the saved tf.plan (run only after reviewing the plan)
+	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu apply tf.plan
+
+infra-destroy:        ## tear the whole stack down to $0
+	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu destroy
+
+# Deploy stops at the plan on purpose — review it, then run `make infra-apply`.
+# (Keeping preview and apply as separate, deliberate steps for live IaC.)
+deploy:               ## push image + restart + plan infra (then review & infra-apply)
+	$(MAKE) ecr-push
+	$(MAKE) restart
+	$(MAKE) infra-plan
+	@echo ">>> Review the plan above. To apply it:  make infra-apply"
+
+timing:               ## where-did-the-time-go for an execution: make timing EXEC=<arn>
+	@: $${EXEC:?set EXEC=<execution-arn>}
+	docker exec $(CONTAINER_NAME) python3 -m encoder.cloud.timing --execution-arn $(EXEC)
