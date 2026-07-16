@@ -4,9 +4,12 @@ Produces a fragmented MP4 at `<tmp>/audio.mp4`. Shaka Packager later
 reads this alongside the video variant MP4s to package them together.
 
 Codec handling:
-- AAC / MP3 / Opus / Vorbis → stream copy when possible (no padding)
-- AC-3 / E-AC-3 / DTS / TrueHD / PCM → transcode to AAC 192k/48kHz
-  (Shaka Packager can't multiplex those into fMP4)
+- AAC → stream copy when possible (no padding)
+- Everything else (MP3 / Opus / Vorbis / AC-3 / E-AC-3 / DTS / TrueHD /
+  PCM / ...) → transcode to AAC 192k/48kHz. Shaka Packager can't reliably
+  multiplex non-AAC audio into the fMP4 our LL-HLS/DASH ladder needs — MP3
+  fails outright ("Unsupported audio codec"), and Opus/Vorbis-in-fMP4 is
+  not dependable for HLS. AAC is the universally-safe target.
 - Any codec + padding required → always transcode to AAC
   (can't apply filters with -c copy)
 """
@@ -20,10 +23,13 @@ from encoder.ffprobe import probe
 from encoder.progress import run_ffmpeg_with_progress
 
 
-# Codecs Shaka Packager can multiplex without transcoding.
-_SHAKA_COMPATIBLE = frozenset({"aac", "mp3", "opus", "vorbis"})
+# The only codec we stream-copy into fMP4. Everything else transcodes to AAC:
+# MP3-in-fMP4 fails in Shaka ("Unsupported audio codec"), and Opus/Vorbis in
+# fMP4 aren't dependable for our LL-HLS/DASH ladder. AAC is universally safe.
+_SHAKA_COMPATIBLE = frozenset({"aac"})
 
-# Codecs we refuse to stream-copy — must transcode to AAC.
+# Kept for clarity; _needs_transcode already transcodes anything not in
+# _SHAKA_COMPATIBLE, so these are a documented subset of "definitely not AAC".
 _INCOMPATIBLE_PREFIXES = ("pcm",)
 _INCOMPATIBLE_NAMES = frozenset({"ac3", "eac3", "dts", "truehd"})
 
