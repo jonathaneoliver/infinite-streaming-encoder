@@ -136,6 +136,7 @@ func (j *Job) parseMarker(line string) bool {
 		percent, _ := strconv.ParseFloat(m[3], 64)
 		now := time.Now()
 		j.mu.Lock()
+		found := false
 		for i := range j.Stages {
 			if j.Stages[i].Key == key {
 				// Stamp StartedAt the first time the stage goes running;
@@ -152,8 +153,23 @@ func (j *Job) parseMarker(line string) bool {
 				}
 				j.Stages[i].Status = status
 				j.Stages[i].Percent = percent
+				found = true
 				break
 			}
+		}
+		if !found {
+			// A stage key not in the plan — e.g. the per-chunk encode stages
+			// (encode:<codec>:<tier>:chunk<N>) that the cloud-batch translator
+			// emits dynamically as the Map fans out, which the UI groups into
+			// the chunk grid. Append it so it renders instead of being dropped.
+			st := StageProgress{Key: key, Label: key, Status: status, Percent: percent}
+			if status == "running" {
+				st.StartedAt = &now
+			}
+			if status == "done" || status == "failed" {
+				st.EndedAt = &now
+			}
+			j.Stages = append(j.Stages, st)
 		}
 		j.mu.Unlock()
 		return true

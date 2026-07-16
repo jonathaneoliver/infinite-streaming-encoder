@@ -26,8 +26,10 @@ from pathlib import Path
 
 try:
     import boto3
+    from botocore.exceptions import ClientError
 except ImportError:  # pragma: no cover
     boto3 = None  # type: ignore
+    ClientError = Exception  # type: ignore
 
 
 def _region() -> str | None:
@@ -47,6 +49,54 @@ def _sfn():
 
 def _s3():
     return boto3.client("s3", region_name=_region())
+
+
+def _logs():
+    return boto3.client("logs", region_name=_region())
+
+
+# CloudWatch log group the Batch job definitions write to (see
+# infra/terraform/modules/jobs/main.tf).
+_BATCH_LOG_GROUP = "/aws/batch/encoder"
+
+
+def _report_task_failure(details: dict) -> None:
+    """Surface a Batch task failure in the JOB LOG (stdout), not just stderr —
+    including the container's exit code and the tail of its CloudWatch log, so
+    the app shows *why* a phase failed instead of an opaque 'TaskFailed'.
+
+    The cause of a batch:submitJob.sync failure is the full DescribeJobs JSON,
+    which carries the container's ExitCode + LogStreamName."""
+    cause = details.get("cause", "")
+    error = details.get("error", "")
+    exit_code = reason = stream = None
+    try:
+        job = json.loads(cause)
+        container = job.get("Container", {})
+        exit_code = container.get("ExitCode")
+        reason = job.get("StatusReason") or container.get("Reason")
+        stream = container.get("LogStreamName")
+        name = job.get("JobName", "?")
+    except (ValueError, TypeError):
+        name = "?"
+
+    print(f"!!! phase failed [{name}] error={error} "
+          f"exit={exit_code} reason={reason or cause[:160]}", flush=True)
+
+    if not stream:
+        return
+    # Pull the tail of the container's own log so the real error is visible.
+    try:
+        events = _logs().get_log_events(
+            logGroupName=_BATCH_LOG_GROUP, logStreamName=stream,
+            limit=25, startFromHead=False,
+        ).get("events", [])
+        if events:
+            print(f"    --- {stream} (last {len(events)} lines) ---", flush=True)
+            for e in events:
+                print(f"    {e.get('message', '').rstrip()}", flush=True)
+    except ClientError as e:
+        print(f"    (could not fetch container log: {e})", flush=True)
 
 
 # Step Function step name → ENCODER-STAGE key. These match the labels
@@ -215,8 +265,7 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
                     _emit_stage(f"concat:{c}:{t}", "done", 100.0)
 
         elif etype == "TaskFailed":
-            cause = ev.get("taskFailedEventDetails", {}).get("cause", "")[:200]
-            print(f"!!! Step failure: {cause}", file=sys.stderr, flush=True)
+            _report_task_failure(ev.get("taskFailedEventDetails", {}))
 
 
 def _download_outputs(s3_prefix: str, local_dir: Path) -> int:
