@@ -38,11 +38,12 @@ variable "compute_max_vcpus" {
 Upper bound on the Batch compute environment's total vCPUs — the concurrency
 ceiling. Spot instances only launch when jobs need them and scale to zero, so
 a higher ceiling costs nothing when idle; it just allows more chunks to run at
-once (less queue-wait). With per-tier right-sizing (small tiers = 2 vCPU), 96
-runs ~48 small chunks or ~12 4K chunks concurrently.
+once (less queue-wait). With per-tier right-sizing (small tiers = 2 vCPU), 48
+runs ~24 small chunks or ~6 4K chunks concurrently — and caps peak spend at
+roughly half of what 96 would (~6 packed instances instead of ~12).
 EOT
   type    = number
-  default = 96
+  default = 48
 }
 
 variable "staging_retention_days" {

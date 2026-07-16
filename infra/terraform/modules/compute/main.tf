@@ -43,10 +43,10 @@ resource "aws_iam_role_policy_attachment" "spot_fleet_tagging" {
 resource "aws_launch_template" "worker" {
   name = "encoder-batch-worker"
 
-  # A custom AMI when one is baked for the current image; otherwise let
-  # Batch pick its default ECS-optimized Graviton AMI.
-  image_id = var.worker_ami_id != "" ? var.worker_ami_id : null
-
+  # NOTE: no image_id here — managed Batch ignores a launch-template AMI.
+  # The custom AMI goes through compute_resources.ec2_configuration
+  # (image_id_override) below. This LT exists only for the prefer-cached
+  # ECS agent config in user_data.
   user_data = base64encode(<<-EOT
     MIME-Version: 1.0
     Content-Type: multipart/mixed; boundary="==BOUNDARY=="
@@ -114,11 +114,23 @@ resource "aws_batch_compute_environment" "spot_graviton" {
     instance_role      = var.instance_profile_arn
     spot_iam_fleet_role = aws_iam_role.spot_fleet.arn
 
-    # prefer-cached pull behavior + optional pre-baked AMI. "$Latest"
-    # so a terraform apply that rebakes/rebuilds the LT rolls forward.
+    # Launch template carries the prefer-cached ECS agent config (user_data).
+    # "$Latest" so a rebuilt LT rolls forward on apply.
     launch_template {
       launch_template_id = aws_launch_template.worker.id
       version            = "$Latest"
+    }
+
+    # Custom worker AMI. This is the ONLY way managed Batch honors a custom
+    # AMI — a launch-template image_id is silently ignored; Batch picks its
+    # own LATEST ECS AMI instead (which is what left the baked AMI unused).
+    # Only emitted when an AMI is baked; empty => Batch's default ECS AMI.
+    dynamic "ec2_configuration" {
+      for_each = var.worker_ami_id != "" ? [1] : []
+      content {
+        image_type        = "ECS_AL2023"
+        image_id_override = var.worker_ami_id
+      }
     }
 
     # Bid at on-demand price — spot is always cheaper; this is a
@@ -137,6 +149,10 @@ resource "aws_batch_compute_environment" "spot_graviton" {
   # queue can be moved onto it first (see name_prefix note above).
   lifecycle {
     create_before_destroy = true
+    # AWS Batch auto-populates an update_policy on the compute env during
+    # in-place UpdateComputeEnvironment calls. We don't manage it, so ignore
+    # it rather than fight a perpetual "remove update_policy" diff.
+    ignore_changes = [update_policy]
   }
 }
 
