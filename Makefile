@@ -139,7 +139,9 @@ AWS_REGION ?= us-west-2
 TF_DIR := infra/terraform
 # ECR repo URL for the Batch worker image — resolved from tofu state, or set
 # in .env to override. ECR_REGISTRY is the host part (for docker login).
-ECR_REPO ?= $(shell cd $(TF_DIR) && tofu output -raw ecr_repo_url 2>/dev/null)
+# -no-color so a colorized tofu warning can never leak ANSI escapes into the
+# value (which then reach `docker login` as a garbage registry host).
+ECR_REPO ?= $(shell cd $(TF_DIR) && tofu output -no-color -raw ecr_repo_url 2>/dev/null)
 ECR_REGISTRY = $(firstword $(subst /, ,$(ECR_REPO)))
 
 # Worker-image tag: short-sha of the last commit that touched anything baked
@@ -149,7 +151,7 @@ ECR_REGISTRY = $(firstword $(subst /, ,$(ECR_REPO)))
 # showing phantom job-def re-tags. Falls back to HEAD if git isn't available.
 IMAGE_TAG := $(shell git log -1 --format=%h -- Dockerfile go.mod go.sum requirements.txt cmd internal scripts static 2>/dev/null || echo $(GIT_SHA))
 
-.PHONY: ecr-login ecr-push infra-init infra-plan infra-apply infra-destroy deploy timing bake-ami unbake-ami clear-costs
+.PHONY: ecr-login ecr-push infra-init infra-plan infra-apply infra-destroy infra-teardown infra-setup deploy timing bake-ami unbake-ami clear-costs
 
 # Resolve the pre-baked worker AMI for the CURRENT image tag, if one exists.
 # Empty when nothing is baked -> Batch pulls the image on boot. This is what
@@ -184,8 +186,40 @@ infra-plan:           ## tofu plan -> tf.plan (review before infra-apply)
 infra-apply:          ## apply the saved tf.plan (run only after reviewing the plan)
 	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu apply tf.plan
 
-infra-destroy:        ## tear the whole stack down to $0
+infra-destroy:        ## tear the whole stack down to $0 (also removes the worker AMI)
 	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu destroy
+	$(MAKE) unbake-ami   # AMI isn't tofu-managed; remove it too so nothing bills
+
+infra-teardown: infra-destroy   ## alias for infra-destroy (mirror of infra-setup)
+
+# Stand the whole stack up from nothing in one shot — the inverse of
+# infra-destroy. Every step is a sub-make so it re-parses the Makefile and
+# re-resolves ECR_REPO / WORKER_AMI from CURRENT state (the top-level values
+# were empty when make started, before any of this existed). Order matters:
+#   1. init + first apply       — create ECR, Batch, VPC, SFN, IAM (no AMI yet;
+#                                  launch template pulls the image on boot).
+#   2. ecr-push                 — push :IMAGE_TAG so the image exists to bake+run.
+#   3. bake-ami                 — bake the worker AMI (needs the instance profile
+#                                  from step 1 AND the image from step 2).
+#   4. second plan + apply      — WORKER_AMI now resolves to the baked AMI, so
+#                                  this wires it into the launch template.
+# Job defs referencing a not-yet-pushed tag apply fine in step 1 — ECR isn't
+# checked at create; step 2 fills it in.
+infra-setup:          ## one-shot stand-up: init + apply + ecr-push + bake-ami + wire AMI
+	$(MAKE) infra-init
+	$(MAKE) infra-plan
+	$(MAKE) infra-apply
+	$(MAKE) ecr-push
+	$(MAKE) bake-ami
+	@echo ">>> waiting for the baked AMI to be queryable as available (EC2 is eventually consistent)..."
+	@until [ -n "$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
+	    --filters Name=tag:image_tag,Values=$(IMAGE_TAG) Name=state,Values=available \
+	    --query 'Images[0].ImageId' --output text 2>/dev/null | grep -v '^None$$')" ]; do \
+	  sleep 3; done
+	$(MAKE) infra-plan
+	$(MAKE) infra-apply
+	@echo ">>> Stack up, image pushed, AMI baked + wired. Cold starts skip the ECR pull."
+	@echo ">>> (The AMI costs ~\$$1.50/mo while it exists — 'make unbake-ami' when done.)"
 
 # Deploy stops at the plan on purpose — review it, then run `make infra-apply`.
 # (Keeping preview and apply as separate, deliberate steps for live IaC.)

@@ -6,6 +6,11 @@ resource "aws_ecr_repository" "encoder_worker" {
   name                 = "encoder-worker"
   image_tag_mutability = "MUTABLE"   # we overwrite :latest on every push
 
+  # Let `tofu destroy` remove the repo even when it still holds images.
+  # Without this, teardown fails with RepositoryNotEmptyException and you
+  # have to hand-delete every image tag first.
+  force_delete = true
+
   image_scanning_configuration {
     scan_on_push = true
   }
