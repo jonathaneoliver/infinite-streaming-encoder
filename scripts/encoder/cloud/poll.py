@@ -105,12 +105,24 @@ class _LogTailer:
 
 
 def _forward_markers(text: str) -> None:
-    """Re-emit ENCODER-* marker lines to stdout so the Go scanner sees them."""
+    """Re-emit interesting remote-log lines to stdout so the Go scanner (and
+    thus the app's job log) sees them: the stage/plan markers that drive the
+    UI, the end-of-run summary, and a definitive AMI-cache signal (the remote
+    `docker pull` status — "up to date" means the pre-baked AMI already had the
+    image, so no pull happened; that's a real signal, not a timing guess)."""
     for line in text.splitlines():
         if line.startswith("[[ENCODER-PLAN ") or line.startswith("[[ENCODER-STAGE "):
             # flush=True so the server's docker logs -f sees it without
             # waiting for Python's output buffer to fill.
             print(line, flush=True)
+        elif line.startswith("[run summary]"):
+            print(line, flush=True)
+        elif "Status: Image is up to date" in line:
+            print("[cloud] image already resident — pre-baked AMI cache HIT "
+                  "(no pull)", flush=True)
+        elif "Status: Downloaded newer image" in line:
+            print("[cloud] image pulled from ECR — no matching AMI cache "
+                  "(this run paid the pull)", flush=True)
 
 
 def poll_until_done(
