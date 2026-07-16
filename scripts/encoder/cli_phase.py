@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import resource
 import shutil
 import sys
 import time
@@ -100,15 +101,60 @@ def _parse(uri: str) -> tuple[str, str]:
     return bucket, key.rstrip("/")
 
 
-def _download(uri: str, dst: Path) -> None:
+class _Xfer:
+    """boto3 transfer Callback that prints a throttled `[progress]` line so
+    the poll loop's live-log forwarder can render a download/upload bar
+    without drowning the app log. Emits at most every 2s, plus on completion."""
+
+    def __init__(self, label: str, total: int):
+        self.label = label
+        self.total = max(total, 1)
+        self.done = 0
+        self._last = 0.0
+
+    def __call__(self, n: int) -> None:
+        self.done += n
+        now = time.monotonic()
+        if now - self._last < 2.0 and self.done < self.total:
+            return
+        self._last = now
+        pct = min(100, self.done * 100 // self.total)
+        print(f"[progress] {self.label}: {pct}% "
+              f"({self.done / 1048576:.1f}/{self.total / 1048576:.1f} MB)",
+              flush=True)
+
+
+def _download(uri: str, dst: Path, progress: bool = True) -> None:
     bucket, key = _parse(uri)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    _s3().download_file(bucket, key, str(dst))
+    cb = None
+    if progress:
+        try:
+            total = _s3().head_object(Bucket=bucket, Key=key)["ContentLength"]
+            cb = _Xfer(f"downloading {Path(key).name}", total)
+        except Exception:  # noqa: BLE001 — progress is best-effort
+            cb = None
+    _s3().download_file(bucket, key, str(dst), Callback=cb)
 
 
-def _upload(src: Path, uri: str) -> None:
+def _upload(src: Path, uri: str, progress: bool = True) -> None:
     bucket, key = _parse(uri)
-    _s3().upload_file(str(src), bucket, key)
+    cb = _Xfer(f"uploading {Path(key).name}", src.stat().st_size) if progress else None
+    _s3().upload_file(str(src), bucket, key, Callback=cb)
+
+
+def _s3_exists(uri: str) -> bool:
+    """True if the object already exists in S3. Used for skip-if-already-done:
+    S3 only exposes fully-uploaded objects, so existence == a complete output
+    from a prior run or a spot-reclaim retry that got far enough to upload."""
+    bucket, key = _parse(uri)
+    try:
+        _s3().head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("404", "NotFound", "NoSuchKey"):
+            return False
+        raise
 
 
 def _write_done(path: Path) -> None:
@@ -124,7 +170,8 @@ def _upload_with_done(local: Path, s3_uri: str) -> None:
     """Upload a file + its .done sidecar so consumers can verify."""
     _write_done(local)
     _upload(local, s3_uri)
-    _upload(local.with_suffix(local.suffix + ".done"), s3_uri + ".done")
+    _upload(local.with_suffix(local.suffix + ".done"), s3_uri + ".done",
+            progress=False)
 
 
 def _download_if_complete(s3_uri: str, dst: Path) -> bool:
@@ -140,7 +187,7 @@ def _download_if_complete(s3_uri: str, dst: Path) -> bool:
     marker_s3 = s3_uri + ".done"
     marker_local = dst.with_suffix(dst.suffix + ".done")
     try:
-        _download(marker_s3, marker_local)
+        _download(marker_s3, marker_local, progress=False)
     except ClientError:
         return False
     try:
@@ -179,6 +226,16 @@ def _tier_by_name(name: str) -> Tier:
 
 def phase_mezzanine(args: argparse.Namespace) -> int:
     work = _prepare_work_dir()
+
+    # Idempotency / resume: if mezzanine.mp4 is already in S3 (a prior run or a
+    # retry), reuse it — skip the source download + stream-copy entirely.
+    # FORCE_REENCODE overrides.
+    out_uri = args.s3_out.rstrip("/") + "/mezzanine.mp4"
+    if not _env_flag("FORCE_REENCODE") and _s3_exists(out_uri):
+        print("[phase mezzanine] reusing mezzanine.mp4 — already in S3, "
+              "skipping download + stream-copy", flush=True)
+        emit_stage("mezzanine", "done", 100.0)
+        return 0
 
     # Download source. `--s3-in` is the full object URI; pull the
     # basename for the local filename.
@@ -232,11 +289,15 @@ class _StepTimer:
         self.marks.append((name, now - self._last))
         self._last = now
 
-    def emit(self, key: str) -> None:
+    def emit(self, key: str, **extra) -> None:
         total = time.monotonic() - self._t0
         kv = " ".join(f"{n}_s={d:.2f}" for n, d in self.marks)
+        # extra carries non-duration measurements (e.g. cpu_s = ffmpeg
+        # CPU-seconds) that still ride the same marker so cloud.cpu_report
+        # can divide them by reserved-vCPU x encode wall-time per tier.
+        extra_kv = "".join(f" {k}={v}" for k, v in extra.items())
         # Machine-readable (parsed by cloud.timing / the app), then human.
-        print(f"[[ENCODER-TIMING phase={self.phase} key={key} {kv} "
+        print(f"[[ENCODER-TIMING phase={self.phase} key={key} {kv}{extra_kv} "
               f"total_s={total:.2f}]]", flush=True)
         human = ", ".join(f"{n}={d:.1f}s" for n, d in self.marks)
         print(f"[timing] {self.phase} {key}: {human}, total={total:.1f}s",
@@ -246,6 +307,22 @@ class _StepTimer:
 def phase_variant(args: argparse.Namespace) -> int:
     work = _prepare_work_dir()
     timer = _StepTimer("variant")
+
+    # Idempotency / resume: the output name is fully determined by codec, tier
+    # and the chunk index (a CLI arg), so we can check S3 BEFORE downloading
+    # the mezzanine. If this exact variant is already there — a prior run, or a
+    # spot-reclaim retry that got far enough to upload — reuse it and skip both
+    # the fetch and the encode. S3 only exposes complete objects, so existence
+    # == a valid finished output. FORCE_REENCODE overrides.
+    ci_suffix = "" if args.chunk_index is None else f"_chunk{args.chunk_index:03d}"
+    out_name = f"{args.codec}_{args.tier}{ci_suffix}.mp4"
+    out_uri = args.s3_out.rstrip("/") + f"/{out_name}"
+    ci = "" if args.chunk_index is None else f":chunk{args.chunk_index}"
+    if not _env_flag("FORCE_REENCODE") and _s3_exists(out_uri):
+        print(f"[phase variant] reusing {out_name} — already in S3, "
+              f"skipping fetch + encode", flush=True)
+        timer.emit(f"encode:{args.codec}:{args.tier}{ci}", cpu_s="0.00", reused="1")
+        return 0
 
     mezz_uri = args.s3_mezz.rstrip("/") + "/mezzanine.mp4"
     mezz_local = work / "mezzanine.mp4"
@@ -291,7 +368,14 @@ def phase_variant(args: argparse.Namespace) -> int:
         print(f"[phase variant] chunk {chunk.index}/{len(chunks)}: "
               f"[{chunk.start_s:.0f}s, {chunk.end_s:.0f}s)", flush=True)
 
+    # CPU-seconds actually consumed by the ffmpeg child(ren) during the
+    # encode (both passes, if two-pass). Divided by (reserved vCPU x encode
+    # wall-time) per tier, this is the real utilization — i.e. how much of
+    # the vCPU we pay for is crunching video vs sitting idle-reserved.
+    ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
     out_path = encode_variant(ctx, args.codec, tier, chunk=chunk)
+    ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu_s = (ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime)
     timer.mark("encode")
 
     # out_path.name is {codec}_{tier}.mp4 whole-clip, or
@@ -302,7 +386,7 @@ def phase_variant(args: argparse.Namespace) -> int:
     timer.mark("upload")
 
     ci = "" if chunk is None else f":chunk{chunk.index}"
-    timer.emit(f"encode:{args.codec}:{args.tier}{ci}")
+    timer.emit(f"encode:{args.codec}:{args.tier}{ci}", cpu_s=f"{cpu_s:.2f}")
     return 0
 
 
@@ -348,6 +432,17 @@ def phase_concat_variant(args: argparse.Namespace) -> int:
 
 def phase_audio(args: argparse.Namespace) -> int:
     work = _prepare_work_dir()
+
+    # Idempotency / resume: reuse an existing audio.mp4 from a prior run or a
+    # retry — skip the mezzanine download + audio extract. (A source with no
+    # audio uploads nothing, so a missing audio.mp4 just runs normally and
+    # re-confirms that.) FORCE_REENCODE overrides.
+    out_uri = args.s3_out.rstrip("/") + "/audio.mp4"
+    if not _env_flag("FORCE_REENCODE") and _s3_exists(out_uri):
+        print("[phase audio] reusing audio.mp4 — already in S3, skipping "
+              "extract", flush=True)
+        emit_stage("audio", "done", 100.0)
+        return 0
 
     mezz_uri = args.s3_mezz.rstrip("/") + "/mezzanine.mp4"
     mezz_local = work / "mezzanine.mp4"

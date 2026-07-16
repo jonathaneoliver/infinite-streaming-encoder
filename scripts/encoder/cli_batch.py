@@ -98,6 +98,63 @@ def _reflect_batch_status(exec_name: str) -> None:
 # infra/terraform/modules/jobs/main.tf).
 _BATCH_LOG_GROUP = "/aws/batch/encoder"
 
+# Only these lines from a running container are worth surfacing live — the
+# throttled S3 transfer bars (_Xfer in cli_phase) and the per-phase "[phase X]
+# doing Y" lines. Everything else (raw ffmpeg/Shaka spew) stays in CloudWatch.
+_PROGRESS_RE = re.compile(r"\[(?:progress|phase)\b")
+
+
+def _short_label(jobname: str) -> str:
+    """Friendly label for a Batch job name in forwarded progress lines."""
+    m = _CHUNK_JOBNAME_RE.match(jobname)
+    if m:
+        return f"{m.group(1)} {m.group(2)} chunk{m.group(3)}"
+    return {"mezz": "mezzanine", "audio": "audio", "pkg": "package",
+            "hls": "hls", "br": "fragments", "concat": "concat",
+            }.get(jobname.split("-", 1)[0], jobname.split("-", 1)[0])
+
+
+def _forward_running_logs(exec_name: str, log_state: dict) -> None:
+    """Tail the CloudWatch streams of currently-RUNNING jobs and forward their
+    [progress]/[phase] lines into the app log — so long phases (mezzanine,
+    packaging, big S3 transfers) show live activity instead of a dark gap
+    between 'submitted' and 'done'. Best-effort; never breaks polling."""
+    batch = _batch()
+    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    try:
+        running = batch.list_jobs(jobQueue=queue, jobStatus="RUNNING"
+                                  ).get("jobSummaryList", [])
+    except ClientError:
+        return
+    ids = [j["jobId"] for j in running if exec_name in j.get("jobName", "")]
+    for i in range(0, len(ids), 100):
+        try:
+            jobs = batch.describe_jobs(jobs=ids[i:i + 100]).get("jobs", [])
+        except ClientError:
+            continue
+        for j in jobs:
+            stream = j.get("container", {}).get("logStreamName")
+            if stream:
+                _tail_progress(stream, _short_label(j.get("jobName", "")), log_state)
+
+
+def _tail_progress(stream: str, label: str, log_state: dict) -> None:
+    """Forward new progress-marked lines from one running container's stream.
+    Tracks the last-seen timestamp per stream so each line is emitted once."""
+    since = log_state.get(stream, 0)
+    try:
+        events = _logs().get_log_events(
+            logGroupName=_BATCH_LOG_GROUP, logStreamName=stream,
+            startTime=since + 1 if since else 0, startFromHead=True,
+        ).get("events", [])
+    except ClientError:
+        return
+    for e in events:
+        log_state[stream] = max(log_state.get(stream, 0), e.get("timestamp", 0))
+        msg = e.get("message", "").rstrip()
+        if _PROGRESS_RE.search(msg):
+            _narrate(f"{label}: {msg}")
+
 
 def _report_task_failure(details: dict) -> None:
     """Surface a Batch task failure in the JOB LOG (stdout), not just stderr —
@@ -398,6 +455,8 @@ def cmd_poll(args: argparse.Namespace) -> int:
     _emit_plan()
 
     seen: set[int] = set()
+    log_state: dict[str, int] = {}  # stream -> last-forwarded timestamp
+    exec_name = args.execution_arn.rsplit(":", 1)[-1]
     interval_s = int(os.environ.get("BATCH_POLL_INTERVAL_S", "5"))
     timeout_s = int(os.environ.get("BATCH_POLL_TIMEOUT_S", "14400"))  # 4h ceiling
 
@@ -426,8 +485,14 @@ def cmd_poll(args: argparse.Namespace) -> int:
         # (runs after _translate_events so it wins over the enter-event's
         # coarse "running"). Best-effort — never let it break polling.
         try:
-            _reflect_batch_status(args.execution_arn.rsplit(":", 1)[-1])
+            _reflect_batch_status(exec_name)
         except Exception:  # noqa: BLE001 — status reflection is cosmetic
+            pass
+        # Forward live [progress]/[phase] lines from running containers so
+        # long phases show activity, not a dark gap. Best-effort.
+        try:
+            _forward_running_logs(exec_name, log_state)
+        except Exception:  # noqa: BLE001 — live tailing is cosmetic
             pass
 
         desc = sfn.describe_execution(executionArn=args.execution_arn)

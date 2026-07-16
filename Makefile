@@ -151,7 +151,7 @@ ECR_REGISTRY = $(firstword $(subst /, ,$(ECR_REPO)))
 # showing phantom job-def re-tags. Falls back to HEAD if git isn't available.
 IMAGE_TAG := $(shell git log -1 --format=%h -- Dockerfile go.mod go.sum requirements.txt cmd internal scripts static 2>/dev/null || echo $(GIT_SHA))
 
-.PHONY: ecr-login ecr-push infra-init infra-plan infra-apply infra-destroy infra-teardown infra-setup deploy timing bake-ami unbake-ami clear-costs
+.PHONY: ecr-login ecr-push infra-init infra-plan infra-apply infra-destroy infra-teardown infra-setup deploy timing cpu-report bake-ami unbake-ami clear-costs
 
 # Resolve the pre-baked worker AMI for the CURRENT image tag, if one exists.
 # Empty when nothing is baked -> Batch pulls the image on boot. This is what
@@ -232,6 +232,10 @@ deploy:               ## push image + restart + plan infra (then review & infra-
 timing:               ## where-did-the-time-go for an execution: make timing EXEC=<arn>
 	@: $${EXEC:?set EXEC=<execution-arn>}
 	docker exec $(CONTAINER_NAME) python3 -m encoder.cloud.timing --execution-arn $(EXEC)
+
+cpu-report:           ## per-tier encode CPU utilization vs reserved vCPU: make cpu-report EXEC=<arn>
+	@: $${EXEC:?set EXEC=<execution-arn>}
+	docker exec $(CONTAINER_NAME) python3 -m encoder.cloud.cpu_report --execution-arn $(EXEC)
 
 # ---- Worker-AMI cache (opt-in, one at a time) --------------------------------
 # The AMI is a pre-warmed cache: a cold spot instance boots with the encoder
