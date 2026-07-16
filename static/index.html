@@ -305,9 +305,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group" id="cpu-arch-group" style="display:none">
                 <label>CPU (cloud)</label>
                 <select id="cpu-arch">
-                    <option value="intel">Intel Xeon (c7i)</option>
-                    <option value="amd">AMD EPYC (c7a)</option>
-                    <option value="graviton">Graviton ARM (c7g)</option>
+                    <option value="graviton" selected>Graviton ARM (c7g)</option>
+                    <option value="intel">Intel Xeon (c7i) — needs multi-arch image</option>
+                    <option value="amd">AMD EPYC (c7a) — needs multi-arch image</option>
                 </select>
             </div>
             <div class="control-group" id="spot-group" style="display:none;align-self:center;padding-top:16px">

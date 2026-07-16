@@ -152,11 +152,20 @@ ECR_REGISTRY = $(firstword $(subst /, ,$(ECR_REPO)))
 # showing phantom job-def re-tags. Falls back to HEAD if git isn't available.
 IMAGE_TAG := $(shell git log -1 --format=%h -- Dockerfile go.mod go.sum requirements.txt cmd internal scripts static 2>/dev/null || echo $(GIT_SHA))
 
-# Image the LEGACY (single-instance) cloud target pulls on the remote. Default
-# to the same ECR image the Batch target runs — PAT-free (the instance role
-# authenticates to ECR) and apples-to-apples for comparison. Override in .env
-# to pin a different tag or fall back to the GHCR image.
-DOCKER_IMAGE ?= $(ECR_REPO):$(IMAGE_TAG)
+# The SHA tag of the image ACTUALLY in ECR (most-recent push, excluding the
+# mutable :latest). This is what a cloud remote can definitely pull — using the
+# local IMAGE_TAG would break the legacy target whenever a bare `make restart`
+# advanced it to a tag that was only built locally, never pushed. A sha (not
+# :latest) so the shared-AMI lookup, which keys on image_tag, still matches.
+ECR_PUSHED_TAG := $(shell aws ecr describe-images --repository-name encoder-worker \
+	--region $(AWS_REGION) --query 'reverse(sort_by(imageDetails,&imagePushedAt))[0].imageTags' \
+	--output text 2>/dev/null | tr '\t' '\n' | grep -v '^latest$$' | head -1)
+
+# Image the LEGACY (single-instance) cloud target pulls on the remote — the
+# same ECR image the Batch target runs (PAT-free, apples-to-apples). Defaults
+# to the last-pushed sha so it's always pullable; falls back to IMAGE_TAG only
+# if ECR can't be reached. Override in .env to pin a specific tag.
+DOCKER_IMAGE ?= $(ECR_REPO):$(if $(ECR_PUSHED_TAG),$(ECR_PUSHED_TAG),$(IMAGE_TAG))
 
 .PHONY: ecr-login ecr-push infra-init infra-plan infra-apply infra-destroy infra-teardown infra-setup deploy timing cpu-report bake-ami unbake-ami clear-costs
 
