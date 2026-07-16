@@ -61,10 +61,23 @@ resource "aws_launch_template" "worker" {
   EOT
   )
 
+  # Application=encoder-app is what the app's AWS page filters EC2 on
+  # (aws.py app_tag_filter), so tagging workers here makes Batch spot
+  # instances show up in the EC2 panel alongside jobs/executions. Tag
+  # volumes too so any orphaned EBS is discoverable the same way.
   tag_specifications {
     resource_type = "instance"
     tags = {
-      Name = "encoder-batch-worker"
+      Name        = "encoder-batch-worker"
+      Application = "encoder-app"
+    }
+  }
+
+  tag_specifications {
+    resource_type = "volume"
+    tags = {
+      Name        = "encoder-batch-worker"
+      Application = "encoder-app"
     }
   }
 }

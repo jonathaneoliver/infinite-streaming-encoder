@@ -142,7 +142,7 @@ TF_DIR := infra/terraform
 ECR_REPO ?= $(shell cd $(TF_DIR) && tofu output -raw ecr_repo_url 2>/dev/null)
 ECR_REGISTRY = $(firstword $(subst /, ,$(ECR_REPO)))
 
-.PHONY: ecr-login ecr-push infra-init infra-plan infra-apply infra-destroy deploy timing bake-ami unbake-ami
+.PHONY: ecr-login ecr-push infra-init infra-plan infra-apply infra-destroy deploy timing bake-ami unbake-ami clear-costs
 
 # Resolve the pre-baked worker AMI for the CURRENT image SHA, if one exists.
 # Empty when nothing is baked -> Batch pulls the image on boot. This is what
@@ -228,3 +228,21 @@ unbake-ami:           ## deregister ALL worker AMIs + delete snapshots ($0 stand
 	    for s in $$snaps; do echo "  delete snapshot $$s"; aws ec2 delete-snapshot --region $(AWS_REGION) --snapshot-id $$s; done; \
 	  done; fi
 	@echo ">>> Removed. IMPORTANT: run 'make infra-apply' so the launch template drops the dead AMI id and workers fall back to pull-on-boot."
+
+# ---- Cost teardown -----------------------------------------------------------
+# clear-costs kills everything that bills while IDLE without destroying the
+# reusable stack (compute env, queue, SFN, VPC, IAM are all ~$0 at rest —
+# scale-to-zero spot, IGW/public subnets, free S3 gateway endpoint). It runs
+# the same tagged sweep as the app's Emergency Clear (instances / orphan
+# volumes / spot requests / S3 data tagged Application=encoder-app) and removes
+# the worker AMI + snapshot. For a TOTAL teardown (also drops ECR images, log
+# groups, VPC — next use needs a full re-deploy) use `make infra-destroy`.
+
+clear-costs:          ## kill every idle AWS cost: sweep tagged instances/volumes/spot/S3 + remove worker AMI
+	@echo ">>> sweeping Application=encoder-app runtime resources (instances, volumes, spot, S3)..."
+	docker exec $(CONTAINER_NAME) python3 -m encoder.cloud.cleanup --sweep-all
+	@echo ">>> removing worker AMI(s)..."
+	$(MAKE) unbake-ami
+	@echo ">>> Idle cost generators cleared. The Batch stack stays (it's ~\$$0 at rest)."
+	@echo ">>> If you had baked an AMI in, run 'make infra-apply' so the launch template drops it."
+	@echo ">>> For a full teardown to nothing:  make infra-destroy"
