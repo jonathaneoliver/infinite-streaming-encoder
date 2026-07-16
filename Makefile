@@ -262,7 +262,18 @@ bake-ami:             ## build a worker AMI with the current image pre-pulled (k
 	  done
 	@echo ">>> Baked encoder-worker-$(IMAGE_TAG) (1 AMI total). Now: make infra-apply  (wires it in)"
 
-unbake-ami:           ## deregister ALL worker AMIs + delete snapshots ($0 standing cost)
+unbake-ami:           ## clear the compute-env AMI pointer, THEN delete the AMIs (self-clearing, no dangling ref)
+	# Clear the compute env's image_id_override FIRST so we never delete an AMI
+	# the env still points at — no dangling pointer, no manual follow-up apply.
+	# Targeted to the compute env only (won't touch job defs). Guarded so it
+	# no-ops on an already-destroyed stack (infra-destroy calls this after
+	# teardown, when there's nothing left in state to apply).
+	@if cd $(TF_DIR) && tofu state list 2>/dev/null | grep -q 'aws_batch_compute_environment.spot_graviton'; then \
+	  echo ">>> clearing compute-env AMI pointer (-> pull-on-boot)..."; \
+	  AWS_REGION=$(AWS_REGION) tofu apply -auto-approve \
+	    -target=module.compute.aws_batch_compute_environment.spot_graviton \
+	    -var image_tag=$(IMAGE_TAG) -var worker_ami_id="" ; \
+	else echo ">>> no compute env in state — skipping pointer clear"; fi
 	@ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
 	    --filters "Name=tag:Name,Values=encoder-worker" --query 'Images[].ImageId' --output text); \
 	  if [ -z "$$ids" ] || [ "$$ids" = "None" ]; then echo "no encoder-worker AMI to remove"; else \
@@ -272,7 +283,7 @@ unbake-ami:           ## deregister ALL worker AMIs + delete snapshots ($0 stand
 	    echo "deregister $$ami"; aws ec2 deregister-image --region $(AWS_REGION) --image-id $$ami; \
 	    for s in $$snaps; do echo "  delete snapshot $$s"; aws ec2 delete-snapshot --region $(AWS_REGION) --snapshot-id $$s; done; \
 	  done; fi
-	@echo ">>> Removed. IMPORTANT: run 'make infra-apply' so the launch template drops the dead AMI id and workers fall back to pull-on-boot."
+	@echo ">>> Removed. Compute env is on pull-on-boot; nothing dangling."
 
 # ---- Cost teardown -----------------------------------------------------------
 # clear-costs kills everything that bills while IDLE without destroying the
@@ -288,6 +299,5 @@ clear-costs:          ## kill every idle AWS cost: sweep tagged instances/volume
 	docker exec $(CONTAINER_NAME) python3 -m encoder.cloud.cleanup --sweep-all
 	@echo ">>> removing worker AMI(s)..."
 	$(MAKE) unbake-ami
-	@echo ">>> Idle cost generators cleared. The Batch stack stays (it's ~\$$0 at rest)."
-	@echo ">>> If you had baked an AMI in, run 'make infra-apply' so the launch template drops it."
-	@echo ">>> For a full teardown to nothing:  make infra-destroy"
+	@echo ">>> Idle cost generators cleared (AMI pointer self-cleared to pull-on-boot)."
+	@echo ">>> The Batch stack stays (it's ~\$$0 at rest). Full teardown: make infra-destroy"

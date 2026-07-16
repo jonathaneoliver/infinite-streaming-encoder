@@ -124,13 +124,16 @@ resource "aws_batch_compute_environment" "spot_graviton" {
     # Custom worker AMI. This is the ONLY way managed Batch honors a custom
     # AMI — a launch-template image_id is silently ignored; Batch picks its
     # own LATEST ECS AMI instead (which is what left the baked AMI unused).
-    # Only emitted when an AMI is baked; empty => Batch's default ECS AMI.
-    dynamic "ec2_configuration" {
-      for_each = var.worker_ami_id != "" ? [1] : []
-      content {
-        image_type        = "ECS_AL2023"
-        image_id_override = var.worker_ami_id
-      }
+    #
+    # The block is ALWAYS present (not a dynamic for_each) so that clearing the
+    # AMI reliably resets it: worker_ami_id="" => image_id_override=null =>
+    # Batch falls back to its default LATEST ECS AMI. Removing the whole block
+    # instead can leave a stale override behind (Batch retains it), which is
+    # what would strand a deleted-AMI pointer. Keeping image_type pinned +
+    # override null is the clean "no custom AMI" state.
+    ec2_configuration {
+      image_type        = "ECS_AL2023"
+      image_id_override = var.worker_ami_id != "" ? var.worker_ami_id : null
     }
 
     # Bid at on-demand price — spot is always cheaper; this is a
@@ -149,10 +152,14 @@ resource "aws_batch_compute_environment" "spot_graviton" {
   # queue can be moved onto it first (see name_prefix note above).
   lifecycle {
     create_before_destroy = true
-    # AWS Batch auto-populates an update_policy on the compute env during
-    # in-place UpdateComputeEnvironment calls. We don't manage it, so ignore
-    # it rather than fight a perpetual "remove update_policy" diff.
-    ignore_changes = [update_policy]
+    # Both of these are Batch-managed at runtime, not by us — ignore them to
+    # avoid perpetual diffs: update_policy is auto-populated on in-place
+    # updates, and desired_vcpus scales dynamically with the job queue (config
+    # keeps it at 0 as a starting point; Batch moves it up/down from there).
+    ignore_changes = [
+      update_policy,
+      compute_resources[0].desired_vcpus,
+    ]
   }
 }
 
