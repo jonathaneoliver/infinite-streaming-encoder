@@ -46,6 +46,24 @@ func probeDurationSeconds(path string) (float64, error) {
 	return strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
 }
 
+// probeSourceWidth reads a clip's video width via ffprobe, so the ladder can
+// be capped at the source resolution (never upscale). Returns 0 on failure —
+// callers treat that as "unknown, don't cap".
+func probeSourceWidth(path string) int {
+	cmd := exec.Command("ffprobe", "-v", "error",
+		"-select_streams", "v:0", "-show_entries", "stream=width",
+		"-of", "default=noprint_wrappers=1:nokey=1", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	w, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0
+	}
+	return w
+}
+
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\[\?[0-9;]*[a-zA-Z]|\x1b[()][0-9A-B]|\x1b\][^\x07]*\x07|\r`)
 
 func stripANSI(s string) string {
@@ -1298,7 +1316,13 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 		job.AppendLog(fmt.Sprintf("[cloud-batch] %s: %.1fs → %d chunk(s)", filename, durationS, nChunks))
 	}
 
-	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Codec, job.Config.MaxRes, job.Config.TwoPass, nChunks)
+	// Probe the source width so the ladder is capped at native resolution
+	// (never upscale). 0 => unknown, don't cap.
+	srcWidth := probeSourceWidth(localSrc)
+	if srcWidth > 0 {
+		job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
+	}
+	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Codec, job.Config.MaxRes, job.Config.TwoPass, nChunks, srcWidth)
 	inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 	if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 		return fmt.Errorf("write input json: %w", err)
@@ -1387,7 +1411,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 // buildSFNInput renders the JSON doc the state machine expects. Picks
 // which (codec, tier) combinations to fan out over based on the
 // JobConfig's Codec + MaxRes.
-func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nChunks int) string {
+func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nChunks, sourceWidth int) string {
 	tiers := []string{"360p", "540p", "720p", "1080p", "1440p", "2160p"}
 	if maxRes != "" {
 		for i, t := range tiers {
@@ -1396,6 +1420,24 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nCh
 				break
 			}
 		}
+	}
+	// Cap at the source resolution — never upscale (mirrors select_tiers in
+	// ladder.py). Without this the cloud-batch path would encode e.g. 1440p and
+	// 2160p variants from a 1080p source: the most expensive jobs (4K HEVC),
+	// producing only an upscaled copy of the same detail. sourceWidth==0 means
+	// the probe failed → don't cap.
+	if sourceWidth > 0 {
+		tierWidth := map[string]int{
+			"360p": 640, "540p": 960, "720p": 1280,
+			"1080p": 1920, "1440p": 2560, "2160p": 3840,
+		}
+		var capped []string
+		for _, t := range tiers {
+			if tierWidth[t] <= sourceWidth {
+				capped = append(capped, t)
+			}
+		}
+		tiers = capped
 	}
 	codecs := []string{"h264", "hevc"}
 	switch codecSel {
