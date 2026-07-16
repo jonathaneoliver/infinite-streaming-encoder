@@ -57,7 +57,7 @@ _CLOUD_STAGES = [
     Stage(key="cloud:launch",        label="launch EC2 instance"),
     Stage(key="cloud:upload",        label="upload inputs (local → S3)"),
     Stage(key="remote:install",      label="install docker on EC2"),
-    Stage(key="remote:ghcr-login",   label="login to GHCR"),
+    Stage(key="remote:login",        label="registry login"),
     Stage(key="remote:pull",         label="docker pull encoder image"),
     Stage(key="remote:fetch-inputs", label="fetch inputs (S3 → EC2)"),
     Stage(key="cloud:encode-remote", label="encode loop (remote)"),
@@ -180,9 +180,16 @@ def main() -> int:
     s3_bucket = _require("S3_BUCKET")
     subnet_id = _require("SUBNET_ID")
     security_group_id = _require("SECURITY_GROUP_ID")
-    ghcr_pat = _require("GHCR_PAT")
 
     aws_region = region()
+
+    # Worker image. Default to the ECR image the Makefile passes through
+    # (DOCKER_IMAGE=<ecr-repo>:<tag>), which the Batch target also runs — so
+    # this legacy path is PAT-free and an apples-to-apples comparison. Only a
+    # ghcr.io image still needs GHCR_PAT; ECR authenticates via the instance
+    # role on the remote.
+    docker_image = _env("DOCKER_IMAGE", "ghcr.io/jonathaneoliver/encoder:latest")
+    ghcr_pat = _require("GHCR_PAT") if "ghcr.io" in docker_image else _env("GHCR_PAT", "")
     s3_prefix = f"s3://{s3_bucket}/jobs/{job_id}"
     local_output_dir = args.output_dir or Path(f"./cloud_output_{job_id}")
 
@@ -222,9 +229,6 @@ def main() -> int:
     print(f"  instance type:  {instance_type} ({'spot' if use_spot else 'on-demand'})")
     print(f"  fallbacks:      {','.join(instance_type_fallbacks) or '(none)'}")
     print(f"  ami:            {ami_id}")
-    docker_image = _env(
-        "DOCKER_IMAGE", "ghcr.io/jonathaneoliver/encoder:latest",
-    )
     print(f"  image:          {docker_image}")
     print(f"  encode args:    {' '.join(passthrough) if passthrough else '<none>'}")
 

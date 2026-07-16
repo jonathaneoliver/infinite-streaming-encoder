@@ -151,6 +151,12 @@ ECR_REGISTRY = $(firstword $(subst /, ,$(ECR_REPO)))
 # showing phantom job-def re-tags. Falls back to HEAD if git isn't available.
 IMAGE_TAG := $(shell git log -1 --format=%h -- Dockerfile go.mod go.sum requirements.txt cmd internal scripts static 2>/dev/null || echo $(GIT_SHA))
 
+# Image the LEGACY (single-instance) cloud target pulls on the remote. Default
+# to the same ECR image the Batch target runs — PAT-free (the instance role
+# authenticates to ECR) and apples-to-apples for comparison. Override in .env
+# to pin a different tag or fall back to the GHCR image.
+DOCKER_IMAGE ?= $(ECR_REPO):$(IMAGE_TAG)
+
 .PHONY: ecr-login ecr-push infra-init infra-plan infra-apply infra-destroy infra-teardown infra-setup deploy timing cpu-report bake-ami unbake-ami clear-costs
 
 # Resolve the pre-baked worker AMI for the CURRENT image tag, if one exists.
