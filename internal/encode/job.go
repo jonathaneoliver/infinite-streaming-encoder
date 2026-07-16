@@ -1308,6 +1308,42 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 	if err := poll.Start(); err != nil {
 		return err
 	}
+
+	// Cancel watcher. A cloud-batch job's only live local process is this
+	// poll subprocess — there's no worker container — so Manager.Cancel
+	// can't stop it directly; it only sets the cancel flag. Watch that flag
+	// here: on cancel, abort the Step Functions execution (which cascades
+	// to its in-flight + queued Batch jobs) and kill the poll so the scan
+	// loop below unblocks and run() finalizes the job as cancelled.
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopWatch:
+				return
+			case <-ticker.C:
+				if job.IsCancelled() {
+					job.AppendLog("[cloud-batch] cancel requested — aborting execution")
+					m.notify(job)
+					stop := exec.Command("python3", "-m", "encoder.cloud.batch_admin",
+						"stop-execution", "--arn", execArn)
+					stop.Env = os.Environ()
+					if o, e := stop.CombinedOutput(); e != nil {
+						job.AppendLog(fmt.Sprintf("[cloud-batch] stop-execution failed: %v: %s",
+							e, strings.TrimSpace(string(o))))
+					}
+					if poll.Process != nil {
+						poll.Process.Kill()
+					}
+					return
+				}
+			}
+		}
+	}()
+
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -1317,7 +1353,10 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 		}
 		m.notify(job)
 	}
-	if err := poll.Wait(); err != nil {
+	// When cancelled we killed the poll on purpose — swallow the resulting
+	// wait error and let run() observe IsCancelled() and finalize the job
+	// as cancelled rather than failed.
+	if err := poll.Wait(); err != nil && !job.IsCancelled() {
 		return fmt.Errorf("cli_batch poll: %w", err)
 	}
 	return nil
@@ -1368,11 +1407,26 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nCh
 	for i := range chunkIndices {
 		chunkIndices[i] = i
 	}
+	// Per-codec packaging flags. The PerCodec stage packages both codecs
+	// unconditionally unless told otherwise; these let its Choice guards
+	// skip the branch for a codec that wasn't encoded (else it fails with
+	// "no <codec> variants found" on a single-codec job).
+	doH264, doHevc := false, false
+	for _, c := range codecs {
+		switch c {
+		case "h264":
+			doH264 = true
+		case "hevc":
+			doHevc = true
+		}
+	}
 	doc := map[string]any{
 		"s3_input":      s3Input,
 		"s3_prefix":     s3Prefix,
 		"variants":      variants,
 		"chunk_indices": chunkIndices,
+		"do_h264":       doH264,
+		"do_hevc":       doHevc,
 		// Injected as the TWO_PASS env var on each variant job by the
 		// state machine's EncodeVariant task (see definition.json.tpl).
 		// String, not bool, so it drops straight into a container env value.

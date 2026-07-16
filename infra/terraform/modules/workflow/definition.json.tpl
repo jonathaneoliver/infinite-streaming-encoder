@@ -72,7 +72,7 @@
               "Comment": "Fan out across (codec, tier); each variant fans out again across chunks, then concats. 12 variants x N chunks. Batch queue depth caps real parallelism.",
               "Type": "Map",
               "ItemsPath": "$.variants",
-              "MaxConcurrency": 12,
+              "MaxConcurrency": 6,
               "ItemSelector": {
                 "codec.$": "$$.Map.Item.Value.codec",
                 "tier.$": "$$.Map.Item.Value.tier",
@@ -168,8 +168,17 @@
       "Branches": [
 
         {
-          "StartAt": "PackageH264",
+          "StartAt": "H264Selected",
           "States": {
+            "H264Selected": {
+              "Comment": "Only package h264 if it was actually encoded (do_h264 from buildSFNInput). A single-codec job would otherwise fail here with 'no h264 variants found'.",
+              "Type": "Choice",
+              "Choices": [
+                { "Variable": "$.do_h264", "BooleanEquals": true, "Next": "PackageH264" }
+              ],
+              "Default": "SkipH264"
+            },
+            "SkipH264": { "Type": "Succeed" },
             "PackageH264": {
               "Type": "Task",
               "Resource": "arn:aws:states:::batch:submitJob.sync",
@@ -222,8 +231,17 @@
         },
 
         {
-          "StartAt": "PackageHevc",
+          "StartAt": "HevcSelected",
           "States": {
+            "HevcSelected": {
+              "Comment": "Only package hevc if it was actually encoded (do_hevc from buildSFNInput). A single-codec job would otherwise fail here with 'no hevc variants found'.",
+              "Type": "Choice",
+              "Choices": [
+                { "Variable": "$.do_hevc", "BooleanEquals": true, "Next": "PackageHevc" }
+              ],
+              "Default": "SkipHevc"
+            },
+            "SkipHevc": { "Type": "Succeed" },
             "PackageHevc": {
               "Type": "Task",
               "Resource": "arn:aws:states:::batch:submitJob.sync",
