@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import resource
 import shutil
 import sys
 import tempfile
@@ -519,6 +520,32 @@ def run_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+# Rough Graviton (c7g/c8g/c6g) spot price per vCPU-hour in us-west-2. We can't
+# read the exact instance type from inside the container, but nproc x this is a
+# solid cost estimate for the encode compute. Override via SPOT_USD_PER_VCPU_HR.
+_SPOT_USD_PER_VCPU_HR = 0.0155
+
+
+def _log_run_summary(wall_s: float, cpu_s: float) -> None:
+    """Emit a run-time time/efficiency/cost summary for the encode — computed
+    from the process's own clock and getrusage (the ffmpeg/packager children's
+    CPU-seconds), so it's reliable even for short runs where CloudWatch is too
+    sparse. efficiency = cpu_s / (wall_s x vCPU) = how much of the box's cores
+    the encode actually used."""
+    vcpu = os.cpu_count() or 1
+    cores_busy = cpu_s / wall_s if wall_s else 0.0
+    util = cores_busy / vcpu if vcpu else 0.0
+    rate = float(os.environ.get("SPOT_USD_PER_VCPU_HR", _SPOT_USD_PER_VCPU_HR))
+    cost = wall_s / 3600.0 * vcpu * rate
+    # Machine-readable marker (parsed like the other ENCODER-* markers) + human.
+    print(f"[[ENCODER-SUMMARY wall_s={wall_s:.1f} cpu_s={cpu_s:.1f} vcpu={vcpu} "
+          f"cores_busy={cores_busy:.2f} efficiency_pct={util * 100:.0f} "
+          f"cost_usd={cost:.3f}]]", flush=True)
+    print(f"[run summary] wall={wall_s:.1f}s  cpu-time={cpu_s:.1f}s  "
+          f"efficiency={util * 100:.0f}% ({cores_busy:.1f} of {vcpu} cores busy)"
+          f"  est encode cost=${cost:.3f} (Graviton spot)", flush=True)
+
+
 def main() -> int:
     # Batch job definitions invoke us as
     # `python -m encoder.cli_local phase <name> ...`. Dispatch to the
@@ -529,9 +556,15 @@ def main() -> int:
         return phase_main(sys.argv[2:])
 
     args = build_parser().parse_args()
-    if args.resume_package_from:
-        return run_resume(args)
-    return run_full(args)
+    t0 = time.monotonic()
+    ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    rc = run_resume(args) if args.resume_package_from else run_full(args)
+    ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    _log_run_summary(
+        time.monotonic() - t0,
+        (ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime),
+    )
+    return rc
 
 
 if __name__ == "__main__":
