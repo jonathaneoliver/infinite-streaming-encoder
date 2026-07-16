@@ -10,6 +10,8 @@
         "JobName.$": "States.Format('mezz-{}', $$.Execution.Name)",
         "JobQueue": "${job_queue_arn}",
         "JobDefinition": "${mezzanine_def}",
+        "ShareIdentifier": "encode",
+        "SchedulingPriorityOverride": 99,
         "Parameters": {
           "s3_in.$": "$.s3_input",
           "s3_out.$": "$.s3_prefix"
@@ -55,6 +57,8 @@
                 "JobName.$": "States.Format('audio-{}', $$.Execution.Name)",
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${audio_def}",
+                "ShareIdentifier": "encode",
+                "SchedulingPriorityOverride": 55,
                 "Parameters": {
                   "s3_mezz.$": "$.s3_prefix",
                   "s3_out.$": "$.s3_prefix"
@@ -78,6 +82,7 @@
                 "tier.$": "$$.Map.Item.Value.tier",
                 "vcpu.$": "$$.Map.Item.Value.vcpu",
                 "memory.$": "$$.Map.Item.Value.memory",
+                "priority.$": "$$.Map.Item.Value.priority",
                 "s3_prefix.$": "$.s3_prefix",
                 "two_pass.$": "$.two_pass",
                 "chunk_indices.$": "$.chunk_indices",
@@ -95,6 +100,7 @@
                       "tier.$": "$.tier",
                       "vcpu.$": "$.vcpu",
                       "memory.$": "$.memory",
+                      "priority.$": "$.priority",
                       "s3_prefix.$": "$.s3_prefix",
                       "two_pass.$": "$.two_pass",
                       "chunk_index.$": "$$.Map.Item.Value",
@@ -110,6 +116,8 @@
                             "JobName.$": "States.Format('var-{}-{}-c{}-{}', $.codec, $.tier, $.chunk_index, $$.Execution.Name)",
                             "JobQueue": "${job_queue_arn}",
                             "JobDefinition": "${variant_def}",
+                            "ShareIdentifier": "encode",
+                            "SchedulingPriorityOverride.$": "$.priority",
                             "Parameters": {
                               "codec.$": "$.codec",
                               "tier.$": "$.tier",
@@ -143,6 +151,8 @@
                       "JobName.$": "States.Format('concat-{}-{}-{}', $.codec, $.tier, $$.Execution.Name)",
                       "JobQueue": "${job_queue_arn}",
                       "JobDefinition": "${concat_def}",
+                      "ShareIdentifier": "encode",
+                      "SchedulingPriorityOverride": 50,
                       "Parameters": {
                         "codec.$": "$.codec",
                         "tier.$": "$.tier",
@@ -194,6 +204,8 @@
                 "JobName.$": "States.Format('pkg-h264-{}', $$.Execution.Name)",
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${package_def}",
+                "ShareIdentifier": "encode",
+                "SchedulingPriorityOverride": 45,
                 "Parameters": {
                   "codec": "h264",
                   "s3_variants.$": "$.s3_prefix",
@@ -211,6 +223,8 @@
                 "JobName.$": "States.Format('hls-h264-{}', $$.Execution.Name)",
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${hls_def}",
+                "ShareIdentifier": "encode",
+                "SchedulingPriorityOverride": 45,
                 "Parameters": {
                   "codec": "h264",
                   "s3_package.$": "$.s3_prefix",
@@ -227,6 +241,8 @@
                 "JobName.$": "States.Format('br-h264-{}', $$.Execution.Name)",
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${byteranges_def}",
+                "ShareIdentifier": "encode",
+                "SchedulingPriorityOverride": 45,
                 "Parameters": {
                   "codec": "h264",
                   "s3_package.$": "$.s3_prefix",
@@ -257,6 +273,8 @@
                 "JobName.$": "States.Format('pkg-hevc-{}', $$.Execution.Name)",
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${package_def}",
+                "ShareIdentifier": "encode",
+                "SchedulingPriorityOverride": 45,
                 "Parameters": {
                   "codec": "hevc",
                   "s3_variants.$": "$.s3_prefix",
@@ -274,6 +292,8 @@
                 "JobName.$": "States.Format('hls-hevc-{}', $$.Execution.Name)",
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${hls_def}",
+                "ShareIdentifier": "encode",
+                "SchedulingPriorityOverride": 45,
                 "Parameters": {
                   "codec": "hevc",
                   "s3_package.$": "$.s3_prefix",
@@ -290,6 +310,8 @@
                 "JobName.$": "States.Format('br-hevc-{}', $$.Execution.Name)",
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${byteranges_def}",
+                "ShareIdentifier": "encode",
+                "SchedulingPriorityOverride": 45,
                 "Parameters": {
                   "codec": "hevc",
                   "s3_package.$": "$.s3_prefix",

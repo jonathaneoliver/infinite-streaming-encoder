@@ -179,10 +179,31 @@ resource "aws_iam_service_linked_role" "batch" {
   }
 }
 
+# Fair-share scheduling policy. Attaching ANY scheduling policy to the queue
+# switches it from FIFO-by-submission to priority-ordered: within a share,
+# Batch schedules by each job's schedulingPriority (higher first). We use a
+# single share ("encode") and set the priority per tier at submit time (see
+# the SFN's SchedulingPriorityOverride), so 4K/HEVC variants win the next free
+# CPU over small ones — a hard scheduler guarantee, not just submission order.
+resource "aws_batch_scheduling_policy" "priority" {
+  name = "encoder-priority"
+
+  fair_share_policy {
+    compute_reservation = 0
+    share_decay_seconds = 0
+
+    share_distribution {
+      share_identifier = "encode"
+      weight_factor    = 1
+    }
+  }
+}
+
 resource "aws_batch_job_queue" "main" {
-  name     = "encoder-queue"
-  state    = "ENABLED"
-  priority = 1
+  name                  = "encoder-queue"
+  state                 = "ENABLED"
+  priority              = 1
+  scheduling_policy_arn = aws_batch_scheduling_policy.priority.arn
 
   compute_environment_order {
     order               = 1

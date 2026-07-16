@@ -1485,20 +1485,30 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nCh
 		Tier   string `json:"tier"`
 		VCPU   string `json:"vcpu"`
 		Memory string `json:"memory"`
+		// Batch schedulingPriority (higher = scheduled first). Derived from
+		// tier (×10) + a nudge for HEVC, so 4K/HEVC chunks win the next free
+		// CPU over small ones — enforced by the queue's fair-share policy. Int
+		// (not string) so it lands as a number in SchedulingPriorityOverride.
+		Priority int `json:"priority"`
 	}
+	tierRank := map[string]int{"360p": 1, "540p": 2, "720p": 3, "1080p": 4, "1440p": 5, "2160p": 6}
 	var variants []variant
 	for _, c := range codecs {
 		for _, t := range tiers {
 			vcpu, mem := variantResources(t)
-			variants = append(variants, variant{Codec: c, Tier: t, VCPU: vcpu, Memory: mem})
+			prio := tierRank[t] * 10
+			if c == "hevc" {
+				prio++ // HEVC just ahead of H.264 within a tier (it's slower)
+			}
+			variants = append(variants, variant{
+				Codec: c, Tier: t, VCPU: vcpu, Memory: mem, Priority: prio,
+			})
 		}
 	}
-	// Encode the slowest variants first so the long-pole jobs (highest
-	// resolution, and HEVC over H.264) start immediately instead of trailing
-	// at the end — with the variant Map's bounded MaxConcurrency, the first
-	// items here are the first to run. Order: tier resolution DESC, then HEVC
-	// before H.264.
-	tierRank := map[string]int{"360p": 1, "540p": 2, "720p": 3, "1080p": 4, "1440p": 5, "2160p": 6}
+	// Also submit slowest-first (order in this list = submission order) so the
+	// long poles enter the queue early; the schedulingPriority above is what
+	// actually enforces it, but a good submission order helps too. Order: tier
+	// resolution DESC, then HEVC before H.264.
 	sort.SliceStable(variants, func(i, j int) bool {
 		if tierRank[variants[i].Tier] != tierRank[variants[j].Tier] {
 			return tierRank[variants[i].Tier] > tierRank[variants[j].Tier]

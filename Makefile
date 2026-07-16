@@ -150,7 +150,13 @@ ECR_REGISTRY = $(firstword $(subst /, ,$(ECR_REPO)))
 # Makefile / infra / docs leave this put — so the ECR tag, the job-def image
 # pins, and the AMI don't churn on every commit, and `make infra-plan` stops
 # showing phantom job-def re-tags. Falls back to HEAD if git isn't available.
-IMAGE_TAG := $(shell git log -1 --format=%h -- Dockerfile go.mod go.sum requirements.txt cmd internal scripts static 2>/dev/null || echo $(GIT_SHA))
+# Only the paths the WORKERS actually run out of the image (Dockerfile + the
+# Python package + static). The Go binary is also baked in but is NEVER
+# executed on a worker (Batch/legacy override the entrypoint to python), and
+# the local server runs from a fresh `make build`, not the ECR image — so a
+# Go-only change must NOT bump the worker tag (that just forces a pointless
+# re-push + AMI re-bake). cmd/ internal/ go.mod are deliberately excluded.
+IMAGE_TAG := $(shell git log -1 --format=%h -- Dockerfile requirements.txt scripts static 2>/dev/null || echo $(GIT_SHA))
 
 # The SHA tag of the image ACTUALLY in ECR (most-recent push, excluding the
 # mutable :latest). This is what a cloud remote can definitely pull — using the
