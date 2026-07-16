@@ -31,7 +31,8 @@ from pathlib import Path
 
 from encoder.cloud.arch import ARCH_PROFILES, DEFAULT_ARCH, profile_for
 from encoder.cloud.aws import (
-    AuthError, check_credentials, resolve_al2023_ami, region, s3_client,
+    AuthError, check_credentials, resolve_al2023_ami, resolve_worker_ami,
+    region, s3_client,
 )
 from encoder.cloud.cleanup import terminate_job
 from encoder.cloud.launch import LaunchError, LaunchSpec, launch
@@ -205,7 +206,19 @@ def main() -> int:
     # or NUMA experiments.
     arch_profile = profile_for(args.cpu_arch or _env("CPU_ARCH", DEFAULT_ARCH))
 
-    ami_id = resolve_al2023_ami(_env("AMI_ID") or None, ami_arch=arch_profile.ami_arch)
+    # Prefer the SAME pre-baked worker AMI the Batch target uses (image already
+    # resident → the remote's docker pull is a cheap manifest check, no layer
+    # download). Only for Graviton (the AMI is arm64) and only when one is baked
+    # for THIS image tag — otherwise fall back to the stock AL2023 AMI + a full
+    # pull. An explicit AMI_ID always wins. Self-correcting: a stale/absent AMI
+    # never breaks the run, it just means a normal pull.
+    ami_id = _env("AMI_ID") or None
+    if not ami_id and arch_profile.ami_arch == "arm64":
+        baked = resolve_worker_ami(docker_image.rsplit(":", 1)[-1], ami_arch="arm64")
+        if baked:
+            ami_id = baked
+            print(f"  worker AMI:     {baked} (pre-baked — skips the image pull)")
+    ami_id = resolve_al2023_ami(ami_id, ami_arch=arch_profile.ami_arch)
     instance_type = _env("INSTANCE_TYPE", arch_profile.primary)
     instance_type_fallbacks = [
         t for t in _env("INSTANCE_TYPE_FALLBACKS", arch_profile.fallbacks).split(",")
