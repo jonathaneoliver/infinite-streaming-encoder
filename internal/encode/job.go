@@ -9,23 +9,47 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// chunkDurationSeconds mirrors scripts/encoder/chunking.DEFAULT_CHUNK_DURATION_S.
-// The control plane computes chunk_count the same way the Python phase does
-// (from the same clip duration) so the two never disagree.
-const chunkDurationSeconds = 30.0
+// defaultChunkDurationSeconds mirrors scripts/encoder/chunking
+// .DEFAULT_CHUNK_DURATION_S. The control plane computes chunk_count the same
+// way the Python phase does (from the same clip duration + chunk size) so the
+// two never disagree.
+const defaultChunkDurationSeconds = 30.0
 
-// chunkCountForDuration mirrors chunking.chunk_count: ceil(dur/30), min 1.
-func chunkCountForDuration(durationS float64) int {
-	if durationS <= 0 {
+// wholeVariantChunkSeconds is a large multiple of the 6s segment duration used
+// for "whole variant" (no chunking): any real clip is shorter, so it collapses
+// to a single chunk, and it still passes chunking.py's "multiple of segment"
+// validation. 86400 = 24h = 14400 x 6.
+const wholeVariantChunkSeconds = 86400.0
+
+// chunkDurationSeconds resolves the configured chunk size. Empty => default
+// 30s; "whole"/"0" => one chunk per variant; otherwise the parsed seconds.
+func (c JobConfig) chunkDurationSeconds() float64 {
+	switch c.ChunkDuration {
+	case "":
+		return defaultChunkDurationSeconds
+	case "whole", "0":
+		return wholeVariantChunkSeconds
+	default:
+		if v, err := strconv.ParseFloat(c.ChunkDuration, 64); err == nil && v > 0 {
+			return v
+		}
+		return defaultChunkDurationSeconds
+	}
+}
+
+// chunkCountForDuration mirrors chunking.chunk_count: ceil(dur/chunk), min 1.
+func chunkCountForDuration(durationS, chunkS float64) int {
+	if durationS <= 0 || chunkS <= 0 {
 		return 1
 	}
-	n := int(math.Ceil(durationS/chunkDurationSeconds - 1e-6))
+	n := int(math.Ceil(durationS/chunkS - 1e-6))
 	if n < 1 {
 		return 1
 	}
@@ -298,6 +322,11 @@ type JobConfig struct {
 	Time            string   `json:"time"`
 	SegmentDuration string   `json:"segment_duration"`
 	PartialDuration string   `json:"partial_duration"`
+	// ChunkDuration tunes the cloud-batch encode granularity: "" = 30s
+	// chunks (max parallelism), "whole" = one job per variant (max
+	// efficiency, less fleet overhead), or a seconds value (multiple of the
+	// 6s segment duration). Only affects the cloud-batch target.
+	ChunkDuration string `json:"chunk_duration,omitempty"`
 	GopDuration     string   `json:"gop_duration"`
 	HlsFormat       string   `json:"hls_format"`
 	Padding         string   `json:"padding"`
@@ -1308,12 +1337,17 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 	// Probe the source duration to plan chunks. ffprobe runs in the worker
 	// image; if it's unavailable (e.g. local dev), fall back to a single
 	// whole-clip chunk so the pipeline still works.
+	chunkS := job.Config.chunkDurationSeconds()
 	nChunks := 1
 	if durationS, err := probeDurationSeconds(localSrc); err != nil {
 		job.AppendLog(fmt.Sprintf("[cloud-batch] ffprobe failed (%v); encoding %s as one chunk", err, filename))
 	} else {
-		nChunks = chunkCountForDuration(durationS)
-		job.AppendLog(fmt.Sprintf("[cloud-batch] %s: %.1fs → %d chunk(s)", filename, durationS, nChunks))
+		nChunks = chunkCountForDuration(durationS, chunkS)
+		grain := fmt.Sprintf("%.0fs chunks", chunkS)
+		if chunkS >= wholeVariantChunkSeconds {
+			grain = "whole variant"
+		}
+		job.AppendLog(fmt.Sprintf("[cloud-batch] %s: %.1fs → %d chunk(s) (%s)", filename, durationS, nChunks, grain))
 	}
 
 	// Probe the source width so the ladder is capped at native resolution
@@ -1322,7 +1356,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 	if srcWidth > 0 {
 		job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
 	}
-	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Codec, job.Config.MaxRes, job.Config.TwoPass, nChunks, srcWidth)
+	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Codec, job.Config.MaxRes, job.Config.TwoPass, nChunks, srcWidth, chunkS)
 	inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 	if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 		return fmt.Errorf("write input json: %w", err)
@@ -1411,7 +1445,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 // buildSFNInput renders the JSON doc the state machine expects. Picks
 // which (codec, tier) combinations to fan out over based on the
 // JobConfig's Codec + MaxRes.
-func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nChunks, sourceWidth int) string {
+func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nChunks, sourceWidth int, chunkS float64) string {
 	tiers := []string{"360p", "540p", "720p", "1080p", "1440p", "2160p"}
 	if maxRes != "" {
 		for i, t := range tiers {
@@ -1459,6 +1493,18 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nCh
 			variants = append(variants, variant{Codec: c, Tier: t, VCPU: vcpu, Memory: mem})
 		}
 	}
+	// Encode the slowest variants first so the long-pole jobs (highest
+	// resolution, and HEVC over H.264) start immediately instead of trailing
+	// at the end — with the variant Map's bounded MaxConcurrency, the first
+	// items here are the first to run. Order: tier resolution DESC, then HEVC
+	// before H.264.
+	tierRank := map[string]int{"360p": 1, "540p": 2, "720p": 3, "1080p": 4, "1440p": 5, "2160p": 6}
+	sort.SliceStable(variants, func(i, j int) bool {
+		if tierRank[variants[i].Tier] != tierRank[variants[j].Tier] {
+			return tierRank[variants[i].Tier] > tierRank[variants[j].Tier]
+		}
+		return variants[i].Codec == "hevc" && variants[j].Codec != "hevc"
+	})
 	// chunk_indices drives the state machine's inner Map: each variant fans
 	// out one encode job per chunk index, then a concat-variant job joins
 	// them. A single-chunk clip (nChunks == 1) still flows through this path —
@@ -1491,6 +1537,9 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nCh
 		"chunk_indices": chunkIndices,
 		"do_h264":       doH264,
 		"do_hevc":       doHevc,
+		// Chunk size (seconds) the encode + concat workers plan against, so
+		// they agree with chunk_indices above. String for a container env var.
+		"chunk_duration": strconv.FormatFloat(chunkS, 'f', -1, 64),
 		// Injected as the TWO_PASS env var on each variant job by the
 		// state machine's EncodeVariant task (see definition.json.tpl).
 		// String, not bool, so it drops straight into a container env value.

@@ -80,7 +80,8 @@
                 "memory.$": "$$.Map.Item.Value.memory",
                 "s3_prefix.$": "$.s3_prefix",
                 "two_pass.$": "$.two_pass",
-                "chunk_indices.$": "$.chunk_indices"
+                "chunk_indices.$": "$.chunk_indices",
+                "chunk_duration.$": "$.chunk_duration"
               },
               "ItemProcessor": {
                 "StartAt": "EncodeChunks",
@@ -96,7 +97,8 @@
                       "memory.$": "$.memory",
                       "s3_prefix.$": "$.s3_prefix",
                       "two_pass.$": "$.two_pass",
-                      "chunk_index.$": "$$.Map.Item.Value"
+                      "chunk_index.$": "$$.Map.Item.Value",
+                      "chunk_duration.$": "$.chunk_duration"
                     },
                     "ItemProcessor": {
                       "StartAt": "EncodeChunk",
@@ -117,7 +119,8 @@
                             },
                             "ContainerOverrides": {
                               "Environment": [
-                                { "Name": "TWO_PASS", "Value.$": "$.two_pass" }
+                                { "Name": "TWO_PASS", "Value.$": "$.two_pass" },
+                                { "Name": "CHUNK_DURATION_S", "Value.$": "$.chunk_duration" }
                               ],
                               "ResourceRequirements": [
                                 { "Type": "VCPU", "Value.$": "$.vcpu" },
@@ -146,6 +149,11 @@
                         "s3_mezz.$": "$.s3_prefix",
                         "s3_chunks.$": "$.s3_prefix",
                         "s3_out.$": "$.s3_prefix"
+                      },
+                      "ContainerOverrides": {
+                        "Environment": [
+                          { "Name": "CHUNK_DURATION_S", "Value.$": "$.chunk_duration" }
+                        ]
                       }
                     },
                     "End": true

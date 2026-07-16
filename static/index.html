@@ -310,6 +310,15 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="amd">AMD EPYC (c7a) — needs multi-arch image</option>
                 </select>
             </div>
+            <div class="control-group" id="chunk-dur-group" style="display:none">
+                <label title="How the cloud-batch target splits each variant. Smaller chunks = more parallel jobs (faster wall-clock, but more fleet overhead / lower efficiency). Whole variant = one job per tier (most efficient, least parallel).">Chunking (cloud)</label>
+                <select id="chunk-duration">
+                    <option value="30" selected>30s chunks (max parallelism)</option>
+                    <option value="60">60s chunks</option>
+                    <option value="300">5m chunks</option>
+                    <option value="whole">Whole variant (max efficiency)</option>
+                </select>
+            </div>
             <div class="control-group" id="spot-group" style="display:none;align-self:center;padding-top:16px">
                 <label title="Spot is ~2.6× cheaper but AWS can reclaim with 2 min notice. Uncheck to use on-demand (guaranteed, no interruption)."><input type="checkbox" id="use-spot" checked style="width:auto;min-width:auto"> Use spot (cheaper)</label>
             </div>
@@ -765,6 +774,9 @@ function onTargetChange() {
     const isLegacy = target === 'cloud';
     document.getElementById('cpu-arch-group').style.display =
         isLegacy ? 'flex' : 'none';
+    // Chunk granularity applies to the cloud-batch (chunked) target only.
+    document.getElementById('chunk-dur-group').style.display =
+        target === 'cloud-batch' ? 'flex' : 'none';
     document.getElementById('spot-group').style.display =
         isLegacy ? 'flex' : 'none';
     document.getElementById('simulate-interrupt-group').style.display =
@@ -851,6 +863,7 @@ async function startEncode(force = false) {
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         two_pass: document.getElementById('two-pass').checked,
         cpu_arch: document.getElementById('cpu-arch').value,
+        chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
         simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
         force_reencode: force
@@ -1121,7 +1134,20 @@ function groupStagesForDisplay(stages) {
         rows.push({ kind: 'stage', s });
     }
     for (const r of rows) if (r.kind === 'chunks') r.cells.sort((a, b) => a.index - b.index);
-    return rows;
+    // Whole-variant mode: a variant encoded as a single chunk renders as a
+    // progress bar (with live ffmpeg %), not a lone LED cell — matching the
+    // legacy per-tier look. Its concat is a trivial passthrough, shown as a
+    // small "join" bar after it.
+    const out = [];
+    for (const r of rows) {
+        if (r.kind === 'chunks' && r.cells.length === 1) {
+            out.push({ kind: 'stage', s: { ...r.cells[0].s, label: `encode ${r.codec} ${r.tier}` } });
+            if (r.concat) out.push({ kind: 'stage', s: { ...r.concat, label: `join ${r.codec} ${r.tier}` } });
+        } else {
+            out.push(r);
+        }
+    }
+    return out;
 }
 
 function updateStagesTable(row, stages) {
@@ -1922,6 +1948,7 @@ async function forceReencode(fileName) {
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         two_pass: document.getElementById('two-pass').checked,
         cpu_arch: document.getElementById('cpu-arch').value,
+        chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
         simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
         force_reencode: true

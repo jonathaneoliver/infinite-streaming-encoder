@@ -88,10 +88,12 @@ def _reflect_batch_status(exec_name: str) -> None:
                 c, t, ci = m.group(1), m.group(2), int(m.group(3))
                 _emit_stage(f"encode:{c}:{t}:chunk{ci}", stage_status, 0.0)
 
-    # queued first, then running — so a job that just transitioned wins as running.
+    # RUNNABLE -> queued, STARTING -> running (0%). RUNNING is deliberately NOT
+    # reflected here: once the container is up it emits its own ENCODER-STAGE
+    # percent markers (now forwarded live), and re-stamping running/0% every
+    # poll would reset that smooth progress back to zero.
     _emit_for("RUNNABLE", "queued")
     _emit_for("STARTING", "running")
-    _emit_for("RUNNING", "running")
 
 
 # CloudWatch log group the Batch job definitions write to (see
@@ -152,8 +154,10 @@ def _tail_progress(stream: str, label: str, log_state: dict) -> None:
     for e in events:
         log_state[stream] = max(log_state.get(stream, 0), e.get("timestamp", 0))
         msg = e.get("message", "").rstrip()
-        if msg.startswith("[[ENCODER-BOOT "):
-            print(msg, flush=True)  # verbatim so the Go scanner parses it
+        if msg.startswith("[[ENCODER-BOOT ") or msg.startswith("[[ENCODER-STAGE "):
+            # Verbatim so the Go scanner parses it — ENCODER-STAGE carries the
+            # live ffmpeg % for this chunk/variant, driving the progress bars.
+            print(msg, flush=True)
         elif _PROGRESS_RE.search(msg):
             _narrate(f"{label}: {msg}")
 

@@ -212,6 +212,17 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
 
+def _chunk_duration_s() -> float:
+    """Chunk size (seconds) from CHUNK_DURATION_S, injected by the state
+    machine. Must match what the Go control plane used for chunk_indices so
+    the two agree on the chunk count. Falls back to the default."""
+    v = os.environ.get("CHUNK_DURATION_S", "").strip()
+    try:
+        return float(v) if v else DEFAULT_CHUNK_DURATION_S
+    except ValueError:
+        return DEFAULT_CHUNK_DURATION_S
+
+
 def _tier_by_name(name: str) -> Tier:
     for t in LADDER:
         if t.name == name:
@@ -358,7 +369,7 @@ def phase_variant(args: argparse.Namespace) -> int:
     # mode (no --chunk-index) is unchanged.
     chunk = None
     if args.chunk_index is not None:
-        chunks = plan_chunks(info.duration_s, DEFAULT_CHUNK_DURATION_S,
+        chunks = plan_chunks(info.duration_s, _chunk_duration_s(),
                              _SEGMENT_DURATION_S)
         if args.chunk_index >= len(chunks):
             print(f"error: chunk-index {args.chunk_index} out of range "
@@ -406,7 +417,7 @@ def phase_concat_variant(args: argparse.Namespace) -> int:
     if not _download_if_complete(mezz_uri, mezz_local):
         print("error: mezzanine.done missing or size mismatch", file=sys.stderr)
         return 1
-    n_chunks = chunk_count(probe(mezz_local).duration_s, DEFAULT_CHUNK_DURATION_S)
+    n_chunks = chunk_count(probe(mezz_local).duration_s, _chunk_duration_s())
 
     # Pull every chunk file down (verifying its .done sidecar).
     for i in range(n_chunks):
