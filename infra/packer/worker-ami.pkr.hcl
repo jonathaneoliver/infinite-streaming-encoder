@@ -42,6 +42,12 @@ variable "instance_type" {
   default = "c7g.large"
 }
 
+variable "instance_profile" {
+  type        = string
+  description = "Existing IAM instance profile for the build instance (needs ECR pull). The Batch worker profile already has it."
+  default     = "encoder-batch-instance"
+}
+
 # Latest ECS-optimized Amazon Linux 2023 Graviton (arm64) AMI. Same
 # family Batch launches by default, so the baked AMI stays Batch-valid.
 data "amazon-ami" "ecs_arm" {
@@ -65,26 +71,13 @@ source "amazon-ebs" "worker" {
   # and `make unbake-ami` key off of.
   ami_name = "encoder-worker-${var.image_tag}"
 
-  # The build instance needs read access to ECR to pull the image.
-  # A temporary instance profile (torn down with the build) avoids
-  # depending on any long-lived role.
-  temporary_iam_instance_profile_policy_document {
-    Version = "2012-10-17"
-    Statement {
-      Effect   = "Allow"
-      Action   = ["ecr:GetAuthorizationToken"]
-      Resource = ["*"]
-    }
-    Statement {
-      Effect = "Allow"
-      Action = [
-        "ecr:BatchGetImage",
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:BatchCheckLayerAvailability",
-      ]
-      Resource = ["*"]
-    }
-  }
+  # Reuse the Batch instance profile (encoder-batch-instance) for the
+  # build. It already carries AmazonEC2ContainerServiceforEC2Role, which
+  # grants ECR pull — exactly what the provisioner needs. Reusing an
+  # existing profile also avoids the temporary-instance-profile path,
+  # whose IAM eventual-consistency wait was mis-reporting a hard
+  # RunInstances error as "timed out waiting for IAM to propagate".
+  iam_instance_profile = var.instance_profile
 
   tags = {
     Name      = "encoder-worker"

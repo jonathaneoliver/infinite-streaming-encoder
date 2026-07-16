@@ -142,15 +142,22 @@ TF_DIR := infra/terraform
 ECR_REPO ?= $(shell cd $(TF_DIR) && tofu output -raw ecr_repo_url 2>/dev/null)
 ECR_REGISTRY = $(firstword $(subst /, ,$(ECR_REPO)))
 
+# Worker-image tag: short-sha of the last commit that touched anything baked
+# INTO the image (the Dockerfile + the dirs it COPYs). Commits that only change
+# Makefile / infra / docs leave this put — so the ECR tag, the job-def image
+# pins, and the AMI don't churn on every commit, and `make infra-plan` stops
+# showing phantom job-def re-tags. Falls back to HEAD if git isn't available.
+IMAGE_TAG := $(shell git log -1 --format=%h -- Dockerfile go.mod go.sum requirements.txt cmd internal scripts static 2>/dev/null || echo $(GIT_SHA))
+
 .PHONY: ecr-login ecr-push infra-init infra-plan infra-apply infra-destroy deploy timing bake-ami unbake-ami clear-costs
 
-# Resolve the pre-baked worker AMI for the CURRENT image SHA, if one exists.
+# Resolve the pre-baked worker AMI for the CURRENT image tag, if one exists.
 # Empty when nothing is baked -> Batch pulls the image on boot. This is what
 # makes the AMI cache opt-in and self-correcting: bake before an encode
 # session, `make unbake-ami` after, and infra-plan/apply just pick up whatever
-# is (or isn't) there for this SHA.
+# is (or isn't) there for this image tag.
 WORKER_AMI ?= $(shell aws ec2 describe-images --owners self --region $(AWS_REGION) \
-	--filters "Name=tag:image_tag,Values=$(GIT_SHA)" "Name=state,Values=available" \
+	--filters "Name=tag:image_tag,Values=$(IMAGE_TAG)" "Name=state,Values=available" \
 	--query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text 2>/dev/null | grep -v '^None$$' || true)
 
 ecr-login:
@@ -160,17 +167,17 @@ ecr-login:
 
 ecr-push: ecr-login   ## build arm64 (Graviton) + push the worker image to ECR
 	docker buildx build --platform linux/arm64 \
-		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(GIT_SHA) \
-		--tag $(ECR_REPO):latest --tag $(ECR_REPO):$(GIT_SHA) --push .
-	@echo "Pushed $(ECR_REPO):latest :$(GIT_SHA) (linux/arm64)"
+		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(IMAGE_TAG) \
+		--tag $(ECR_REPO):latest --tag $(ECR_REPO):$(IMAGE_TAG) --push .
+	@echo "Pushed $(ECR_REPO):latest :$(IMAGE_TAG) (linux/arm64)"
 
 infra-init:           ## tofu init (local backend override, if present)
 	cd $(TF_DIR) && tofu init
 
 infra-plan:           ## tofu plan -> tf.plan (review before infra-apply)
-	@echo ">>> image_tag=$(GIT_SHA)  worker_ami_id=$(if $(WORKER_AMI),$(WORKER_AMI),<none, pull-on-boot>)"
+	@echo ">>> image_tag=$(IMAGE_TAG)  worker_ami_id=$(if $(WORKER_AMI),$(WORKER_AMI),<none, pull-on-boot>)"
 	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu plan \
-		-var image_tag=$(GIT_SHA) \
+		-var image_tag=$(IMAGE_TAG) \
 		-var worker_ami_id="$(WORKER_AMI)" \
 		-out=tf.plan
 
@@ -203,11 +210,11 @@ bake-ami:             ## build a worker AMI with the current image pre-pulled (k
 	@: $${ECR_REPO:?ECR_REPO empty — run `make infra-apply` first, or set it in .env}
 	cd infra/packer && packer init worker-ami.pkr.hcl && \
 	  packer build -var region=$(AWS_REGION) -var ecr_repo=$(ECR_REPO) \
-	    -var image_tag=$(GIT_SHA) worker-ami.pkr.hcl
-	@echo ">>> keeping only encoder-worker-$(GIT_SHA); removing any older worker AMIs..."
+	    -var image_tag=$(IMAGE_TAG) worker-ami.pkr.hcl
+	@echo ">>> keeping only encoder-worker-$(IMAGE_TAG); removing any older worker AMIs..."
 	@ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
 	    --filters "Name=tag:Name,Values=encoder-worker" \
-	    --query "Images[?Tags[?Key=='image_tag'&&Value!='$(GIT_SHA)']].ImageId" --output text); \
+	    --query "Images[?Tags[?Key=='image_tag'&&Value!='$(IMAGE_TAG)']].ImageId" --output text); \
 	  for ami in $$ids; do \
 	    [ "$$ami" = "None" ] && continue; \
 	    snaps=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) --image-ids $$ami \
@@ -215,7 +222,7 @@ bake-ami:             ## build a worker AMI with the current image pre-pulled (k
 	    echo "deregister $$ami"; aws ec2 deregister-image --region $(AWS_REGION) --image-id $$ami; \
 	    for s in $$snaps; do echo "  delete snapshot $$s"; aws ec2 delete-snapshot --region $(AWS_REGION) --snapshot-id $$s; done; \
 	  done
-	@echo ">>> Baked encoder-worker-$(GIT_SHA) (1 AMI total). Now: make infra-apply  (wires it in)"
+	@echo ">>> Baked encoder-worker-$(IMAGE_TAG) (1 AMI total). Now: make infra-apply  (wires it in)"
 
 unbake-ami:           ## deregister ALL worker AMIs + delete snapshots ($0 standing cost)
 	@ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
