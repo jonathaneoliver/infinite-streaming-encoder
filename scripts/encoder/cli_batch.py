@@ -180,6 +180,29 @@ def _narrate(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _report_reclaims(exit_ev: dict, label: str) -> None:
+    """Surface spot interruptions in the job log. A reclaim fails a Batch job
+    attempt with a 'Host EC2 instance was terminated' reason and the retry
+    strategy re-runs it on fresh capacity — all transparent under
+    submitJob.sync, so this is the ONLY place a reclaim becomes visible. The
+    completed job's Attempts[] (carried in the exit event output) records each
+    interrupted attempt."""
+    try:
+        out = exit_ev.get("stateExitedEventDetails", {}).get("output", "")
+        attempts = json.loads(out).get("Attempts", [])
+    except (ValueError, TypeError):
+        return
+    n = 0
+    for a in attempts:
+        reason = str(a.get("StatusReason", "") or
+                     a.get("Container", {}).get("Reason", ""))
+        if reason.startswith("Host EC2") or "was terminated" in reason.lower():
+            n += 1
+    if n:
+        _narrate(f"⚠ {label}: spot-reclaimed {n}x, retried on fresh capacity "
+                 f"(resumed the chunk, not the whole variant)")
+
+
 def _forward_container_timing(exit_ev: dict) -> None:
     """Pull the container's [timing] line (fetch/encode/upload) from CloudWatch
     for a just-completed chunk and add it to the job log, so the per-chunk
@@ -327,12 +350,14 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
             if key:
                 _emit_stage(key, "done", 100.0)
                 _narrate(f"✓ {key.replace(':', ' ')} done")
+                _report_reclaims(ev, key.replace(':', ' '))
             elif name == "EncodeChunk":
                 idn = _enter_of(ev, chunk_enter)
                 if idn:
                     c, t, ci = idn
                     _emit_stage(f"encode:{c}:{t}:chunk{ci}", "done", 100.0)
                     _narrate(f"✓ encode {c} {t} chunk{ci} done")
+                    _report_reclaims(ev, f"encode {c} {t} chunk{ci}")
                     _forward_container_timing(ev)
             elif name == "ConcatVariant":
                 idn = _enter_of(ev, concat_enter)
@@ -340,6 +365,7 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
                     c, t = idn
                     _emit_stage(f"concat:{c}:{t}", "done", 100.0)
                     _narrate(f"✓ concat {c} {t} done")
+                    _report_reclaims(ev, f"concat {c} {t}")
 
         elif etype == "TaskFailed":
             _report_task_failure(ev.get("taskFailedEventDetails", {}))
