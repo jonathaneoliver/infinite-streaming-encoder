@@ -48,7 +48,7 @@ from encoder.ladder import LADDER, Tier, select_tiers
 from encoder.mezzanine import MezzanineSpec, create_mezzanine
 from encoder.packager import PackageSpec, package
 from encoder.padding import multi_duration_lcm, plan_padding
-from encoder.progress import emit_stage
+from encoder.progress import emit_boot_ami, emit_stage
 
 try:
     import boto3
@@ -677,6 +677,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    emit_boot_ami()  # report which AMI this Batch worker booted from
     return args.fn(args)
 
 

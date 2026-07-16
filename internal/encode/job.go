@@ -69,6 +69,11 @@ var (
 	// Stages into StagesHistory (so end-of-job timing still has all
 	// phases), clear Stages, and stamp CurrentFile / FileIndex / TotalFiles.
 	fileMarkerRe = regexp.MustCompile(`^\[\[ENCODER-FILE index=(\d+) total=(\d+) name=(.+)\]\]$`)
+	// ENCODER-BOOT reports the AMI the worker's instance actually booted
+	// from (via IMDS). We compare it to WORKER_AMI_ID (the pre-baked worker
+	// AMI) to flag whether the image was already resident — a definitive
+	// "AMI cache hit" signal for the UI, independent of timing.
+	bootMarkerRe = regexp.MustCompile(`^\[\[ENCODER-BOOT ami=(\S+)\]\]$`)
 )
 
 // parseMarker returns true when the line was a recognised progress marker
@@ -178,6 +183,16 @@ func (j *Job) parseMarker(line string) bool {
 		idx, _ := strconv.Atoi(m[1])
 		total, _ := strconv.Atoi(m[2])
 		j.startFile(strings.TrimSpace(m[3]), idx, total)
+		return true
+	}
+	if m := bootMarkerRe.FindStringSubmatch(line); m != nil {
+		ami := m[1]
+		j.mu.Lock()
+		j.BootAMI = ami
+		// Pre-baked when the instance's AMI matches the worker AMI we baked
+		// (WORKER_AMI_ID, passed in by the Makefile). Empty env => unknown.
+		j.PrebakedAMI = ami != "" && ami == os.Getenv("WORKER_AMI_ID")
+		j.mu.Unlock()
 		return true
 	}
 	// Non-consuming matches: capture sideband info but still let the
@@ -317,6 +332,13 @@ type Job struct {
 	EndedAt   *time.Time `json:"ended_at,omitempty"`
 	Progress  string     `json:"progress"`
 	Error     string     `json:"error,omitempty"`
+
+	// BootAMI is the AMI a cloud worker's instance actually booted from
+	// (from the [[ENCODER-BOOT]] marker); PrebakedAMI is true when that
+	// matches the pre-baked worker AMI, i.e. the image was already resident
+	// and the ECR pull was skipped. Drives the "pre-baked AMI" UI badge.
+	BootAMI     string `json:"boot_ami,omitempty"`
+	PrebakedAMI bool   `json:"prebaked_ami,omitempty"`
 
 	// Stages is populated from [[ENCODER-PLAN]] + [[ENCODER-STAGE]]
 	// markers the Python orchestrator emits. Empty when the job hasn't

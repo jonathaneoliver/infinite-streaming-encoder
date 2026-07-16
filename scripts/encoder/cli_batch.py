@@ -152,7 +152,9 @@ def _tail_progress(stream: str, label: str, log_state: dict) -> None:
     for e in events:
         log_state[stream] = max(log_state.get(stream, 0), e.get("timestamp", 0))
         msg = e.get("message", "").rstrip()
-        if _PROGRESS_RE.search(msg):
+        if msg.startswith("[[ENCODER-BOOT "):
+            print(msg, flush=True)  # verbatim so the Go scanner parses it
+        elif _PROGRESS_RE.search(msg):
             _narrate(f"{label}: {msg}")
 
 

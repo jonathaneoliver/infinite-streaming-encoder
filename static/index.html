@@ -33,6 +33,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .cloud-warning a { color: #ffd89b; text-decoration: underline; cursor: pointer; }
 .job-cloud-badge { display: inline-block; color: #ffa94d; background: rgba(255, 169, 77, 0.15); border: 1px solid #ffa94d; border-radius: 3px; padding: 0 6px; margin-left: 8px; font-size: 0.7rem; cursor: pointer; vertical-align: middle; }
 .job-cloud-badge:hover { background: rgba(255, 169, 77, 0.3); }
+.job-ami-badge { display: inline-block; color: #06d6a0; background: rgba(6, 214, 160, 0.15); border: 1px solid #06d6a0; border-radius: 3px; padding: 0 6px; margin-left: 8px; font-size: 0.7rem; vertical-align: middle; }
 .encode-options > legend { padding: 0 8px; color: #888; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; }
 .encode-options > .controls { margin-top: 0; }
 .control-group { display: flex; flex-direction: column; gap: 4px; }
@@ -1072,6 +1073,7 @@ function jobRowHtml(j) {
                     <span class="job-files">${escapeHtml((j.config.files || []).join(', '))}</span>
                     <span class="job-meta"> — ${j.config.target} / ${j.config.codec}${j.config.max_res ? ' / ' + j.config.max_res : ''}</span>
                     ${cloudBadge}
+                    <span class="job-ami-badge" style="display:none"></span>
                 </div>
                 <span class="job-status status-${j.status}">${j.status.toUpperCase()}</span>
             </div>
@@ -1207,6 +1209,21 @@ function updateJobRow(row, j) {
         status.textContent = j.status.toUpperCase();
     }
     row.querySelector('.job-progress').textContent = j.progress || '';
+
+    // Pre-baked AMI badge — set once the worker reports its boot AMI and the
+    // server confirms it matches the baked worker AMI (image already resident).
+    const amiEl = row.querySelector('.job-ami-badge');
+    if (amiEl) {
+        if (j.prebaked_ami) {
+            amiEl.textContent = '⚡ pre-baked AMI';
+            amiEl.title = 'Instance booted from the pre-baked worker AMI'
+                + (j.boot_ami ? ' (' + j.boot_ami + ')' : '')
+                + ' — image already resident, ECR pull skipped';
+            amiEl.style.display = '';
+        } else {
+            amiEl.style.display = 'none';
+        }
+    }
 
     const err = row.querySelector('.job-error');
     if (j.error) {

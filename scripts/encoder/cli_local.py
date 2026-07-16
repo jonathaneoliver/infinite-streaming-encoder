@@ -40,7 +40,7 @@ from encoder.ladder import (
 from encoder.mezzanine import MezzanineSpec, create_mezzanine
 from encoder.packager import PackageSpec, package
 from encoder.padding import multi_duration_lcm, plan_padding
-from encoder.progress import Stage, emit_plan, emit_stage
+from encoder.progress import Stage, emit_boot_ami, emit_plan, emit_stage
 from encoder.resume import discover, resolve_codec_selection
 
 # Matches bash's minimum.
@@ -556,6 +556,7 @@ def main() -> int:
         return phase_main(sys.argv[2:])
 
     args = build_parser().parse_args()
+    emit_boot_ami()  # report which AMI this instance booted from (cloud remote)
     t0 = time.monotonic()
     ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
     rc = run_resume(args) if args.resume_package_from else run_full(args)

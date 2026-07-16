@@ -111,7 +111,8 @@ def _forward_markers(text: str) -> None:
     `docker pull` status — "up to date" means the pre-baked AMI already had the
     image, so no pull happened; that's a real signal, not a timing guess)."""
     for line in text.splitlines():
-        if line.startswith("[[ENCODER-PLAN ") or line.startswith("[[ENCODER-STAGE "):
+        if (line.startswith("[[ENCODER-PLAN ") or line.startswith("[[ENCODER-STAGE ")
+                or line.startswith("[[ENCODER-BOOT ")):
             # flush=True so the server's docker logs -f sees it without
             # waiting for Python's output buffer to fill.
             print(line, flush=True)
