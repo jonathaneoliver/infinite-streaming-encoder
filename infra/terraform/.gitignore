@@ -14,3 +14,6 @@ crash.*.log
 *.auto.tfvars
 *.tfvars
 backend_override.tf
+
+# tofu plan artifact from `make infra-plan`
+tf.plan

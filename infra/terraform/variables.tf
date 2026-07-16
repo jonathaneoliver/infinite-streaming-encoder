@@ -20,6 +20,19 @@ EOT
   default = "latest"
 }
 
+variable "worker_ami_id" {
+  description = <<EOT
+Optional pre-baked worker AMI id (from `make bake-ami`) with the encoder image
+already loaded, so cold instances skip the ~60s ECR pull. Empty => Batch's
+default ECS-optimized Graviton AMI. `make infra-apply` resolves this from the
+AMI tagged with the current image SHA, so it's opt-in and self-correcting:
+bake before an encode session, `make unbake-ami` after to drop the standing
+EBS-snapshot cost back to $0. A missing/stale AMI just falls back to pull-on-boot.
+EOT
+  type    = string
+  default = ""
+}
+
 variable "compute_max_vcpus" {
   description = <<EOT
 Upper bound on the Batch compute environment's total vCPUs — the concurrency

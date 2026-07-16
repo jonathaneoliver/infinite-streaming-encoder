@@ -142,7 +142,16 @@ TF_DIR := infra/terraform
 ECR_REPO ?= $(shell cd $(TF_DIR) && tofu output -raw ecr_repo_url 2>/dev/null)
 ECR_REGISTRY = $(firstword $(subst /, ,$(ECR_REPO)))
 
-.PHONY: ecr-login ecr-push infra-init infra-plan infra-apply infra-destroy deploy timing
+.PHONY: ecr-login ecr-push infra-init infra-plan infra-apply infra-destroy deploy timing bake-ami unbake-ami
+
+# Resolve the pre-baked worker AMI for the CURRENT image SHA, if one exists.
+# Empty when nothing is baked -> Batch pulls the image on boot. This is what
+# makes the AMI cache opt-in and self-correcting: bake before an encode
+# session, `make unbake-ami` after, and infra-plan/apply just pick up whatever
+# is (or isn't) there for this SHA.
+WORKER_AMI ?= $(shell aws ec2 describe-images --owners self --region $(AWS_REGION) \
+	--filters "Name=tag:image_tag,Values=$(GIT_SHA)" "Name=state,Values=available" \
+	--query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text 2>/dev/null | grep -v '^None$$' || true)
 
 ecr-login:
 	@: $${ECR_REPO:?ECR_REPO empty — run `make infra-apply` first, or set it in .env}
@@ -159,7 +168,11 @@ infra-init:           ## tofu init (local backend override, if present)
 	cd $(TF_DIR) && tofu init
 
 infra-plan:           ## tofu plan -> tf.plan (review before infra-apply)
-	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu plan -out=tf.plan
+	@echo ">>> image_tag=$(GIT_SHA)  worker_ami_id=$(if $(WORKER_AMI),$(WORKER_AMI),<none, pull-on-boot>)"
+	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu plan \
+		-var image_tag=$(GIT_SHA) \
+		-var worker_ami_id="$(WORKER_AMI)" \
+		-out=tf.plan
 
 infra-apply:          ## apply the saved tf.plan (run only after reviewing the plan)
 	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu apply tf.plan
@@ -178,3 +191,40 @@ deploy:               ## push image + restart + plan infra (then review & infra-
 timing:               ## where-did-the-time-go for an execution: make timing EXEC=<arn>
 	@: $${EXEC:?set EXEC=<execution-arn>}
 	docker exec $(CONTAINER_NAME) python3 -m encoder.cloud.timing --execution-arn $(EXEC)
+
+# ---- Worker-AMI cache (opt-in, one at a time) --------------------------------
+# The AMI is a pre-warmed cache: a cold spot instance boots with the encoder
+# image already resident, skipping the ~60s ECR pull. It's OPT-IN and costs
+# ~$1.50/mo in EBS-snapshot storage while it exists, so bake it before an
+# encode session and `make unbake-ami` after. Exactly one encoder-worker AMI
+# is ever kept: bake prunes every other one, unbake removes them all.
+
+bake-ami:             ## build a worker AMI with the current image pre-pulled (keeps only this one)
+	@: $${ECR_REPO:?ECR_REPO empty — run `make infra-apply` first, or set it in .env}
+	cd infra/packer && packer init worker-ami.pkr.hcl && \
+	  packer build -var region=$(AWS_REGION) -var ecr_repo=$(ECR_REPO) \
+	    -var image_tag=$(GIT_SHA) worker-ami.pkr.hcl
+	@echo ">>> keeping only encoder-worker-$(GIT_SHA); removing any older worker AMIs..."
+	@ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
+	    --filters "Name=tag:Name,Values=encoder-worker" \
+	    --query "Images[?Tags[?Key=='image_tag'&&Value!='$(GIT_SHA)']].ImageId" --output text); \
+	  for ami in $$ids; do \
+	    [ "$$ami" = "None" ] && continue; \
+	    snaps=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) --image-ids $$ami \
+	      --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' --output text); \
+	    echo "deregister $$ami"; aws ec2 deregister-image --region $(AWS_REGION) --image-id $$ami; \
+	    for s in $$snaps; do echo "  delete snapshot $$s"; aws ec2 delete-snapshot --region $(AWS_REGION) --snapshot-id $$s; done; \
+	  done
+	@echo ">>> Baked encoder-worker-$(GIT_SHA) (1 AMI total). Now: make infra-apply  (wires it in)"
+
+unbake-ami:           ## deregister ALL worker AMIs + delete snapshots ($0 standing cost)
+	@ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
+	    --filters "Name=tag:Name,Values=encoder-worker" --query 'Images[].ImageId' --output text); \
+	  if [ -z "$$ids" ] || [ "$$ids" = "None" ]; then echo "no encoder-worker AMI to remove"; else \
+	  for ami in $$ids; do \
+	    snaps=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) --image-ids $$ami \
+	      --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' --output text); \
+	    echo "deregister $$ami"; aws ec2 deregister-image --region $(AWS_REGION) --image-id $$ami; \
+	    for s in $$snaps; do echo "  delete snapshot $$s"; aws ec2 delete-snapshot --region $(AWS_REGION) --snapshot-id $$s; done; \
+	  done; fi
+	@echo ">>> Removed. IMPORTANT: run 'make infra-apply' so the launch template drops the dead AMI id and workers fall back to pull-on-boot."

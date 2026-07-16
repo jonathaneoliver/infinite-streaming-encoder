@@ -70,6 +70,7 @@ module "compute" {
   security_group_id    = module.network.batch_sg_id
   instance_profile_arn = module.iam.instance_profile_arn
   max_vcpus            = var.compute_max_vcpus
+  worker_ami_id        = var.worker_ami_id
 }
 
 module "jobs" {

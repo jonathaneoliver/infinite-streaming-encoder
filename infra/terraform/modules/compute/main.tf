@@ -28,8 +28,56 @@ resource "aws_iam_role_policy_attachment" "spot_fleet_tagging" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole"
 }
 
+# Launch template for Batch workers. Two jobs:
+#   1. ECS_IMAGE_PULL_BEHAVIOR=prefer-cached — if the exact image tag
+#      (an immutable short-sha) is already on the box (baked into a
+#      custom AMI, or pulled by an earlier job on the same instance),
+#      skip the ~60s ECR pull. A tag that ISN'T cached still pulls
+#      normally, so a stale/missing AMI self-corrects: the cache is
+#      used only when it matches the deployed SHA. This is why we pin
+#      image_tag to a SHA (never `latest`) — prefer-cached + a mutable
+#      tag would serve a stale image.
+#   2. Optionally boot from a pre-baked AMI (var.worker_ami_id) that
+#      already has the image loaded. Empty => Batch's default
+#      ECS-optimized Graviton AMI, which pulls on the first job.
+resource "aws_launch_template" "worker" {
+  name = "encoder-batch-worker"
+
+  # A custom AMI when one is baked for the current image; otherwise let
+  # Batch pick its default ECS-optimized Graviton AMI.
+  image_id = var.worker_ami_id != "" ? var.worker_ami_id : null
+
+  user_data = base64encode(<<-EOT
+    MIME-Version: 1.0
+    Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+
+    --==BOUNDARY==
+    Content-Type: text/x-shellscript; charset="us-ascii"
+
+    #!/bin/bash
+    echo "ECS_IMAGE_PULL_BEHAVIOR=prefer-cached" >> /etc/ecs/ecs.config
+
+    --==BOUNDARY==--
+  EOT
+  )
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "encoder-batch-worker"
+    }
+  }
+}
+
 resource "aws_batch_compute_environment" "spot_graviton" {
-  compute_environment_name = "encoder-spot-graviton"
+  # name_prefix (not a fixed name) so a replacement can be created
+  # alongside the old one — a fixed name would collide. Paired with
+  # create_before_destroy below, this lets an attribute that forces
+  # replacement (e.g. adding the launch template) roll over cleanly:
+  # build the new env, move the queue to it, then delete the old. A
+  # fixed name forces delete-first, which AWS refuses while the job
+  # queue is still attached ("found existing JobQueue relationship").
+  compute_environment_name_prefix = "encoder-spot-graviton-"
   type                     = "MANAGED"
   state                    = "ENABLED"
   service_role             = aws_iam_service_linked_role.batch.arn
@@ -53,6 +101,13 @@ resource "aws_batch_compute_environment" "spot_graviton" {
     instance_role      = var.instance_profile_arn
     spot_iam_fleet_role = aws_iam_role.spot_fleet.arn
 
+    # prefer-cached pull behavior + optional pre-baked AMI. "$Latest"
+    # so a terraform apply that rebakes/rebuilds the LT rolls forward.
+    launch_template {
+      launch_template_id = aws_launch_template.worker.id
+      version            = "$Latest"
+    }
+
     # Bid at on-demand price — spot is always cheaper; this is a
     # safety ceiling, not the actual price we pay.
     bid_percentage = 100
@@ -64,6 +119,12 @@ resource "aws_batch_compute_environment" "spot_graviton" {
 
   # Tear down compute env last (has to go after queue detaches).
   depends_on = [aws_iam_role_policy_attachment.spot_fleet_tagging]
+
+  # Create the replacement before destroying the old env so the job
+  # queue can be moved onto it first (see name_prefix note above).
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # Batch itself needs a service-linked role; terraform can create or
