@@ -76,6 +76,8 @@
               "ItemSelector": {
                 "codec.$": "$$.Map.Item.Value.codec",
                 "tier.$": "$$.Map.Item.Value.tier",
+                "vcpu.$": "$$.Map.Item.Value.vcpu",
+                "memory.$": "$$.Map.Item.Value.memory",
                 "s3_prefix.$": "$.s3_prefix",
                 "two_pass.$": "$.two_pass",
                 "chunk_indices.$": "$.chunk_indices"
@@ -90,6 +92,8 @@
                     "ItemSelector": {
                       "codec.$": "$.codec",
                       "tier.$": "$.tier",
+                      "vcpu.$": "$.vcpu",
+                      "memory.$": "$.memory",
                       "s3_prefix.$": "$.s3_prefix",
                       "two_pass.$": "$.two_pass",
                       "chunk_index.$": "$$.Map.Item.Value"
@@ -114,6 +118,10 @@
                             "ContainerOverrides": {
                               "Environment": [
                                 { "Name": "TWO_PASS", "Value.$": "$.two_pass" }
+                              ],
+                              "ResourceRequirements": [
+                                { "Type": "VCPU", "Value.$": "$.vcpu" },
+                                { "Type": "MEMORY", "Value.$": "$.memory" }
                               ]
                             }
                           },

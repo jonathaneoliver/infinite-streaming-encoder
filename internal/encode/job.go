@@ -1344,13 +1344,16 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nCh
 		codecs = []string{"hevc"}
 	}
 	type variant struct {
-		Codec string `json:"codec"`
-		Tier  string `json:"tier"`
+		Codec  string `json:"codec"`
+		Tier   string `json:"tier"`
+		VCPU   string `json:"vcpu"`
+		Memory string `json:"memory"`
 	}
 	var variants []variant
 	for _, c := range codecs {
 		for _, t := range tiers {
-			variants = append(variants, variant{Codec: c, Tier: t})
+			vcpu, mem := variantResources(t)
+			variants = append(variants, variant{Codec: c, Tier: t, VCPU: vcpu, Memory: mem})
 		}
 	}
 	// chunk_indices drives the state machine's inner Map: each variant fans
@@ -1377,6 +1380,23 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nCh
 	}
 	b, _ := json.Marshal(doc)
 	return string(b)
+}
+
+// variantResources sizes a chunk encode job to its tier and returns Batch
+// resourceRequirements values (strings, as Batch expects) that override the
+// job def's default at submit time. Small tiers request little so many pack
+// onto one Graviton instance (more concurrent slots, less queue-wait); only
+// 4K needs the big allocation. On an 8 vCPU / 16 GiB c7g.2xlarge that's ~4
+// small chunks, ~2 mid, or 1 large per instance.
+func variantResources(tier string) (vcpu, memory string) {
+	switch tier {
+	case "360p", "540p":
+		return "2", "4096"
+	case "720p", "1080p":
+		return "4", "8192"
+	default: // 1440p, 2160p
+		return "8", "16384"
+	}
 }
 
 // resolveCodec checks which codecs are already encoded in OutputDir and returns
