@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -53,6 +54,44 @@ def _s3():
 
 def _logs():
     return boto3.client("logs", region_name=_region())
+
+
+def _batch():
+    return boto3.client("batch", region_name=_region())
+
+
+# var-<codec>-<tier>-c<N>-<execName> — the chunk job name from the SFN template.
+_CHUNK_JOBNAME_RE = re.compile(r"^var-([^-]+)-([^-]+)-c(\d+)-")
+
+
+def _reflect_batch_status(exec_name: str) -> None:
+    """Reflect each chunk job's actual Batch status into its grid cell, so a
+    cell shows 'queued' (waiting for a slot) vs 'running' (actually encoding).
+    The SFN state-enter event only says 'submitted', which spans RUNNABLE →
+    STARTING → RUNNING — so we ask Batch directly. Done chunks are SUCCEEDED
+    and won't appear in these lists, so their 'done' state is left intact."""
+    batch = _batch()
+    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+
+    def _emit_for(status_filter: str, stage_status: str) -> None:
+        try:
+            jobs = batch.list_jobs(jobQueue=queue, jobStatus=status_filter
+                                   ).get("jobSummaryList", [])
+        except ClientError:
+            return
+        for j in jobs:
+            name = j.get("jobName", "")
+            if exec_name not in name:
+                continue
+            m = _CHUNK_JOBNAME_RE.match(name)
+            if m:
+                c, t, ci = m.group(1), m.group(2), int(m.group(3))
+                _emit_stage(f"encode:{c}:{t}:chunk{ci}", stage_status, 0.0)
+
+    # queued first, then running — so a job that just transitioned wins as running.
+    _emit_for("RUNNABLE", "queued")
+    _emit_for("STARTING", "running")
+    _emit_for("RUNNING", "running")
 
 
 # CloudWatch log group the Batch job definitions write to (see
@@ -133,6 +172,37 @@ def _emit_plan() -> None:
 def _emit_stage(key: str, status: str, percent: float = 0.0) -> None:
     print(f"[[ENCODER-STAGE key={key} status={status} percent={percent:.1f}]]",
           flush=True)
+
+
+def _narrate(msg: str) -> None:
+    """A plain (non-marker) line for the job log — the Go server appends these
+    verbatim, so they narrate the pipeline in the app's 'Show log'."""
+    print(msg, flush=True)
+
+
+def _forward_container_timing(exit_ev: dict) -> None:
+    """Pull the container's [timing] line (fetch/encode/upload) from CloudWatch
+    for a just-completed chunk and add it to the job log, so the per-chunk
+    breakdown shows up live as chunks finish."""
+    try:
+        out = exit_ev.get("stateExitedEventDetails", {}).get("output", "")
+        stream = json.loads(out).get("Container", {}).get("LogStreamName")
+    except (ValueError, TypeError):
+        stream = None
+    if not stream:
+        return
+    try:
+        events = _logs().get_log_events(
+            logGroupName=_BATCH_LOG_GROUP, logStreamName=stream,
+            limit=100, startFromHead=False,
+        ).get("events", [])
+    except ClientError:
+        return
+    for e in reversed(events):
+        msg = e.get("message", "")
+        if msg.lstrip().startswith("[timing]"):
+            _narrate("    " + msg.strip())
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -237,32 +307,39 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
             key = _STEP_TO_STAGE.get(name)
             if key:
                 _emit_stage(key, "running", 0.0)
+                _narrate(f"▶ {key.replace(':', ' ')} submitted")
             elif name == "EncodeChunk":
                 idn = chunk_enter.get(ev["id"])
                 if idn:
                     c, t, ci = idn
                     _emit_stage(f"encode:{c}:{t}:chunk{ci}", "running", 0.0)
+                    _narrate(f"▶ encode {c} {t} chunk{ci} submitted")
             elif name == "ConcatVariant":
                 idn = concat_enter.get(ev["id"])
                 if idn:
                     c, t = idn
                     _emit_stage(f"concat:{c}:{t}", "running", 0.0)
+                    _narrate(f"▶ concat {c} {t} submitted")
 
         elif etype == "TaskStateExited":
             name = ev.get("stateExitedEventDetails", {}).get("name", "")
             key = _STEP_TO_STAGE.get(name)
             if key:
                 _emit_stage(key, "done", 100.0)
+                _narrate(f"✓ {key.replace(':', ' ')} done")
             elif name == "EncodeChunk":
                 idn = _enter_of(ev, chunk_enter)
                 if idn:
                     c, t, ci = idn
                     _emit_stage(f"encode:{c}:{t}:chunk{ci}", "done", 100.0)
+                    _narrate(f"✓ encode {c} {t} chunk{ci} done")
+                    _forward_container_timing(ev)
             elif name == "ConcatVariant":
                 idn = _enter_of(ev, concat_enter)
                 if idn:
                     c, t = idn
                     _emit_stage(f"concat:{c}:{t}", "done", 100.0)
+                    _narrate(f"✓ concat {c} {t} done")
 
         elif etype == "TaskFailed":
             _report_task_failure(ev.get("taskFailedEventDetails", {}))
@@ -319,6 +396,13 @@ def cmd_poll(args: argparse.Namespace) -> int:
             if not token:
                 break
         _translate_events(events, seen)
+        # Then refine chunk cells to queued/running from live Batch status
+        # (runs after _translate_events so it wins over the enter-event's
+        # coarse "running"). Best-effort — never let it break polling.
+        try:
+            _reflect_batch_status(args.execution_arn.rsplit(":", 1)[-1])
+        except Exception:  # noqa: BLE001 — status reflection is cosmetic
+            pass
 
         desc = sfn.describe_execution(executionArn=args.execution_arn)
         status = desc["status"]

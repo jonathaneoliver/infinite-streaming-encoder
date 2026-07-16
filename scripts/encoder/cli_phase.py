@@ -33,6 +33,7 @@ import argparse
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from encoder.audio import AudioSpec, create_audio
@@ -213,8 +214,38 @@ def phase_mezzanine(args: argparse.Namespace) -> int:
 # variant — one (codec, tier) encode.
 # ---------------------------------------------------------------------------
 
+
+class _StepTimer:
+    """Times the in-container sub-steps of a phase and emits a machine-readable
+    marker plus a human line. Combined with the Batch job's createdAt/startedAt/
+    stoppedAt (queue + instance bringup + image pull, from `cloud.timing`), this
+    gives the full where-does-the-time-go breakdown for a chunk."""
+
+    def __init__(self, phase: str):
+        self.phase = phase
+        self.marks: list[tuple[str, float]] = []
+        self._t0 = time.monotonic()
+        self._last = self._t0
+
+    def mark(self, name: str) -> None:
+        now = time.monotonic()
+        self.marks.append((name, now - self._last))
+        self._last = now
+
+    def emit(self, key: str) -> None:
+        total = time.monotonic() - self._t0
+        kv = " ".join(f"{n}_s={d:.2f}" for n, d in self.marks)
+        # Machine-readable (parsed by cloud.timing / the app), then human.
+        print(f"[[ENCODER-TIMING phase={self.phase} key={key} {kv} "
+              f"total_s={total:.2f}]]", flush=True)
+        human = ", ".join(f"{n}={d:.1f}s" for n, d in self.marks)
+        print(f"[timing] {self.phase} {key}: {human}, total={total:.1f}s",
+              flush=True)
+
+
 def phase_variant(args: argparse.Namespace) -> int:
     work = _prepare_work_dir()
+    timer = _StepTimer("variant")
 
     mezz_uri = args.s3_mezz.rstrip("/") + "/mezzanine.mp4"
     mezz_local = work / "mezzanine.mp4"
@@ -222,9 +253,11 @@ def phase_variant(args: argparse.Namespace) -> int:
     if not _download_if_complete(mezz_uri, mezz_local):
         print("error: mezzanine.done missing or size mismatch", file=sys.stderr)
         return 1
+    timer.mark("fetch")
 
     tier = _tier_by_name(args.tier)
     info = probe(mezz_local)
+    timer.mark("probe")
 
     # Encode contexts for a single variant are simpler than the full
     # pipeline — no padding (already applied in mezzanine if enabled),
@@ -259,12 +292,17 @@ def phase_variant(args: argparse.Namespace) -> int:
               f"[{chunk.start_s:.0f}s, {chunk.end_s:.0f}s)", flush=True)
 
     out_path = encode_variant(ctx, args.codec, tier, chunk=chunk)
+    timer.mark("encode")
 
     # out_path.name is {codec}_{tier}.mp4 whole-clip, or
     # {codec}_{tier}_chunkNNN.mp4 for a chunk — upload under the same name.
     out_uri = args.s3_out.rstrip("/") + f"/{out_path.name}"
     print(f"[phase variant] uploading {out_uri}", flush=True)
     _upload_with_done(out_path, out_uri)
+    timer.mark("upload")
+
+    ci = "" if chunk is None else f":chunk{chunk.index}"
+    timer.emit(f"encode:{args.codec}:{args.tier}{ci}")
     return 0
 
 

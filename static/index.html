@@ -105,6 +105,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    fan-out is visible at a glance. Colours match the stage-bar palette. */
 .chunk-grid { display: flex; flex-wrap: wrap; gap: 2px; align-items: center; }
 .chunk-cell { width: 11px; height: 11px; border-radius: 2px; background: #1a2a4a; }
+/* queued = submitted to Batch but waiting for a slot (amber, no pulse) —
+   distinct from running = actually encoding (blue, pulsing). */
+.chunk-cell.chunk-queued { background: #ffa94d; }
 .chunk-cell.chunk-running { background: #4361ee; animation: chunkpulse 1s ease-in-out infinite; }
 .chunk-cell.chunk-done { background: #06d6a0; }
 .chunk-cell.chunk-failed { background: #ef476f; }
