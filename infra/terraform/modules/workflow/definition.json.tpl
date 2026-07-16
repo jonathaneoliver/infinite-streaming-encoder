@@ -23,9 +23,10 @@
       "ResultPath": "$.mezzanine",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed"],
-          "IntervalSeconds": 30,
-          "MaxAttempts": 2,
+          "Comment": "Retry only transient orchestration errors (submit throttling / Batch service blips). A States.TaskFailed here means the Batch job itself failed — its evaluate_on_exit already decided recoverability (retry spot reclaims, EXIT on everything else), so re-running the whole job just repeats an unrecoverable failure. Let it fall straight through to Catch -> Failed.",
+          "ErrorEquals": ["Batch.AWSBatchException", "States.Timeout"],
+          "IntervalSeconds": 15,
+          "MaxAttempts": 3,
           "BackoffRate": 2.0
         }
       ],
@@ -175,6 +176,7 @@
                   "s3_out.$": "$.s3_prefix"
                 }
               },
+              "ResultPath": null,
               "Next": "HlsH264"
             },
             "HlsH264": {
@@ -190,6 +192,7 @@
                   "s3_out.$": "$.s3_prefix"
                 }
               },
+              "ResultPath": null,
               "Next": "ByterangesH264"
             },
             "ByterangesH264": {
@@ -227,6 +230,7 @@
                   "s3_out.$": "$.s3_prefix"
                 }
               },
+              "ResultPath": null,
               "Next": "HlsHevc"
             },
             "HlsHevc": {
@@ -242,6 +246,7 @@
                   "s3_out.$": "$.s3_prefix"
                 }
               },
+              "ResultPath": null,
               "Next": "ByterangesHevc"
             },
             "ByterangesHevc": {

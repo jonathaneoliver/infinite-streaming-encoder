@@ -106,7 +106,8 @@ resource "aws_batch_job_definition" "mezzanine" {
     ]
     command = [
       "python3", "-m", "encoder.cli_local", "phase", "mezzanine",
-      "Ref::s3_in", "Ref::s3_out",
+      "--s3-in", "Ref::s3_in",
+      "--s3-out", "Ref::s3_out",
     ]
   }))
 
