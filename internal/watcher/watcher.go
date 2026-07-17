@@ -41,6 +41,13 @@ func (w *Watcher) Run() {
 }
 
 func (w *Watcher) scan(initial bool) {
+	// Runtime toggle (persisted): when the watcher is disabled we don't scan
+	// or submit at all. Re-enabling resumes on the next tick — the first scan
+	// after re-enable re-seeds file sizes and only submits once a file is seen
+	// stable, so flipping it back on won't instantly flood.
+	if !w.manager.WatcherEnabled() {
+		return
+	}
 	entries, err := os.ReadDir(w.dir)
 	if err != nil {
 		log.Printf("watcher: read dir %s: %v", w.dir, err)

@@ -258,7 +258,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
 </head>
 <body>
-<h1>Infinite Streaming Encoder</h1>
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+    <h1 style="margin:0">Infinite Streaming Encoder</h1>
+    <label id="watcher-toggle" title="Auto-encode new files dropped into the source folder. Persists across restarts." style="display:flex;align-items:center;gap:7px;font-size:13px;color:#aaa;cursor:pointer;user-select:none">
+        <input type="checkbox" id="watcher-enabled" onchange="setWatcher(this.checked)" style="cursor:pointer;width:15px;height:15px">
+        <span>Auto-watch source folder</span>
+        <span id="watcher-state" style="font-size:11px"></span>
+    </label>
+</div>
 
 <div class="tabs">
     <div class="tab active" onclick="switchTab('originals')">Originals</div>
@@ -2107,9 +2114,12 @@ function _fleetInstanceRow(i) {
         starting(j) ? 'opacity:.5;' + stripe('rgba(255,255,255,.3)') : '')).join('');
 
     // Box lifecycle state from ECS (booting / pulling before any job lands).
+    // Only surfaced as a box-level badge when there are NO jobs to list —
+    // once jobs show, a STARTING job's striped "starting" segment already
+    // conveys "pulling image", so a separate badge would just be redundant.
     const st = i.init_state || (jobs.length ? 'running' : 'idle');
     const S = _FLEET_STATE[st];
-    const badge = S ? ` <span style="color:${S.c};font-size:11px" title="${S.tip}">${S.t}</span>` : '';
+    const badge = (S && !jobs.length) ? ` <span style="color:${S.c};font-size:11px" title="${S.tip}">${S.t}</span>` : '';
 
     if ((st === 'booting' || st === 'pulling') && !jobs.length && cap) {
         // Warming-up box with no job yet: striped full-width bar, not flat idle.
@@ -2779,6 +2789,35 @@ setInterval(loadSources, 60000);
 startAwsAutoRefresh();
 loadVersion();
 loadLadders();
+loadSettings();
+
+function _renderWatcher(enabled) {
+    const cb = document.getElementById('watcher-enabled');
+    const st = document.getElementById('watcher-state');
+    if (cb) cb.checked = !!enabled;
+    if (st) {
+        st.textContent = enabled ? '● watching' : '○ off';
+        st.style.color = enabled ? '#6ab04c' : '#666';
+    }
+}
+async function loadSettings() {
+    try {
+        const res = await fetch('/api/settings');
+        if (!res.ok) return;
+        _renderWatcher((await res.json()).watcher_enabled);
+    } catch (e) { /* leave unchecked */ }
+}
+async function setWatcher(enabled) {
+    _renderWatcher(enabled); // optimistic
+    try {
+        const res = await fetch('/api/settings', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ watcher_enabled: enabled }),
+        });
+        if (res.ok) _renderWatcher((await res.json()).watcher_enabled);
+        else loadSettings(); // revert to server truth on failure
+    } catch (e) { loadSettings(); }
+}
 
 async function loadVersion() {
     try {

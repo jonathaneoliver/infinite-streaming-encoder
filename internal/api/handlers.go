@@ -38,6 +38,8 @@ func NewServer(mgr *encode.Manager) *Server {
 		),
 	}
 	s.Mux.HandleFunc("GET /api/version", s.getVersion)
+	s.Mux.HandleFunc("GET /api/settings", s.getSettings)
+	s.Mux.HandleFunc("POST /api/settings", s.putSettings)
 	s.Mux.HandleFunc("GET /api/sources", s.listSources)
 	s.Mux.HandleFunc("GET /api/ladders", s.getLadders)
 	s.Mux.HandleFunc("POST /api/ladders", s.putLadder)
@@ -154,6 +156,29 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.Manager.Jobs())
+}
+
+// getSettings returns the persisted global settings (currently just the
+// watcher on/off toggle).
+func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.Manager.Settings())
+}
+
+// putSettings applies a partial settings update. Only fields present in the
+// body are changed; the watcher toggle persists across restarts.
+func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
+	// Pointer fields so we can tell "set to false" from "omitted".
+	var body struct {
+		WatcherEnabled *bool `json:"watcher_enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request: "+err.Error(), 400)
+		return
+	}
+	if body.WatcherEnabled != nil {
+		s.Manager.SetWatcherEnabled(*body.WatcherEnabled)
+	}
+	writeJSON(w, s.Manager.Settings())
 }
 
 func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {

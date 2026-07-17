@@ -92,7 +92,13 @@ func main() {
 	})
 	mgr.Reconcile()
 
-	if *autoWatch {
+	// The -auto-watch flag / AUTO_WATCH env is only the *default*; a persisted
+	// UI toggle (settings.json) wins so it sticks across restarts.
+	mgr.InitSettings(*autoWatch)
+
+	// Always run the watcher goroutine; it self-gates on the persisted
+	// WatcherEnabled setting, which the UI toggles live.
+	{
 		defaults := encode.JobConfig{
 			Codec:  *defaultCodec,
 			Ladder: *defaultLadder,
@@ -101,8 +107,8 @@ func main() {
 		}
 		w := watcher.New(*sourceDir, *watchInterval, mgr, defaults)
 		go w.Run()
-		log.Printf("watcher: monitoring %s every %s (target=%s codec=%s)",
-			*sourceDir, *watchInterval, *defaultTarget, *defaultCodec)
+		log.Printf("watcher: monitoring %s every %s (enabled=%v, target=%s codec=%s)",
+			*sourceDir, *watchInterval, mgr.WatcherEnabled(), *defaultTarget, *defaultCodec)
 	}
 
 	go awswatch.Run(context.Background(), awswatch.Config{

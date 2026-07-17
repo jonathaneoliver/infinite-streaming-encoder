@@ -497,6 +497,11 @@ type Manager struct {
 	// $TmpDir/ladders.json; resolves the concrete rungs for the cloud path.
 	Ladders *LadderStore
 
+	// Persisted global settings (e.g. watcher on/off) owned at
+	// $TmpDir/settings.json. Survives restarts so a UI toggle sticks.
+	settingsMu sync.Mutex
+	settings   Settings
+
 	sem         chan struct{}
 	subscribers []chan *Job
 	subMu       sync.Mutex
