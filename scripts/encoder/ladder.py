@@ -44,15 +44,20 @@ class Tier:
         raise ValueError(f"unknown codec: {codec}")
 
 
-# The six-tier ladder. Numbers are identical to bash's
-# ALL_RESOLUTION_TIERS — changing them is a policy call, not a port issue.
+# The six-tier default ("legacy") ladder. Bitrates track smashing dev's
+# distinct-height geometric ladder (#763 c72b147d, refined by #834's 1.5x
+# ladder) — the current ALL_RESOLUTION_TIERS on origin/dev. Note the column
+# order here is (h264, h265, av1); the bash tuple is (h265, h264, av1), so
+# these are the same numbers with those two swapped. H264 sits above HEVC/AV1
+# at every tier (it's the least efficient codec, so it needs more bitrate for
+# the same quality). Changing any kbps value is a quality-policy call.
 LADDER: tuple[Tier, ...] = (
     Tier("360p",  640,  360,  600,   300,   300,   "medium", 20, 16, 10, 10, 30),
-    Tier("540p",  960,  540,  1200,  900,   900,   "medium", 24, 20, 10, 10, 34),
-    Tier("720p",  1280, 720,  2400,  1500,  1500,  "medium", 28, 24, 10, 10, 38),
-    Tier("1080p", 1920, 1080, 5000,  4500,  4500,  "medium", 36, 32, 10, 10, 45),
-    Tier("1440p", 2560, 1440, 11000, 7500,  7500,  "medium", 42, 36, 10, 10, 52),
-    Tier("2160p", 3840, 2160, 21700, 15000, 15000, "medium", 54, 48, 10, 10, 64),
+    Tier("540p",  960,  540,  1722,  1001,  1001,  "medium", 24, 20, 10, 10, 34),
+    Tier("720p",  1280, 720,  2779,  1662,  1662,  "medium", 28, 24, 10, 10, 38),
+    Tier("1080p", 1920, 1080, 6957,  4273,  4273,  "medium", 36, 32, 10, 10, 45),
+    Tier("1440p", 2560, 1440, 16995, 10547, 10547, "medium", 42, 36, 10, 10, 52),
+    Tier("2160p", 3840, 2160, 26453, 16458, 16458, "medium", 54, 48, 10, 10, 64),
 )
 
 
