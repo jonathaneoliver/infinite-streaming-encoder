@@ -42,9 +42,9 @@
     },
 
     "FanOut": {
-      "Comment": "Audio + variants run in parallel; both must succeed before packaging.",
+      "Comment": "Audio + variants run in parallel; both must succeed before packaging. ResultPath is null: the encode/audio results (Batch job JSON per chunk) aren't needed downstream — package-all reads everything from S3 — and carrying an array of every chunk job's result would blow the 256 KB state-data limit at PerCodec.",
       "Type": "Parallel",
-      "ResultPath": "$.fanout",
+      "ResultPath": null,
       "Branches": [
 
         {
@@ -139,6 +139,7 @@
                         ]
                       }
                     },
+                    "ResultPath": null,
                     "End": true
                   },
                   "EncodeChunks": {
@@ -198,6 +199,7 @@
                               ]
                             }
                           },
+                          "ResultPath": null,
                           "End": true
                         }
                       }
