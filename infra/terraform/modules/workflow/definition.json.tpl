@@ -92,11 +92,55 @@
                 "chunk_indices.$": "$.chunk_indices",
                 "chunk_duration.$": "$.chunk_duration",
                 "maxrate_percent.$": "$.maxrate_percent",
-                "bufsize_multiplier.$": "$.bufsize_multiplier"
+                "bufsize_multiplier.$": "$.bufsize_multiplier",
+                "chunked.$": "$.chunked"
               },
               "ItemProcessor": {
-                "StartAt": "EncodeChunks",
+                "StartAt": "Chunked",
                 "States": {
+                  "Chunked": {
+                    "Comment": "Single-chunk (whole-variant) runs skip the chunk fan-out + concat entirely and encode the whole variant in one job (chunk_index=-1 writes the un-suffixed file directly).",
+                    "Type": "Choice",
+                    "Choices": [
+                      { "Variable": "$.chunked", "StringEquals": "true", "Next": "EncodeChunks" }
+                    ],
+                    "Default": "EncodeWhole"
+                  },
+                  "EncodeWhole": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::batch:submitJob.sync",
+                    "Parameters": {
+                      "JobName.$": "States.Format('var-{}-{}-whole-{}', $.codec, $.label, $$.Execution.Name)",
+                      "JobQueue": "${job_queue_arn}",
+                      "JobDefinition": "${variant_def}",
+                      "ShareIdentifier": "encode",
+                      "SchedulingPriorityOverride.$": "$.priority",
+                      "Parameters": {
+                        "codec.$": "$.codec",
+                        "label.$": "$.label",
+                        "width.$": "$.width",
+                        "height.$": "$.height",
+                        "bitrate.$": "$.bitrate",
+                        "preset.$": "$.preset",
+                        "chunk_index": "-1",
+                        "s3_mezz.$": "$.s3_prefix",
+                        "s3_out.$": "$.s3_prefix"
+                      },
+                      "ContainerOverrides": {
+                        "Environment": [
+                          { "Name": "TWO_PASS", "Value.$": "$.two_pass" },
+                          { "Name": "CHUNK_DURATION_S", "Value.$": "$.chunk_duration" },
+                          { "Name": "MAXRATE_PERCENT", "Value.$": "$.maxrate_percent" },
+                          { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" }
+                        ],
+                        "ResourceRequirements": [
+                          { "Type": "VCPU", "Value.$": "$.vcpu" },
+                          { "Type": "MEMORY", "Value.$": "$.memory" }
+                        ]
+                      }
+                    },
+                    "End": true
+                  },
                   "EncodeChunks": {
                     "Comment": "One encode job per chunk index, concurrent across chunks. A single-chunk clip runs one job (chunk 0 = whole clip).",
                     "Type": "Map",

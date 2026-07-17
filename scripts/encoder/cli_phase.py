@@ -347,6 +347,13 @@ def phase_variant(args: argparse.Namespace) -> int:
     work = _prepare_work_dir()
     timer = _StepTimer("variant")
 
+    # A negative chunk index is the whole-variant sentinel (single-chunk runs:
+    # the SFN skips the chunk fan-out + concat and encodes the whole variant in
+    # one job). Normalize to None so all the chunk-index logic below treats it
+    # as a whole-clip encode writing {codec}_{label}.mp4 directly.
+    if args.chunk_index is not None and args.chunk_index < 0:
+        args.chunk_index = None
+
     # Idempotency / resume: the output name is fully determined by codec, tier
     # and the chunk index (a CLI arg), so we can check S3 BEFORE downloading
     # the mezzanine. If this exact variant is already there — a prior run, or a

@@ -5412,3 +5412,5 @@
 [161103279ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:8080/api/jobs/stream:0
 [161106283ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_RESET @ http://localhost:8080/api/jobs/stream:0
 [161141427ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://localhost:8080/favicon.ico:0
+[162895566ms] [ERROR] Failed to load resource: net::ERR_INCOMPLETE_CHUNKED_ENCODING @ http://localhost:8080/api/jobs/stream:0
+[162972280ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://localhost:8080/favicon.ico:0

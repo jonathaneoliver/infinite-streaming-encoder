@@ -1555,6 +1555,11 @@ func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, 
 		// Chunk size (seconds) the encode + concat workers plan against, so
 		// they agree with chunk_indices above. String for a container env var.
 		"chunk_duration": strconv.FormatFloat(chunkS, 'f', -1, 64),
+		// True when the clip splits into >1 chunk. Single-chunk (whole-variant)
+		// runs skip the chunk fan-out + concat entirely: the SFN encodes the
+		// whole variant in one job (chunk_index=-1) writing the un-suffixed
+		// {codec}_{label}.mp4 directly. String for the SFN Choice comparison.
+		"chunked": strconv.FormatBool(nChunks > 1),
 		// Ladder-level VBV shaping, applied to every variant's encode (the
 		// worker reads these as MAXRATE_PERCENT / BUFSIZE_MULT env). Threaded
 		// so a custom ladder's VBV is honored in the cloud, not just locally.
