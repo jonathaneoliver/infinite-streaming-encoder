@@ -864,6 +864,42 @@ function _ladderBandsCharts(d) {
       </div>`).join('');
 }
 
+// Rungs for a codec sorted by bitrate, with ordinal labels for repeated
+// resolutions (mirrors the label rule used everywhere else).
+function _labeledSorted(rows) {
+    const counts = {};
+    (rows || []).forEach(r => { const rn = r[1] + 'p'; counts[rn] = (counts[rn] || 0) + 1; });
+    const idx = {};
+    return (rows || []).map(r => {
+        const rn = r[1] + 'p';
+        let label = rn;
+        if (counts[rn] > 1) { idx[rn] = (idx[rn] || 0) + 1; label = rn + '_' + idx[rn]; }
+        return { label, avg: r[2] };
+    }).sort((a, b) => a.avg - b.avg);
+}
+
+// Colour a step multiplier: red = rungs too close (<1.25×, redundant), amber =
+// big jump (>2.4×, quality gap), green = healthy spacing.
+function _stepColor(r) { return r < 1.25 ? '#d06666' : (r > 2.4 ? '#d0a24a' : '#6ab04c'); }
+
+// Per-codec strip of rungs with the bitrate step multiplier between each
+// adjacent pair — the ladder's spacing at a glance.
+function _ladderSteps(d) {
+    const present = _CODEC_ORDER.filter(c => (d.codecs && d.codecs[c] || []).length);
+    return present.map(c => {
+        const rungs = _labeledSorted(d.codecs[c]);
+        let inner = `<span style="color:${_CODEC_COLOR[c]};font-weight:700;min-width:42px">${c}</span>`;
+        rungs.forEach((r, i) => {
+            if (i > 0) {
+                const ratio = r.avg / rungs[i - 1].avg;
+                inner += `<span style="color:${_stepColor(ratio)};font-size:11px" title="step from previous rung">×${ratio.toFixed(2)}</span>`;
+            }
+            inner += `<span style="background:#2a2f3a;border-radius:3px;padding:1px 6px;font-size:12px;white-space:nowrap"><span style="color:#9aa">${r.label}</span> ${r.avg}</span>`;
+        });
+        return `<div style="display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin:3px 0">${inner}</div>`;
+    }).join('');
+}
+
 function renderLaddersTab() {
     const el = document.getElementById('ladders-list');
     if (!el) return;
@@ -886,6 +922,8 @@ function renderLaddersTab() {
           </div>
           <p style="color:#888;margin:4px 0 10px">${d.description || ''}</p>
           ${_alignedLadderTable(d)}
+          <div style="color:#888;font-size:12px;margin:14px 0 4px">ladder step — bitrate ratio between adjacent rungs (<span style="color:#6ab04c">healthy 1.25–2.4×</span> · <span style="color:#d06666">&lt;1.25× too close</span> · <span style="color:#d0a24a">&gt;2.4× big jump</span>)</div>
+          ${_ladderSteps(d)}
           <div style="color:#888;font-size:12px;margin:14px 0 4px">delivered bandwidth per segment length · bitrate (linear) ↑ · column per codec · bar = avg→peak, height = span · colour = resolution — peak = avg × (maxrate% + bufsize×/T), so shorter segments burst higher; overlapping bars sit too close</div>
           <div style="display:flex;gap:22px;overflow-x:auto;align-items:flex-start">${_ladderBandsCharts(d)}</div>
         </div>`;
