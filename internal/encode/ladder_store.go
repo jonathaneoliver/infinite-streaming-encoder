@@ -47,6 +47,7 @@ func defaultSeedLadders() map[string]LadderDef {
 	legacyHEVC := [][]int{{640, 360, 300}, {960, 540, 1001}, {1280, 720, 1662}, {1920, 1080, 4273}, {2560, 1440, 10547}, {3840, 2160, 16458}}
 	appleH264 := [][]int{{416, 234, 145}, {640, 360, 365}, {768, 432, 730}, {768, 432, 1100}, {960, 540, 2000}, {1280, 720, 3000}, {1280, 720, 4500}, {1920, 1080, 6000}, {1920, 1080, 7800}}
 	appleHEVC := [][]int{{640, 360, 145}, {768, 432, 300}, {960, 540, 600}, {960, 540, 900}, {960, 540, 1600}, {1280, 720, 2400}, {1280, 720, 3400}, {1920, 1080, 4500}, {1920, 1080, 5800}, {2560, 1440, 8100}, {3840, 2160, 11600}, {3840, 2160, 16800}}
+	appleUniqH264 := [][]int{{416, 234, 145}, {640, 360, 365}, {704, 396, 730}, {768, 432, 1100}, {960, 540, 2000}, {1216, 684, 3000}, {1280, 720, 4500}, {1856, 1044, 6000}, {1920, 1080, 7800}}
 	appleUniqHEVC := [][]int{{640, 360, 145}, {768, 432, 300}, {832, 468, 600}, {896, 504, 900}, {960, 540, 1600}, {1216, 684, 2400}, {1280, 720, 3400}, {1856, 1044, 4500}, {1920, 1080, 5800}, {2560, 1440, 8100}, {3776, 2124, 11600}, {3840, 2160, 16800}}
 	return map[string]LadderDef{
 		"legacy": {
@@ -67,27 +68,36 @@ func defaultSeedLadders() map[string]LadderDef {
 				"av1":  appleHEVC,
 			},
 		},
-		"live": {
-			Description: "Apple bitrates under Apple's live/linear VBV: peak <= 1.25x avg. maxrate 110% + tight 0.10x buffer keep delivered peak <=~1.20x even at 1s segments.",
-			Seed:              true,
-			MaxratePercent:    110,
-			BufsizeMultiplier: 0.10,
-			Codecs: map[string][][]int{
-				"h264": appleH264,
-				"hevc": appleHEVC,
-				"av1":  appleHEVC,
-			},
-		},
 		"apple-uniq": {
 			Description: "Apple bitrates with every rung given a unique 16:9 resolution.",
 			Seed:        true,
 			Codecs: map[string][][]int{
-				"h264": {{416, 234, 145}, {640, 360, 365}, {704, 396, 730}, {768, 432, 1100}, {960, 540, 2000}, {1216, 684, 3000}, {1280, 720, 4500}, {1856, 1044, 6000}, {1920, 1080, 7800}},
+				"h264": appleUniqH264,
+				"hevc": appleUniqHEVC,
+				"av1":  appleUniqHEVC,
+			},
+		},
+		"apple-uniq-live": {
+			Description: "apple-uniq bitrates under Apple's live/linear VBV: peak <= 1.25x avg. maxrate 110% + tight 0.10x buffer keep delivered peak <=~1.20x even at 1s segments; unique resolutions keep the bands distinct.",
+			Seed:              true,
+			MaxratePercent:    110,
+			BufsizeMultiplier: 0.10,
+			Codecs: map[string][][]int{
+				"h264": appleUniqH264,
 				"hevc": appleUniqHEVC,
 				"av1":  appleUniqHEVC,
 			},
 		},
 	}
+}
+
+// ladderDefsEqual compares two ladder definitions by their JSON encoding — a
+// cheap structural equality that ignores map/field ordering. Used to detect a
+// seed whose code definition drifted from the persisted copy.
+func ladderDefsEqual(a, b LadderDef) bool {
+	ab, err1 := json.Marshal(a)
+	bb, err2 := json.Marshal(b)
+	return err1 == nil && err2 == nil && string(ab) == string(bb)
 }
 
 // LoadLadderStore loads the store from `path`, seeding it from the built-ins
@@ -105,10 +115,22 @@ func LoadLadderStore(path string) *LadderStore {
 			s.ladders = f.Ladders
 		}
 	}
-	// Ensure every seed exists (re-add any that were removed/corrupted).
 	changed := false
+	// Prune stale seeds: a stored ladder marked seed:true that is no longer a
+	// current built-in (renamed/removed in code) — e.g. an old "live" after it
+	// became "apple-uniq-live". User ladders (seed:false) are never pruned.
+	for name, def := range s.ladders {
+		if def.Seed {
+			if _, ok := seeds[name]; !ok {
+				delete(s.ladders, name)
+				changed = true
+			}
+		}
+	}
+	// Ensure every current seed exists + is up to date (re-add if removed, and
+	// refresh a seed whose code definition changed).
 	for name, def := range seeds {
-		if _, ok := s.ladders[name]; !ok {
+		if cur, ok := s.ladders[name]; !ok || !ladderDefsEqual(cur, def) {
 			s.ladders[name] = def
 			changed = true
 		}
@@ -171,9 +193,13 @@ func (s *LadderStore) Has(name string) bool {
 	return ok
 }
 
-// seedNames is the set of built-in ladders that may not be overwritten or
-// deleted.
-var seedNames = map[string]bool{"legacy": true, "apple": true, "apple-uniq": true}
+// isSeedName reports whether a name is a built-in ladder (read-only: may not be
+// overwritten or deleted via the API). Derived from defaultSeedLadders so it
+// never drifts as seeds are added/renamed.
+func isSeedName(name string) bool {
+	_, ok := defaultSeedLadders()[name]
+	return ok
+}
 
 // Put adds or replaces a user-defined ladder. Seed ladders are read-only and
 // cannot be overwritten. The def is validated and force-marked non-seed.
@@ -181,7 +207,7 @@ func (s *LadderStore) Put(name string, def LadderDef) error {
 	if name == "" {
 		return fmt.Errorf("ladder name is required")
 	}
-	if seedNames[name] {
+	if isSeedName(name) {
 		return fmt.Errorf("%q is a built-in ladder and cannot be modified", name)
 	}
 	if err := validateLadderDef(def); err != nil {
@@ -197,7 +223,7 @@ func (s *LadderStore) Put(name string, def LadderDef) error {
 
 // Delete removes a user-defined ladder. Seed ladders cannot be deleted.
 func (s *LadderStore) Delete(name string) error {
-	if seedNames[name] {
+	if isSeedName(name) {
 		return fmt.Errorf("%q is a built-in ladder and cannot be deleted", name)
 	}
 	s.mu.Lock()

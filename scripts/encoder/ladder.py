@@ -208,17 +208,18 @@ SEED_LADDERS: dict[str, dict] = {
             "av1":  _SEED_APPLE_HEVC_UNIQ,
         },
     },
-    "live": {
-        "description": "Apple bitrates under Apple's live/linear VBV: peak "
-                       "<= 1.25x avg. maxrate 110% + tight 0.10x buffer keep "
-                       "delivered peak <=~1.20x even at 1s segments.",
+    "apple-uniq-live": {
+        "description": "apple-uniq bitrates under Apple's live/linear VBV: "
+                       "peak <= 1.25x avg. maxrate 110% + tight 0.10x buffer "
+                       "keep delivered peak <=~1.20x even at 1s segments; "
+                       "unique resolutions keep the bands distinct.",
         "seed": True,
         "maxrate_percent": 110,
         "bufsize_multiplier": 0.10,
         "codecs": {
-            "h264": _SEED_APPLE_H264,
-            "hevc": _SEED_APPLE_HEVC,
-            "av1":  _SEED_APPLE_HEVC,
+            "h264": _SEED_APPLE_H264_UNIQ,
+            "hevc": _SEED_APPLE_HEVC_UNIQ,
+            "av1":  _SEED_APPLE_HEVC_UNIQ,
         },
     },
 }
