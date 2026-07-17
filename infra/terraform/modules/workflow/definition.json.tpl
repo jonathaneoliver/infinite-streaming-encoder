@@ -73,10 +73,10 @@
           "StartAt": "Variants",
           "States": {
             "Variants": {
-              "Comment": "Fan out across (codec, tier); each variant fans out again across chunks, then concats. 12 variants x N chunks. Batch queue depth caps real parallelism.",
+              "Comment": "Fan out across (codec, tier); each variant fans out again across chunks, then concats. Batch queue depth + compute-env max_vcpus cap real parallelism; 12 lets a full 48-vCPU fleet (6x 8-vCPU boxes) stay busy in whole-variant mode.",
               "Type": "Map",
               "ItemsPath": "$.variants",
-              "MaxConcurrency": 6,
+              "MaxConcurrency": 12,
               "ItemSelector": {
                 "codec.$": "$$.Map.Item.Value.codec",
                 "label.$": "$$.Map.Item.Value.label",
