@@ -70,14 +70,18 @@ func resHeightRank(height int) int {
 // returning Batch resourceRequirements (strings). Mirrors the old
 // variantResources but keyed on pixel height so it works for any ladder's
 // rung resolutions (incl. apple's non-standard heights).
+// Memory is deliberately set BELOW the naive 1:2 vCPU:GiB ratio so jobs pack by
+// vCPU. A c*.2xlarge is 8 vCPU / 16 GiB, but only ~15.2 GiB is schedulable after
+// the OS + ECS agent reserve. At the old 8 GiB, two 4-vCPU jobs (16 GiB) didn't
+// fit — only one landed, leaving 4 vCPU idle and halving fleet utilization.
+// 7 GiB lets two 4-vCPU jobs pack (14 GiB) and fill the box; 3.5 GiB lets four
+// 2-vCPU jobs pack. Well within a 4K libx265 encode's actual footprint (~2-4 GiB).
 func variantResourcesForHeight(height int) (vcpu, memory string) {
 	switch {
 	case height <= 540:
-		return "2", "4096"
-	case height <= 1080:
-		return "4", "8192"
-	default: // 1440p, 2160p
-		return "4", "8192"
+		return "2", "3584" // 4 per 16-GiB box
+	default: // 720p and up
+		return "4", "7168" // 2 per 16-GiB box
 	}
 }
 

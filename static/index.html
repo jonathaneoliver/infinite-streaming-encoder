@@ -531,13 +531,13 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
         </div>
 
         <div class="aws-section">
-            <h3>Batch Jobs (cloud-batch)</h3>
-            <div id="aws-batch-jobs"></div>
+            <h3>EC2 Instances</h3>
+            <div id="aws-instances"></div>
         </div>
 
         <div class="aws-section">
-            <h3>EC2 Instances</h3>
-            <div id="aws-instances"></div>
+            <h3>Batch Jobs (cloud-batch)</h3>
+            <div id="aws-batch-jobs"></div>
         </div>
 
         <div class="aws-section">
@@ -1978,6 +1978,14 @@ function renderAws(data) {
 
 function renderAwsExecutions(execs) {
     const el = document.getElementById('aws-executions');
+    execs = execs || [];
+    // Show every RUNNING execution + the 5 most recent finished ones; the long
+    // tail of old terminal executions is just history (AWS keeps it 90 days,
+    // free — no cleanup needed, so we only trim the display).
+    const running = execs.filter(e => e.status === 'RUNNING' || e.error);
+    const finished = execs.filter(e => e.status && e.status !== 'RUNNING').slice(0, 5);
+    const hidden = execs.filter(e => e.status && e.status !== 'RUNNING').length - finished.length;
+    execs = running.concat(finished);
     if (execs.length === 0) { el.innerHTML = '<div class="aws-empty">No executions.</div>'; return; }
     const rows = execs.map(e => {
         if (e.error) return `<tr><td colspan="4" class="aws-state-available">${escapeHtml(e.error)}</td></tr>`;
@@ -1991,9 +1999,11 @@ function renderAwsExecutions(execs) {
                 : '—'}</td>
         </tr>`;
     }).join('');
+    const more = hidden > 0
+        ? `<div style="color:#888;font-size:11px;margin-top:4px">+ ${hidden} older finished execution${hidden > 1 ? 's' : ''} (hidden)</div>` : '';
     el.innerHTML = `<table class="aws-table"><thead><tr>
         <th>Execution</th><th>Status</th><th>Age</th><th></th>
-    </tr></thead><tbody>${rows}</tbody></table>`;
+    </tr></thead><tbody>${rows}</tbody></table>${more}`;
 }
 
 function renderAwsBatchJobs(jobs) {
@@ -2175,8 +2185,12 @@ function renderFleet(fleet, instances) {
 
 function renderAwsInstances(instances) {
     const el = document.getElementById('aws-instances');
+    // Hide terminated/shutting-down boxes — they're gone and cost nothing, so
+    // they're just noise. Keep live states only.
+    instances = (instances || []).filter(i =>
+        ['running', 'pending', 'stopping', 'stopped'].includes(i.state));
     if (instances.length === 0) {
-        el.innerHTML = '<div class="aws-empty">No instances.</div>';
+        el.innerHTML = '<div class="aws-empty">No active instances.</div>';
         return;
     }
     const rows = instances.map(i => `
