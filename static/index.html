@@ -443,9 +443,12 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
 <!-- JOBS TAB -->
 <div id="tab-jobs" class="tab-content">
+    <div class="panel" id="jobs-fleet-panel" style="display:none">
+        <h2>Fleet</h2>
+        <div id="jobs-fleet-full" title="Live cloud fleet — per-instance packing, utilization, and lifecycle (from the AWS inventory)"></div>
+    </div>
     <div class="panel">
         <h2>Jobs</h2>
-        <div id="jobs-fleet" style="font-size:12px;color:#888;margin:-6px 0 12px" title="Live cloud fleet utilization (from the AWS inventory)"></div>
         <div id="jobs-list">
             <div class="no-files">No jobs yet</div>
         </div>
@@ -2083,28 +2086,51 @@ function _jobColor(name) {
     return '#5a6472'; // mezz/audio/package/etc
 }
 
+// Lifecycle badges for a box's ECS state before/without a running job.
+const _FLEET_STATE = {
+    booting: { c: '#d0a24a', t: '◦ booting', tip: 'EC2 up — OS boot + ECS agent register + first image pull happen here' },
+    pulling: { c: '#4a90d9', t: '⋯ pulling image', tip: 'task placed — pulling image / starting container' },
+    idle:    { c: '#d0a24a', t: '◦ idle', tip: 'running but no jobs — a scale-down candidate' },
+};
 function _fleetInstanceRow(i) {
     const cap = i.vcpus || 0;
     const used = i.used_vcpus || 0;
     const idle = (i.idle_vcpus != null) ? i.idle_vcpus : Math.max(0, cap - used);
     const jobs = i.jobs || [];
-    const seg = (w, color, title) => `<div style="width:${w}%;background:${color}" title="${escapeHtml(title)}"></div>`;
+    const starting = j => /^(STARTING|STARTUP|PROVISIONING|PENDING|SUBMITTED|RUNNABLE)$/i.test(j.status || '');
+    const seg = (w, color, title, extra) => `<div style="width:${w}%;background:${color};${extra || ''}" title="${escapeHtml(title)}"></div>`;
+    // A job still STARTING (its container is pulling the image) renders dimmed +
+    // striped, so you can see the box warming up for it before it's RUNNING.
+    const stripe = c => `background-image:repeating-linear-gradient(45deg,${c} 0 6px,transparent 6px 12px)`;
     let parts = jobs.map(j => seg(cap ? (j.vcpu || 0) / cap * 100 : 0, _jobColor(j.name),
-        `${_jobFriendly(j.name)} — ${j.vcpu} vCPU`)).join('');
-    if (idle > 0 && cap) parts += seg(idle / cap * 100, '#20252f', `${idle} idle vCPU`);
-    const isIdle = jobs.length === 0;
-    const rightLabel = isIdle ? `idle (${cap} vCPU)` : `${used}/${cap} vCPU · ${jobs.length} job${jobs.length > 1 ? 's' : ''}`;
-    const idleFlag = isIdle ? ` <span style="color:#d0a24a;font-size:11px" title="running but no jobs — a scale-down candidate">◦ idle</span>` : '';
+        `${_jobFriendly(j.name)} — ${j.vcpu} vCPU${starting(j) ? ' (starting — pulling image)' : ''}`,
+        starting(j) ? 'opacity:.5;' + stripe('rgba(255,255,255,.3)') : '')).join('');
+
+    // Box lifecycle state from ECS (booting / pulling before any job lands).
+    const st = i.init_state || (jobs.length ? 'running' : 'idle');
+    const S = _FLEET_STATE[st];
+    const badge = S ? ` <span style="color:${S.c};font-size:11px" title="${S.tip}">${S.t}</span>` : '';
+
+    if ((st === 'booting' || st === 'pulling') && !jobs.length && cap) {
+        // Warming-up box with no job yet: striped full-width bar, not flat idle.
+        parts = seg(100, '#20252f', S.tip, stripe(S.c + '55'));
+    } else if (idle > 0 && cap) {
+        parts += seg(idle / cap * 100, '#20252f', `${idle} idle vCPU`);
+    }
+
+    const rightLabel = jobs.length
+        ? `${used}/${cap} vCPU · ${jobs.length} job${jobs.length > 1 ? 's' : ''}`
+        : (st === 'booting' ? 'booting' : st === 'pulling' ? 'pulling image' : `idle (${cap} vCPU)`);
     // Inline list of what this box is running right now (friendly names + dot).
     const jobList = jobs.length
         ? `<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:#9aa;margin-top:3px">`
-          + jobs.map(j => `<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${_jobColor(j.name)};vertical-align:middle;margin-right:4px"></span>`
-              + `${escapeHtml(_jobFriendly(j.name))} <span style="color:#666">${j.vcpu}v</span></span>`).join('')
+          + jobs.map(j => `<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${_jobColor(j.name)};vertical-align:middle;margin-right:4px;${starting(j) ? 'opacity:.5' : ''}"></span>`
+              + `${escapeHtml(_jobFriendly(j.name))} <span style="color:#666">${j.vcpu}v${starting(j) ? ' · starting' : ''}</span></span>`).join('')
           + `</div>`
         : '';
     return `<div>
       <div style="display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-bottom:2px">
-        <span>${escapeHtml(i.type || '')} <span style="color:#666">${escapeHtml((i.id || '').slice(-6))}</span>${idleFlag}</span>
+        <span>${escapeHtml(i.type || '')} <span style="color:#666">${escapeHtml((i.id || '').slice(-6))}</span>${badge}</span>
         <span>${rightLabel} · ${formatDuration(i.age_seconds || 0)}</span>
       </div>
       <div style="height:16px;background:#20252f;border-radius:4px;overflow:hidden;display:flex">${parts}</div>
@@ -2156,31 +2182,39 @@ function renderFleet(fleet, instances) {
     const idle = (fleet.idle_vcpus != null) ? fleet.idle_vcpus : Math.max(0, total - used);
     const pct = total ? Math.round(used / total * 100) : 0;
 
-    // Compact one-liner for the Jobs tab.
-    const jf = document.getElementById('jobs-fleet');
-    if (jf) jf.innerHTML = running.length
-        ? `<span style="color:#4a90d9;font-weight:600">${used}/${total} vCPU busy</span> (${pct}%) · ${running.length} instance${running.length > 1 ? 's' : ''} · ${fleet.running_jobs || 0} running / ${fleet.queued_jobs || 0} queued · $${(fleet.estimated_hourly_usd || 0).toFixed(2)}/hr`
-        : '<span style="color:#888">fleet idle — no instances running</span>';
+    // Build the full panel once, then render it into both the AWS tab and the
+    // Jobs-page Fleet panel.
+    let panelHtml;
+    if (!running.length && !total) {
+        panelHtml = '<div class="aws-empty">No active fleet.</div>';
+    } else {
+        const bar = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+          <div style="flex:1;max-width:520px;height:22px;background:#20252f;border-radius:5px;overflow:hidden">
+            <div style="width:${pct}%;height:100%;background:#4a90d9"></div>
+          </div>
+          <div style="font-size:13px;color:#ccc"><b>${used}</b> / ${total} vCPU busy (${pct}%) · <span style="color:#888">${idle} idle</span></div>
+        </div>
+        <div style="color:#888;font-size:12px;margin-bottom:12px">${fleet.instance_count || running.length} instances · ${fleet.running_jobs || 0} running / ${fleet.queued_jobs || 0} queued jobs · $${(fleet.estimated_hourly_usd || 0).toFixed(2)}/hr · $${(fleet.spend_24h_usd || 0).toFixed(2)} last 24h</div>`;
+        // If jobs couldn't be mapped to instances (missing ecs perm), say so.
+        const mapped = running.some(i => (i.jobs || []).length);
+        const note = (used > 0 && !mapped)
+            ? `<div style="color:#d0a24a;font-size:12px;margin-bottom:8px">per-instance placement unavailable (grant ecs:DescribeContainerInstances) — showing fleet totals only</div>`
+            : '';
+        const rows = running.map(_fleetInstanceRow).join('');
+        panelHtml = bar + _fleetSparks(fleet.history) + note + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
+    }
 
     const el = document.getElementById('aws-fleet');
-    if (!el) return;
-    if (!running.length && !total) { el.innerHTML = '<div class="aws-empty">No active fleet.</div>'; return; }
+    if (el) el.innerHTML = panelHtml;
 
-    const bar = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
-      <div style="flex:1;max-width:520px;height:22px;background:#20252f;border-radius:5px;overflow:hidden">
-        <div style="width:${pct}%;height:100%;background:#4a90d9"></div>
-      </div>
-      <div style="font-size:13px;color:#ccc"><b>${used}</b> / ${total} vCPU busy (${pct}%) · <span style="color:#888">${idle} idle</span></div>
-    </div>
-    <div style="color:#888;font-size:12px;margin-bottom:12px">${fleet.instance_count || running.length} instances · ${fleet.running_jobs || 0} running / ${fleet.queued_jobs || 0} queued jobs · $${(fleet.estimated_hourly_usd || 0).toFixed(2)}/hr · $${(fleet.spend_24h_usd || 0).toFixed(2)} last 24h</div>`;
-
-    // If jobs couldn't be mapped to instances (missing ecs perm), say so.
-    const mapped = running.some(i => (i.jobs || []).length);
-    const note = (used > 0 && !mapped)
-        ? `<div style="color:#d0a24a;font-size:12px;margin-bottom:8px">per-instance placement unavailable (grant ecs:DescribeContainerInstances) — showing fleet totals only</div>`
-        : '';
-    const rows = running.map(_fleetInstanceRow).join('');
-    el.innerHTML = bar + _fleetSparks(fleet.history) + note + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
+    // Jobs page: show the same full panel above the jobs list; hide it entirely
+    // when there's no fleet so the page isn't cluttered while idle.
+    const jp = document.getElementById('jobs-fleet-panel');
+    const jff = document.getElementById('jobs-fleet-full');
+    if (jp && jff) {
+        if (running.length || total) { jff.innerHTML = panelHtml; jp.style.display = ''; }
+        else { jp.style.display = 'none'; }
+    }
 }
 
 function renderAwsInstances(instances) {

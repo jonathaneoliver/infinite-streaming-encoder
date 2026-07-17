@@ -295,14 +295,35 @@ def _forward_container_timing(exit_ev: dict) -> None:
 # submit
 # ---------------------------------------------------------------------------
 
+def _execution_name(input_doc: str) -> str | None:
+    """A readable, unique execution name derived from the S3 job prefix
+    ({jobid}-{stem}) instead of AWS's UUID, so the console + app show e.g.
+    "1784319521959-insane_fpv_shots-a1b2c3". Sanitized to [A-Za-z0-9_-],
+    truncated, with a short random suffix to guarantee uniqueness (retries /
+    resume reusing a job id never collide). Also flows into the Batch job
+    names (which the app already parses phase-first, so the tail is ignored)."""
+    import re
+    import uuid
+    try:
+        prefix = json.loads(input_doc).get("s3_prefix", "")
+    except (ValueError, TypeError):
+        return None
+    base = prefix.rstrip("/").rsplit("/", 1)[-1]
+    base = re.sub(r"[^A-Za-z0-9_-]", "_", base)[:60].strip("_-")
+    if not base:
+        return None
+    return f"{base}-{uuid.uuid4().hex[:6]}"
+
+
 def cmd_submit(args: argparse.Namespace) -> int:
     sfn = _sfn()
     with open(args.input_json) as f:
         input_doc = f.read()
-    resp = sfn.start_execution(
-        stateMachineArn=args.state_machine_arn,
-        input=input_doc,
-    )
+    kwargs = {"stateMachineArn": args.state_machine_arn, "input": input_doc}
+    name = _execution_name(input_doc)
+    if name:
+        kwargs["name"] = name
+    resp = sfn.start_execution(**kwargs)
     print(resp["executionArn"], flush=True)
     return 0
 

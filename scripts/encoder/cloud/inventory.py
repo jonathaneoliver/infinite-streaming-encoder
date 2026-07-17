@@ -432,6 +432,58 @@ def _enrich_fleet(batch_jobs: list[dict], instances: list[dict]) -> dict[str, An
     }
 
 
+def _annotate_init_states(instances: list[dict]) -> None:
+    """Tag each running EC2 box with its ECS lifecycle state so the fleet view
+    shows what a box is doing *before* a job lands on it, not just "idle":
+      booting  — EC2 up but not yet a connected ECS member (OS boot + agent
+                 register + first image pull happen here)
+      pulling  — a task is placed and PENDING (image pull / container start)
+      running  — has a running task
+      idle     — registered, connected, no tasks (a scale-down candidate)
+    Covers boxes with no jobs yet by listing the cluster's container instances
+    directly (the job->instance map in _enrich_fleet only sees busy boxes).
+    Best-effort: any AWS/permission error just leaves init_state unset."""
+    running = [i for i in instances if i.get("state") == "running"]
+    if not running:
+        return
+    try:
+        from encoder.cloud.compute_env import _encoder_ce
+        ce = _encoder_ce()
+        cluster = None
+        if ce:
+            ces = batch_client().describe_compute_environments(
+                computeEnvironments=[ce]).get("computeEnvironments", [])
+            if ces:
+                cluster = ces[0].get("ecsClusterArn")
+        if not cluster:
+            return
+        ecs = ecs_client()
+        arns: list[str] = []
+        for page in ecs.get_paginator("list_container_instances").paginate(cluster=cluster):
+            arns.extend(page.get("containerInstanceArns", []))
+        by_ec2: dict[str, dict] = {}
+        for i in range(0, len(arns), 100):
+            for ci in ecs.describe_container_instances(
+                    cluster=cluster, containerInstances=arns[i:i + 100]
+            ).get("containerInstances", []):
+                by_ec2[ci.get("ec2InstanceId")] = ci
+    except ClientError:
+        return
+
+    for inst in running:
+        ci = by_ec2.get(inst["id"])
+        if ci is None:
+            inst["init_state"] = "booting"
+        elif not ci.get("agentConnected") or ci.get("status") == "REGISTERING":
+            inst["init_state"] = "booting"
+        elif ci.get("pendingTasksCount", 0) > 0:
+            inst["init_state"] = "pulling"
+        elif ci.get("runningTasksCount", 0) > 0 or inst.get("jobs"):
+            inst["init_state"] = "running"
+        else:
+            inst["init_state"] = "idle"
+
+
 def _record_fleet_samples(hourly_usd: float, fleet: dict) -> dict:
     """Append a fleet sample to a persisted log and return the trailing-24h
     spend (integrated burn rate) plus a recent history for sparklines. No Cost
@@ -516,6 +568,7 @@ def collect() -> dict[str, Any]:
     # Fleet packing (busy/idle vCPU per instance + summary) and self-tracked
     # 24h spend. _enrich_fleet annotates `instances` in place.
     fleet = _enrich_fleet(batch_jobs, instances)
+    _annotate_init_states(instances)  # booting / pulling / idle per box
     fleet["estimated_hourly_usd"] = round(hourly_total, 4)
     _sampled = _record_fleet_samples(hourly_total, fleet)
     fleet["spend_24h_usd"] = _sampled["spend_24h_usd"]
