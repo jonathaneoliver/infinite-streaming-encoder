@@ -801,25 +801,25 @@ function _resColor(h) {
     return `hsl(${(212 - t * 212).toFixed(0)},60%,55%)`;
 }
 
-function _ladderBandsSVG(d) {
+// One chart for a given segment length T (seconds). The delivered peak over a
+// segment of length T is avg × (maxrate% + bufsize×/T): shorter segments burst
+// higher because the VBV buffer drains into a smaller window. dHi is the shared
+// Y domain (passed in) so the 1s/2s/6s charts are directly comparable.
+function _ladderBandsSVG(d, T, dHi) {
     const pct = (d.maxrate_percent || 124) / 100;
+    const bufMult = d.bufsize_multiplier || 0.25;
     const present = _CODEC_ORDER.filter(c => (d.codecs && d.codecs[c] || []).length);
     if (!present.length) return '';
+    const peakOf = avg => Math.round(avg * (pct + bufMult / T));
     const byCodec = {};
-    let lo = Infinity, hi = 0;
     present.forEach(c => {
         byCodec[c] = (d.codecs[c] || [])
-            .map(r => ({ res: r[1] + 'p', h: r[1], avg: r[2], peak: Math.round(r[2] * pct) }))
+            .map(r => ({ res: r[1] + 'p', h: r[1], avg: r[2], peak: peakOf(r[2]) }))
             .sort((a, b) => a.avg - b.avg);
-        byCodec[c].forEach(v => { lo = Math.min(lo, v.avg); hi = Math.max(hi, v.peak); });
     });
-    const AX = 60, TOP = 26, BOT = 14, COLW = 180, H = 470;
-    const W = AX + present.length * COLW + 12;
+    const AX = 46, TOP = 24, BOT = 14, COLW = 92, H = 460;
+    const W = AX + present.length * COLW + 8;
     const plotH = H - TOP - BOT;
-    // Linear bitrate axis from 0 — so a bar's HEIGHT is its kbps span
-    // (peak − avg) at a constant pixels-per-kbps, directly comparable
-    // across rungs (log would distort the band widths).
-    const dHi = hi * 1.04;
     const y = v => TOP + (1 - v / dHi) * plotH;
     const step = [100, 250, 500, 1000, 2000, 2500, 5000, 10000, 20000, 50000].find(s => dHi / s <= 8) || 50000;
     const ticks = [];
@@ -827,24 +827,41 @@ function _ladderBandsSVG(d) {
     const grid = ticks.map(t => {
         const yy = y(t).toFixed(1);
         const lbl = t === 0 ? '0' : (t >= 1000 ? (t / 1000) + 'M' : t + 'k');
-        return `<line x1="${AX}" y1="${yy}" x2="${W - 6}" y2="${yy}" stroke="#333"/>`
-            + `<text x="${AX - 6}" y="${(+yy + 3.5).toFixed(1)}" fill="#888" font-size="10" text-anchor="end">${lbl}</text>`;
+        return `<line x1="${AX}" y1="${yy}" x2="${W - 4}" y2="${yy}" stroke="#333"/>`
+            + `<text x="${AX - 5}" y="${(+yy + 3.3).toFixed(1)}" fill="#888" font-size="9" text-anchor="end">${lbl}</text>`;
     }).join('');
-    const barW = COLW * 0.52;
+    const barW = COLW * 0.58;
     const cols = present.map((c, ci) => {
         const colX = AX + ci * COLW, bx = colX + (COLW - barW) / 2;
-        const header = `<text x="${colX + COLW / 2}" y="${TOP - 10}" fill="${_CODEC_COLOR[c]}" font-size="12.5" font-weight="700" text-anchor="middle">${c}</text>`;
+        const header = `<text x="${colX + COLW / 2}" y="${TOP - 9}" fill="${_CODEC_COLOR[c]}" font-size="11" font-weight="700" text-anchor="middle">${c}</text>`;
         const bars = byCodec[c].map(v => {
             const yt = y(v.peak), bh = Math.max(2, y(v.avg) - yt), col = _resColor(v.h);
-            const onBar = bh >= 13
-                ? `<text x="${bx + barW / 2}" y="${(yt + bh / 2 + 3.5).toFixed(1)}" fill="#fff" font-size="9.5" text-anchor="middle">${v.res}</text>`
-                : `<text x="${bx + barW + 4}" y="${(yt + bh / 2 + 3.5).toFixed(1)}" fill="#aaa" font-size="9" text-anchor="start">${v.res}</text>`;
-            return `<rect x="${bx.toFixed(1)}" y="${yt.toFixed(1)}" width="${barW.toFixed(1)}" height="${bh.toFixed(1)}" rx="2" fill="${col}" fill-opacity="0.82" stroke="${col}"><title>${c} ${v.res}: avg ${v.avg}k → peak ${v.peak}k</title></rect>${onBar}`;
+            const onBar = bh >= 12
+                ? `<text x="${bx + barW / 2}" y="${(yt + bh / 2 + 3.2).toFixed(1)}" fill="#fff" font-size="8.5" text-anchor="middle">${v.res}</text>` : '';
+            return `<rect x="${bx.toFixed(1)}" y="${yt.toFixed(1)}" width="${barW.toFixed(1)}" height="${bh.toFixed(1)}" rx="2" fill="${col}" fill-opacity="0.82" stroke="${col}"><title>${c} ${v.res} @ ${T}s: avg ${v.avg}k → peak ${v.peak}k</title></rect>${onBar}`;
         }).join('');
         return header + bars;
     }).join('');
-    return `<div style="overflow-x:auto"><svg width="${W}" height="${H}" style="max-width:100%;font-family:inherit">
-      <text x="6" y="${TOP - 10}" fill="#888" font-size="10">kbps</text>${grid}${cols}</svg></div>`;
+    return `<svg width="${W}" height="${H}" style="font-family:inherit">${grid}${cols}</svg>`;
+}
+
+// Three side-by-side charts (1s / 2s / 6s segments) sharing one Y scale, so the
+// bands visibly grow as segments shorten — and a tight bufsize keeps that
+// growth small.
+function _ladderBandsCharts(d) {
+    const pct = (d.maxrate_percent || 124) / 100;
+    const bufMult = d.bufsize_multiplier || 0.25;
+    let maxAvg = 0;
+    _CODEC_ORDER.forEach(c => (d.codecs && d.codecs[c] || []).forEach(r => { maxAvg = Math.max(maxAvg, r[2]); }));
+    if (!maxAvg) return '';
+    // Biggest peak is at the shortest segment (1s); pad 4% for headroom.
+    const sharedDHi = maxAvg * (pct + bufMult / 1) * 1.04;
+    // peak/avg = maxrate% + bufsize×/T, the SAME for every rung in a chart.
+    return [1, 2, 6].map(T => `<div>
+        <div style="text-align:center;color:#ccc;font-size:12px;font-weight:600;margin-bottom:2px">${T}s segments
+          <span style="color:#e0883a">· peak ${(pct + bufMult / T).toFixed(2)}× avg</span></div>
+        ${_ladderBandsSVG(d, T, sharedDHi)}
+      </div>`).join('');
 }
 
 function renderLaddersTab() {
@@ -868,13 +885,9 @@ function renderLaddersTab() {
             <span style="color:#888;margin-left:auto" title="VBV shaping applied to every rung">${vbv.join(' · ')}</span>
           </div>
           <p style="color:#888;margin:4px 0 10px">${d.description || ''}</p>
-          <div style="display:flex;gap:32px;flex-wrap:wrap;align-items:flex-start">
-            <div>${_alignedLadderTable(d)}</div>
-            <div style="flex:1;min-width:360px">
-              <div style="color:#888;font-size:12px;margin-bottom:2px">bitrate (linear) ↑ · one column per codec · bar height = avg→peak span · colour = resolution — bars overlapping within a column sit too close in delivered bandwidth</div>
-              ${_ladderBandsSVG(d)}
-            </div>
-          </div>
+          ${_alignedLadderTable(d)}
+          <div style="color:#888;font-size:12px;margin:14px 0 4px">delivered bandwidth per segment length · bitrate (linear) ↑ · column per codec · bar = avg→peak, height = span · colour = resolution — peak = avg × (maxrate% + bufsize×/T), so shorter segments burst higher; overlapping bars sit too close</div>
+          <div style="display:flex;gap:22px;overflow-x:auto;align-items:flex-start">${_ladderBandsCharts(d)}</div>
         </div>`;
     }).join('');
 }
