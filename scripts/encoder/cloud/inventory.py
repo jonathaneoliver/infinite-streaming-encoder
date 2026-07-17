@@ -432,28 +432,36 @@ def _enrich_fleet(batch_jobs: list[dict], instances: list[dict]) -> dict[str, An
     }
 
 
-def _spend_last_24h(hourly_usd: float) -> float:
-    """Self-tracked spend over the trailing 24h: append the current burn rate
-    to a persisted sample log and integrate. No Cost Explorer / extra IAM —
-    the AWS poller runs this every ~60s so the log accrues continuously.
-    Gaps > 1h (server down) are not counted."""
+def _record_fleet_samples(hourly_usd: float, fleet: dict) -> dict:
+    """Append a fleet sample to a persisted log and return the trailing-24h
+    spend (integrated burn rate) plus a recent history for sparklines. No Cost
+    Explorer / extra IAM — the AWS poller runs this every ~60s so the log
+    accrues continuously; gaps > 1h (server down) are not counted.
+
+    Sample record: [ts, hourly_usd, used_vcpus, total_vcpus, queued, running].
+    Old 2-field [ts, hourly] records are tolerated for backward compat.
+    """
     path = os.environ.get("COST_LOG") or os.path.join(
         os.environ.get("TMPDIR") or "/tmp", "cost_samples.json")
     now = datetime.now(timezone.utc).timestamp()
     cutoff = now - 24 * 3600
-    samples: list[list[float]] = []
+    samples: list[list] = []
     try:
         with open(path) as f:
             samples = json.load(f)
     except (OSError, ValueError):
         samples = []
-    samples = [s for s in samples if isinstance(s, list) and len(s) == 2 and s[0] >= cutoff - 3600]
-    samples.append([now, float(hourly_usd)])
+    samples = [s for s in samples if isinstance(s, list) and len(s) >= 2 and s[0] >= cutoff - 3600]
+    samples.append([round(now, 1), round(float(hourly_usd), 4),
+                    fleet.get("used_vcpus", 0), fleet.get("total_vcpus", 0),
+                    fleet.get("queued_jobs", 0), fleet.get("running_jobs", 0)])
+
     spend = 0.0
     for a, b in zip(samples, samples[1:]):
         dt_h = (b[0] - a[0]) / 3600.0
         if 0 < dt_h <= 1.0:  # ignore gaps (server was down)
             spend += (a[1] + b[1]) / 2.0 * dt_h
+
     try:
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
@@ -461,7 +469,20 @@ def _spend_last_24h(hourly_usd: float) -> float:
         os.replace(tmp, path)
     except OSError:
         pass
-    return round(spend, 4)
+
+    # Sparkline history: last 2h, downsampled to ~180 points.
+    hist = [s for s in samples if s[0] >= now - 2 * 3600]
+    if len(hist) > 180:
+        stride = len(hist) // 180 + 1
+        hist = hist[::stride]
+    history = [{
+        "t": s[0],
+        "util": round((s[2] / s[3]) if len(s) >= 4 and s[3] else 0.0, 3),
+        "queued": s[4] if len(s) >= 5 else 0,
+        "running": s[5] if len(s) >= 6 else 0,
+        "hourly": s[1],
+    } for s in hist]
+    return {"spend_24h_usd": round(spend, 4), "history": history}
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +515,9 @@ def collect() -> dict[str, Any]:
     # 24h spend. _enrich_fleet annotates `instances` in place.
     fleet = _enrich_fleet(batch_jobs, instances)
     fleet["estimated_hourly_usd"] = round(hourly_total, 4)
-    fleet["spend_24h_usd"] = _spend_last_24h(hourly_total)
+    _sampled = _record_fleet_samples(hourly_total, fleet)
+    fleet["spend_24h_usd"] = _sampled["spend_24h_usd"]
+    fleet["history"] = _sampled["history"]
 
     return {
         "fleet": fleet,

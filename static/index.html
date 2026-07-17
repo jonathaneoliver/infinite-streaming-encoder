@@ -2076,6 +2076,38 @@ function _fleetInstanceRow(i) {
     </div>`;
 }
 
+// Tiny inline sparkline SVG from an array of numbers.
+function _sparkline(vals, color, opts) {
+    opts = opts || {};
+    if (!vals || vals.length < 2) return '';
+    const W = opts.w || 150, H = opts.h || 26, pad = 2;
+    const min = (opts.min != null) ? opts.min : Math.min(...vals);
+    const max = (opts.max != null) ? opts.max : Math.max(...vals);
+    const span = (max - min) || 1;
+    const n = vals.length;
+    const x = i => pad + (i / (n - 1)) * (W - 2 * pad);
+    const y = v => (H - pad) - ((v - min) / span) * (H - 2 * pad);
+    const pts = vals.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+    const lx = x(n - 1).toFixed(1), ly = y(vals[n - 1]).toFixed(1);
+    return `<svg width="${W}" height="${H}" style="vertical-align:middle">
+      <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5"/>
+      <circle cx="${lx}" cy="${ly}" r="2" fill="${color}"/></svg>`;
+}
+
+function _fleetSparks(history) {
+    if (!history || history.length < 2) return '';
+    const util = history.map(s => Math.round((s.util || 0) * 100));
+    const jobs = history.map(s => (s.queued || 0) + (s.running || 0));
+    const cost = history.map(s => s.hourly || 0);
+    const cell = (label, spark, cur) =>
+        `<div style="font-size:11px;color:#888">${label}<br>${spark} <span style="color:#ccc">${cur}</span></div>`;
+    return `<div style="display:flex;gap:26px;flex-wrap:wrap;margin:4px 0 14px">
+      ${cell('utilization (2h)', _sparkline(util, '#4a90d9', { min: 0, max: 100 }), util[util.length - 1] + '%')}
+      ${cell('jobs queued+running', _sparkline(jobs, '#e0883a', { min: 0 }), jobs[jobs.length - 1])}
+      ${cell('$/hr', _sparkline(cost, '#6ab04c', { min: 0 }), '$' + (cost[cost.length - 1] || 0).toFixed(2))}
+    </div>`;
+}
+
 let _lastFleet = null;
 function renderFleet(fleet, instances) {
     _lastFleet = { fleet, instances };
@@ -2108,7 +2140,7 @@ function renderFleet(fleet, instances) {
         ? `<div style="color:#d0a24a;font-size:12px;margin-bottom:8px">per-instance placement unavailable (grant ecs:DescribeContainerInstances) — showing fleet totals only</div>`
         : '';
     const rows = running.map(_fleetInstanceRow).join('');
-    el.innerHTML = bar + note + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
+    el.innerHTML = bar + _fleetSparks(fleet.history) + note + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
 }
 
 function renderAwsInstances(instances) {
