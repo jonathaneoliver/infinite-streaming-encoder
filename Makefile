@@ -245,7 +245,14 @@ infra-setup:          ## one-shot stand-up: init + apply + ecr-push + bake-ami +
 
 # Deploy stops at the plan on purpose — review it, then run `make infra-apply`.
 # (Keeping preview and apply as separate, deliberate steps for live IaC.)
-deploy:               ## push image + restart + plan infra (then review & infra-apply)
+deploy:               ## push image + restart + plan + APPLY infra (one shot)
+	$(MAKE) ecr-push
+	$(MAKE) restart
+	$(MAKE) infra-plan
+	$(MAKE) infra-apply
+	@echo ">>> deploy complete: image pushed, server restarted, infra applied"
+
+deploy-review:        ## like deploy but stop at the plan (review before infra-apply)
 	$(MAKE) ecr-push
 	$(MAKE) restart
 	$(MAKE) infra-plan
