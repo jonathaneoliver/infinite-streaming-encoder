@@ -273,8 +273,15 @@ def _executions() -> list[dict[str, Any]]:
     return out[:25]
 
 
+# Sort order for the active-jobs list: actively-working statuses first, then
+# by most-recent state change — so running/just-changed encodes surface at the
+# top and the list reads as "what's happening now".
+_BATCH_STATUS_RANK = {"RUNNING": 0, "STARTING": 1, "RUNNABLE": 2, "PENDING": 3, "SUBMITTED": 4}
+
+
 def _batch_jobs() -> list[dict[str, Any]]:
-    """Active jobs on the encoder Batch queue (any non-terminal status)."""
+    """Active jobs on the encoder Batch queue (any non-terminal status),
+    ordered most-recently-changed first within status."""
     queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
     batch = batch_client()
     out: list[dict[str, Any]] = []
@@ -282,11 +289,19 @@ def _batch_jobs() -> list[dict[str, Any]]:
         for status in _ACTIVE_BATCH_STATUSES:
             for j in batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", []):
                 created = j.get("createdAt")  # epoch millis
+                started = j.get("startedAt")
+                stopped = j.get("stoppedAt")
+                # Latest known state-transition time (createdAt for a queued job,
+                # startedAt once running, stoppedAt if it just terminated).
+                changed = max([t for t in (created, started, stopped) if t] or [0])
+                st = j.get("status", status)
                 out.append({
                     "id": j["jobId"],
                     "name": j.get("jobName", ""),
-                    "status": j.get("status", status),
+                    "status": st,
                     "created_at": created,
+                    "started_at": started,
+                    "changed_at": changed,
                     "age_seconds": (
                         (datetime.now(timezone.utc).timestamp() - created / 1000.0)
                         if created else 0.0
@@ -294,6 +309,8 @@ def _batch_jobs() -> list[dict[str, Any]]:
                 })
     except ClientError as e:
         return [{"error": str(e)}]
+    # Active statuses first, then most-recent change at the top.
+    out.sort(key=lambda j: (_BATCH_STATUS_RANK.get(j["status"], 9), -(j.get("changed_at") or 0)))
     return out
 
 
