@@ -39,8 +39,23 @@ from botocore.exceptions import ClientError
 
 from encoder.cloud.aws import (
     APP_TAG_KEY, APP_TAG_VALUE, app_tag_filter, batch_client, ec2_client,
-    region, s3_client, sfn_client,
+    ecs_client, region, s3_client, sfn_client,
 )
+
+
+# vCPU by instance-size suffix (family-independent for the c/m/r/g families we
+# use). Lets us compute each box's capacity from its type without an API call.
+_VCPU_BY_SIZE = {
+    "medium": 1, "large": 2, "xlarge": 4, "2xlarge": 8, "4xlarge": 16,
+    "8xlarge": 32, "12xlarge": 48, "16xlarge": 64, "24xlarge": 96,
+    "48xlarge": 192, "metal": 64,
+}
+
+
+def _vcpus_for_type(itype: str | None) -> int:
+    if not itype or "." not in itype:
+        return 0
+    return _VCPU_BY_SIZE.get(itype.split(".", 1)[1], 0)
 
 
 # Rough on-demand hourly rates for c-family compute-optimised, us-west-2.
@@ -315,6 +330,141 @@ def _batch_jobs() -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Fleet packing (job -> instance) + 24h spend tracking
+# ---------------------------------------------------------------------------
+
+def _enrich_fleet(batch_jobs: list[dict], instances: list[dict]) -> dict[str, Any]:
+    """Resolve each active job's vCPU + the EC2 instance it runs on, annotate
+    the instances with busy/idle vCPU + their job list, and return a fleet
+    summary. Best-effort: any AWS error just omits the packing detail (the
+    fleet gauge still works from running-job vCPU).
+
+    Mapping: job -> ECS container instance (batch.describe_jobs) -> EC2
+    instance (ecs.describe_container_instances).
+    """
+    active = [j for j in batch_jobs if not j.get("error")]
+    ids = [j["id"] for j in active]
+    running = [i for i in instances if i.get("state") == "running"]
+    for inst in instances:
+        inst["vcpus"] = _vcpus_for_type(inst.get("type"))
+    if not ids:
+        cap = sum(i["vcpus"] for i in running)
+        return {"total_vcpus": cap, "used_vcpus": 0, "idle_vcpus": cap,
+                "utilization": 0.0, "instance_count": len(running),
+                "running_jobs": 0, "queued_jobs": 0}
+
+    by_id = {j["id"]: j for j in active}
+    arns_by_cluster: dict[str, set] = {}
+    try:
+        batch = batch_client()
+        for i in range(0, len(ids), 100):
+            for jd in batch.describe_jobs(jobs=ids[i:i + 100]).get("jobs", []):
+                jm = by_id.get(jd.get("jobId"))
+                if not jm:
+                    continue
+                cont = jd.get("container", {}) or {}
+                vcpu = 0
+                for rr in cont.get("resourceRequirements", []) or []:
+                    if rr.get("type") == "VCPU":
+                        try:
+                            vcpu = int(float(rr.get("value", 0)))
+                        except (TypeError, ValueError):
+                            vcpu = 0
+                if not vcpu:
+                    try:
+                        vcpu = int(cont.get("vcpus") or 0)
+                    except (TypeError, ValueError):
+                        vcpu = 0
+                jm["vcpu"] = vcpu
+                arn = cont.get("containerInstanceArn")
+                if arn and arn.count("/") >= 2:
+                    cluster = arn.split("/")[-2]
+                    arns_by_cluster.setdefault(cluster, set()).add(arn)
+                    jm["_ci_arn"] = arn
+    except ClientError:
+        pass
+
+    ci_to_ec2: dict[str, str] = {}
+    try:
+        ecs = ecs_client()
+        for cluster, arns in arns_by_cluster.items():
+            al = list(arns)
+            for i in range(0, len(al), 100):
+                for ci in ecs.describe_container_instances(
+                        cluster=cluster, containerInstances=al[i:i + 100]
+                ).get("containerInstances", []):
+                    ci_to_ec2[ci.get("containerInstanceArn")] = ci.get("ec2InstanceId")
+    except ClientError:
+        pass
+
+    used_by_inst: dict[str, int] = {}
+    jobs_by_inst: dict[str, list] = {}
+    for jm in active:
+        arn = jm.pop("_ci_arn", None)
+        iid = ci_to_ec2.get(arn) if arn else None
+        if iid:
+            jm["instance_id"] = iid
+            used_by_inst[iid] = used_by_inst.get(iid, 0) + (jm.get("vcpu") or 0)
+            jobs_by_inst.setdefault(iid, []).append(
+                {"name": jm.get("name"), "vcpu": jm.get("vcpu"), "status": jm.get("status")})
+
+    for inst in running:
+        cap = inst["vcpus"]
+        used = used_by_inst.get(inst["id"], 0)
+        inst["used_vcpus"] = min(used, cap) if cap else used
+        inst["idle_vcpus"] = max(0, cap - used)
+        inst["jobs"] = sorted(jobs_by_inst.get(inst["id"], []),
+                              key=lambda j: -(j.get("vcpu") or 0))
+
+    cap_total = sum(i["vcpus"] for i in running)
+    # Fleet gauge uses running-job vCPU directly (robust even if the ECS
+    # mapping is unavailable), capped at capacity.
+    running_vcpu = sum((j.get("vcpu") or 0) for j in active if j.get("status") == "RUNNING")
+    used_total = min(running_vcpu, cap_total) if cap_total else running_vcpu
+    return {
+        "total_vcpus": cap_total,
+        "used_vcpus": used_total,
+        "idle_vcpus": max(0, cap_total - used_total),
+        "utilization": round(used_total / cap_total, 3) if cap_total else 0.0,
+        "instance_count": len(running),
+        "running_jobs": sum(1 for j in active if j.get("status") == "RUNNING"),
+        "queued_jobs": sum(1 for j in active if j.get("status") in ("SUBMITTED", "PENDING", "RUNNABLE")),
+    }
+
+
+def _spend_last_24h(hourly_usd: float) -> float:
+    """Self-tracked spend over the trailing 24h: append the current burn rate
+    to a persisted sample log and integrate. No Cost Explorer / extra IAM —
+    the AWS poller runs this every ~60s so the log accrues continuously.
+    Gaps > 1h (server down) are not counted."""
+    path = os.environ.get("COST_LOG") or os.path.join(
+        os.environ.get("TMPDIR") or "/tmp", "cost_samples.json")
+    now = datetime.now(timezone.utc).timestamp()
+    cutoff = now - 24 * 3600
+    samples: list[list[float]] = []
+    try:
+        with open(path) as f:
+            samples = json.load(f)
+    except (OSError, ValueError):
+        samples = []
+    samples = [s for s in samples if isinstance(s, list) and len(s) == 2 and s[0] >= cutoff - 3600]
+    samples.append([now, float(hourly_usd)])
+    spend = 0.0
+    for a, b in zip(samples, samples[1:]):
+        dt_h = (b[0] - a[0]) / 3600.0
+        if 0 < dt_h <= 1.0:  # ignore gaps (server was down)
+            spend += (a[1] + b[1]) / 2.0 * dt_h
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(samples[-5000:], f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return round(spend, 4)
+
+
+# ---------------------------------------------------------------------------
 # Public entry
 # ---------------------------------------------------------------------------
 
@@ -340,7 +490,14 @@ def collect() -> dict[str, Any]:
     running_executions = [e for e in executions if e.get("status") == "RUNNING"]
     active_batch_jobs = [j for j in batch_jobs if not j.get("error")]
 
+    # Fleet packing (busy/idle vCPU per instance + summary) and self-tracked
+    # 24h spend. _enrich_fleet annotates `instances` in place.
+    fleet = _enrich_fleet(batch_jobs, instances)
+    fleet["estimated_hourly_usd"] = round(hourly_total, 4)
+    fleet["spend_24h_usd"] = _spend_last_24h(hourly_total)
+
     return {
+        "fleet": fleet,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "region": region(),
         "app_tag": {"key": APP_TAG_KEY, "value": APP_TAG_VALUE},
@@ -356,6 +513,7 @@ def collect() -> dict[str, Any]:
             "orphan_volumes": len(orphan_volumes),
             "total_s3_bytes": total_s3_bytes,
             "estimated_hourly_usd": round(hourly_total, 4),
+            "spend_24h_usd": fleet["spend_24h_usd"],
             "running_executions": len(running_executions),
             "active_batch_jobs": len(active_batch_jobs),
         },

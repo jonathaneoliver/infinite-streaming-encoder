@@ -445,6 +445,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 <div id="tab-jobs" class="tab-content">
     <div class="panel">
         <h2>Jobs</h2>
+        <div id="jobs-fleet" style="font-size:12px;color:#888;margin:-6px 0 12px" title="Live cloud fleet utilization (from the AWS inventory)"></div>
         <div id="jobs-list">
             <div class="no-files">No jobs yet</div>
         </div>
@@ -507,9 +508,18 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <div class="aws-metric-value" id="aws-hourly">—</div>
             </div>
             <div class="aws-metric">
+                <div class="aws-metric-label" title="Self-tracked: burn rate integrated over the trailing 24h">Spent (last 24h)</div>
+                <div class="aws-metric-value" id="aws-spend-24h">—</div>
+            </div>
+            <div class="aws-metric">
                 <div class="aws-metric-label">Region</div>
                 <div class="aws-metric-value" id="aws-region">—</div>
             </div>
+        </div>
+
+        <div class="aws-section">
+            <h3 style="margin-top:0">Fleet</h3>
+            <div id="aws-fleet"><div class="aws-empty">No active fleet.</div></div>
         </div>
 
         <div class="aws-section">
@@ -1944,7 +1954,10 @@ function renderAws(data) {
     const hourlyEl = document.getElementById('aws-hourly');
     hourlyEl.textContent = '$' + hourly.toFixed(2);
     hourlyEl.className = 'aws-metric-value' + (hourly > 0 ? ' warn' : ' ok');
+    document.getElementById('aws-spend-24h').textContent = '$' + (s.spend_24h_usd || 0).toFixed(2);
     document.getElementById('aws-region').textContent = data.region || '—';
+
+    renderFleet(data.fleet || {}, data.instances || []);
 
     const execs = s.running_executions || 0;
     const bjobs = s.active_batch_jobs || 0;
@@ -2031,6 +2044,71 @@ async function batchStopAll() {
         alert(`Stopped ${(rep.stopped_executions||[]).length} execution(s), terminated ${(rep.terminated_jobs||[]).length} job(s).`);
         refreshAws();
     } catch (e) { alert('Stop-all failed: ' + e.message); }
+}
+
+// Colour a fleet-packing segment by the codec in the Batch job name.
+function _jobColor(name) {
+    name = name || '';
+    if (name.includes('hevc')) return _CODEC_COLOR.hevc;
+    if (name.includes('av1')) return _CODEC_COLOR.av1;
+    if (name.includes('h264')) return _CODEC_COLOR.h264;
+    return '#5a6472'; // mezz/audio/package/etc
+}
+
+function _fleetInstanceRow(i) {
+    const cap = i.vcpus || 0;
+    const used = i.used_vcpus || 0;
+    const idle = (i.idle_vcpus != null) ? i.idle_vcpus : Math.max(0, cap - used);
+    const jobs = i.jobs || [];
+    const seg = (w, color, title) => `<div style="width:${w}%;background:${color}" title="${escapeHtml(title)}"></div>`;
+    let parts = jobs.map(j => seg(cap ? (j.vcpu || 0) / cap * 100 : 0, _jobColor(j.name),
+        `${j.name || ''} — ${j.vcpu} vCPU`)).join('');
+    if (idle > 0 && cap) parts += seg(idle / cap * 100, '#20252f', `${idle} idle vCPU`);
+    const isIdle = jobs.length === 0;
+    const rightLabel = isIdle ? `idle (${cap} vCPU)` : `${used}/${cap} vCPU · ${jobs.length} job${jobs.length > 1 ? 's' : ''}`;
+    const idleFlag = isIdle ? ` <span style="color:#d0a24a;font-size:11px" title="running but no jobs — a scale-down candidate">◦ idle</span>` : '';
+    return `<div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-bottom:2px">
+        <span>${escapeHtml(i.type || '')} <span style="color:#666">${escapeHtml((i.id || '').slice(-6))}</span>${idleFlag}</span>
+        <span>${rightLabel} · ${formatDuration(i.age_seconds || 0)}</span>
+      </div>
+      <div style="height:16px;background:#20252f;border-radius:4px;overflow:hidden;display:flex">${parts}</div>
+    </div>`;
+}
+
+let _lastFleet = null;
+function renderFleet(fleet, instances) {
+    _lastFleet = { fleet, instances };
+    const running = (instances || []).filter(i => i.state === 'running');
+    const total = fleet.total_vcpus || 0, used = fleet.used_vcpus || 0;
+    const idle = (fleet.idle_vcpus != null) ? fleet.idle_vcpus : Math.max(0, total - used);
+    const pct = total ? Math.round(used / total * 100) : 0;
+
+    // Compact one-liner for the Jobs tab.
+    const jf = document.getElementById('jobs-fleet');
+    if (jf) jf.innerHTML = running.length
+        ? `<span style="color:#4a90d9;font-weight:600">${used}/${total} vCPU busy</span> (${pct}%) · ${running.length} instance${running.length > 1 ? 's' : ''} · ${fleet.running_jobs || 0} running / ${fleet.queued_jobs || 0} queued · $${(fleet.estimated_hourly_usd || 0).toFixed(2)}/hr`
+        : '<span style="color:#888">fleet idle — no instances running</span>';
+
+    const el = document.getElementById('aws-fleet');
+    if (!el) return;
+    if (!running.length && !total) { el.innerHTML = '<div class="aws-empty">No active fleet.</div>'; return; }
+
+    const bar = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+      <div style="flex:1;max-width:520px;height:22px;background:#20252f;border-radius:5px;overflow:hidden">
+        <div style="width:${pct}%;height:100%;background:#4a90d9"></div>
+      </div>
+      <div style="font-size:13px;color:#ccc"><b>${used}</b> / ${total} vCPU busy (${pct}%) · <span style="color:#888">${idle} idle</span></div>
+    </div>
+    <div style="color:#888;font-size:12px;margin-bottom:12px">${fleet.instance_count || running.length} instances · ${fleet.running_jobs || 0} running / ${fleet.queued_jobs || 0} queued jobs · $${(fleet.estimated_hourly_usd || 0).toFixed(2)}/hr · $${(fleet.spend_24h_usd || 0).toFixed(2)} last 24h</div>`;
+
+    // If jobs couldn't be mapped to instances (missing ecs perm), say so.
+    const mapped = running.some(i => (i.jobs || []).length);
+    const note = (used > 0 && !mapped)
+        ? `<div style="color:#d0a24a;font-size:12px;margin-bottom:8px">per-instance placement unavailable (grant ecs:DescribeContainerInstances) — showing fleet totals only</div>`
+        : '';
+    const rows = running.map(_fleetInstanceRow).join('');
+    el.innerHTML = bar + note + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
 }
 
 function renderAwsInstances(instances) {
@@ -2222,9 +2300,11 @@ async function executeClear() {
 function startAwsAutoRefresh() {
     const chk = document.getElementById('aws-auto-refresh');
     const tick = () => {
-        if (chk.checked && document.querySelector('#tab-aws').classList.contains('active')) {
-            refreshAws();
-        }
+        // Refresh on the AWS tab, and also on the Jobs tab to keep the compact
+        // fleet-utilization line live there.
+        const onAws = document.querySelector('#tab-aws').classList.contains('active');
+        const onJobs = document.querySelector('#tab-jobs').classList.contains('active');
+        if (chk.checked && (onAws || onJobs)) refreshAws();
     };
     awsTimer = setInterval(tick, 10000);
 }
