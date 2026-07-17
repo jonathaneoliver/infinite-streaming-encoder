@@ -6,3 +6,6 @@ __pycache__/
 
 # Auto-generated agent memory/session journal — local only, not source.
 .memsearch/
+
+# Playwright MCP browser-automation console logs — local only, not source.
+.playwright-mcp/
