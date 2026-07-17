@@ -93,9 +93,9 @@ resource "aws_batch_compute_environment" "spot_graviton" {
   # fixed name forces delete-first, which AWS refuses while the job
   # queue is still attached ("found existing JobQueue relationship").
   compute_environment_name_prefix = "encoder-spot-graviton-"
-  type                     = "MANAGED"
-  state                    = "ENABLED"
-  service_role             = aws_iam_service_linked_role.batch.arn
+  type                            = "MANAGED"
+  state                           = "ENABLED"
+  service_role                    = aws_iam_service_linked_role.batch.arn
 
   compute_resources {
     type                = "SPOT"
@@ -114,7 +114,7 @@ resource "aws_batch_compute_environment" "spot_graviton" {
     subnets            = var.subnet_ids
     security_group_ids = [var.security_group_id]
 
-    instance_role      = var.instance_profile_arn
+    instance_role       = var.instance_profile_arn
     spot_iam_fleet_role = aws_iam_role.spot_fleet.arn
 
     # Launch template carries the prefer-cached ECS agent config (user_data).
@@ -162,6 +162,10 @@ resource "aws_batch_compute_environment" "spot_graviton" {
     ignore_changes = [
       update_policy,
       compute_resources[0].desired_vcpus,
+      # min_vcpus is driven at runtime by the server's awswatch loop (warm a
+      # box during a run, drop to 0 when idle) via UpdateComputeEnvironment;
+      # don't let apply clobber it back to the config value.
+      compute_resources[0].min_vcpus,
     ]
   }
 }

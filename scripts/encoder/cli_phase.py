@@ -636,6 +636,81 @@ def phase_byteranges(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# package-all — combined package + byteranges + fMP4 HLS for one codec in a
+# single job. Downloads the variants + audio ONCE, then packages, writes the
+# byterange sidecars, and generates the LL-HLS playlists all from the local
+# package dir (no re-download between steps), and uploads once. Replaces the
+# old package -> hls -> byteranges chain of three separate Batch jobs — which
+# each cold-started, re-downloaded the whole ladder, and (a latent bug) ran
+# HLS before the byteranges it embeds. Correct order is package -> byteranges
+# -> hls (hls_from_dash reads the .byteranges sidecars).
+# ---------------------------------------------------------------------------
+
+def phase_package_all(args: argparse.Namespace) -> int:
+    work = _prepare_work_dir()
+
+    # Discover + download the whole-variant MP4s for this codec (same listing
+    # as the old package phase; chunk files excluded).
+    bucket, base_key = _parse(args.s3_variants.rstrip("/"))
+    prefix = f"{base_key}/{args.codec}_"
+    labels: list[str] = []
+    paginator = _s3().get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            name = obj["Key"].rsplit("/", 1)[-1]
+            if not name.endswith(".mp4"):
+                continue
+            label = name[len(args.codec) + 1:-4]
+            if not label or _CHUNK_RE.search(label):
+                continue
+            labels.append(label)
+    labels = sorted(set(labels))
+
+    labels_present: list[str] = []
+    for label in labels:
+        uri = args.s3_variants.rstrip("/") + f"/{args.codec}_{label}.mp4"
+        if _download_if_complete(uri, work / f"{args.codec}_{label}.mp4"):
+            labels_present.append(label)
+    if not labels_present:
+        print(f"error: no {args.codec} variants found under {args.s3_variants}",
+              file=sys.stderr)
+        return 1
+
+    audio_local = work / "audio.mp4"
+    has_audio = False
+    try:
+        if _download_if_complete(args.s3_audio.rstrip("/") + "/audio.mp4", audio_local):
+            has_audio = True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") not in ("404", "NoSuchKey", "NotFound"):
+            raise
+
+    stem = f"output_{args.codec}"
+    pkg_dir = work / stem
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+
+    emit_stage(f"package:{args.codec}", "running", 0.0)
+    package(PackageSpec(
+        tmp_dir=work, output_dir=pkg_dir, codec=args.codec,
+        labels=tuple(labels_present), segment_duration_s=_SEGMENT_DURATION_S,
+        partial_duration_s=_PARTIAL_DURATION_S, include_audio=has_audio,
+    ))
+    emit_stage(f"package:{args.codec}", "done", 100.0)
+
+    # Byteranges BEFORE HLS — the playlists embed the fragment byte ranges.
+    emit_stage(f"fragments:{args.codec}", "running", 0.0)
+    generate_byteranges_sidecars(pkg_dir)
+    emit_stage(f"fragments:{args.codec}", "done", 100.0)
+
+    emit_stage(f"hls:{args.codec}", "running", 0.0)
+    generate_fmp4_hls(pkg_dir)
+    emit_stage(f"hls:{args.codec}", "done", 100.0)
+
+    _upload_dir(pkg_dir, args.s3_out.rstrip("/") + f"/{stem}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Bulk dir transfer helpers — used by phases that produce or consume
 # a whole directory tree (package, hls, byteranges).
 # ---------------------------------------------------------------------------
@@ -722,6 +797,15 @@ def _build_parser() -> argparse.ArgumentParser:
     pk.add_argument("--s3-audio", required=True, dest="s3_audio")
     pk.add_argument("--s3-out", required=True, dest="s3_out")
     pk.set_defaults(fn=phase_package)
+
+    # Combined package + byteranges + fMP4 HLS in one job (replaces the
+    # package -> hls -> byteranges chain).
+    pa = sub.add_parser("package-all")
+    pa.add_argument("--codec", required=True, choices=("h264", "hevc", "av1"))
+    pa.add_argument("--s3-variants", required=True, dest="s3_variants")
+    pa.add_argument("--s3-audio", required=True, dest="s3_audio")
+    pa.add_argument("--s3-out", required=True, dest="s3_out")
+    pa.set_defaults(fn=phase_package_all)
 
     h = sub.add_parser("hls")
     h.add_argument("--codec", required=True, choices=("h264", "hevc", "av1"))

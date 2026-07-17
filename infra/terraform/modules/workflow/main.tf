@@ -15,14 +15,15 @@
 
 locals {
   definition = templatefile("${path.module}/definition.json.tpl", {
-    job_queue_arn    = var.job_queue_arn
-    mezzanine_def    = var.job_def_arns["mezzanine"]
-    variant_def      = var.job_def_arns["variant"]
-    concat_def       = var.job_def_arns["concat"]
-    audio_def        = var.job_def_arns["audio"]
-    package_def      = var.job_def_arns["package"]
-    hls_def          = var.job_def_arns["hls"]
-    byteranges_def   = var.job_def_arns["byteranges"]
+    job_queue_arn   = var.job_queue_arn
+    mezzanine_def   = var.job_def_arns["mezzanine"]
+    variant_def     = var.job_def_arns["variant"]
+    concat_def      = var.job_def_arns["concat"]
+    audio_def       = var.job_def_arns["audio"]
+    package_def     = var.job_def_arns["package"]
+    package_all_def = var.job_def_arns["package_all"]
+    hls_def         = var.job_def_arns["hls"]
+    byteranges_def  = var.job_def_arns["byteranges"]
   })
 }
 

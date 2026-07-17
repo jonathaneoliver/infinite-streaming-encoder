@@ -45,24 +45,24 @@ locals {
         # HostTerminated = spot reclaim. Batch schedules the retry on
         # fresh capacity; if nothing else changed, the job picks up
         # at the start of its phase, not mid-encode.
-        action           = "RETRY"
-        on_reason        = "Host EC2*"   # matches "Host EC2 instance was terminated"
+        action    = "RETRY"
+        on_reason = "Host EC2*" # matches "Host EC2 instance was terminated"
       },
       {
-        action    = "RETRY"
-        on_exit_code = "1"   # generic ffmpeg transient
+        action       = "RETRY"
+        on_exit_code = "1" # generic ffmpeg transient
       },
       {
         # Catch-all: everything else exits without retry. AWS requires
         # every evaluate_on_exit to carry at least one condition, so the
         # "*" glob stands in for "any exit code".
-        action    = "EXIT"
+        action       = "EXIT"
         on_exit_code = "*"
       },
     ]
   }
 
-  timeout_seconds = 3600  # 1h is a generous ceiling; any phase over this is a bug
+  timeout_seconds = 3600 # 1h is a generous ceiling; any phase over this is a bug
 }
 
 # Helper local to DRY up the ContainerProperties blob.
@@ -281,6 +281,51 @@ resource "aws_batch_job_definition" "package" {
     ]
     command = [
       "python3", "-m", "encoder.cli_local", "phase", "package",
+      "--codec", "Ref::codec",
+      "--s3-variants", "Ref::s3_variants",
+      "--s3-audio", "Ref::s3_audio",
+      "--s3-out", "Ref::s3_out",
+    ]
+  }))
+
+  retry_strategy {
+    attempts = local.retry_strategy.attempts
+
+    dynamic "evaluate_on_exit" {
+      for_each = local.retry_strategy.evaluate_on_exit
+      content {
+        action       = evaluate_on_exit.value.action
+        on_reason    = try(evaluate_on_exit.value.on_reason, null)
+        on_exit_code = try(evaluate_on_exit.value.on_exit_code, null)
+      }
+    }
+  }
+
+  timeout {
+    attempt_duration_seconds = local.timeout_seconds
+  }
+
+  platform_capabilities = ["EC2"]
+}
+
+# ------------------------------------------------------------------
+# encoder-package-all — combined package + byteranges + fMP4 HLS in one
+# job. Downloads the ladder once and does all three steps locally, instead
+# of the package -> hls -> byteranges chain of 3 jobs that each cold-started
+# and re-downloaded the package. 2 vCPU / 4 GiB (Shaka Packager is the
+# heaviest of the three).
+# ------------------------------------------------------------------
+resource "aws_batch_job_definition" "package_all" {
+  name = "encoder-package-all"
+  type = "container"
+
+  container_properties = jsonencode(merge(local.base_container, {
+    resourceRequirements = [
+      { type = "VCPU", value = "2" },
+      { type = "MEMORY", value = "4096" },
+    ]
+    command = [
+      "python3", "-m", "encoder.cli_local", "phase", "package-all",
       "--codec", "Ref::codec",
       "--s3-variants", "Ref::s3_variants",
       "--s3-audio", "Ref::s3_audio",

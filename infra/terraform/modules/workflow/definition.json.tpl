@@ -210,60 +210,25 @@
               "Comment": "Only package h264 if it was actually encoded (do_h264 from buildSFNInput). A single-codec job would otherwise fail here with 'no h264 variants found'.",
               "Type": "Choice",
               "Choices": [
-                { "Variable": "$.do_h264", "BooleanEquals": true, "Next": "PackageH264" }
+                { "Variable": "$.do_h264", "BooleanEquals": true, "Next": "PackageAllH264" }
               ],
               "Default": "SkipH264"
             },
             "SkipH264": { "Type": "Succeed" },
-            "PackageH264": {
+            "PackageAllH264": {
+              "Comment": "Combined package + byteranges + fMP4 HLS in one job (downloads the ladder once).",
               "Type": "Task",
               "Resource": "arn:aws:states:::batch:submitJob.sync",
               "Parameters": {
-                "JobName.$": "States.Format('pkg-h264-{}', $$.Execution.Name)",
+                "JobName.$": "States.Format('pkgall-h264-{}', $$.Execution.Name)",
                 "JobQueue": "${job_queue_arn}",
-                "JobDefinition": "${package_def}",
+                "JobDefinition": "${package_all_def}",
                 "ShareIdentifier": "encode",
                 "SchedulingPriorityOverride": 45,
                 "Parameters": {
                   "codec": "h264",
                   "s3_variants.$": "$.s3_prefix",
                   "s3_audio.$": "$.s3_prefix",
-                  "s3_out.$": "$.s3_prefix"
-                }
-              },
-              "ResultPath": null,
-              "Next": "HlsH264"
-            },
-            "HlsH264": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::batch:submitJob.sync",
-              "Parameters": {
-                "JobName.$": "States.Format('hls-h264-{}', $$.Execution.Name)",
-                "JobQueue": "${job_queue_arn}",
-                "JobDefinition": "${hls_def}",
-                "ShareIdentifier": "encode",
-                "SchedulingPriorityOverride": 45,
-                "Parameters": {
-                  "codec": "h264",
-                  "s3_package.$": "$.s3_prefix",
-                  "s3_out.$": "$.s3_prefix"
-                }
-              },
-              "ResultPath": null,
-              "Next": "ByterangesH264"
-            },
-            "ByterangesH264": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::batch:submitJob.sync",
-              "Parameters": {
-                "JobName.$": "States.Format('br-h264-{}', $$.Execution.Name)",
-                "JobQueue": "${job_queue_arn}",
-                "JobDefinition": "${byteranges_def}",
-                "ShareIdentifier": "encode",
-                "SchedulingPriorityOverride": 45,
-                "Parameters": {
-                  "codec": "h264",
-                  "s3_package.$": "$.s3_prefix",
                   "s3_out.$": "$.s3_prefix"
                 }
               },
@@ -279,60 +244,25 @@
               "Comment": "Only package hevc if it was actually encoded (do_hevc from buildSFNInput). A single-codec job would otherwise fail here with 'no hevc variants found'.",
               "Type": "Choice",
               "Choices": [
-                { "Variable": "$.do_hevc", "BooleanEquals": true, "Next": "PackageHevc" }
+                { "Variable": "$.do_hevc", "BooleanEquals": true, "Next": "PackageAllHevc" }
               ],
               "Default": "SkipHevc"
             },
             "SkipHevc": { "Type": "Succeed" },
-            "PackageHevc": {
+            "PackageAllHevc": {
+              "Comment": "Combined package + byteranges + fMP4 HLS in one job (downloads the ladder once).",
               "Type": "Task",
               "Resource": "arn:aws:states:::batch:submitJob.sync",
               "Parameters": {
-                "JobName.$": "States.Format('pkg-hevc-{}', $$.Execution.Name)",
+                "JobName.$": "States.Format('pkgall-hevc-{}', $$.Execution.Name)",
                 "JobQueue": "${job_queue_arn}",
-                "JobDefinition": "${package_def}",
+                "JobDefinition": "${package_all_def}",
                 "ShareIdentifier": "encode",
                 "SchedulingPriorityOverride": 45,
                 "Parameters": {
                   "codec": "hevc",
                   "s3_variants.$": "$.s3_prefix",
                   "s3_audio.$": "$.s3_prefix",
-                  "s3_out.$": "$.s3_prefix"
-                }
-              },
-              "ResultPath": null,
-              "Next": "HlsHevc"
-            },
-            "HlsHevc": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::batch:submitJob.sync",
-              "Parameters": {
-                "JobName.$": "States.Format('hls-hevc-{}', $$.Execution.Name)",
-                "JobQueue": "${job_queue_arn}",
-                "JobDefinition": "${hls_def}",
-                "ShareIdentifier": "encode",
-                "SchedulingPriorityOverride": 45,
-                "Parameters": {
-                  "codec": "hevc",
-                  "s3_package.$": "$.s3_prefix",
-                  "s3_out.$": "$.s3_prefix"
-                }
-              },
-              "ResultPath": null,
-              "Next": "ByterangesHevc"
-            },
-            "ByterangesHevc": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::batch:submitJob.sync",
-              "Parameters": {
-                "JobName.$": "States.Format('br-hevc-{}', $$.Execution.Name)",
-                "JobQueue": "${job_queue_arn}",
-                "JobDefinition": "${byteranges_def}",
-                "ShareIdentifier": "encode",
-                "SchedulingPriorityOverride": 45,
-                "Parameters": {
-                  "codec": "hevc",
-                  "s3_package.$": "$.s3_prefix",
                   "s3_out.$": "$.s3_prefix"
                 }
               },

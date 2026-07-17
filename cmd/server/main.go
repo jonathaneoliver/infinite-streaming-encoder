@@ -110,6 +110,9 @@ func main() {
 		MaxLifetime:         *awsMaxLifetime,
 		AutoTerminateStale:  *awsAutoTerminate,
 		FailedStagingMaxAge: 1 * time.Hour,
+		// Keep one small box warm during active cloud-batch runs so the
+		// packaging tail doesn't cold-start; 0 disables (min_vcpus stays 0).
+		WarmMinVCPUs: intEnv("WARM_MIN_VCPUS", 2),
 	})
 
 	srv := api.NewServer(mgr)

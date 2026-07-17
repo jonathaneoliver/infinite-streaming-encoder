@@ -31,6 +31,6 @@ encoder image loaded, so a cold instance skips the ~60s ECR pull. Empty string
 purely a cache: `make infra-apply` resolves it from the current image SHA, and
 a stale or missing AMI simply falls back to pull-on-boot — nothing breaks.
 EOT
-  type    = string
-  default = ""
+  type        = string
+  default     = ""
 }
