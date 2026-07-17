@@ -1468,6 +1468,16 @@ func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, 
 	if ladderName == "" {
 		ladderName = "legacy"
 	}
+	// Ladder-level VBV, defaulted to match ladder.py (124% / 0.25×).
+	ladderDef, _ := store.Get(ladderName)
+	maxratePct := ladderDef.MaxratePercent
+	if maxratePct <= 0 {
+		maxratePct = 124
+	}
+	bufMult := ladderDef.BufsizeMultiplier
+	if bufMult <= 0 {
+		bufMult = 0.25
+	}
 	codecs := []string{"h264", "hevc"}
 	switch codecSel {
 	case "h264":
@@ -1545,6 +1555,11 @@ func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, 
 		// Chunk size (seconds) the encode + concat workers plan against, so
 		// they agree with chunk_indices above. String for a container env var.
 		"chunk_duration": strconv.FormatFloat(chunkS, 'f', -1, 64),
+		// Ladder-level VBV shaping, applied to every variant's encode (the
+		// worker reads these as MAXRATE_PERCENT / BUFSIZE_MULT env). Threaded
+		// so a custom ladder's VBV is honored in the cloud, not just locally.
+		"maxrate_percent":    strconv.Itoa(maxratePct),
+		"bufsize_multiplier": strconv.FormatFloat(bufMult, 'f', -1, 64),
 		// NOTE: two_pass is per-variant now (see the variant struct above),
 		// not a top-level field — HEVC two-passes, H264 doesn't, in one run.
 	}

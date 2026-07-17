@@ -46,8 +46,15 @@ from dataclasses import dataclass
 DEFAULT_MAXRATE_PERCENT = 124
 
 # VBV bufsize as a multiple of the target bitrate. Ladder-level
-# `bufsize_multiplier` overrides this default.
-BUFSIZE_MULTIPLIER = 2
+# `bufsize_multiplier` overrides this default. 0.25× matches smashing dev
+# (history 2× → 1× #829 → 0.25× #868): the peak a window of length T can
+# reach is maxrate + bufsize/T, so a SMALL buffer stops short segments from
+# bursting — 0.25× holds peaks to ~1.5× target at 1s and ~1.28× at 6s, so
+# avg/peak stay consistent when the same encode is (re-)segmented at 1s/2s/6s.
+# The trade is less room for the encoder to spend bits on hard scenes (watch
+# VMAF on the lowest rungs). Two-pass HEVC compensates for the ~17% undershoot
+# a tight buffer causes on x265.
+BUFSIZE_MULTIPLIER = 0.25
 
 
 @dataclass(frozen=True)

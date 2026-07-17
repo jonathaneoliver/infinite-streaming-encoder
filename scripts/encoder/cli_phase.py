@@ -45,7 +45,10 @@ from encoder.ffprobe import probe
 from encoder.hls import (
     TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls,
 )
-from encoder.ladder import Rung, burnin_for_height, label_res_name
+from encoder.ladder import (
+    BUFSIZE_MULTIPLIER, DEFAULT_MAXRATE_PERCENT, Rung, burnin_for_height,
+    label_res_name,
+)
 from encoder.mezzanine import MezzanineSpec, create_mezzanine
 from encoder.packager import PackageSpec, package
 from encoder.padding import multi_duration_lcm, plan_padding
@@ -213,6 +216,16 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
 
+def _env_num(name: str, default: float) -> float:
+    """Numeric env var → float, or `default` if unset/unparseable. Used for the
+    ladder-level VBV knobs (MAXRATE_PERCENT / BUFSIZE_MULT) the SFN injects."""
+    try:
+        v = os.environ.get(name, "").strip()
+        return float(v) if v else default
+    except ValueError:
+        return default
+
+
 def _chunk_duration_s() -> float:
     """Chunk size (seconds) from CHUNK_DURATION_S, injected by the state
     machine. Must match what the Go control plane used for chunk_indices so
@@ -372,6 +385,10 @@ def phase_variant(args: argparse.Namespace) -> int:
         gop_duration_s=_GOP_DURATION_S,
         content_duration_s=info.duration_s,
         padding_duration_s=0.0,
+        # Ladder-level VBV shaping, injected by the SFN (buildSFNInput). Same
+        # for every variant of a run; defaults match ladder.py when unset.
+        maxrate_percent=int(_env_num("MAXRATE_PERCENT", DEFAULT_MAXRATE_PERCENT)),
+        bufsize_multiplier=_env_num("BUFSIZE_MULT", BUFSIZE_MULTIPLIER),
         # Two-pass is HEVC-only and set per-variant: the Step Function
         # injects TWO_PASS via containerOverrides only on HEVC variant jobs
         # (see buildSFNInput — H264 variants get TWO_PASS=false), and the

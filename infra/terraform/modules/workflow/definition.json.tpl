@@ -90,7 +90,9 @@
                 "s3_prefix.$": "$.s3_prefix",
                 "two_pass.$": "$$.Map.Item.Value.two_pass",
                 "chunk_indices.$": "$.chunk_indices",
-                "chunk_duration.$": "$.chunk_duration"
+                "chunk_duration.$": "$.chunk_duration",
+                "maxrate_percent.$": "$.maxrate_percent",
+                "bufsize_multiplier.$": "$.bufsize_multiplier"
               },
               "ItemProcessor": {
                 "StartAt": "EncodeChunks",
@@ -112,7 +114,9 @@
                       "s3_prefix.$": "$.s3_prefix",
                       "two_pass.$": "$.two_pass",
                       "chunk_index.$": "$$.Map.Item.Value",
-                      "chunk_duration.$": "$.chunk_duration"
+                      "chunk_duration.$": "$.chunk_duration",
+                      "maxrate_percent.$": "$.maxrate_percent",
+                      "bufsize_multiplier.$": "$.bufsize_multiplier"
                     },
                     "ItemProcessor": {
                       "StartAt": "EncodeChunk",
@@ -140,7 +144,9 @@
                             "ContainerOverrides": {
                               "Environment": [
                                 { "Name": "TWO_PASS", "Value.$": "$.two_pass" },
-                                { "Name": "CHUNK_DURATION_S", "Value.$": "$.chunk_duration" }
+                                { "Name": "CHUNK_DURATION_S", "Value.$": "$.chunk_duration" },
+                                { "Name": "MAXRATE_PERCENT", "Value.$": "$.maxrate_percent" },
+                                { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" }
                               ],
                               "ResourceRequirements": [
                                 { "Type": "VCPU", "Value.$": "$.vcpu" },

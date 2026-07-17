@@ -52,7 +52,8 @@ class EncodeContext:
     padding_duration_s: float   # 0.0 = no padding applied
     maxrate_percent: int = DEFAULT_MAXRATE_PERCENT
     # VBV bufsize as a multiple of each rung's target bitrate. Ladder-level
-    # "bufsize_multiplier" flows in here; default matches the historical 2x.
+    # "bufsize_multiplier" flows in here; default 0.25x (tight VBV) matches
+    # smashing dev — keeps avg/peak consistent across 1s/2s/6s segmentations.
     bufsize_multiplier: float = BUFSIZE_MULTIPLIER
     # Two-pass software encode for libx265 (ports smashing #965). Two-pass
     # is a *codec* property, not a global toggle: HEVC (libx265) needs it,
