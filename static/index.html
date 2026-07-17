@@ -264,6 +264,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
     <div class="tab active" onclick="switchTab('originals')">Originals</div>
     <div class="tab" onclick="switchTab('outputs')">Outputs</div>
     <div class="tab" onclick="switchTab('jobs')">Jobs</div>
+    <div class="tab" onclick="switchTab('ladders')">Ladders</div>
     <div class="tab tab-aws" onclick="switchTab('aws')">AWS ☁</div>
     <div class="tab" onclick="switchTab('about')" style="margin-left:auto">About</div>
 </div>
@@ -334,6 +335,12 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="hevc">HEVC only</option>
                     <option value="av1">AV1 only</option>
                     <option value="all">All (H.264 + HEVC + AV1)</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label title="Bitrate ladder (resolutions + target bitrates). Manage ladders in the Ladders tab.">Ladder</label>
+                <select id="ladder">
+                    <option value="legacy">legacy</option>
                 </select>
             </div>
             <div class="control-group">
@@ -441,6 +448,21 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
         <div id="jobs-list">
             <div class="no-files">No jobs yet</div>
         </div>
+    </div>
+</div>
+
+<!-- LADDERS TAB -->
+<div id="tab-ladders" class="tab-content">
+    <div class="panel">
+        <h2 style="display:flex;align-items:center;gap:12px">Ladders
+            <button class="btn btn-primary" style="margin-left:auto" onclick="newLadder()">+ New ladder</button>
+        </h2>
+        <p style="color:var(--muted,#888);margin:0 0 12px">
+            A ladder is the set of resolutions + target bitrates each codec is encoded at.
+            Built-in ladders (legacy / apple / apple-uniq) are read-only; you can add your own.
+            Burn-in overlay geometry is derived from each rung's height automatically.
+        </p>
+        <div id="ladders-list"><div class="no-files">Loading…</div></div>
     </div>
 </div>
 
@@ -708,6 +730,126 @@ function switchTab(name) {
     if (name === 'outputs') loadOutputs();
     if (name === 'aws') refreshAws();
     if (name === 'about') loadVersion();
+    if (name === 'ladders') renderLaddersTab();
+}
+
+// ---- Ladders ----
+let laddersCache = {};
+
+async function loadLadders() {
+    try {
+        const res = await fetch('/api/ladders');
+        laddersCache = (await res.json()) || {};
+    } catch (e) { laddersCache = {}; }
+    // Populate the encode-options dropdown, preserving the current choice.
+    const sel = document.getElementById('ladder');
+    if (sel) {
+        const cur = sel.value || 'legacy';
+        const names = Object.keys(laddersCache).sort();
+        sel.innerHTML = names.map(n =>
+            `<option value="${n}">${n}${laddersCache[n].seed ? '' : ' (custom)'}</option>`).join('');
+        sel.value = names.includes(cur) ? cur : (names.includes('legacy') ? 'legacy' : names[0] || '');
+    }
+}
+
+function _rungRows(rows) {
+    return (rows || []).map(r =>
+        `<tr><td style="padding:2px 10px 2px 0">${r[0]}×${r[1]}</td>`
+        + `<td style="padding:2px 10px 2px 0;color:#888">${r[1]}p</td>`
+        + `<td style="padding:2px 0;text-align:right">${r[2]} kbps</td></tr>`).join('');
+}
+
+function renderLaddersTab() {
+    const el = document.getElementById('ladders-list');
+    if (!el) return;
+    const names = Object.keys(laddersCache).sort();
+    if (!names.length) { el.innerHTML = '<div class="no-files">No ladders</div>'; return; }
+    el.innerHTML = names.map(name => {
+        const d = laddersCache[name] || {};
+        const codecs = Object.keys(d.codecs || {}).sort();
+        const vbv = [];
+        if (d.maxrate_percent) vbv.push(`maxrate ${d.maxrate_percent}%`);
+        if (d.bufsize_multiplier) vbv.push(`bufsize ${d.bufsize_multiplier}×`);
+        const tables = codecs.map(c => `
+            <div style="min-width:210px">
+              <div style="font-weight:600;margin-bottom:4px">${c}
+                <span style="color:#888">(${(d.codecs[c] || []).length} rungs)</span></div>
+              <table style="border-collapse:collapse;font-size:13px"><tbody>${_rungRows(d.codecs[c])}</tbody></table>
+            </div>`).join('');
+        const actions = d.seed
+            ? `<span class="job-ami-badge" title="Built-in, read-only">built-in</span>`
+            : `<button class="btn" onclick="editLadder('${name}')">Edit</button>
+               <button class="btn" style="background:#7a2b2b;color:#fff" onclick="deleteLadder('${name}')">Delete</button>`;
+        return `<div class="panel" style="margin-bottom:16px">
+          <div style="display:flex;align-items:center;gap:12px">
+            <h3 style="margin:0">${name}</h3>${actions}
+            <span style="color:#888;margin-left:auto">${vbv.join(' · ')}</span>
+          </div>
+          <p style="color:#888;margin:4px 0 10px">${d.description || ''}</p>
+          <div style="display:flex;gap:28px;flex-wrap:wrap">${tables}</div>
+        </div>`;
+    }).join('');
+}
+
+function _ladderTemplate() {
+    return {
+        description: "My custom ladder",
+        codecs: {
+            h264: [[640, 360, 600], [1280, 720, 2800], [1920, 1080, 7000]],
+            hevc: [[640, 360, 300], [1280, 720, 1700], [1920, 1080, 4300]]
+        }
+    };
+}
+
+function _showLadderEditor(name, def) {
+    const el = document.getElementById('ladders-list');
+    const isNew = !name;
+    el.innerHTML = `<div class="panel">
+      <h3>${isNew ? 'New ladder' : 'Edit ' + name}</h3>
+      <div class="control-group"><label>Name</label>
+        <input id="ladder-ed-name" value="${name || ''}" ${isNew ? '' : 'readonly'} placeholder="my-ladder"></div>
+      <div class="control-group"><label>Definition (JSON)</label>
+        <textarea id="ladder-ed-json" rows="18" style="width:100%;font-family:monospace;font-size:13px">${JSON.stringify(def, null, 2)}</textarea></div>
+      <p style="color:#888">Each rung is <code>[width, height, bitrate_kbps]</code> — one row per resolution per codec.
+        Optional top-level <code>maxrate_percent</code> (default 124) and <code>bufsize_multiplier</code> (default 2) tune the VBV.
+        Burn-in overlay is derived from height. Repeated resolutions get ordinal labels (1080p_1, 1080p_2).</p>
+      <div id="ladder-ed-err" style="color:#e66;margin-bottom:8px"></div>
+      <button class="btn btn-primary" onclick="saveLadder()">Save</button>
+      <button class="btn" onclick="renderLaddersTab()">Cancel</button>
+    </div>`;
+}
+
+function newLadder() { _showLadderEditor('', _ladderTemplate()); }
+
+function editLadder(name) {
+    const d = { ...(laddersCache[name] || {}) };
+    delete d.seed;
+    _showLadderEditor(name, d);
+}
+
+async function saveLadder() {
+    const name = document.getElementById('ladder-ed-name').value.trim();
+    const errEl = document.getElementById('ladder-ed-err');
+    let def;
+    try { def = JSON.parse(document.getElementById('ladder-ed-json').value); }
+    catch (e) { errEl.textContent = 'Invalid JSON: ' + e.message; return; }
+    const res = await fetch('/api/ladders', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, ...def })
+    });
+    if (!res.ok) { errEl.textContent = await res.text(); return; }
+    laddersCache = (await res.json()) || {};
+    await loadLadders();
+    renderLaddersTab();
+}
+
+async function deleteLadder(name) {
+    if (!confirm(`Delete ladder "${name}"? This cannot be undone.`)) return;
+    const res = await fetch('/api/ladders/' + encodeURIComponent(name), { method: 'DELETE' });
+    if (!res.ok) { alert(await res.text()); return; }
+    laddersCache = (await res.json()) || {};
+    await loadLadders();
+    renderLaddersTab();
 }
 
 function formatSize(bytes) {
@@ -868,6 +1010,7 @@ async function startEncode(force = false) {
         padding: document.getElementById('padding').value,
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         hevc_single_pass: document.getElementById('hevc-pass').value === '1',
+        ladder: document.getElementById('ladder').value,
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
@@ -1953,6 +2096,7 @@ async function forceReencode(fileName) {
         padding: document.getElementById('padding').value,
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         hevc_single_pass: document.getElementById('hevc-pass').value === '1',
+        ladder: document.getElementById('ladder').value,
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
@@ -2182,6 +2326,7 @@ connectSSE();
 setInterval(loadSources, 60000);
 startAwsAutoRefresh();
 loadVersion();
+loadLadders();
 
 async function loadVersion() {
     try {

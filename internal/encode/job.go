@@ -493,6 +493,10 @@ type Manager struct {
 	// then errors cleanly at submit time).
 	StateMachineArn string
 
+	// Ladders is the persisted ladder store (built-in + user-defined). Owns
+	// $TmpDir/ladders.json; resolves the concrete rungs for the cloud path.
+	Ladders *LadderStore
+
 	sem         chan struct{}
 	subscribers []chan *Job
 	subMu       sync.Mutex
@@ -522,6 +526,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 	}
 	os.MkdirAll(cfg.TmpDir, 0755)
 	return &Manager{
+		Ladders:         LoadLadderStore(filepath.Join(cfg.TmpDir, "ladders.json")),
 		SourceDir:       cfg.SourceDir,
 		OutputDir:       cfg.OutputDir,
 		TmpDir:          cfg.TmpDir,
@@ -1370,7 +1375,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 	if srcWidth > 0 {
 		job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
 	}
-	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, nChunks, srcWidth, chunkS)
+	inputJSON := buildSFNInput(m.Ladders, s3Input, s3Prefix, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, nChunks, srcWidth, chunkS)
 	inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 	if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 		return fmt.Errorf("write input json: %w", err)
@@ -1459,7 +1464,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 // buildSFNInput renders the JSON doc the state machine expects. Picks
 // which (codec, tier) combinations to fan out over based on the
 // JobConfig's Codec + MaxRes.
-func buildSFNInput(s3Input, s3Prefix, ladderName, codecSel, maxRes string, hevcSinglePass bool, nChunks, sourceWidth int, chunkS float64) string {
+func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, maxRes string, hevcSinglePass bool, nChunks, sourceWidth int, chunkS float64) string {
 	if ladderName == "" {
 		ladderName = "legacy"
 	}
@@ -1477,7 +1482,7 @@ func buildSFNInput(s3Input, s3Prefix, ladderName, codecSel, maxRes string, hevcS
 	var variants []sfnVariant
 	doH264, doHevc := false, false
 	for _, c := range codecs {
-		rungs := resolveLadderRungs(ladderName, c, maxRes, sourceWidth)
+		rungs := store.resolveRungs(ladderName, c, maxRes, sourceWidth)
 		if len(rungs) == 0 {
 			continue
 		}
@@ -1652,6 +1657,11 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 		// prior mezzanines / variants — the work_dir is on the host
 		// filesystem, not inside the ephemeral container layer.
 		"-e", "TMPDIR=" + m.TmpDir,
+		// Point the Python encoder at the persisted ladder store (mounted via
+		// TmpDir) so custom/edited ladders resolve for local encodes too. The
+		// file is written by the control plane; cloud variant jobs don't need
+		// it (they get concrete rungs from the SFN).
+		"-e", "LADDER_STORE=" + filepath.Join(m.TmpDir, "ladders.json"),
 		"--entrypoint", script,
 	}
 	// Cloud jobs drive AWS from inside the worker; pass the credentials

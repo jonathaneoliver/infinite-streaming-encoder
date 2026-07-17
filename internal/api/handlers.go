@@ -39,6 +39,9 @@ func NewServer(mgr *encode.Manager) *Server {
 	}
 	s.Mux.HandleFunc("GET /api/version", s.getVersion)
 	s.Mux.HandleFunc("GET /api/sources", s.listSources)
+	s.Mux.HandleFunc("GET /api/ladders", s.getLadders)
+	s.Mux.HandleFunc("POST /api/ladders", s.putLadder)
+	s.Mux.HandleFunc("DELETE /api/ladders/{name}", s.deleteLadder)
 	s.Mux.HandleFunc("GET /api/outputs", s.listOutputs)
 	s.Mux.HandleFunc("GET /api/outputs/{name}", s.listOutputContents)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/playlists", s.listPlaylists)
@@ -391,6 +394,41 @@ type outputDir struct {
 	HlsFormat   string   `json:"hls_format"`
 	Partial     string   `json:"partial"`
 	Padding     string   `json:"padding"`
+}
+
+// getLadders returns all ladder definitions (built-in + user-defined) keyed by
+// name. The UI populates the encode-options dropdown and the Ladders tab from
+// this. Seed ladders carry "seed": true and are read-only.
+func (s *Server) getLadders(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.Manager.Ladders.List())
+}
+
+// putLadder creates or replaces a user-defined ladder. Body is a LadderDef
+// plus a "name". Built-in ladders are read-only (the store rejects them).
+func (s *Server) putLadder(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+		encode.LadderDef
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), 400)
+		return
+	}
+	if err := s.Manager.Ladders.Put(req.Name, req.LadderDef); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	writeJSON(w, s.Manager.Ladders.List())
+}
+
+// deleteLadder removes a user-defined ladder. Built-in ladders can't be deleted.
+func (s *Server) deleteLadder(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := s.Manager.Ladders.Delete(name); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	writeJSON(w, s.Manager.Ladders.List())
 }
 
 func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {

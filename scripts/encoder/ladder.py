@@ -210,24 +210,57 @@ class LadderError(ValueError):
     pass
 
 
-def get_ladder(name: str) -> dict:
-    """Return a ladder definition by name.
+def _store_path() -> str | None:
+    """Filesystem path to the persisted ladder store, or None.
 
-    Stage 1: served from the built-in SEED_LADDERS. Later stages layer a
-    user-editable store on top (the Go control plane owns the store file and
-    passes custom ladders through as resolved rung specs), so this stays the
-    single Python entry point for "give me ladder X".
+    The Go control plane owns the store (ladders.json) and sets LADDER_STORE
+    on worker containers; we also probe the mounted temp dir as a fallback.
     """
+    import os
+    p = os.environ.get("LADDER_STORE")
+    if p:
+        return p
+    for env in ("TMPDIR", "ENCODER_TMP_ROOT", "TMP_DIR"):
+        base = os.environ.get(env)
+        if base:
+            return os.path.join(base, "ladders.json")
+    return None
+
+
+def load_ladders() -> dict:
+    """Built-in seeds overlaid with the persisted store (user-defined ladders
+    and any edits). Reading the same file the Go control plane writes is what
+    lets custom ladders resolve for local encodes too. Missing/corrupt store
+    → just the seeds."""
+    import json
+    import os
+    ladders = dict(SEED_LADDERS)
+    path = _store_path()
+    if path and os.path.isfile(path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            for name, definition in (data.get("ladders") or {}).items():
+                if isinstance(definition, dict) and definition.get("codecs"):
+                    ladders[name] = definition
+        except (OSError, ValueError):
+            pass
+    return ladders
+
+
+def get_ladder(name: str) -> dict:
+    """Return a ladder definition by name (seeds + persisted store)."""
+    ladders = load_ladders()
     try:
-        return SEED_LADDERS[name]
+        return ladders[name]
     except KeyError:
         raise LadderError(
-            f"unknown ladder {name!r} (have: {', '.join(SEED_LADDERS)})"
+            f"unknown ladder {name!r} (have: {', '.join(sorted(ladders))})"
         ) from None
 
 
 def ladder_names() -> list[str]:
-    return list(SEED_LADDERS)
+    return sorted(load_ladders())
 
 
 def label_res_name(label: str) -> str:
