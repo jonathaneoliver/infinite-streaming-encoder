@@ -2004,7 +2004,7 @@ function renderAwsBatchJobs(jobs) {
         const st = (j.status || '').toLowerCase();
         const active = ['submitted','pending','runnable','starting','running'].includes(st);
         return `<tr>
-            <td>${escapeHtml(j.name || '')}</td>
+            <td title="${escapeHtml(j.name || '')}">${escapeHtml(_jobFriendly(j.name))}</td>
             <td class="aws-state-${st === 'running' ? 'running' : st === 'runnable' || st === 'pending' || st === 'submitted' || st === 'starting' ? 'pending' : st}">${escapeHtml(j.status || '')}</td>
             <td>${formatDuration(j.age_seconds || 0)}</td>
             <td>${active
@@ -2046,6 +2046,24 @@ async function batchStopAll() {
     } catch (e) { alert('Stop-all failed: ' + e.message); }
 }
 
+// Turn a raw Batch job name into a human label, dropping the execution UUID.
+// Names: mezz-<exec> · audio-<exec> · var-<codec>-<label>-c<N>-<exec> ·
+// concat-<codec>-<label>-<exec> · pkg|hls|br-<codec>-<exec>.
+function _jobFriendly(name) {
+    if (!name) return '';
+    const p = name.split('-');
+    switch (p[0]) {
+        case 'mezz': return 'mezzanine';
+        case 'audio': return 'audio';
+        case 'var': return `encode ${p[1]} ${p[2]}` + (p[3] ? ` · ${p[3].replace(/^c/, 'chunk ')}` : '');
+        case 'concat': return `concat ${p[1]} ${p[2]}`;
+        case 'pkg': return `package ${p[1]}`;
+        case 'hls': return `HLS ${p[1]}`;
+        case 'br': return `byteranges ${p[1]}`;
+        default: return name;
+    }
+}
+
 // Colour a fleet-packing segment by the codec in the Batch job name.
 function _jobColor(name) {
     name = name || '';
@@ -2062,17 +2080,25 @@ function _fleetInstanceRow(i) {
     const jobs = i.jobs || [];
     const seg = (w, color, title) => `<div style="width:${w}%;background:${color}" title="${escapeHtml(title)}"></div>`;
     let parts = jobs.map(j => seg(cap ? (j.vcpu || 0) / cap * 100 : 0, _jobColor(j.name),
-        `${j.name || ''} — ${j.vcpu} vCPU`)).join('');
+        `${_jobFriendly(j.name)} — ${j.vcpu} vCPU`)).join('');
     if (idle > 0 && cap) parts += seg(idle / cap * 100, '#20252f', `${idle} idle vCPU`);
     const isIdle = jobs.length === 0;
     const rightLabel = isIdle ? `idle (${cap} vCPU)` : `${used}/${cap} vCPU · ${jobs.length} job${jobs.length > 1 ? 's' : ''}`;
     const idleFlag = isIdle ? ` <span style="color:#d0a24a;font-size:11px" title="running but no jobs — a scale-down candidate">◦ idle</span>` : '';
+    // Inline list of what this box is running right now (friendly names + dot).
+    const jobList = jobs.length
+        ? `<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:#9aa;margin-top:3px">`
+          + jobs.map(j => `<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${_jobColor(j.name)};vertical-align:middle;margin-right:4px"></span>`
+              + `${escapeHtml(_jobFriendly(j.name))} <span style="color:#666">${j.vcpu}v</span></span>`).join('')
+          + `</div>`
+        : '';
     return `<div>
       <div style="display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-bottom:2px">
         <span>${escapeHtml(i.type || '')} <span style="color:#666">${escapeHtml((i.id || '').slice(-6))}</span>${idleFlag}</span>
         <span>${rightLabel} · ${formatDuration(i.age_seconds || 0)}</span>
       </div>
       <div style="height:16px;background:#20252f;border-radius:4px;overflow:hidden;display:flex">${parts}</div>
+      ${jobList}
     </div>`;
 }
 
