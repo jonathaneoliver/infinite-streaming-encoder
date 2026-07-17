@@ -226,6 +226,28 @@ def _env_num(name: str, default: float) -> float:
         return default
 
 
+def _cgroup_mem_limit_mib() -> float | None:
+    """The container's hard memory limit in MiB (the MEMORY resourceRequirement,
+    enforced as a cgroup limit), or None if unlimited/unreadable. Lets the mem
+    report show peak vs limit. Handles cgroup v2 (memory.max) and v1."""
+    for path in ("/sys/fs/cgroup/memory.max",
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            v = open(path).read().strip()
+        except OSError:
+            continue
+        if v == "max":
+            return None
+        try:
+            n = int(v)
+        except ValueError:
+            continue
+        if n <= 0 or n > (1 << 50):  # unset / effectively unlimited
+            return None
+        return n / (1024 * 1024)
+    return None
+
+
 def _chunk_duration_s() -> float:
     """Chunk size (seconds) from CHUNK_DURATION_S, injected by the state
     machine. Must match what the Go control plane used for chunk_indices so
@@ -430,7 +452,20 @@ def phase_variant(args: argparse.Namespace) -> int:
     out_path = encode_variant(ctx, args.codec, rung, chunk=chunk)
     ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu_s = (ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime)
+    # Peak resident memory of the ffmpeg child(ren) — ru_maxrss is the max RSS
+    # of the largest child, in KiB on Linux. This is the real number for sizing
+    # the job's MEMORY request: if it approaches the cgroup limit we're at OOM
+    # risk (an over-the-limit encode is SIGKILLed and fails the whole run).
+    peak_mib = ru1.ru_maxrss / 1024.0
     timer.mark("encode")
+
+    limit_mib = _cgroup_mem_limit_mib()
+    if limit_mib:
+        print(f"[mem] {args.codec} {args.label}{'' if chunk is None else f' chunk{chunk.index}'}: "
+              f"peak RSS {peak_mib:.0f} MiB / {limit_mib:.0f} MiB limit "
+              f"({peak_mib / limit_mib * 100:.0f}% of limit)", flush=True)
+    else:
+        print(f"[mem] {args.codec} {args.label}: peak RSS {peak_mib:.0f} MiB", flush=True)
 
     # out_path.name is {codec}_{tier}.mp4 whole-clip, or
     # {codec}_{tier}_chunkNNN.mp4 for a chunk — upload under the same name.
@@ -440,7 +475,8 @@ def phase_variant(args: argparse.Namespace) -> int:
     timer.mark("upload")
 
     ci = "" if chunk is None else f":chunk{chunk.index}"
-    timer.emit(f"encode:{args.codec}:{args.label}{ci}", cpu_s=f"{cpu_s:.2f}")
+    timer.emit(f"encode:{args.codec}:{args.label}{ci}",
+               cpu_s=f"{cpu_s:.2f}", mem_mib=f"{peak_mib:.0f}")
     return 0
 
 
