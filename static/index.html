@@ -904,7 +904,7 @@ function renderLaddersTab() {
                <button class="btn" style="background:#7a2b2b;color:#fff" onclick="deleteLadder('${name}')">Delete</button>`;
         return `<div class="panel" style="margin-bottom:16px">
           <div style="display:flex;align-items:center;gap:12px">
-            <h3 style="margin:0">${name}</h3>${actions}
+            <h3 style="margin:0;cursor:context-menu" title="Right-click to clone this profile" oncontextmenu="return _cloneMenu(event,'${name}')">${name}</h3>${actions}
             <span style="color:#888;margin-left:auto" title="VBV shaping applied to every rung">${vbv.join(' · ')}</span>
           </div>
           <p style="color:#888;margin:4px 0 10px">${d.description || ''}</p>
@@ -948,10 +948,18 @@ function _edFromDef(name, def, isNew) {
 }
 
 function newLadder() {
-    // Start by cloning an existing ladder (default legacy).
+    // Start by cloning an existing ladder (default legacy); name seeded as
+    // copy-of-<source> so the clone lineage is obvious.
     const base = laddersCache['legacy'] ? 'legacy' : Object.keys(laddersCache).sort()[0];
-    _ed = _edFromDef('', laddersCache[base] || _ladderTemplate(), true);
-    _ed.cloneFrom = base || '';
+    cloneProfile(base || '');
+}
+
+// Clone a specific profile into a new-ladder editor (right-click on a title, or
+// the internal default). Name is prefixed copy-of-<source>; user can rename.
+function cloneProfile(name) {
+    _ed = _edFromDef(name ? 'copy-of-' + name : '', laddersCache[name] || _ladderTemplate(), true);
+    _ed.cloneFrom = name || '';
+    switchTab('ladders');
     _renderLadderEditor();
 }
 
@@ -962,10 +970,31 @@ function editLadder(name) {
 
 function _edClone(srcName) {
     const src = laddersCache[srcName]; if (!src) return;
-    _ed = _edFromDef(_ed.name, src, _ed.isNew);
+    // Keep a user-typed custom name; otherwise re-seed copy-of-<source>.
+    const keep = (_ed.name && !_ed.name.startsWith('copy-of-')) ? _ed.name : 'copy-of-' + srcName;
+    _ed = _edFromDef(keep, src, _ed.isNew);
     _ed.cloneFrom = srcName;
     _renderLadderEditor();
 }
+
+// Lightweight right-click "Clone this profile" menu on ladder titles.
+function _cloneMenu(ev, name) {
+    ev.preventDefault();
+    let m = document.getElementById('ctx-clone');
+    if (!m) {
+        m = document.createElement('div');
+        m.id = 'ctx-clone';
+        m.style.cssText = 'position:fixed;z-index:1000;background:#1f2430;border:1px solid #444;border-radius:6px;padding:4px;box-shadow:0 6px 18px rgba(0,0,0,.5)';
+        document.body.appendChild(m);
+    }
+    m.innerHTML = `<div style="padding:6px 12px;cursor:pointer;white-space:nowrap" onmousedown="cloneProfile('${name}');_hideCloneMenu()">⧉ Clone &ldquo;${name}&rdquo;</div>`;
+    m.style.left = Math.min(ev.clientX, window.innerWidth - 200) + 'px';
+    m.style.top = ev.clientY + 'px';
+    m.style.display = 'block';
+    setTimeout(() => document.addEventListener('mousedown', _hideCloneMenu, { once: true }), 0);
+    return false;
+}
+function _hideCloneMenu() { const m = document.getElementById('ctx-clone'); if (m) m.style.display = 'none'; }
 
 // Value edits (typed into an input) mutate state + refresh preview only, so the
 // input keeps focus. Structural edits (add/remove/clone) re-render the editor.
