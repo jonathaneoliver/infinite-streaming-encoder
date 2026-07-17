@@ -3,7 +3,6 @@ output "job_def_arns" {
   value = {
     mezzanine   = aws_batch_job_definition.mezzanine.arn
     variant     = aws_batch_job_definition.variant.arn
-    concat      = aws_batch_job_definition.concat.arn
     audio       = aws_batch_job_definition.audio.arn
     package     = aws_batch_job_definition.package.arn
     package_all = aws_batch_job_definition.package_all.arn

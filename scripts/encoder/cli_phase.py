@@ -39,7 +39,7 @@ import time
 from pathlib import Path
 
 from encoder.audio import AudioSpec, create_audio
-from encoder.chunking import DEFAULT_CHUNK_DURATION_S, chunk_count, plan_chunks
+from encoder.chunking import DEFAULT_CHUNK_DURATION_S, plan_chunks
 from encoder.encode_variants import EncodeContext, concat_chunks, encode_variant
 from encoder.ffprobe import probe
 from encoder.hls import (
@@ -481,41 +481,6 @@ def phase_variant(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# concat-variant — join a variant's chunk encodes into the whole variant.
-# Runs after the chunk array job for one (codec, tier) completes.
-# ---------------------------------------------------------------------------
-
-def phase_concat_variant(args: argparse.Namespace) -> int:
-    work = _prepare_work_dir()
-
-    # Derive the chunk count from the mezzanine duration — the same source
-    # the variant phase used to plan chunks, so the two never disagree.
-    mezz_uri = args.s3_mezz.rstrip("/") + "/mezzanine.mp4"
-    mezz_local = work / "mezzanine.mp4"
-    if not _download_if_complete(mezz_uri, mezz_local):
-        print("error: mezzanine.done missing or size mismatch", file=sys.stderr)
-        return 1
-    n_chunks = chunk_count(probe(mezz_local).duration_s, _chunk_duration_s())
-
-    # Pull every chunk file down (verifying its .done sidecar).
-    for i in range(n_chunks):
-        name = f"{args.codec}_{args.label}_chunk{i:03d}.mp4"
-        uri = args.s3_chunks.rstrip("/") + f"/{name}"
-        if not _download_if_complete(uri, work / name):
-            print(f"error: chunk {name} missing or incomplete at {uri}",
-                  file=sys.stderr)
-            return 1
-
-    out_path = concat_chunks(work, args.codec, args.label, n_chunks)
-
-    out_uri = args.s3_out.rstrip("/") + f"/{args.codec}_{args.label}.mp4"
-    print(f"[phase concat-variant] joined {n_chunks} chunk(s) → {out_uri}",
-          flush=True)
-    _upload_with_done(out_path, out_uri)
-    return 0
-
-
-# ---------------------------------------------------------------------------
 # audio — extract / transcode the mezzanine's audio track.
 # ---------------------------------------------------------------------------
 
@@ -692,28 +657,67 @@ def phase_byteranges(args: argparse.Namespace) -> int:
 def phase_package_all(args: argparse.Namespace) -> int:
     work = _prepare_work_dir()
 
-    # Discover + download the whole-variant MP4s for this codec (same listing
-    # as the old package phase; chunk files excluded).
+    # Discover this codec's variants. Whole-variant runs upload
+    # {codec}_{label}.mp4 directly; chunked runs upload
+    # {codec}_{label}_chunkNNN.mp4 and are joined HERE — the concat used to be a
+    # separate Batch job per variant, which cost a cold-start + a redundant S3
+    # round-trip (upload the joined mp4, then re-download it here). Folding it in
+    # downloads the chunks once, stream-copies them together, and packages. By
+    # the time this phase runs the SFN has barriered on every chunk job
+    # succeeding, so a chunk set present in S3 is complete and (max index + 1)
+    # is the authoritative chunk count.
     bucket, base_key = _parse(args.s3_variants.rstrip("/"))
     prefix = f"{base_key}/{args.codec}_"
-    labels: list[str] = []
+    whole_labels: set[str] = set()
+    chunk_last: dict[str, int] = {}  # base label -> highest chunk index in S3
     paginator = _s3().get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             name = obj["Key"].rsplit("/", 1)[-1]
             if not name.endswith(".mp4"):
                 continue
-            label = name[len(args.codec) + 1:-4]
-            if not label or _CHUNK_RE.search(label):
+            label = name[len(args.codec) + 1:-4]  # strip "{codec}_" and ".mp4"
+            if not label:
                 continue
-            labels.append(label)
-    labels = sorted(set(labels))
+            m = _CHUNK_RE.search(label)
+            if m:
+                base = label[:m.start()]
+                idx = int(m.group()[len("_chunk"):])
+                chunk_last[base] = max(chunk_last.get(base, -1), idx)
+            else:
+                whole_labels.add(label)
 
     labels_present: list[str] = []
-    for label in labels:
+
+    # Whole variants: download the joined mp4 directly.
+    for label in sorted(whole_labels):
         uri = args.s3_variants.rstrip("/") + f"/{args.codec}_{label}.mp4"
         if _download_if_complete(uri, work / f"{args.codec}_{label}.mp4"):
             labels_present.append(label)
+
+    # Chunked variants: pull every chunk, concat locally (stream copy), then
+    # drop the chunk files so they don't inflate disk during packaging.
+    for base in sorted(chunk_last):
+        if base in whole_labels:
+            continue  # already have the joined file
+        n = chunk_last[base] + 1
+        for i in range(n):
+            name = f"{args.codec}_{base}_chunk{i:03d}.mp4"
+            uri = args.s3_variants.rstrip("/") + f"/{name}"
+            if not _download_if_complete(uri, work / name):
+                print(f"error: chunk {name} missing/incomplete under "
+                      f"{args.s3_variants}", file=sys.stderr)
+                return 1
+        concat_chunks(work, args.codec, base, n)
+        print(f"[phase package-all] joined {n} chunk(s) -> "
+              f"{args.codec}_{base}.mp4", flush=True)
+        for i in range(n):
+            name = f"{args.codec}_{base}_chunk{i:03d}.mp4"
+            (work / name).unlink(missing_ok=True)
+            (work / f"{name}.done").unlink(missing_ok=True)
+        labels_present.append(base)
+
+    labels_present = sorted(set(labels_present))
     if not labels_present:
         print(f"error: no {args.codec} variants found under {args.s3_variants}",
               file=sys.stderr)
@@ -817,17 +821,6 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="encode only this 0-based chunk of the variant "
                         "(Batch array index); omit for a whole-clip encode")
     v.set_defaults(fn=phase_variant)
-
-    cv = sub.add_parser("concat-variant")
-    cv.add_argument("--codec", required=True, choices=("h264", "hevc", "av1"))
-    cv.add_argument("--label", required=True,
-                    help="rung identity, e.g. 1080p or 1080p_1 (apple dup)")
-    cv.add_argument("--s3-mezz", required=True, dest="s3_mezz",
-                    help="prefix holding mezzanine.mp4 (used to derive chunk count)")
-    cv.add_argument("--s3-chunks", required=True, dest="s3_chunks",
-                    help="prefix holding the {codec}_{tier}_chunkNNN.mp4 files")
-    cv.add_argument("--s3-out", required=True, dest="s3_out")
-    cv.set_defaults(fn=phase_concat_variant)
 
     a = sub.add_parser("audio")
     a.add_argument("--s3-mezz", required=True, dest="s3_mezz")

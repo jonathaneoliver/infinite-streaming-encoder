@@ -18,7 +18,6 @@ locals {
     job_queue_arn   = var.job_queue_arn
     mezzanine_def   = var.job_def_arns["mezzanine"]
     variant_def     = var.job_def_arns["variant"]
-    concat_def      = var.job_def_arns["concat"]
     audio_def       = var.job_def_arns["audio"]
     package_def     = var.job_def_arns["package"]
     package_all_def = var.job_def_arns["package_all"]

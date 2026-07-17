@@ -183,51 +183,6 @@ resource "aws_batch_job_definition" "variant" {
 }
 
 # ------------------------------------------------------------------
-# encoder-concat — join a variant's per-chunk encodes into the whole
-# variant via the ffmpeg concat demuxer (stream copy). CPU-light like
-# the mezzanine phase; 2 vCPU + 4 GiB. Runs once per (codec, tier)
-# after that variant's chunk fan-out completes.
-# ------------------------------------------------------------------
-resource "aws_batch_job_definition" "concat" {
-  name = "encoder-concat"
-  type = "container"
-
-  container_properties = jsonencode(merge(local.base_container, {
-    resourceRequirements = [
-      { type = "VCPU", value = "2" },
-      { type = "MEMORY", value = "4096" },
-    ]
-    command = [
-      "python3", "-m", "encoder.cli_local", "phase", "concat-variant",
-      "--codec", "Ref::codec",
-      "--label", "Ref::label",
-      "--s3-mezz", "Ref::s3_mezz",
-      "--s3-chunks", "Ref::s3_chunks",
-      "--s3-out", "Ref::s3_out",
-    ]
-  }))
-
-  retry_strategy {
-    attempts = local.retry_strategy.attempts
-
-    dynamic "evaluate_on_exit" {
-      for_each = local.retry_strategy.evaluate_on_exit
-      content {
-        action       = evaluate_on_exit.value.action
-        on_reason    = try(evaluate_on_exit.value.on_reason, null)
-        on_exit_code = try(evaluate_on_exit.value.on_exit_code, null)
-      }
-    }
-  }
-
-  timeout {
-    attempt_duration_seconds = local.timeout_seconds
-  }
-
-  platform_capabilities = ["EC2"]
-}
-
-# ------------------------------------------------------------------
 # encoder-audio — extract / transcode the audio track.
 # ------------------------------------------------------------------
 resource "aws_batch_job_definition" "audio" {

@@ -73,7 +73,7 @@
           "StartAt": "Variants",
           "States": {
             "Variants": {
-              "Comment": "Fan out across (codec, tier); each variant fans out again across chunks, then concats. Batch queue depth + compute-env max_vcpus cap real parallelism; 12 lets a full 48-vCPU fleet (6x 8-vCPU boxes) stay busy in whole-variant mode.",
+              "Comment": "Fan out across (codec, tier); each variant fans out again across chunks. The chunks are joined inline by the package-all phase (no separate concat job). Batch queue depth + compute-env max_vcpus cap real parallelism; 12 lets a full 48-vCPU fleet (6x 8-vCPU boxes) stay busy in whole-variant mode.",
               "Type": "Map",
               "ItemsPath": "$.variants",
               "MaxConcurrency": 12,
@@ -200,32 +200,6 @@
                           },
                           "End": true
                         }
-                      }
-                    },
-                    "ResultPath": "$.chunk_results",
-                    "Next": "ConcatVariant"
-                  },
-                  "ConcatVariant": {
-                    "Comment": "Join the variant's chunk encodes into the whole variant (stream copy).",
-                    "Type": "Task",
-                    "Resource": "arn:aws:states:::batch:submitJob.sync",
-                    "Parameters": {
-                      "JobName.$": "States.Format('concat-{}-{}-{}', $.codec, $.label, $$.Execution.Name)",
-                      "JobQueue": "${job_queue_arn}",
-                      "JobDefinition": "${concat_def}",
-                      "ShareIdentifier": "encode",
-                      "SchedulingPriorityOverride": 50,
-                      "Parameters": {
-                        "codec.$": "$.codec",
-                        "label.$": "$.label",
-                        "s3_mezz.$": "$.s3_prefix",
-                        "s3_chunks.$": "$.s3_prefix",
-                        "s3_out.$": "$.s3_prefix"
-                      },
-                      "ContainerOverrides": {
-                        "Environment": [
-                          { "Name": "CHUNK_DURATION_S", "Value.$": "$.chunk_duration" }
-                        ]
                       }
                     },
                     "End": true
