@@ -926,56 +926,127 @@ function _ladderTemplate() {
     };
 }
 
-function _showLadderEditor(name, def) {
-    const el = document.getElementById('ladders-list');
-    const isNew = !name;
-    const esc = s => (s || '').replace(/"/g, '&quot;');
-    el.innerHTML = `<div class="panel" style="max-width:760px">
-      <h3>${isNew ? 'New ladder' : 'Edit ' + name}</h3>
-      <div class="control-group"><label>Name</label>
-        <input id="ladder-ed-name" value="${esc(name)}" ${isNew ? '' : 'readonly'} placeholder="my-ladder"></div>
-      <div class="control-group"><label>Description</label>
-        <input id="ladder-ed-desc" value="${esc(def.description)}" placeholder="what this ladder is for"></div>
-      <div style="display:flex;gap:16px">
-        <div class="control-group"><label title="VBV peak ceiling: maxrate = target × this%. Apple VOD guidance is <200%; we default 124%.">Maxrate %</label>
-          <input id="ladder-ed-maxrate" type="number" step="1" value="${def.maxrate_percent || 124}" style="width:90px"></div>
-        <div class="control-group"><label title="VBV buffer = target × this. Smaller = more constant bitrate (better for re-segmenting to 1s/2s). 0.25× keeps 1s peaks ≤~1.5× target.">Bufsize ×</label>
-          <input id="ladder-ed-bufsize" type="number" step="0.05" value="${def.bufsize_multiplier || 0.25}" style="width:90px"></div>
+// Working state for the visual ladder editor. All inline handlers route
+// through functions (top-level fns are reachable from inline handlers; a
+// top-level `let` is not) which mutate this and refresh the live preview.
+let _ed = null;
+
+function _escAttr(s) { return (s || '').replace(/"/g, '&quot;'); }
+
+// Deep-copy a ladder def into editor state (so edits never mutate the cache).
+function _edFromDef(name, def, isNew) {
+    const codecs = {};
+    _CODEC_ORDER.forEach(c => { if (def.codecs && def.codecs[c]) codecs[c] = def.codecs[c].map(r => [r[0], r[1], r[2]]); });
+    return {
+        name: name || '', isNew,
+        description: def.description || '',
+        maxrate_percent: def.maxrate_percent || 124,
+        bufsize_multiplier: def.bufsize_multiplier || 0.25,
+        codecs,
+    };
+}
+
+function newLadder() {
+    // Start by cloning an existing ladder (default legacy).
+    const base = laddersCache['legacy'] ? 'legacy' : Object.keys(laddersCache).sort()[0];
+    _ed = _edFromDef('', laddersCache[base] || _ladderTemplate(), true);
+    _ed.cloneFrom = base || '';
+    _renderLadderEditor();
+}
+
+function editLadder(name) {
+    _ed = _edFromDef(name, laddersCache[name] || {}, false);
+    _renderLadderEditor();
+}
+
+function _edClone(srcName) {
+    const src = laddersCache[srcName]; if (!src) return;
+    _ed = _edFromDef(_ed.name, src, _ed.isNew);
+    _ed.cloneFrom = srcName;
+    _renderLadderEditor();
+}
+
+// Value edits (typed into an input) mutate state + refresh preview only, so the
+// input keeps focus. Structural edits (add/remove/clone) re-render the editor.
+function _edSet(field, val, kind) {
+    _ed[field] = kind === 'int' ? (parseInt(val, 10) || 0) : kind === 'float' ? (parseFloat(val) || 0) : val;
+    if (field === 'maxrate_percent' || field === 'bufsize_multiplier') _edPreview();
+}
+function _edRung(c, i, field, val) { _ed.codecs[c][i][field] = parseInt(val, 10) || 0; _edPreview(); }
+function _edDelRung(c, i) { _ed.codecs[c].splice(i, 1); if (!_ed.codecs[c].length) delete _ed.codecs[c]; _renderLadderEditor(); }
+function _edAddRung(c) {
+    const rs = _ed.codecs[c]; const last = rs[rs.length - 1] || [1920, 1080, 5000];
+    rs.push([last[0], last[1], Math.round(last[2] * 1.5)]); _renderLadderEditor();
+}
+function _edAddCodec(c) { _ed.codecs[c] = [[640, 360, 600], [1280, 720, 2800], [1920, 1080, 7000]]; _renderLadderEditor(); }
+
+function _edCodecTable(c) {
+    const rungs = _ed.codecs[c], color = _CODEC_COLOR[c];
+    if (!rungs) {
+        return `<div style="min-width:150px"><div style="color:${color};font-weight:700;margin-bottom:4px">${c}</div>
+          <button class="btn" style="padding:2px 8px" onclick="_edAddCodec('${c}')">+ add ${c}</button></div>`;
+    }
+    const rows = rungs.map((r, i) => `<tr>
+        <td><input type="number" value="${r[0]}" style="width:62px" oninput="_edRung('${c}',${i},0,this.value)" title="width"></td>
+        <td><input type="number" value="${r[1]}" style="width:58px" oninput="_edRung('${c}',${i},1,this.value)" title="height"></td>
+        <td><input type="number" value="${r[2]}" style="width:80px" oninput="_edRung('${c}',${i},2,this.value)" title="target bitrate (kbps)"></td>
+        <td><button class="btn" style="padding:0 7px" onclick="_edDelRung('${c}',${i})" title="remove rung">×</button></td>
+      </tr>`).join('');
+    return `<div style="min-width:250px">
+        <div style="color:${color};font-weight:700;margin-bottom:4px">${c} <span style="color:#888;font-weight:400">(${rungs.length})</span></div>
+        <table style="border-collapse:collapse;font-size:12px">
+          <thead><tr style="color:#888"><th style="text-align:left;font-weight:400">W</th><th style="text-align:left;font-weight:400">H</th><th style="text-align:left;font-weight:400">kbps</th><th></th></tr></thead>
+          <tbody>${rows}</tbody></table>
+        <button class="btn" style="margin-top:5px;padding:2px 8px" onclick="_edAddRung('${c}')">+ rung</button>
+      </div>`;
+}
+
+function _edPreview() {
+    const p = document.getElementById('led-preview'); if (!p) return;
+    p.innerHTML = _alignedLadderTable(_ed)
+        + `<div style="color:#888;font-size:12px;margin:12px 0 4px">delivered bandwidth per segment length — peak ×avg coloured vs Apple <span style="color:#6ab04c">live ≤1.25×</span> / <span style="color:#d0a24a">VOD ≤2×</span></div>`
+        + `<div style="display:flex;gap:22px;overflow-x:auto;align-items:flex-start">${_ladderBandsCharts(_ed)}</div>`;
+}
+
+function _renderLadderEditor() {
+    const el = document.getElementById('ladders-list'), e = _ed;
+    const cloneOpts = Object.keys(laddersCache).sort().map(n => `<option value="${n}"${n === e.cloneFrom ? ' selected' : ''}>${n}</option>`).join('');
+    el.innerHTML = `<div class="panel">
+      <h3 style="margin-top:0">${e.isNew ? 'New ladder' : 'Edit ' + e.name}</h3>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
+        <div class="control-group"><label>Name</label>
+          <input value="${_escAttr(e.name)}" ${e.isNew ? '' : 'readonly'} placeholder="my-ladder" oninput="_edSet('name',this.value)"></div>
+        ${e.isNew ? `<div class="control-group"><label>Clone from</label>
+          <select onchange="_edClone(this.value)">${cloneOpts}</select></div>` : ''}
+        <div class="control-group"><label title="VBV peak ceiling: maxrate = target × this%. Apple: VOD <200%, live <125%.">Maxrate %</label>
+          <input type="number" step="1" value="${e.maxrate_percent}" style="width:88px" oninput="_edSet('maxrate_percent',this.value,'int')"></div>
+        <div class="control-group"><label title="VBV buffer = target × this. Smaller = more constant bitrate; 0.10× keeps 1s peaks ≤~1.20×.">Bufsize ×</label>
+          <input type="number" step="0.05" value="${e.bufsize_multiplier}" style="width:88px" oninput="_edSet('bufsize_multiplier',this.value,'float')"></div>
       </div>
-      <div class="control-group"><label>Codecs — rungs per codec (JSON)</label>
-        <textarea id="ladder-ed-json" rows="16" style="width:100%;font-family:monospace;font-size:13px">${JSON.stringify(def.codecs || {}, null, 2)}</textarea></div>
-      <p style="color:#888">Each rung is <code>[width, height, bitrate_kbps]</code> — one row per resolution per codec (h264 / hevc / av1).
-        Burn-in overlay is derived from height. Repeated resolutions get ordinal labels (1080p_1, 1080p_2).</p>
-      <div id="ladder-ed-err" style="color:#e66;margin-bottom:8px"></div>
+      <div class="control-group" style="margin-top:8px"><label>Description</label>
+        <input value="${_escAttr(e.description)}" placeholder="what this ladder is for" oninput="_edSet('description',this.value)" style="width:100%;max-width:600px"></div>
+      <div style="color:#888;font-size:12px;margin:12px 0 4px">rungs per codec — edit the bitrate (kbps), width or height; add/remove rungs. Burn-in is derived from height.</div>
+      <div style="display:flex;gap:26px;flex-wrap:wrap">${_CODEC_ORDER.map(_edCodecTable).join('')}</div>
+      <div style="border-top:1px solid #333;margin:16px 0 10px"></div>
+      <div id="led-preview"></div>
+      <div id="led-err" style="color:#e66;margin:10px 0"></div>
       <button class="btn btn-primary" onclick="saveLadder()">Save</button>
       <button class="btn" onclick="renderLaddersTab()">Cancel</button>
     </div>`;
-}
-
-function newLadder() { _showLadderEditor('', _ladderTemplate()); }
-
-function editLadder(name) {
-    const d = { ...(laddersCache[name] || {}) };
-    delete d.seed;
-    _showLadderEditor(name, d);
+    _edPreview();
 }
 
 async function saveLadder() {
-    const name = document.getElementById('ladder-ed-name').value.trim();
-    const errEl = document.getElementById('ladder-ed-err');
-    let codecs;
-    try { codecs = JSON.parse(document.getElementById('ladder-ed-json').value); }
-    catch (e) { errEl.textContent = 'Invalid codecs JSON: ' + e.message; return; }
-    const body = {
-        name,
-        description: document.getElementById('ladder-ed-desc').value.trim(),
-        maxrate_percent: parseInt(document.getElementById('ladder-ed-maxrate').value, 10) || 0,
-        bufsize_multiplier: parseFloat(document.getElementById('ladder-ed-bufsize').value) || 0,
-        codecs,
-    };
+    const errEl = document.getElementById('led-err');
+    const name = (_ed.name || '').trim();
+    if (!name) { errEl.textContent = 'Name is required'; return; }
     const res = await fetch('/api/ladders', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: JSON.stringify({
+            name, description: _ed.description,
+            maxrate_percent: _ed.maxrate_percent, bufsize_multiplier: _ed.bufsize_multiplier,
+            codecs: _ed.codecs,
+        })
     });
     if (!res.ok) { errEl.textContent = await res.text(); return; }
     laddersCache = (await res.json()) || {};
