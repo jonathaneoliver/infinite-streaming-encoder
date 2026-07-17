@@ -357,10 +357,14 @@ def phase_variant(args: argparse.Namespace) -> int:
         gop_duration_s=_GOP_DURATION_S,
         content_duration_s=info.duration_s,
         padding_duration_s=0.0,
-        # Two-pass is enabled per-execution: the Step Function injects
-        # TWO_PASS via containerOverrides (see buildSFNInput), and the
-        # --two-pass flag covers direct/local invocation of this phase.
-        two_pass=args.two_pass or _env_flag("TWO_PASS"),
+        # Two-pass is HEVC-only and set per-variant: the Step Function
+        # injects TWO_PASS via containerOverrides only on HEVC variant jobs
+        # (see buildSFNInput — H264 variants get TWO_PASS=false), and the
+        # --two-pass flag covers direct invocation of this phase. This
+        # worker encodes a single codec, so the env already carries the
+        # codec-correct decision; feeding it hevc_two_pass is a no-op for a
+        # non-HEVC job (encode_variants gates on codec == "hevc").
+        hevc_two_pass=args.two_pass or _env_flag("TWO_PASS"),
     )
 
     # Chunked mode: encode only chunk `--chunk-index` of the variant. The

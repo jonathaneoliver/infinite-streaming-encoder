@@ -84,7 +84,7 @@
                 "memory.$": "$$.Map.Item.Value.memory",
                 "priority.$": "$$.Map.Item.Value.priority",
                 "s3_prefix.$": "$.s3_prefix",
-                "two_pass.$": "$.two_pass",
+                "two_pass.$": "$$.Map.Item.Value.two_pass",
                 "chunk_indices.$": "$.chunk_indices",
                 "chunk_duration.$": "$.chunk_duration"
               },

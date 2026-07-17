@@ -100,9 +100,15 @@ def build_parser() -> argparse.ArgumentParser:
                    dest="bitrate_override_hevc")
     p.add_argument("--bitrate-override-h264", default=None,
                    dest="bitrate_override_h264")
-    p.add_argument("--two-pass", action="store_true", dest="two_pass",
-                   help="two-pass software encode (libx264/libx265) for an "
-                        "accurate target average; ~2x encode time, no-op for av1")
+    # HEVC (libx265) is two-pass by default — it's the accurate-average
+    # path and the correct behaviour. This flag forces HEVC single-pass
+    # (~2x faster) for a side-by-side bitrate comparison. H264 is always
+    # single-pass (x264's VBV already hits target); av1 has no two-pass.
+    p.add_argument("--hevc-single-pass", action="store_true",
+                   dest="hevc_single_pass",
+                   help="encode HEVC single-pass instead of the default "
+                        "two-pass (faster, less accurate average — for "
+                        "comparison; H264/AV1 are single-pass regardless)")
 
     p.add_argument("--vmaf-lookup-csv", default=None, dest="vmaf_lookup_csv",
                    help="unused for now; reserved for burn-in VMAF labels")
@@ -299,7 +305,7 @@ def run_full(args: argparse.Namespace) -> int:
             gop_duration_s=args.gop_duration_s,
             content_duration_s=effective_duration_s,
             padding_duration_s=video_pad_s,
-            two_pass=args.two_pass,
+            hevc_two_pass=not args.hevc_single_pass,
         )
         ovr_hevc = parse_bitrate_override(args.bitrate_override_hevc)
         ovr_h264 = parse_bitrate_override(args.bitrate_override_h264)

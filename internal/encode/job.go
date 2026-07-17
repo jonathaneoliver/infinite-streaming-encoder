@@ -332,11 +332,16 @@ type JobConfig struct {
 	Padding         string   `json:"padding"`
 	KeepMezzanine   bool     `json:"keep_mezzanine"`
 	ForceReencode   bool     `json:"force_reencode"`
-	// TwoPass enables a two-pass software encode (libx264/libx265) for an
-	// accurate target average bitrate. ~2x encode time; no-op for av1.
-	// Applies to both targets: local passes --two-pass to cli_local.py,
-	// cloud injects TWO_PASS into the variant jobs via the SFN input.
-	TwoPass bool `json:"two_pass,omitempty"`
+	// HevcSinglePass forces HEVC to encode single-pass. Two-pass is a codec
+	// property, applied automatically: HEVC (libx265) is two-pass by default
+	// (the accurate-average path — its single-pass VBR drifts below target),
+	// H264 (libx264) is always single-pass (its VBV already hits target, so
+	// two-pass just doubles time), AV1 has no two-pass path. So the default
+	// (false) does the right thing per codec with no user decision. Set true
+	// only to run HEVC single-pass (~2x faster) for a bitrate comparison.
+	// Local passes --hevc-single-pass to cli_local.py; cloud bakes the
+	// per-codec decision into each variant's TWO_PASS via the SFN input.
+	HevcSinglePass bool `json:"hevc_single_pass,omitempty"`
 	// CPU architecture for cloud encodes: "intel" | "amd" | "graviton".
 	// Empty defaults to intel. Ignored for local encodes (which always
 	// run on the host's native architecture).
@@ -1088,8 +1093,8 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	if cfg.KeepMezzanine {
 		args = append(args, "--keep-mezzanine")
 	}
-	if cfg.TwoPass {
-		args = append(args, "--two-pass")
+	if cfg.HevcSinglePass {
+		args = append(args, "--hevc-single-pass")
 	}
 	// CPU arch only makes sense for cloud encodes (local runs on the
 	// host's own architecture), and cli_local.py doesn't accept the
@@ -1161,8 +1166,8 @@ func (cfg *JobConfig) cloudBatchArgs(sourceDir, outputDir string, filenames []st
 	if cfg.KeepMezzanine {
 		args = append(args, "--keep-mezzanine")
 	}
-	if cfg.TwoPass {
-		args = append(args, "--two-pass")
+	if cfg.HevcSinglePass {
+		args = append(args, "--hevc-single-pass")
 	}
 	if cfg.CpuArch != "" {
 		args = append(args, "--cpu-arch", cfg.CpuArch)
@@ -1356,7 +1361,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 	if srcWidth > 0 {
 		job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
 	}
-	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Codec, job.Config.MaxRes, job.Config.TwoPass, nChunks, srcWidth, chunkS)
+	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, nChunks, srcWidth, chunkS)
 	inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 	if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 		return fmt.Errorf("write input json: %w", err)
@@ -1445,7 +1450,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 // buildSFNInput renders the JSON doc the state machine expects. Picks
 // which (codec, tier) combinations to fan out over based on the
 // JobConfig's Codec + MaxRes.
-func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nChunks, sourceWidth int, chunkS float64) string {
+func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, hevcSinglePass bool, nChunks, sourceWidth int, chunkS float64) string {
 	tiers := []string{"360p", "540p", "720p", "1080p", "1440p", "2160p"}
 	if maxRes != "" {
 		for i, t := range tiers {
@@ -1490,6 +1495,11 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nCh
 		// CPU over small ones — enforced by the queue's fair-share policy. Int
 		// (not string) so it lands as a number in SchedulingPriorityOverride.
 		Priority int `json:"priority"`
+		// TwoPass is a per-codec property (not a global run setting): HEVC
+		// two-passes by default (accurate average), H264 never does. Injected
+		// as the TWO_PASS env on each variant's encode jobs by the SFN. String
+		// ("true"/"false") so it drops straight into a container env value.
+		TwoPass string `json:"two_pass"`
 	}
 	tierRank := map[string]int{"360p": 1, "540p": 2, "720p": 3, "1080p": 4, "1440p": 5, "2160p": 6}
 	var variants []variant
@@ -1497,11 +1507,17 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nCh
 		for _, t := range tiers {
 			vcpu, mem := variantResources(t)
 			prio := tierRank[t] * 10
+			// Two-pass is HEVC-only and automatic: H264's single-pass VBV
+			// already hits target average, so it never two-passes; HEVC
+			// two-passes by default (accurate average) unless the user asked
+			// for a single-pass comparison run (hevcSinglePass).
+			twoPass := c == "hevc" && !hevcSinglePass
 			if c == "hevc" {
 				prio++ // HEVC just ahead of H.264 within a tier (it's slower)
 			}
 			variants = append(variants, variant{
 				Codec: c, Tier: t, VCPU: vcpu, Memory: mem, Priority: prio,
+				TwoPass: strconv.FormatBool(twoPass),
 			})
 		}
 	}
@@ -1550,10 +1566,8 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, twoPass bool, nCh
 		// Chunk size (seconds) the encode + concat workers plan against, so
 		// they agree with chunk_indices above. String for a container env var.
 		"chunk_duration": strconv.FormatFloat(chunkS, 'f', -1, 64),
-		// Injected as the TWO_PASS env var on each variant job by the
-		// state machine's EncodeVariant task (see definition.json.tpl).
-		// String, not bool, so it drops straight into a container env value.
-		"two_pass": strconv.FormatBool(twoPass),
+		// NOTE: two_pass is per-variant now (see the variant struct above),
+		// not a top-level field — HEVC two-passes, H264 doesn't, in one run.
 	}
 	b, _ := json.Marshal(doc)
 	return string(b)

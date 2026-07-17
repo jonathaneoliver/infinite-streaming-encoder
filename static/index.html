@@ -381,7 +381,13 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             </div>
             <div class="control-group" style="align-self:center;padding-top:16px">
                 <label><input type="checkbox" id="keep-mezzanine" style="width:auto;min-width:auto"> Keep mezzanine</label>
-                <label title="Two-pass software encode (libx264/libx265) for an accurate target average bitrate. ~2x encode time; no effect on AV1."><input type="checkbox" id="two-pass" style="width:auto;min-width:auto"> Two-pass</label>
+            </div>
+            <div class="control-group">
+                <label title="Two-pass is applied automatically per codec: HEVC (libx265) needs it for an accurate average/peak bitrate, H264 (libx264) does not, AV1 never. This only affects HEVC — pick 1-pass to run a faster, less-accurate HEVC encode for comparison.">HEVC pass</label>
+                <select id="hevc-pass">
+                    <option value="2">2-pass (accurate, default)</option>
+                    <option value="1">1-pass (faster, for comparison)</option>
+                </select>
             </div>
             <button class="btn btn-primary" id="encode-btn" onclick="startEncode(event.altKey)" oncontextmenu="event.preventDefault(); startEncode(true); return false;" title="Click: encode checked files (skips any already fully encoded). Alt/Option+click OR right-click: force re-encode all checked files (archives existing outputs)." disabled>Start Encode</button>
             </div>
@@ -861,7 +867,7 @@ async function startEncode(force = false) {
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
-        two_pass: document.getElementById('two-pass').checked,
+        hevc_single_pass: document.getElementById('hevc-pass').value === '1',
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
@@ -1946,7 +1952,7 @@ async function forceReencode(fileName) {
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
-        two_pass: document.getElementById('two-pass').checked,
+        hevc_single_pass: document.getElementById('hevc-pass').value === '1',
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,

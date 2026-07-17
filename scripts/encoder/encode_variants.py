@@ -52,23 +52,25 @@ class EncodeContext:
     content_duration_s: float   # pre-padding duration, for PADDING label enable
     padding_duration_s: float   # 0.0 = no padding applied
     maxrate_percent: int = DEFAULT_MAXRATE_PERCENT
-    # Two-pass software encode for libx264/libx265 (ports smashing #965).
-    # Single-pass capped VBR distributes bits with only a lookahead
-    # window, so on complex content the achieved average can fall short
-    # of the -b:v target — which drags the real bitrate below the
-    # advertised AVERAGE-BANDWIDTH and packs the ladder rungs together.
-    # Two-pass fixes it: pass 1 profiles scene complexity into a stats
-    # file (output discarded via the null muxer), pass 2 distributes bits
-    # to hit the average accurately while the SAME maxrate/bufsize VBV
-    # keeps peaks flat. Roughly doubles encode time. Ignored for av1
-    # (libsvtav1) — matches bash, which only two-passes the x26x encoders.
+    # Two-pass software encode for libx265 (ports smashing #965). Two-pass
+    # is a *codec* property, not a global toggle: HEVC (libx265) needs it,
+    # H264 (libx264) does not, and AV1 (libsvtav1) has no two-pass path.
     #
-    # Note vs smashing: the undershoot there was ~17% and acute because
-    # its VBV bufsize was 0.25x target. This repo runs a looser VBV
-    # (BUFSIZE_MULTIPLIER=2, maxrate 124%), so single-pass drift is
-    # milder here; two-pass is still the accurate-average path and keeps
-    # behaviour aligned with the bash pipeline.
-    two_pass: bool = False
+    # Why HEVC needs it: single-pass capped VBR distributes bits with only
+    # a lookahead window, so on complex content the achieved average falls
+    # short of the -b:v target — which drags the real bitrate below the
+    # advertised AVERAGE-BANDWIDTH and packs the ladder rungs together.
+    # x265 overshoots/undershoots avg+peak noticeably; x264's single-pass
+    # VBV already lands the target average, so two-passing H264 just
+    # doubles encode time for no measurable gain. Two-pass fixes HEVC:
+    # pass 1 profiles scene complexity into a stats file (output discarded
+    # via the null muxer), pass 2 distributes bits to hit the average
+    # accurately while the SAME maxrate/bufsize VBV keeps peaks flat.
+    #
+    # hevc_two_pass defaults True (the correct behaviour). Set False only
+    # to run HEVC single-pass for a side-by-side bitrate comparison — see
+    # the "HEVC pass" selector in the UI, which maps here.
+    hevc_two_pass: bool = True
 
 
 class EncodeError(RuntimeError):
@@ -266,8 +268,10 @@ def encode_variant(
         total_duration_s = chunk.duration_s
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # av1 (libsvtav1) has no two-pass path here — bash never two-passed it.
-    two_pass = ctx.two_pass and codec in ("h264", "hevc")
+    # Two-pass is HEVC-only: x264's single-pass VBV already hits target
+    # average, and av1 (libsvtav1) has no two-pass path here (bash never
+    # two-passed it). So only libx265 runs the pass-1 stats profiling.
+    two_pass = ctx.hevc_two_pass and codec == "hevc"
 
     try:
         if two_pass:
