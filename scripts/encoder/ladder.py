@@ -224,7 +224,7 @@ SEED_LADDERS: dict[str, dict] = {
     },
 }
 
-DEFAULT_LADDER = "legacy"
+DEFAULT_LADDER = "apple-uniq-live"
 
 
 class LadderError(ValueError):

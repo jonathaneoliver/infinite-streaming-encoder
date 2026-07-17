@@ -1466,7 +1466,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 // JobConfig's Codec + MaxRes.
 func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, maxRes string, hevcSinglePass bool, nChunks, sourceWidth int, chunkS float64) string {
 	if ladderName == "" {
-		ladderName = "legacy"
+		ladderName = "apple-uniq-live"
 	}
 	// Ladder-level VBV, defaulted to match ladder.py (124% / 0.25×).
 	ladderDef, _ := store.Get(ladderName)

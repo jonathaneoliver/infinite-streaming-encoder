@@ -74,8 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Ladder by name (legacy | apple | apple-uniq | any custom ladder). Not
     # restricted to `choices` so user-defined ladders work; validated via
     # get_ladder at run time.
-    p.add_argument("--ladder", default="legacy", dest="ladder",
-                   help="encoding ladder name (default: legacy)")
+    p.add_argument("--ladder", default="apple-uniq-live", dest="ladder",
+                   help="encoding ladder name (default: apple-uniq-live)")
     p.add_argument("--max-res", default=None, dest="max_res",
                    choices=("360p", "540p", "720p", "1080p", "1440p", "2160p"))
     p.add_argument("--time", type=float, default=None, dest="time_limit_s",

@@ -340,7 +340,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group">
                 <label title="Bitrate ladder (resolutions + target bitrates). Manage ladders in the Ladders tab.">Ladder</label>
                 <select id="ladder">
-                    <option value="legacy">legacy</option>
+                    <option value="apple-uniq-live">apple-uniq-live</option>
                 </select>
             </div>
             <div class="control-group">
@@ -744,11 +744,12 @@ async function loadLadders() {
     // Populate the encode-options dropdown, preserving the current choice.
     const sel = document.getElementById('ladder');
     if (sel) {
-        const cur = sel.value || 'legacy';
+        const DEFAULT = 'apple-uniq-live';
+        const cur = sel.value || DEFAULT;
         const names = Object.keys(laddersCache).sort();
         sel.innerHTML = names.map(n =>
             `<option value="${n}">${n}${laddersCache[n].seed ? '' : ' (custom)'}</option>`).join('');
-        sel.value = names.includes(cur) ? cur : (names.includes('legacy') ? 'legacy' : names[0] || '');
+        sel.value = names.includes(cur) ? cur : (names.includes(DEFAULT) ? DEFAULT : names[0] || '');
     }
 }
 
@@ -1465,6 +1466,25 @@ function renderLadderTable(ladder) {
 // updates so a new log line doesn't collapse an open viewer.
 const openLogs = new Set();
 
+function _jobConfigHtml(c) {
+    const chip = (label, val, hl) =>
+        `<span style="background:#232a36;border-radius:3px;padding:1px 7px;font-size:11px;color:#bbb">`
+        + `<span style="color:${hl || '#7a8'}">${label}</span> ${escapeHtml(String(val))}</span>`;
+    const chips = [
+        chip('profile', c.ladder || 'apple-uniq-live', '#e0883a'),
+        chip('codec', c.codec || 'both'),
+        chip('target', c.target || 'local'),
+    ];
+    if (c.max_res) chips.push(chip('max-res', c.max_res));
+    if (c.hevc_single_pass) chips.push(chip('hevc', '1-pass'));
+    if (c.chunk_duration) chips.push(chip('chunk', c.chunk_duration + 's'));
+    if (c.cpu_arch && (c.target === 'cloud' || c.target === 'cloud-batch')) chips.push(chip('cpu', c.cpu_arch));
+    if (c.padding) chips.push(chip('padding', c.padding));
+    if (c.time) chips.push(chip('time', c.time));
+    if (c.force_reencode) chips.push(chip('force', 're-encode', '#d0883a'));
+    return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px">${chips.join('')}</div>`;
+}
+
 function jobRowHtml(j) {
     const cloudBadge = (j.config.target === 'cloud' || j.config.target === 'cloud-batch')
         ? `<span class="job-cloud-badge" onclick="switchTab('aws')" title="Click to view AWS resources">☁ cloud</span>`
@@ -1474,12 +1494,13 @@ function jobRowHtml(j) {
             <div class="job-header">
                 <div>
                     <span class="job-files">${escapeHtml((j.config.files || []).join(', '))}</span>
-                    <span class="job-meta"> — ${j.config.target} / ${j.config.codec}${j.config.max_res ? ' / ' + j.config.max_res : ''}</span>
+                    <span class="job-meta"> — ${j.config.target} / ${j.config.codec} / ${j.config.ladder || 'apple-uniq-live'}${j.config.max_res ? ' / ' + j.config.max_res : ''}</span>
                     ${cloudBadge}
                     <span class="job-ami-badge" style="display:none"></span>
                 </div>
                 <span class="job-status status-${j.status}">${j.status.toUpperCase()}</span>
             </div>
+            ${_jobConfigHtml(j.config)}
             <div class="job-progress"></div>
             <div class="job-error" style="color:#ef476f;font-size:0.8rem;margin-top:4px;display:none"></div>
             <div class="current-file" style="display:none;font-size:0.85rem;color:#8cf;margin-top:8px;font-weight:600"></div>
