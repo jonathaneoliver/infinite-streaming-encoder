@@ -3,3 +3,6 @@
 .DS_Store
 __pycache__/
 *.pyc
+
+# Auto-generated agent memory/session journal — local only, not source.
+.memsearch/
