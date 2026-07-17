@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Encoder</title>
+<title>Infinite Streaming Encoder</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 24px; }
@@ -33,6 +33,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .cloud-warning a { color: #ffd89b; text-decoration: underline; cursor: pointer; }
 .job-cloud-badge { display: inline-block; color: #ffa94d; background: rgba(255, 169, 77, 0.15); border: 1px solid #ffa94d; border-radius: 3px; padding: 0 6px; margin-left: 8px; font-size: 0.7rem; cursor: pointer; vertical-align: middle; }
 .job-cloud-badge:hover { background: rgba(255, 169, 77, 0.3); }
+.job-ami-badge { display: inline-block; color: #06d6a0; background: rgba(6, 214, 160, 0.15); border: 1px solid #06d6a0; border-radius: 3px; padding: 0 6px; margin-left: 8px; font-size: 0.7rem; vertical-align: middle; }
 .encode-options > legend { padding: 0 8px; color: #888; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; }
 .encode-options > .controls { margin-top: 0; }
 .control-group { display: flex; flex-direction: column; gap: 4px; }
@@ -101,6 +102,21 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .stage-bar-fill.stage-fill-skipped { background: repeating-linear-gradient(45deg, #555 0 6px, #444 6px 12px); }
 .stage-skipped { opacity: 0.7; }
 .stage-skipped .stage-label::after { content: ' (reused)'; color: #888; font-size: 0.75rem; font-style: italic; }
+/* Chunk grid: one cell per encode chunk of a variant, so the parallel
+   fan-out is visible at a glance. Colours match the stage-bar palette. */
+.chunk-grid { display: flex; flex-wrap: wrap; gap: 2px; align-items: center; }
+.chunk-cell { width: 11px; height: 11px; border-radius: 2px; background: #1a2a4a; }
+/* queued = submitted to Batch but waiting for a slot (amber, no pulse) —
+   distinct from running = actually encoding (blue, pulsing). */
+.chunk-cell.chunk-queued { background: #ffa94d; }
+.chunk-cell.chunk-running { background: #4361ee; animation: chunkpulse 1s ease-in-out infinite; }
+.chunk-cell.chunk-done { background: #06d6a0; }
+.chunk-cell.chunk-failed { background: #ef476f; }
+@keyframes chunkpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.chunk-concat { margin-left: 7px; color: #667; font-size: 0.85rem; line-height: 1; }
+.chunk-concat.concat-running { color: #4361ee; }
+.chunk-concat.concat-done { color: #06d6a0; }
+.chunk-concat.concat-failed { color: #ef476f; }
 
 /* --- AWS tab --- */
 .tab-aws { color: #ffa94d; }
@@ -242,12 +258,20 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
 </head>
 <body>
-<h1>Encoder</h1>
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+    <h1 style="margin:0">Infinite Streaming Encoder</h1>
+    <label id="watcher-toggle" title="Auto-encode new files dropped into the source folder. Persists across restarts." style="display:flex;align-items:center;gap:7px;font-size:13px;color:#aaa;cursor:pointer;user-select:none">
+        <input type="checkbox" id="watcher-enabled" onchange="setWatcher(this.checked)" style="cursor:pointer;width:15px;height:15px">
+        <span>Auto-watch source folder</span>
+        <span id="watcher-state" style="font-size:11px"></span>
+    </label>
+</div>
 
 <div class="tabs">
     <div class="tab active" onclick="switchTab('originals')">Originals</div>
     <div class="tab" onclick="switchTab('outputs')">Outputs</div>
     <div class="tab" onclick="switchTab('jobs')">Jobs</div>
+    <div class="tab" onclick="switchTab('ladders')">Ladders</div>
     <div class="tab tab-aws" onclick="switchTab('aws')">AWS ☁</div>
     <div class="tab" onclick="switchTab('about')" style="margin-left:auto">About</div>
 </div>
@@ -272,20 +296,35 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <a onclick="switchTab('aws')">AWS tab</a>
                 to confirm nothing is leaking before and after each job.
             </div>
+            <div id="legacy-cloud-warning" style="display:none;padding:10px;background:#3a2a3a;border:1px solid #ef476f;border-radius:4px;margin-bottom:10px;color:#ffb3c1;font-size:0.85rem">
+                <strong>Deprecated:</strong> the legacy cloud target launches one EC2 spot instance per
+                job via boto3 <code>run_instances</code>. Prefer <em>Cloud (AWS Batch)</em> — same pipeline, better
+                retry behaviour, interruption-resistant.
+            </div>
             <div class="controls">
             <div class="control-group">
                 <label>Target</label>
                 <select id="target" onchange="onTargetChange()">
                     <option value="local">Local</option>
-                    <option value="cloud">Cloud (AWS)</option>
+                    <option value="cloud-batch">Cloud (AWS Batch)</option>
+                    <option value="cloud">Cloud (legacy — EC2 spot, deprecated)</option>
                 </select>
             </div>
             <div class="control-group" id="cpu-arch-group" style="display:none">
                 <label>CPU (cloud)</label>
                 <select id="cpu-arch">
-                    <option value="intel">Intel Xeon (c7i)</option>
-                    <option value="amd">AMD EPYC (c7a)</option>
-                    <option value="graviton">Graviton ARM (c7g)</option>
+                    <option value="graviton" selected>Graviton ARM (c7g)</option>
+                    <option value="intel">Intel Xeon (c7i) — needs multi-arch image</option>
+                    <option value="amd">AMD EPYC (c7a) — needs multi-arch image</option>
+                </select>
+            </div>
+            <div class="control-group" id="chunk-dur-group" style="display:none">
+                <label title="How the cloud-batch target splits each variant. Smaller chunks = more parallel jobs (faster wall-clock, but more fleet overhead / lower efficiency). Whole variant = one job per tier (most efficient, least parallel).">Chunking (cloud)</label>
+                <select id="chunk-duration">
+                    <option value="30" selected>30s chunks (max parallelism)</option>
+                    <option value="60">60s chunks</option>
+                    <option value="300">5m chunks</option>
+                    <option value="whole">Whole variant (max efficiency)</option>
                 </select>
             </div>
             <div class="control-group" id="spot-group" style="display:none;align-self:center;padding-top:16px">
@@ -303,6 +342,12 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="hevc">HEVC only</option>
                     <option value="av1">AV1 only</option>
                     <option value="all">All (H.264 + HEVC + AV1)</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label title="Bitrate ladder (resolutions + target bitrates). Manage ladders in the Ladders tab.">Ladder</label>
+                <select id="ladder">
+                    <option value="apple-uniq-live">apple-uniq-live</option>
                 </select>
             </div>
             <div class="control-group">
@@ -351,6 +396,13 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group" style="align-self:center;padding-top:16px">
                 <label><input type="checkbox" id="keep-mezzanine" style="width:auto;min-width:auto"> Keep mezzanine</label>
             </div>
+            <div class="control-group">
+                <label title="Two-pass is applied automatically per codec: HEVC (libx265) needs it for an accurate average/peak bitrate, H264 (libx264) does not, AV1 never. This only affects HEVC — pick 1-pass to run a faster, less-accurate HEVC encode for comparison.">HEVC pass</label>
+                <select id="hevc-pass">
+                    <option value="2">2-pass (accurate, default)</option>
+                    <option value="1">1-pass (faster, for comparison)</option>
+                </select>
+            </div>
             <button class="btn btn-primary" id="encode-btn" onclick="startEncode(event.altKey)" oncontextmenu="event.preventDefault(); startEncode(true); return false;" title="Click: encode checked files (skips any already fully encoded). Alt/Option+click OR right-click: force re-encode all checked files (archives existing outputs)." disabled>Start Encode</button>
             </div>
         </fieldset>
@@ -398,11 +450,30 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
 <!-- JOBS TAB -->
 <div id="tab-jobs" class="tab-content">
+    <div class="panel" id="jobs-fleet-panel" style="display:none">
+        <h2>Fleet</h2>
+        <div id="jobs-fleet-full" title="Live cloud fleet — per-instance packing, utilization, and lifecycle (from the AWS inventory)"></div>
+    </div>
     <div class="panel">
         <h2>Jobs</h2>
         <div id="jobs-list">
             <div class="no-files">No jobs yet</div>
         </div>
+    </div>
+</div>
+
+<!-- LADDERS TAB -->
+<div id="tab-ladders" class="tab-content">
+    <div class="panel">
+        <h2 style="display:flex;align-items:center;gap:12px">Ladders
+            <button class="btn btn-primary" style="margin-left:auto" onclick="newLadder()">+ New ladder</button>
+        </h2>
+        <p style="color:var(--muted,#888);margin:0 0 12px">
+            A ladder is the set of resolutions + target bitrates each codec is encoded at.
+            Built-in ladders (legacy / apple / apple-uniq) are read-only; you can add your own.
+            Burn-in overlay geometry is derived from each rung's height automatically.
+        </p>
+        <div id="ladders-list"><div class="no-files">Loading…</div></div>
     </div>
 </div>
 
@@ -423,6 +494,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
         <div class="aws-summary" id="aws-summary">
             <div class="aws-metric">
+                <div class="aws-metric-label">Running executions</div>
+                <div class="aws-metric-value" id="aws-executions-count">—</div>
+            </div>
+            <div class="aws-metric">
+                <div class="aws-metric-label">Active batch jobs</div>
+                <div class="aws-metric-value" id="aws-batchjobs-count">—</div>
+            </div>
+            <div class="aws-metric">
                 <div class="aws-metric-label">Running instances</div>
                 <div class="aws-metric-value" id="aws-running">—</div>
             </div>
@@ -439,14 +518,36 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <div class="aws-metric-value" id="aws-hourly">—</div>
             </div>
             <div class="aws-metric">
+                <div class="aws-metric-label" title="Self-tracked: burn rate integrated over the trailing 24h">Spent (last 24h)</div>
+                <div class="aws-metric-value" id="aws-spend-24h">—</div>
+            </div>
+            <div class="aws-metric">
                 <div class="aws-metric-label">Region</div>
                 <div class="aws-metric-value" id="aws-region">—</div>
             </div>
         </div>
 
         <div class="aws-section">
+            <h3 style="margin-top:0">Fleet</h3>
+            <div id="aws-fleet"><div class="aws-empty">No active fleet.</div></div>
+        </div>
+
+        <div class="aws-section">
+            <div class="aws-header" style="margin-bottom:8px">
+                <h3 style="margin:0">Step Functions Executions (cloud-batch)</h3>
+                <button class="btn btn-danger" style="padding:4px 10px;font-size:0.8rem" onclick="batchStopAll()">Stop all cloud-batch</button>
+            </div>
+            <div id="aws-executions"></div>
+        </div>
+
+        <div class="aws-section">
             <h3>EC2 Instances</h3>
             <div id="aws-instances"></div>
+        </div>
+
+        <div class="aws-section">
+            <h3>Batch Jobs (cloud-batch)</h3>
+            <div id="aws-batch-jobs"></div>
         </div>
 
         <div class="aws-section">
@@ -473,6 +574,20 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <strong>Does not touch anything without that tag.</strong>
             </p>
             <button class="btn btn-danger" onclick="openClearModal()">Clear all AWS resources</button>
+            <p style="margin-top:12px;font-size:0.85rem;opacity:0.85">
+                <strong>Not cleared here:</strong> the pre-baked worker AMI
+                (if you ran <code>make bake-ami</code>). It's an AMI + EBS
+                snapshot, not a running resource, so this button leaves it
+                alone. It costs ~$1.50/mo in snapshot storage while it exists.
+                Remove it from the command line with:
+            </p>
+            <pre style="margin:6px 0 0;padding:8px 10px;font-size:0.8rem;background:rgba(0,0,0,0.25);border-radius:4px;overflow-x:auto"><code>make unbake-ami   # just the AMI + its snapshot, then re-run: make infra-apply
+make clear-costs  # this button's sweep AND the AMI, in one command</code></pre>
+            <p style="margin-top:6px;font-size:0.8rem;opacity:0.7">
+                Or by hand: <code>aws ec2 deregister-image --image-id &lt;ami&gt;</code>
+                then <code>aws ec2 delete-snapshot --snapshot-id &lt;snap&gt;</code>
+                (find them with <code>aws ec2 describe-images --owners self --filters Name=tag:Name,Values=encoder-worker</code>).
+            </p>
         </div>
     </div>
 </div>
@@ -635,6 +750,368 @@ function switchTab(name) {
     if (name === 'outputs') loadOutputs();
     if (name === 'aws') refreshAws();
     if (name === 'about') loadVersion();
+    if (name === 'ladders') renderLaddersTab();
+}
+
+// ---- Ladders ----
+let laddersCache = {};
+
+async function loadLadders() {
+    try {
+        const res = await fetch('/api/ladders');
+        laddersCache = (await res.json()) || {};
+    } catch (e) { laddersCache = {}; }
+    // Populate the encode-options dropdown, preserving the current choice.
+    const sel = document.getElementById('ladder');
+    if (sel) {
+        const DEFAULT = 'apple-uniq-live';
+        const cur = sel.value || DEFAULT;
+        const names = Object.keys(laddersCache).sort();
+        sel.innerHTML = names.map(n =>
+            `<option value="${n}">${n}${laddersCache[n].seed ? '' : ' (custom)'}</option>`).join('');
+        sel.value = names.includes(cur) ? cur : (names.includes(DEFAULT) ? DEFAULT : names[0] || '');
+    }
+}
+
+// One table per ladder: rows are resolutions (highest first), columns are
+// h264 / hevc / av1 (fixed order), cell = that codec's target bitrate(s) at
+// that resolution ("—" if the codec has no rung there; multi-rung apple
+// resolutions list all rungs, e.g. "600 / 900 / 1600").
+const _CODEC_ORDER = ['h264', 'hevc', 'av1'];
+
+function _alignedLadderTable(d) {
+    const present = _CODEC_ORDER.filter(c => (d.codecs && d.codecs[c] || []).length);
+    if (!present.length) return '<div style="color:#888">no rungs</div>';
+    // Every variant gets its own row. Rows are keyed by (resolution, Nth rung
+    // at that resolution) so a codec with 3×540p produces three 540p rows and
+    // a codec with one 540p fills only the first (— in the others). The step
+    // multiplier merged into each cell is the ratio to that codec's previous
+    // rung by bitrate.
+    const cellByKey = {}, meta = {};
+    present.forEach(c => {
+        const rungs = (d.codecs[c] || []).map(r => ({ h: r[1], res: r[1] + 'p', b: r[2] })).sort((a, b) => a.b - b.b);
+        const ord = {};
+        rungs.forEach((r, i) => {
+            const n = (ord[r.res] = (ord[r.res] || 0) + 1);
+            const key = r.res + '|' + n;
+            meta[key] = { res: r.res, h: r.h, n };
+            (cellByKey[key] = cellByKey[key] || {})[c] = { b: r.b, step: i > 0 ? r.b / rungs[i - 1].b : null };
+        });
+    });
+    const keys = Object.keys(cellByKey).sort((a, b) => meta[b].h - meta[a].h || meta[a].n - meta[b].n);
+    const th = `<th style="text-align:left;padding:4px 16px 6px 0">Resolution</th>`
+        + present.map(c => `<th style="text-align:right;padding:4px 0 6px 18px">${c}</th>`).join('');
+    const cellHtml = cell => {
+        if (!cell) return '<span style="color:#666">—</span>';
+        const s = cell.step ? ` <span style="color:${_stepColor(cell.step)};font-size:11px">×${cell.step.toFixed(2)}</span>` : '';
+        return `${cell.b}${s}`;
+    };
+    const body = keys.map(k => {
+        const cells = present.map(c => `<td style="text-align:right;padding:3px 0 3px 18px;font-variant-numeric:tabular-nums">${cellHtml(cellByKey[k][c])}</td>`).join('');
+        return `<tr><td style="padding:3px 16px 3px 0">${meta[k].res}</td>${cells}</tr>`;
+    }).join('');
+    const foot = `<tr style="color:#888;border-top:1px solid #333"><td style="padding-top:5px">kbps ×step · rungs</td>`
+        + present.map(c => `<td style="text-align:right;padding-top:5px">${(d.codecs[c] || []).length}</td>`).join('') + `</tr>`;
+    return `<table style="border-collapse:collapse;font-size:13px">
+      <thead><tr style="border-bottom:1px solid #555">${th}</tr></thead>
+      <tbody>${body}</tbody><tfoot>${foot}</tfoot></table>`;
+}
+
+// Per-ladder avg→peak band chart (inline SVG, no library). Y axis is a log
+// bitrate scale; one column per codec; each variant is a vertical bar spanning
+// [avg, peak] = [target, target × maxrate%], colored by resolution (so the
+// same resolution shares a colour across codec columns) and labelled with its
+// resolution. Bars whose vertical extents overlap within a column are ladder
+// rungs sitting too close in delivered bandwidth.
+const _CODEC_COLOR = { h264: '#4a90d9', hevc: '#e0883a', av1: '#6ab04c' };
+
+// Resolution → colour, by height on a blue(low)→red(high) log ramp, so a given
+// resolution is the same hue in every codec column.
+function _resColor(h) {
+    const t = Math.max(0, Math.min(1, (Math.log(h) - Math.log(234)) / (Math.log(2160) - Math.log(234))));
+    return `hsl(${(212 - t * 212).toFixed(0)},60%,55%)`;
+}
+
+// One chart for a given segment length T (seconds). The delivered peak over a
+// segment of length T is avg × (maxrate% + bufsize×/T): shorter segments burst
+// higher because the VBV buffer drains into a smaller window. dHi is the shared
+// Y domain (passed in) so the 1s/2s/6s charts are directly comparable.
+function _ladderBandsSVG(d, T, dHi) {
+    const pct = (d.maxrate_percent || 124) / 100;
+    const bufMult = d.bufsize_multiplier || 0.25;
+    const present = _CODEC_ORDER.filter(c => (d.codecs && d.codecs[c] || []).length);
+    if (!present.length) return '';
+    const peakOf = avg => Math.round(avg * (pct + bufMult / T));
+    const byCodec = {};
+    present.forEach(c => {
+        byCodec[c] = (d.codecs[c] || [])
+            .map(r => ({ res: r[1] + 'p', h: r[1], avg: r[2], peak: peakOf(r[2]) }))
+            .sort((a, b) => a.avg - b.avg);
+    });
+    const AX = 42, TOP = 24, BOT = 14, COLW = 76, H = 440;
+    const W = AX + present.length * COLW + 8;
+    const plotH = H - TOP - BOT;
+    const y = v => TOP + (1 - v / dHi) * plotH;
+    const step = [100, 250, 500, 1000, 2000, 2500, 5000, 10000, 20000, 50000].find(s => dHi / s <= 8) || 50000;
+    const ticks = [];
+    for (let t = 0; t <= dHi; t += step) ticks.push(t);
+    const grid = ticks.map(t => {
+        const yy = y(t).toFixed(1);
+        const lbl = t === 0 ? '0' : (t >= 1000 ? (t / 1000) + 'M' : t + 'k');
+        return `<line x1="${AX}" y1="${yy}" x2="${W - 4}" y2="${yy}" stroke="#333"/>`
+            + `<text x="${AX - 5}" y="${(+yy + 3.3).toFixed(1)}" fill="#888" font-size="9" text-anchor="end">${lbl}</text>`;
+    }).join('');
+    const barW = COLW * 0.58;
+    const cols = present.map((c, ci) => {
+        const colX = AX + ci * COLW, bx = colX + (COLW - barW) / 2;
+        const header = `<text x="${colX + COLW / 2}" y="${TOP - 9}" fill="${_CODEC_COLOR[c]}" font-size="11" font-weight="700" text-anchor="middle">${c}</text>`;
+        const bars = byCodec[c].map(v => {
+            const yt = y(v.peak), bh = Math.max(2, y(v.avg) - yt), col = _resColor(v.h);
+            const onBar = bh >= 12
+                ? `<text x="${bx + barW / 2}" y="${(yt + bh / 2 + 3.2).toFixed(1)}" fill="#fff" font-size="8.5" text-anchor="middle">${v.res}</text>` : '';
+            return `<rect x="${bx.toFixed(1)}" y="${yt.toFixed(1)}" width="${barW.toFixed(1)}" height="${bh.toFixed(1)}" rx="2" fill="${col}" fill-opacity="0.82" stroke="${col}"><title>${c} ${v.res} @ ${T}s: avg ${v.avg}k → peak ${v.peak}k</title></rect>${onBar}`;
+        }).join('');
+        return header + bars;
+    }).join('');
+    return `<svg width="${W}" height="${H}" style="font-family:inherit">${grid}${cols}</svg>`;
+}
+
+// Three side-by-side charts (1s / 2s / 6s segments) sharing one Y scale, so the
+// bands visibly grow as segments shorten — and a tight bufsize keeps that
+// growth small.
+function _ladderBandsCharts(d) {
+    const pct = (d.maxrate_percent || 124) / 100;
+    const bufMult = d.bufsize_multiplier || 0.25;
+    let maxAvg = 0;
+    _CODEC_ORDER.forEach(c => (d.codecs && d.codecs[c] || []).forEach(r => { maxAvg = Math.max(maxAvg, r[2]); }));
+    if (!maxAvg) return '';
+    // Biggest peak is at the shortest segment (1s); pad 4% for headroom.
+    const sharedDHi = maxAvg * (pct + bufMult / 1) * 1.04;
+    // peak/avg = maxrate% + bufsize×/T, the SAME for every rung in a chart.
+    return [1, 2, 6].map(T => {
+        const mult = pct + bufMult / T;
+        return `<div>
+        <div style="text-align:center;color:#ccc;font-size:12px;font-weight:600;margin-bottom:2px">${T}s segments
+          <span style="color:${_peakColor(mult)}" title="Apple: live ≤1.25× avg, VOD ≤2×">· peak ${mult.toFixed(2)}× avg</span></div>
+        ${_ladderBandsSVG(d, T, sharedDHi)}
+      </div>`;
+    }).join('');
+}
+
+// Colour a step multiplier: red = rungs too close (<1.25×, redundant), amber =
+// big jump (>2.4×, quality gap), green = healthy spacing. Used by the ladder
+// table, which merges each rung's step-from-previous into its bitrate cell.
+function _stepColor(r) { return r < 1.25 ? '#d06666' : (r > 2.4 ? '#d0a24a' : '#6ab04c'); }
+
+// Colour a peak/avg multiplier against Apple's authoring ceilings: green =
+// within the live/linear limit (peak ≤ 1.25× avg), amber = within the VOD
+// limit (≤ 2×), red = over VOD.
+function _peakColor(m) { return m <= 1.25 ? '#6ab04c' : (m <= 2.0 ? '#d0a24a' : '#d06666'); }
+
+function renderLaddersTab() {
+    const el = document.getElementById('ladders-list');
+    if (!el) return;
+    const names = Object.keys(laddersCache).sort();
+    if (!names.length) { el.innerHTML = '<div class="no-files">No ladders</div>'; return; }
+    el.innerHTML = names.map(name => {
+        const d = laddersCache[name] || {};
+        const vbv = [
+            `maxrate ${d.maxrate_percent || 124}%`,
+            `bufsize ${d.bufsize_multiplier || 0.25}×`,
+        ];
+        const actions = d.seed
+            ? `<span class="job-ami-badge" title="Built-in, read-only">built-in</span>`
+            : `<button class="btn" onclick="editLadder('${name}')">Edit</button>
+               <button class="btn" style="background:#7a2b2b;color:#fff" onclick="deleteLadder('${name}')">Delete</button>`;
+        return `<div class="panel" style="margin-bottom:16px">
+          <div style="display:flex;align-items:center;gap:12px">
+            <h3 style="margin:0;cursor:context-menu" title="Right-click to clone this profile" oncontextmenu="return _cloneMenu(event,'${name}')">${name}</h3>${actions}
+            <span style="color:#888" title="VBV shaping applied to every rung">${vbv.join(' · ')}</span>
+          </div>
+          <p style="color:#888;margin:4px 0 10px">${d.description || ''}</p>
+          <div style="color:#888;font-size:12px;margin:0 0 6px">table: kbps + step× to previous rung (<span style="color:#6ab04c">1.25–2.4× ok</span> · <span style="color:#d06666">&lt;1.25× close</span> · <span style="color:#d0a24a">&gt;2.4× jump</span>) · charts: avg→peak per 1s/2s/6s segment, peak×avg vs Apple <span style="color:#6ab04c">live ≤1.25×</span>/<span style="color:#d0a24a">VOD ≤2×</span></div>
+          <div style="display:flex;gap:20px;overflow-x:auto;align-items:flex-start">
+            <div style="flex:0 0 auto">${_alignedLadderTable(d)}</div>
+            <div style="display:flex;gap:16px;align-items:flex-start">${_ladderBandsCharts(d)}</div>
+          </div>
+        </div>`;
+    }).join('');
+}
+
+function _ladderTemplate() {
+    return {
+        description: "My custom ladder",
+        codecs: {
+            h264: [[640, 360, 600], [1280, 720, 2800], [1920, 1080, 7000]],
+            hevc: [[640, 360, 300], [1280, 720, 1700], [1920, 1080, 4300]]
+        }
+    };
+}
+
+// Working state for the visual ladder editor. All inline handlers route
+// through functions (top-level fns are reachable from inline handlers; a
+// top-level `let` is not) which mutate this and refresh the live preview.
+let _ed = null;
+
+function _escAttr(s) { return (s || '').replace(/"/g, '&quot;'); }
+
+// Deep-copy a ladder def into editor state (so edits never mutate the cache).
+function _edFromDef(name, def, isNew) {
+    const codecs = {};
+    _CODEC_ORDER.forEach(c => { if (def.codecs && def.codecs[c]) codecs[c] = def.codecs[c].map(r => [r[0], r[1], r[2]]); });
+    return {
+        name: name || '', isNew,
+        description: def.description || '',
+        maxrate_percent: def.maxrate_percent || 124,
+        bufsize_multiplier: def.bufsize_multiplier || 0.25,
+        codecs,
+    };
+}
+
+function newLadder() {
+    // Start by cloning an existing ladder (default legacy); name seeded as
+    // copy-of-<source> so the clone lineage is obvious.
+    const base = laddersCache['legacy'] ? 'legacy' : Object.keys(laddersCache).sort()[0];
+    cloneProfile(base || '');
+}
+
+// Clone a specific profile into a new-ladder editor (right-click on a title, or
+// the internal default). Name is prefixed copy-of-<source>; user can rename.
+function cloneProfile(name) {
+    _ed = _edFromDef(name ? 'copy-of-' + name : '', laddersCache[name] || _ladderTemplate(), true);
+    _ed.cloneFrom = name || '';
+    switchTab('ladders');
+    _renderLadderEditor();
+}
+
+function editLadder(name) {
+    _ed = _edFromDef(name, laddersCache[name] || {}, false);
+    _renderLadderEditor();
+}
+
+function _edClone(srcName) {
+    const src = laddersCache[srcName]; if (!src) return;
+    // Keep a user-typed custom name; otherwise re-seed copy-of-<source>.
+    const keep = (_ed.name && !_ed.name.startsWith('copy-of-')) ? _ed.name : 'copy-of-' + srcName;
+    _ed = _edFromDef(keep, src, _ed.isNew);
+    _ed.cloneFrom = srcName;
+    _renderLadderEditor();
+}
+
+// Lightweight right-click "Clone this profile" menu on ladder titles.
+function _cloneMenu(ev, name) {
+    ev.preventDefault();
+    let m = document.getElementById('ctx-clone');
+    if (!m) {
+        m = document.createElement('div');
+        m.id = 'ctx-clone';
+        m.style.cssText = 'position:fixed;z-index:1000;background:#1f2430;border:1px solid #444;border-radius:6px;padding:4px;box-shadow:0 6px 18px rgba(0,0,0,.5)';
+        document.body.appendChild(m);
+    }
+    m.innerHTML = `<div style="padding:6px 12px;cursor:pointer;white-space:nowrap" onmousedown="cloneProfile('${name}');_hideCloneMenu()">⧉ Clone &ldquo;${name}&rdquo;</div>`;
+    m.style.left = Math.min(ev.clientX, window.innerWidth - 200) + 'px';
+    m.style.top = ev.clientY + 'px';
+    m.style.display = 'block';
+    setTimeout(() => document.addEventListener('mousedown', _hideCloneMenu, { once: true }), 0);
+    return false;
+}
+function _hideCloneMenu() { const m = document.getElementById('ctx-clone'); if (m) m.style.display = 'none'; }
+
+// Value edits (typed into an input) mutate state + refresh preview only, so the
+// input keeps focus. Structural edits (add/remove/clone) re-render the editor.
+function _edSet(field, val, kind) {
+    _ed[field] = kind === 'int' ? (parseInt(val, 10) || 0) : kind === 'float' ? (parseFloat(val) || 0) : val;
+    if (field === 'maxrate_percent' || field === 'bufsize_multiplier') _edPreview();
+}
+function _edRung(c, i, field, val) { _ed.codecs[c][i][field] = parseInt(val, 10) || 0; _edPreview(); }
+function _edDelRung(c, i) { _ed.codecs[c].splice(i, 1); if (!_ed.codecs[c].length) delete _ed.codecs[c]; _renderLadderEditor(); }
+function _edAddRung(c) {
+    const rs = _ed.codecs[c]; const last = rs[rs.length - 1] || [1920, 1080, 5000];
+    rs.push([last[0], last[1], Math.round(last[2] * 1.5)]); _renderLadderEditor();
+}
+function _edAddCodec(c) { _ed.codecs[c] = [[640, 360, 600], [1280, 720, 2800], [1920, 1080, 7000]]; _renderLadderEditor(); }
+
+function _edCodecTable(c) {
+    const rungs = _ed.codecs[c], color = _CODEC_COLOR[c];
+    if (!rungs) {
+        return `<div style="min-width:150px"><div style="color:${color};font-weight:700;margin-bottom:4px">${c}</div>
+          <button class="btn" style="padding:2px 8px" onclick="_edAddCodec('${c}')">+ add ${c}</button></div>`;
+    }
+    const rows = rungs.map((r, i) => `<tr>
+        <td><input type="number" value="${r[0]}" style="width:62px" oninput="_edRung('${c}',${i},0,this.value)" title="width"></td>
+        <td><input type="number" value="${r[1]}" style="width:58px" oninput="_edRung('${c}',${i},1,this.value)" title="height"></td>
+        <td><input type="number" value="${r[2]}" style="width:80px" oninput="_edRung('${c}',${i},2,this.value)" title="target bitrate (kbps)"></td>
+        <td><button class="btn" style="padding:0 7px" onclick="_edDelRung('${c}',${i})" title="remove rung">×</button></td>
+      </tr>`).join('');
+    return `<div style="min-width:250px">
+        <div style="color:${color};font-weight:700;margin-bottom:4px">${c} <span style="color:#888;font-weight:400">(${rungs.length})</span></div>
+        <table style="border-collapse:collapse;font-size:12px">
+          <thead><tr style="color:#888"><th style="text-align:left;font-weight:400">W</th><th style="text-align:left;font-weight:400">H</th><th style="text-align:left;font-weight:400">kbps</th><th></th></tr></thead>
+          <tbody>${rows}</tbody></table>
+        <button class="btn" style="margin-top:5px;padding:2px 8px" onclick="_edAddRung('${c}')">+ rung</button>
+      </div>`;
+}
+
+function _edPreview() {
+    const p = document.getElementById('led-preview'); if (!p) return;
+    p.innerHTML = _alignedLadderTable(_ed)
+        + `<div style="color:#888;font-size:12px;margin:12px 0 4px">delivered bandwidth per segment length — peak ×avg coloured vs Apple <span style="color:#6ab04c">live ≤1.25×</span> / <span style="color:#d0a24a">VOD ≤2×</span></div>`
+        + `<div style="display:flex;gap:22px;overflow-x:auto;align-items:flex-start">${_ladderBandsCharts(_ed)}</div>`;
+}
+
+function _renderLadderEditor() {
+    const el = document.getElementById('ladders-list'), e = _ed;
+    const cloneOpts = Object.keys(laddersCache).sort().map(n => `<option value="${n}"${n === e.cloneFrom ? ' selected' : ''}>${n}</option>`).join('');
+    el.innerHTML = `<div class="panel">
+      <h3 style="margin-top:0">${e.isNew ? 'New ladder' : 'Edit ' + e.name}</h3>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
+        <div class="control-group"><label>Name</label>
+          <input value="${_escAttr(e.name)}" ${e.isNew ? '' : 'readonly'} placeholder="my-ladder" oninput="_edSet('name',this.value)"></div>
+        ${e.isNew ? `<div class="control-group"><label>Clone from</label>
+          <select onchange="_edClone(this.value)">${cloneOpts}</select></div>` : ''}
+        <div class="control-group"><label title="VBV peak ceiling: maxrate = target × this%. Apple: VOD <200%, live <125%.">Maxrate %</label>
+          <input type="number" step="1" value="${e.maxrate_percent}" style="width:88px" oninput="_edSet('maxrate_percent',this.value,'int')"></div>
+        <div class="control-group"><label title="VBV buffer = target × this. Smaller = more constant bitrate; 0.10× keeps 1s peaks ≤~1.20×.">Bufsize ×</label>
+          <input type="number" step="0.05" value="${e.bufsize_multiplier}" style="width:88px" oninput="_edSet('bufsize_multiplier',this.value,'float')"></div>
+      </div>
+      <div class="control-group" style="margin-top:8px"><label>Description</label>
+        <input value="${_escAttr(e.description)}" placeholder="what this ladder is for" oninput="_edSet('description',this.value)" style="width:100%;max-width:600px"></div>
+      <div style="color:#888;font-size:12px;margin:12px 0 4px">rungs per codec — edit the bitrate (kbps), width or height; add/remove rungs. Burn-in is derived from height.</div>
+      <div style="display:flex;gap:26px;flex-wrap:wrap">${_CODEC_ORDER.map(_edCodecTable).join('')}</div>
+      <div style="border-top:1px solid #333;margin:16px 0 10px"></div>
+      <div id="led-preview"></div>
+      <div id="led-err" style="color:#e66;margin:10px 0"></div>
+      <button class="btn btn-primary" onclick="saveLadder()">Save</button>
+      <button class="btn" onclick="renderLaddersTab()">Cancel</button>
+    </div>`;
+    _edPreview();
+}
+
+async function saveLadder() {
+    const errEl = document.getElementById('led-err');
+    const name = (_ed.name || '').trim();
+    if (!name) { errEl.textContent = 'Name is required'; return; }
+    const res = await fetch('/api/ladders', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            name, description: _ed.description,
+            maxrate_percent: _ed.maxrate_percent, bufsize_multiplier: _ed.bufsize_multiplier,
+            codecs: _ed.codecs,
+        })
+    });
+    if (!res.ok) { errEl.textContent = await res.text(); return; }
+    laddersCache = (await res.json()) || {};
+    await loadLadders();
+    renderLaddersTab();
+}
+
+async function deleteLadder(name) {
+    if (!confirm(`Delete ladder "${name}"? This cannot be undone.`)) return;
+    const res = await fetch('/api/ladders/' + encodeURIComponent(name), { method: 'DELETE' });
+    if (!res.ok) { alert(await res.text()); return; }
+    laddersCache = (await res.json()) || {};
+    await loadLadders();
+    renderLaddersTab();
 }
 
 function formatSize(bytes) {
@@ -696,16 +1173,24 @@ function renderSources() {
 
 function onTargetChange() {
     const target = document.getElementById('target').value;
+    const isAnyCloud = target === 'cloud' || target === 'cloud-batch';
     document.getElementById('cloud-warning').style.display =
+        isAnyCloud ? 'block' : 'none';
+    document.getElementById('legacy-cloud-warning').style.display =
         target === 'cloud' ? 'block' : 'none';
-    // CPU arch only matters for cloud; hide it on local so the form
-    // doesn't suggest a setting that gets ignored.
+    // CPU arch, spot toggle, and simulate-interrupt are knobs only
+    // the legacy cloud (EC2-spot-per-job) target honours. Batch picks
+    // capacity from its compute environment's allocation strategy.
+    const isLegacy = target === 'cloud';
     document.getElementById('cpu-arch-group').style.display =
-        target === 'cloud' ? 'flex' : 'none';
+        isLegacy ? 'flex' : 'none';
+    // Chunk granularity applies to the cloud-batch (chunked) target only.
+    document.getElementById('chunk-dur-group').style.display =
+        target === 'cloud-batch' ? 'flex' : 'none';
     document.getElementById('spot-group').style.display =
-        target === 'cloud' ? 'flex' : 'none';
+        isLegacy ? 'flex' : 'none';
     document.getElementById('simulate-interrupt-group').style.display =
-        target === 'cloud' ? 'flex' : 'none';
+        isLegacy ? 'flex' : 'none';
 }
 
 // Before submitting a cloud encode, peek at the AWS inventory. If
@@ -760,7 +1245,7 @@ async function startEncode(force = false) {
     if (selected.length === 0) return;
 
     const target = document.getElementById('target').value;
-    if (target === 'cloud' && !await confirmCloudIfBilling()) return;
+    if ((target === 'cloud' || target === 'cloud-batch') && !await confirmCloudIfBilling()) return;
 
     if (force) {
         const confirmed = await showDialog(
@@ -786,7 +1271,10 @@ async function startEncode(force = false) {
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
+        hevc_single_pass: document.getElementById('hevc-pass').value === '1',
+        ladder: document.getElementById('ladder').value,
         cpu_arch: document.getElementById('cpu-arch').value,
+        chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
         simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
         force_reencode: force
@@ -998,8 +1486,27 @@ function renderLadderTable(ladder) {
 // updates so a new log line doesn't collapse an open viewer.
 const openLogs = new Set();
 
+function _jobConfigHtml(c) {
+    const chip = (label, val, hl) =>
+        `<span style="background:#232a36;border-radius:3px;padding:1px 7px;font-size:11px;color:#bbb">`
+        + `<span style="color:${hl || '#7a8'}">${label}</span> ${escapeHtml(String(val))}</span>`;
+    const chips = [
+        chip('profile', c.ladder || 'apple-uniq-live', '#e0883a'),
+        chip('codec', c.codec || 'both'),
+        chip('target', c.target || 'local'),
+    ];
+    if (c.max_res) chips.push(chip('max-res', c.max_res));
+    if (c.hevc_single_pass) chips.push(chip('hevc', '1-pass'));
+    if (c.chunk_duration) chips.push(chip('chunk', c.chunk_duration + 's'));
+    if (c.cpu_arch && (c.target === 'cloud' || c.target === 'cloud-batch')) chips.push(chip('cpu', c.cpu_arch));
+    if (c.padding) chips.push(chip('padding', c.padding));
+    if (c.time) chips.push(chip('time', c.time));
+    if (c.force_reencode) chips.push(chip('force', 're-encode', '#d0883a'));
+    return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px">${chips.join('')}</div>`;
+}
+
 function jobRowHtml(j) {
-    const cloudBadge = j.config.target === 'cloud'
+    const cloudBadge = (j.config.target === 'cloud' || j.config.target === 'cloud-batch')
         ? `<span class="job-cloud-badge" onclick="switchTab('aws')" title="Click to view AWS resources">☁ cloud</span>`
         : '';
     return `
@@ -1007,11 +1514,13 @@ function jobRowHtml(j) {
             <div class="job-header">
                 <div>
                     <span class="job-files">${escapeHtml((j.config.files || []).join(', '))}</span>
-                    <span class="job-meta"> — ${j.config.target} / ${j.config.codec}${j.config.max_res ? ' / ' + j.config.max_res : ''}</span>
+                    <span class="job-meta"> — ${j.config.target} / ${j.config.codec} / ${j.config.ladder || 'apple-uniq-live'}${j.config.max_res ? ' / ' + j.config.max_res : ''}</span>
                     ${cloudBadge}
+                    <span class="job-ami-badge" style="display:none"></span>
                 </div>
                 <span class="job-status status-${j.status}">${j.status.toUpperCase()}</span>
             </div>
+            ${_jobConfigHtml(j.config)}
             <div class="job-progress"></div>
             <div class="job-error" style="color:#ef476f;font-size:0.8rem;margin-top:4px;display:none"></div>
             <div class="current-file" style="display:none;font-size:0.85rem;color:#8cf;margin-top:8px;font-weight:600"></div>
@@ -1024,6 +1533,54 @@ function jobRowHtml(j) {
     `;
 }
 
+// Match a per-chunk encode stage key: encode:<codec>:<tier>:chunk<N>.
+const CHUNK_KEY_RE = /^encode:([^:]+):([^:]+):chunk(\d+)$/;
+// Match the per-variant concat stage key: concat:<codec>:<tier>.
+const CONCAT_KEY_RE = /^concat:([^:]+):([^:]+)$/;
+
+// Fold the flat stage list into display rows: normal stages pass through,
+// but per-chunk encode stages for one (codec, tier) collapse into a single
+// grid row (with the matching concat stage as the join indicator), so a
+// job with 12 variants x N chunks stays readable.
+function groupStagesForDisplay(stages) {
+    const rows = [];
+    const groupIndex = {};   // "codec:tier" -> rows[] index
+    for (const s of stages) {
+        const cm = CHUNK_KEY_RE.exec(s.key);
+        if (cm) {
+            const gk = cm[1] + ':' + cm[2];
+            if (!(gk in groupIndex)) {
+                groupIndex[gk] = rows.length;
+                rows.push({ kind: 'chunks', codec: cm[1], tier: cm[2],
+                            cells: [], concat: null });
+            }
+            rows[groupIndex[gk]].cells.push({ key: s.key, index: +cm[3], s });
+            continue;
+        }
+        const nm = CONCAT_KEY_RE.exec(s.key);
+        if (nm && (nm[1] + ':' + nm[2]) in groupIndex) {
+            rows[groupIndex[nm[1] + ':' + nm[2]]].concat = s;
+            continue;
+        }
+        rows.push({ kind: 'stage', s });
+    }
+    for (const r of rows) if (r.kind === 'chunks') r.cells.sort((a, b) => a.index - b.index);
+    // Whole-variant mode: a variant encoded as a single chunk renders as a
+    // progress bar (with live ffmpeg %), not a lone LED cell — matching the
+    // legacy per-tier look. Its concat is a trivial passthrough, shown as a
+    // small "join" bar after it.
+    const out = [];
+    for (const r of rows) {
+        if (r.kind === 'chunks' && r.cells.length === 1) {
+            out.push({ kind: 'stage', s: { ...r.cells[0].s, label: `encode ${r.codec} ${r.tier}` } });
+            if (r.concat) out.push({ kind: 'stage', s: { ...r.concat, label: `join ${r.codec} ${r.tier}` } });
+        } else {
+            out.push(r);
+        }
+    }
+    return out;
+}
+
 function updateStagesTable(row, stages) {
     const table = row.querySelector('.stages-table');
     const tbody = table.querySelector('tbody');
@@ -1033,35 +1590,67 @@ function updateStagesTable(row, stages) {
     }
     table.style.display = '';
 
-    // Rebuild the tbody only when the set of rows changed (typically
-    // only once per job, when the first [[ENCODER-PLAN]] marker arrives).
-    const wantKeys = stages.map(s => s.key).join(',');
-    if (tbody.dataset.keys !== wantKeys) {
-        tbody.innerHTML = stages.map(s => `
-            <tr data-stage-key="${escapeHtml(s.key)}">
-                <td class="stage-label">${escapeHtml(s.label)}</td>
-                <td class="stage-bar"><div class="stage-bar-track"><div class="stage-bar-fill"></div></div></td>
-                <td class="stage-pct"></td>
-            </tr>
-        `).join('');
-        tbody.dataset.keys = wantKeys;
+    const rows = groupStagesForDisplay(stages);
+    // Structural signature: rebuild the tbody only when the row set changes.
+    const sig = rows.map(r => r.kind === 'chunks'
+        ? 'c:' + r.codec + ':' + r.tier + ':' + r.cells.length + (r.concat ? ':j' : '')
+        : r.s.key).join(',');
+    if (tbody.dataset.sig !== sig) {
+        tbody.innerHTML = rows.map(r => {
+            if (r.kind === 'stage') {
+                return `<tr data-stage-key="${escapeHtml(r.s.key)}">
+                    <td class="stage-label">${escapeHtml(r.s.label)}</td>
+                    <td class="stage-bar"><div class="stage-bar-track"><div class="stage-bar-fill"></div></div></td>
+                    <td class="stage-pct"></td></tr>`;
+            }
+            const cells = r.cells.map(c =>
+                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" title="chunk ${c.index}"></span>`).join('');
+            const concat = r.concat
+                ? `<span class="chunk-concat" data-stage-key="${escapeHtml(r.concat.key)}" title="concat / join">&#8904;</span>` : '';
+            return `<tr data-chunk-group="${escapeHtml(r.codec + ':' + r.tier)}">
+                <td class="stage-label">encode ${escapeHtml(r.codec)} ${escapeHtml(r.tier)}</td>
+                <td class="stage-bar"><div class="chunk-grid">${cells}${concat}</div></td>
+                <td class="stage-pct chunk-count"></td></tr>`;
+        }).join('');
+        tbody.dataset.sig = sig;
     }
 
-    // Per-tick update: fill width, colour, and numeric pct.
-    for (const s of stages) {
-        const tr = tbody.querySelector(`tr[data-stage-key="${s.key}"]`);
+    // Per-tick update.
+    for (const r of rows) {
+        if (r.kind === 'stage') {
+            const s = r.s;
+            const tr = tbody.querySelector(`tr[data-stage-key="${s.key}"]`);
+            if (!tr) continue;
+            tr.className = 'stage-' + s.status;
+            const fill = tr.querySelector('.stage-bar-fill');
+            fill.style.width = s.percent.toFixed(1) + '%';
+            fill.className = 'stage-bar-fill';
+            if (s.status === 'done')    fill.classList.add('stage-fill-done');
+            if (s.status === 'failed')  fill.classList.add('stage-fill-failed');
+            if (s.status === 'skipped') fill.classList.add('stage-fill-skipped');
+            tr.querySelector('.stage-pct').textContent =
+                s.status === 'pending' ? '—'
+                : s.status === 'skipped' ? 'reused'
+                : s.percent.toFixed(0) + '%';
+            continue;
+        }
+        // Chunk group: colour each cell by its chunk's status.
+        const tr = tbody.querySelector(`tr[data-chunk-group="${r.codec + ':' + r.tier}"]`);
         if (!tr) continue;
-        tr.className = 'stage-' + s.status;
-        const fill = tr.querySelector('.stage-bar-fill');
-        fill.style.width = s.percent.toFixed(1) + '%';
-        fill.className = 'stage-bar-fill';
-        if (s.status === 'done')    fill.classList.add('stage-fill-done');
-        if (s.status === 'failed')  fill.classList.add('stage-fill-failed');
-        if (s.status === 'skipped') fill.classList.add('stage-fill-skipped');
-        tr.querySelector('.stage-pct').textContent =
-            s.status === 'pending' ? '—'
-            : s.status === 'skipped' ? 'reused'
-            : s.percent.toFixed(0) + '%';
+        let done = 0;
+        for (const c of r.cells) {
+            const cell = tr.querySelector(`.chunk-cell[data-chunk-key="${c.key}"]`);
+            if (!cell) continue;
+            cell.className = 'chunk-cell' + (c.s.status === 'pending' ? '' : ' chunk-' + c.s.status);
+            if (c.s.status === 'done' || c.s.status === 'skipped') done++;
+        }
+        if (r.concat) {
+            const el = tr.querySelector('.chunk-concat');
+            if (el) el.className = 'chunk-concat' + (r.concat.status === 'pending' ? '' : ' concat-' + r.concat.status);
+        }
+        const joined = r.concat && (r.concat.status === 'done');
+        tr.querySelector('.chunk-count').textContent =
+            joined ? 'joined' : `${done}/${r.cells.length}`;
     }
 }
 
@@ -1077,6 +1666,21 @@ function updateJobRow(row, j) {
         status.textContent = j.status.toUpperCase();
     }
     row.querySelector('.job-progress').textContent = j.progress || '';
+
+    // Pre-baked AMI badge — set once the worker reports its boot AMI and the
+    // server confirms it matches the baked worker AMI (image already resident).
+    const amiEl = row.querySelector('.job-ami-badge');
+    if (amiEl) {
+        if (j.prebaked_ami) {
+            amiEl.textContent = '⚡ pre-baked AMI';
+            amiEl.title = 'Instance booted from the pre-baked worker AMI'
+                + (j.boot_ami ? ' (' + j.boot_ami + ')' : '')
+                + ' — image already resident, ECR pull skipped';
+            amiEl.style.display = '';
+        } else {
+            amiEl.style.display = 'none';
+        }
+    }
 
     const err = row.querySelector('.job-error');
     if (j.error) {
@@ -1360,18 +1964,277 @@ function renderAws(data) {
     const hourlyEl = document.getElementById('aws-hourly');
     hourlyEl.textContent = '$' + hourly.toFixed(2);
     hourlyEl.className = 'aws-metric-value' + (hourly > 0 ? ' warn' : ' ok');
+    document.getElementById('aws-spend-24h').textContent = '$' + (s.spend_24h_usd || 0).toFixed(2);
     document.getElementById('aws-region').textContent = data.region || '—';
 
+    renderFleet(data.fleet || {}, data.instances || []);
+
+    const execs = s.running_executions || 0;
+    const bjobs = s.active_batch_jobs || 0;
+    const execEl = document.getElementById('aws-executions-count');
+    execEl.textContent = execs;
+    execEl.className = 'aws-metric-value' + (execs > 0 ? ' warn' : ' ok');
+    const bjEl = document.getElementById('aws-batchjobs-count');
+    bjEl.textContent = bjobs;
+    bjEl.className = 'aws-metric-value' + (bjobs > 0 ? ' warn' : ' ok');
+
+    renderAwsExecutions(data.executions || []);
+    renderAwsBatchJobs(data.batch_jobs || []);
     renderAwsInstances(data.instances || []);
     renderAwsSpotRequests(data.spot_requests || []);
     renderAwsVolumes(data.volumes || []);
     renderAwsS3(data.s3_prefixes || []);
 }
 
+function renderAwsExecutions(execs) {
+    const el = document.getElementById('aws-executions');
+    execs = execs || [];
+    // Show every RUNNING execution + the 5 most recent finished ones; the long
+    // tail of old terminal executions is just history (AWS keeps it 90 days,
+    // free — no cleanup needed, so we only trim the display).
+    const running = execs.filter(e => e.status === 'RUNNING' || e.error);
+    const finished = execs.filter(e => e.status && e.status !== 'RUNNING').slice(0, 5);
+    const hidden = execs.filter(e => e.status && e.status !== 'RUNNING').length - finished.length;
+    execs = running.concat(finished);
+    if (execs.length === 0) { el.innerHTML = '<div class="aws-empty">No executions.</div>'; return; }
+    const rows = execs.map(e => {
+        if (e.error) return `<tr><td colspan="4" class="aws-state-available">${escapeHtml(e.error)}</td></tr>`;
+        const st = (e.status || '').toLowerCase();
+        return `<tr>
+            <td>${escapeHtml(e.name || '')}</td>
+            <td class="aws-state-${st === 'running' ? 'running' : st}">${escapeHtml(e.status || '')}</td>
+            <td>${formatDuration(e.age_seconds || 0)}</td>
+            <td>${e.status === 'RUNNING'
+                ? `<span class="aws-row-action" onclick="stopExecution('${escapeAttr(e.arn)}')">stop</span>`
+                : '—'}</td>
+        </tr>`;
+    }).join('');
+    const more = hidden > 0
+        ? `<div style="color:#888;font-size:11px;margin-top:4px">+ ${hidden} older finished execution${hidden > 1 ? 's' : ''} (hidden)</div>` : '';
+    el.innerHTML = `<table class="aws-table"><thead><tr>
+        <th>Execution</th><th>Status</th><th>Age</th><th></th>
+    </tr></thead><tbody>${rows}</tbody></table>${more}`;
+}
+
+function renderAwsBatchJobs(jobs) {
+    const el = document.getElementById('aws-batch-jobs');
+    if (jobs.length === 0) { el.innerHTML = '<div class="aws-empty">No active batch jobs.</div>'; return; }
+    const rows = jobs.map(j => {
+        if (j.error) return `<tr><td colspan="4" class="aws-state-available">${escapeHtml(j.error)}</td></tr>`;
+        const st = (j.status || '').toLowerCase();
+        const active = ['submitted','pending','runnable','starting','running'].includes(st);
+        return `<tr>
+            <td title="${escapeHtml(j.name || '')}">${escapeHtml(_jobFriendly(j.name))}</td>
+            <td class="aws-state-${st === 'running' ? 'running' : st === 'runnable' || st === 'pending' || st === 'submitted' || st === 'starting' ? 'pending' : st}">${escapeHtml(j.status || '')}</td>
+            <td>${formatDuration(j.age_seconds || 0)}</td>
+            <td>${active
+                ? `<span class="aws-row-action" onclick="terminateBatchJob('${escapeAttr(j.id)}')">terminate</span>`
+                : '—'}</td>
+        </tr>`;
+    }).join('');
+    el.innerHTML = `<table class="aws-table"><thead><tr>
+        <th>Job</th><th>Status</th><th>Age</th><th></th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function stopExecution(arn) {
+    if (!confirm('Stop this execution? Its Batch jobs will be aborted.')) return;
+    try {
+        const r = await fetch('/api/aws/executions/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({arn})});
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        refreshAws();
+    } catch (e) { alert('Stop failed: ' + e.message); }
+}
+
+async function terminateBatchJob(id) {
+    if (!confirm('Terminate this Batch job?')) return;
+    try {
+        const r = await fetch('/api/aws/batch-jobs/terminate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        refreshAws();
+    } catch (e) { alert('Terminate failed: ' + e.message); }
+}
+
+async function batchStopAll() {
+    if (!confirm('Stop ALL cloud-batch executions and terminate ALL their Batch jobs?')) return;
+    try {
+        const r = await fetch('/api/aws/batch/stop-all', {method:'POST'});
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const rep = await r.json();
+        alert(`Stopped ${(rep.stopped_executions||[]).length} execution(s), terminated ${(rep.terminated_jobs||[]).length} job(s).`);
+        refreshAws();
+    } catch (e) { alert('Stop-all failed: ' + e.message); }
+}
+
+// Turn a raw Batch job name into a human label, dropping the execution UUID.
+// Names: mezz-<exec> · audio-<exec> · var-<codec>-<label>-c<N>-<exec> ·
+// concat-<codec>-<label>-<exec> · pkg|hls|br-<codec>-<exec>.
+function _jobFriendly(name) {
+    if (!name) return '';
+    const p = name.split('-');
+    switch (p[0]) {
+        case 'mezz': return 'mezzanine';
+        case 'audio': return 'audio';
+        case 'var': return `encode ${p[1]} ${p[2]}` + (p[3] ? ` · ${p[3].replace(/^c/, 'chunk ')}` : '');
+        case 'concat': return `concat ${p[1]} ${p[2]}`;
+        case 'pkg': return `package ${p[1]}`;
+        case 'hls': return `HLS ${p[1]}`;
+        case 'br': return `byteranges ${p[1]}`;
+        default: return name;
+    }
+}
+
+// Colour a fleet-packing segment by the codec in the Batch job name.
+function _jobColor(name) {
+    name = name || '';
+    if (name.includes('hevc')) return _CODEC_COLOR.hevc;
+    if (name.includes('av1')) return _CODEC_COLOR.av1;
+    if (name.includes('h264')) return _CODEC_COLOR.h264;
+    return '#5a6472'; // mezz/audio/package/etc
+}
+
+// Lifecycle badges for a box's ECS state before/without a running job.
+const _FLEET_STATE = {
+    booting: { c: '#d0a24a', t: '◦ booting', tip: 'EC2 up — OS boot + ECS agent register + first image pull happen here' },
+    pulling: { c: '#4a90d9', t: '⋯ pulling image', tip: 'task placed — pulling image / starting container' },
+    idle:    { c: '#d0a24a', t: '◦ idle', tip: 'running but no jobs — a scale-down candidate' },
+};
+function _fleetInstanceRow(i) {
+    const cap = i.vcpus || 0;
+    const used = i.used_vcpus || 0;
+    const idle = (i.idle_vcpus != null) ? i.idle_vcpus : Math.max(0, cap - used);
+    const jobs = i.jobs || [];
+    const starting = j => /^(STARTING|STARTUP|PROVISIONING|PENDING|SUBMITTED|RUNNABLE)$/i.test(j.status || '');
+    const seg = (w, color, title, extra) => `<div style="width:${w}%;background:${color};${extra || ''}" title="${escapeHtml(title)}"></div>`;
+    // A job still STARTING (its container is pulling the image) renders dimmed +
+    // striped, so you can see the box warming up for it before it's RUNNING.
+    const stripe = c => `background-image:repeating-linear-gradient(45deg,${c} 0 6px,transparent 6px 12px)`;
+    let parts = jobs.map(j => seg(cap ? (j.vcpu || 0) / cap * 100 : 0, _jobColor(j.name),
+        `${_jobFriendly(j.name)} — ${j.vcpu} vCPU${starting(j) ? ' (starting — pulling image)' : ''}`,
+        starting(j) ? 'opacity:.5;' + stripe('rgba(255,255,255,.3)') : '')).join('');
+
+    // Box lifecycle state from ECS (booting / pulling before any job lands).
+    // Only surfaced as a box-level badge when there are NO jobs to list —
+    // once jobs show, a STARTING job's striped "starting" segment already
+    // conveys "pulling image", so a separate badge would just be redundant.
+    const st = i.init_state || (jobs.length ? 'running' : 'idle');
+    const S = _FLEET_STATE[st];
+    const badge = (S && !jobs.length) ? ` <span style="color:${S.c};font-size:11px" title="${S.tip}">${S.t}</span>` : '';
+
+    if ((st === 'booting' || st === 'pulling') && !jobs.length && cap) {
+        // Warming-up box with no job yet: striped full-width bar, not flat idle.
+        parts = seg(100, '#20252f', S.tip, stripe(S.c + '55'));
+    } else if (idle > 0 && cap) {
+        parts += seg(idle / cap * 100, '#20252f', `${idle} idle vCPU`);
+    }
+
+    const rightLabel = jobs.length
+        ? `${used}/${cap} vCPU · ${jobs.length} job${jobs.length > 1 ? 's' : ''}`
+        : (st === 'booting' ? 'booting' : st === 'pulling' ? 'pulling image' : `idle (${cap} vCPU)`);
+    // Inline list of what this box is running right now (friendly names + dot).
+    const jobList = jobs.length
+        ? `<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:#9aa;margin-top:3px">`
+          + jobs.map(j => `<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${_jobColor(j.name)};vertical-align:middle;margin-right:4px;${starting(j) ? 'opacity:.5' : ''}"></span>`
+              + `${escapeHtml(_jobFriendly(j.name))} <span style="color:#666">${j.vcpu}v${starting(j) ? ' · starting' : ''}</span></span>`).join('')
+          + `</div>`
+        : '';
+    return `<div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-bottom:2px">
+        <span>${escapeHtml(i.type || '')} <span style="color:#666">${escapeHtml((i.id || '').slice(-6))}</span>${badge}</span>
+        <span>${rightLabel} · ${formatDuration(i.age_seconds || 0)}</span>
+      </div>
+      <div style="height:16px;background:#20252f;border-radius:4px;overflow:hidden;display:flex">${parts}</div>
+      ${jobList}
+    </div>`;
+}
+
+// Tiny inline sparkline SVG from an array of numbers.
+function _sparkline(vals, color, opts) {
+    opts = opts || {};
+    if (!vals || vals.length < 2) return '';
+    const W = opts.w || 150, H = opts.h || 26, pad = 2;
+    const min = (opts.min != null) ? opts.min : Math.min(...vals);
+    const max = (opts.max != null) ? opts.max : Math.max(...vals);
+    const span = (max - min) || 1;
+    const n = vals.length;
+    const x = i => pad + (i / (n - 1)) * (W - 2 * pad);
+    const y = v => (H - pad) - ((v - min) / span) * (H - 2 * pad);
+    const pts = vals.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+    const lx = x(n - 1).toFixed(1), ly = y(vals[n - 1]).toFixed(1);
+    return `<svg width="${W}" height="${H}" style="vertical-align:middle">
+      <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5"/>
+      <circle cx="${lx}" cy="${ly}" r="2" fill="${color}"/></svg>`;
+}
+
+function _fleetSparks(history) {
+    if (!history || history.length < 2) return '';
+    const util = history.map(s => Math.round((s.util || 0) * 100));
+    const used = history.map(s => s.used || 0);
+    const jobs = history.map(s => (s.queued || 0) + (s.running || 0));
+    const cost = history.map(s => s.hourly || 0);
+    const totalMax = Math.max(...history.map(s => s.total || 0), 1);
+    const curTotal = history[history.length - 1].total || 0;
+    const cell = (label, spark, cur) =>
+        `<div style="font-size:11px;color:#888">${label}<br>${spark} <span style="color:#ccc">${cur}</span></div>`;
+    return `<div style="display:flex;gap:26px;flex-wrap:wrap;margin:4px 0 14px">
+      ${cell('utilization (2h)', _sparkline(util, '#4a90d9', { min: 0, max: 100 }), util[util.length - 1] + '%')}
+      ${cell('vCPU used (2h)', _sparkline(used, '#9b59b6', { min: 0, max: totalMax }), used[used.length - 1] + ' / ' + curTotal)}
+      ${cell('jobs queued+running', _sparkline(jobs, '#e0883a', { min: 0 }), jobs[jobs.length - 1])}
+      ${cell('$/hr', _sparkline(cost, '#6ab04c', { min: 0 }), '$' + (cost[cost.length - 1] || 0).toFixed(2))}
+    </div>`;
+}
+
+let _lastFleet = null;
+function renderFleet(fleet, instances) {
+    _lastFleet = { fleet, instances };
+    const running = (instances || []).filter(i => i.state === 'running');
+    const total = fleet.total_vcpus || 0, used = fleet.used_vcpus || 0;
+    const idle = (fleet.idle_vcpus != null) ? fleet.idle_vcpus : Math.max(0, total - used);
+    const pct = total ? Math.round(used / total * 100) : 0;
+
+    // Build the full panel once, then render it into both the AWS tab and the
+    // Jobs-page Fleet panel.
+    let panelHtml;
+    if (!running.length && !total) {
+        panelHtml = '<div class="aws-empty">No active fleet.</div>';
+    } else {
+        const bar = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+          <div style="flex:1;max-width:520px;height:22px;background:#20252f;border-radius:5px;overflow:hidden">
+            <div style="width:${pct}%;height:100%;background:#4a90d9"></div>
+          </div>
+          <div style="font-size:13px;color:#ccc"><b>${used}</b> / ${total} vCPU busy (${pct}%) · <span style="color:#888">${idle} idle</span></div>
+        </div>
+        <div style="color:#888;font-size:12px;margin-bottom:12px">${fleet.instance_count || running.length} instances · ${fleet.running_jobs || 0} running / ${fleet.queued_jobs || 0} queued jobs · $${(fleet.estimated_hourly_usd || 0).toFixed(2)}/hr · $${(fleet.spend_24h_usd || 0).toFixed(2)} last 24h</div>`;
+        // If jobs couldn't be mapped to instances (missing ecs perm), say so.
+        const mapped = running.some(i => (i.jobs || []).length);
+        const note = (used > 0 && !mapped)
+            ? `<div style="color:#d0a24a;font-size:12px;margin-bottom:8px">per-instance placement unavailable (grant ecs:DescribeContainerInstances) — showing fleet totals only</div>`
+            : '';
+        const rows = running.map(_fleetInstanceRow).join('');
+        panelHtml = bar + _fleetSparks(fleet.history) + note + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
+    }
+
+    const el = document.getElementById('aws-fleet');
+    if (el) el.innerHTML = panelHtml;
+
+    // Jobs page: show the same full panel above the jobs list; hide it entirely
+    // when there's no fleet so the page isn't cluttered while idle.
+    const jp = document.getElementById('jobs-fleet-panel');
+    const jff = document.getElementById('jobs-fleet-full');
+    if (jp && jff) {
+        if (running.length || total) { jff.innerHTML = panelHtml; jp.style.display = ''; }
+        else { jp.style.display = 'none'; }
+    }
+}
+
 function renderAwsInstances(instances) {
     const el = document.getElementById('aws-instances');
+    // Hide terminated/shutting-down boxes — they're gone and cost nothing, so
+    // they're just noise. Keep live states only.
+    instances = (instances || []).filter(i =>
+        ['running', 'pending', 'stopping', 'stopped'].includes(i.state));
     if (instances.length === 0) {
-        el.innerHTML = '<div class="aws-empty">No instances.</div>';
+        el.innerHTML = '<div class="aws-empty">No active instances.</div>';
         return;
     }
     const rows = instances.map(i => `
@@ -1557,9 +2420,11 @@ async function executeClear() {
 function startAwsAutoRefresh() {
     const chk = document.getElementById('aws-auto-refresh');
     const tick = () => {
-        if (chk.checked && document.querySelector('#tab-aws').classList.contains('active')) {
-            refreshAws();
-        }
+        // Refresh on the AWS tab, and also on the Jobs tab to keep the compact
+        // fleet-utilization line live there.
+        const onAws = document.querySelector('#tab-aws').classList.contains('active');
+        const onJobs = document.querySelector('#tab-jobs').classList.contains('active');
+        if (chk.checked && (onAws || onJobs)) refreshAws();
     };
     awsTimer = setInterval(tick, 10000);
 }
@@ -1692,7 +2557,10 @@ async function forceReencode(fileName) {
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
         keep_mezzanine: document.getElementById('keep-mezzanine').checked,
+        hevc_single_pass: document.getElementById('hevc-pass').value === '1',
+        ladder: document.getElementById('ladder').value,
         cpu_arch: document.getElementById('cpu-arch').value,
+        chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
         simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
         force_reencode: true
@@ -1920,6 +2788,36 @@ connectSSE();
 setInterval(loadSources, 60000);
 startAwsAutoRefresh();
 loadVersion();
+loadLadders();
+loadSettings();
+
+function _renderWatcher(enabled) {
+    const cb = document.getElementById('watcher-enabled');
+    const st = document.getElementById('watcher-state');
+    if (cb) cb.checked = !!enabled;
+    if (st) {
+        st.textContent = enabled ? '● watching' : '○ off';
+        st.style.color = enabled ? '#6ab04c' : '#666';
+    }
+}
+async function loadSettings() {
+    try {
+        const res = await fetch('/api/settings');
+        if (!res.ok) return;
+        _renderWatcher((await res.json()).watcher_enabled);
+    } catch (e) { /* leave unchecked */ }
+}
+async function setWatcher(enabled) {
+    _renderWatcher(enabled); // optimistic
+    try {
+        const res = await fetch('/api/settings', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ watcher_enabled: enabled }),
+        });
+        if (res.ok) _renderWatcher((await res.json()).watcher_enabled);
+        else loadSettings(); // revert to server truth on failure
+    } catch (e) { loadSettings(); }
+}
 
 async function loadVersion() {
     try {

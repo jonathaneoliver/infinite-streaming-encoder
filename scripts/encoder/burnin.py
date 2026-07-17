@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fractions import Fraction
 
-from encoder.ladder import Tier
+from encoder.ladder import Rung
 
 
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -30,12 +30,32 @@ INITIAL_TIMECODE = r"00\:00\:00\:00"
 @dataclass(frozen=True)
 class BurninContext:
     codec: str                # "hevc"/"h264"/"av1"
-    tier: Tier
+    tier: Rung
     fps: Fraction             # for timecode rate
     rate_label: str           # "AVG~4.50Mbps / PEAK<=5.58Mbps" or similar
     encoder_label: str        # e.g. "SW"
     content_duration_s: float # for PADDING-label enable expression
     padding_duration_s: float # 0 → no PADDING label at all
+    # Absolute start offset of this encode within the full content. 0 for a
+    # whole-clip encode; the chunk's start_s when encoding a single chunk, so
+    # the burnt-in timecode stays continuous across concatenated chunks.
+    timecode_start_s: float = 0.0
+
+
+def format_timecode(start_s: float, fps: Fraction) -> str:
+    """SMPTE-ish HH:MM:SS:FF (colons escaped for drawtext) for `start_s`.
+
+    start_s=0 yields "00\\:00\\:00\\:00", matching the pre-chunking constant,
+    so whole-clip encodes are unchanged.
+    """
+    fps_int = max(1, round(float(fps)))
+    total_frames = round(start_s * float(fps))
+    frames = total_frames % fps_int
+    total_seconds = total_frames // fps_int
+    ss = total_seconds % 60
+    mm = (total_seconds // 60) % 60
+    hh = total_seconds // 3600
+    return rf"{hh:02d}\:{mm:02d}\:{ss:02d}\:{frames:02d}"
 
 
 def _escape(text: str) -> str:
@@ -93,13 +113,15 @@ def build_filter(ctx: BurninContext) -> str:
     y_encoder = y_codec_res + tier.fontsize_label + 5
     y_watermark = y_encoder + tier.fontsize_label + 5
 
-    codec_res_label = f"{ctx.codec.upper()} {tier.name} | {float(ctx.fps):.2f}fps"
+    # res_name (not label): apple dup rungs (1080p_1/1080p_2) both display
+    # as their true resolution "1080p" in the burn-in overlay.
+    codec_res_label = f"{ctx.codec.upper()} {tier.res_name} | {float(ctx.fps):.2f}fps"
 
     overlays = [
         _drawtext(
             "", fontsize=tier.fontsize_tc, color="yellow", box_opacity=1.0,
             x=tier.burnin_x, y=y_tc,
-            timecode=INITIAL_TIMECODE, rate=ctx.fps,
+            timecode=format_timecode(ctx.timecode_start_s, ctx.fps), rate=ctx.fps,
         ),
         _drawtext(
             ctx.rate_label, fontsize=tier.fontsize_label, color="cyan",

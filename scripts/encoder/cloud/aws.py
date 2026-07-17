@@ -74,6 +74,18 @@ def sts_client():
     return boto3.client("sts", region_name=region())
 
 
+def sfn_client():
+    return boto3.client("stepfunctions", region_name=region())
+
+
+def batch_client():
+    return boto3.client("batch", region_name=region())
+
+
+def ecs_client():
+    return boto3.client("ecs", region_name=region())
+
+
 class AuthError(RuntimeError):
     """STS preflight couldn't confirm authenticated credentials."""
 
@@ -99,3 +111,27 @@ def resolve_al2023_ami(ami_id: str | None = None, ami_arch: str = "x86_64") -> s
     name = f"/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-{ami_arch}"
     resp = ssm_client().get_parameter(Name=name)
     return resp["Parameter"]["Value"]
+
+
+def resolve_worker_ami(image_tag: str, ami_arch: str = "arm64") -> str | None:
+    """Find a pre-baked `encoder-worker` AMI whose baked image tag matches
+    `image_tag` — the SAME AMI the Batch compute env uses. Booting it means the
+    worker image is already resident, so the remote's `docker pull` is a cheap
+    manifest check with no layer download (~60s saved). Returns None when no
+    current AMI exists (caller falls back to the stock AL2023 AMI + a full pull),
+    so a stale/absent AMI never breaks the run — same self-correcting contract
+    as the Batch side."""
+    try:
+        resp = ec2_client().describe_images(
+            Owners=["self"],
+            Filters=[
+                {"Name": "tag:Name", "Values": ["encoder-worker"]},
+                {"Name": "tag:image_tag", "Values": [image_tag]},
+                {"Name": "architecture", "Values": [ami_arch]},
+                {"Name": "state", "Values": ["available"]},
+            ],
+        )
+    except Exception:  # noqa: BLE001 — AMI reuse is best-effort; fall back
+        return None
+    images = sorted(resp.get("Images", []), key=lambda i: i.get("CreationDate", ""))
+    return images[-1]["ImageId"] if images else None

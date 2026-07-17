@@ -21,7 +21,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from encoder.fragments import parse_segment
-from encoder.ladder import Tier
 from encoder.manifests import hls_from_dash as _hls_from_dash
 import json
 
@@ -75,10 +74,10 @@ def generate_fmp4_hls(package_dir: Path) -> bool:
 
 @dataclass(frozen=True)
 class TsHlsSpec:
-    tmp_dir: Path              # holds {codec}_{res}.mp4 + audio.mp4
+    tmp_dir: Path              # holds {codec}_{label}.mp4 + audio.mp4
     ts_output_dir: Path        # top-level dir for the TS package
     codec: str
-    tiers: tuple[Tier, ...]
+    labels: tuple[str, ...]    # rung labels ("1080p", "1080p_1", ...)
     segment_duration_s: float
     include_audio: bool
 
@@ -134,12 +133,12 @@ def generate_ts_hls(spec: TsHlsSpec) -> Path:
     """
     spec.ts_output_dir.mkdir(parents=True, exist_ok=True)
 
-    for tier in spec.tiers:
-        source_mp4 = spec.tmp_dir / f"{spec.codec}_{tier.name}.mp4"
+    for label in spec.labels:
+        source_mp4 = spec.tmp_dir / f"{spec.codec}_{label}.mp4"
         if not source_mp4.is_file():
             continue
         _run_ffmpeg_hls(
-            source_mp4, spec.ts_output_dir / tier.name, spec.segment_duration_s,
+            source_mp4, spec.ts_output_dir / label, spec.segment_duration_s,
         )
 
     if spec.include_audio:

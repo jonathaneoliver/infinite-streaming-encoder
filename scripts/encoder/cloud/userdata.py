@@ -57,6 +57,16 @@ def render(spec: UserDataSpec) -> str:
     image = shlex.quote(spec.docker_image)
     simulate_s = int(spec.simulate_interrupt_after_s)
 
+    # Registry login. An ECR image authenticates with the instance's own IAM
+    # role (no secret to bake in) — this is the PAT-free path that matches the
+    # Batch target. Anything else (e.g. GHCR) falls back to the PAT login.
+    if ".dkr.ecr." in spec.docker_image:
+        registry = shlex.quote(spec.docker_image.split("/", 1)[0])
+        login_cmd = (f"aws ecr get-login-password --region {region} "
+                     f"| docker login --username AWS --password-stdin {registry}")
+    else:
+        login_cmd = f"echo {pat} | docker login ghcr.io -u {user} --password-stdin"
+
     # Triple-brace blocks in f-strings would be awkward; compose plainly.
     return f"""#!/bin/bash
 set -euxo pipefail
@@ -194,9 +204,9 @@ systemctl enable --now docker
 echo ">>> docker enabled"
 stage remote:install done 100
 
-stage remote:ghcr-login running
-echo {pat} | docker login ghcr.io -u {user} --password-stdin
-stage remote:ghcr-login done 100
+stage remote:login running
+{login_cmd}
+stage remote:login done 100
 
 stage remote:pull running
 docker pull {image}

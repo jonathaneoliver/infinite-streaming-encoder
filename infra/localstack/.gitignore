@@ -1,0 +1,2 @@
+# Never commit the LocalStack auth token (lives in .env).
+.env

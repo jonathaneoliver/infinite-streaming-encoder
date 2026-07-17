@@ -58,10 +58,12 @@ func main() {
 	hostTmpDir := flag.String("host-tmp-dir", env("HOST_TMP_DIR", ""), "host path for TmpDir")
 	hostAWSDir := flag.String("host-aws-dir", env("HOST_AWS_DIR", ""), "host path for ~/.aws (cloud jobs only)")
 	encoderImage := flag.String("encoder-image", env("ENCODER_IMAGE", "encoder:latest"), "image used for worker containers")
+	stateMachineArn := flag.String("state-machine-arn", env("STATE_MACHINE_ARN", ""), "Step Functions state machine ARN for the cloud-batch target (empty disables that target)")
 	autoWatch := flag.Bool("auto-watch", env("AUTO_WATCH", "true") == "true", "auto-encode new files in source dir")
 	watchInterval := flag.Duration("watch-interval", 30*time.Second, "filesystem watch polling interval")
 	defaultTarget := flag.String("default-target", env("DEFAULT_TARGET", "local"), "default encode target: cloud or local")
 	defaultCodec := flag.String("default-codec", env("DEFAULT_CODEC", "both"), "default codec: h264, hevc, both")
+	defaultLadder := flag.String("default-ladder", env("DEFAULT_LADDER", "apple-uniq-live"), "default encoding ladder profile")
 	defaultMaxRes := flag.String("default-max-res", env("DEFAULT_MAX_RES", ""), "default max resolution (empty = no limit)")
 	maxConcurrent := flag.Int("max-concurrent", intEnv("MAX_CONCURRENT", 1), "max concurrent encode jobs")
 	// AWS watchdog (issue #5 phase 5). Polls `encoder.cloud.inventory` on
@@ -75,30 +77,38 @@ func main() {
 	flag.Parse()
 
 	mgr := encode.NewManager(encode.ManagerConfig{
-		SourceDir:     *sourceDir,
-		OutputDir:     *outputDir,
-		TmpDir:        *tmpDir,
-		ScriptsDir:    *scriptsDir,
-		DockerImage:   *dockerImage,
-		HostSourceDir: *hostSourceDir,
-		HostOutputDir: *hostOutputDir,
-		HostTmpDir:    *hostTmpDir,
-		HostAWSDir:    *hostAWSDir,
-		EncoderImage:  *encoderImage,
-		MaxConcurrent: *maxConcurrent,
+		SourceDir:       *sourceDir,
+		OutputDir:       *outputDir,
+		TmpDir:          *tmpDir,
+		ScriptsDir:      *scriptsDir,
+		DockerImage:     *dockerImage,
+		HostSourceDir:   *hostSourceDir,
+		HostOutputDir:   *hostOutputDir,
+		HostTmpDir:      *hostTmpDir,
+		HostAWSDir:      *hostAWSDir,
+		EncoderImage:    *encoderImage,
+		StateMachineArn: *stateMachineArn,
+		MaxConcurrent:   *maxConcurrent,
 	})
 	mgr.Reconcile()
 
-	if *autoWatch {
+	// The -auto-watch flag / AUTO_WATCH env is only the *default*; a persisted
+	// UI toggle (settings.json) wins so it sticks across restarts.
+	mgr.InitSettings(*autoWatch)
+
+	// Always run the watcher goroutine; it self-gates on the persisted
+	// WatcherEnabled setting, which the UI toggles live.
+	{
 		defaults := encode.JobConfig{
 			Codec:  *defaultCodec,
+			Ladder: *defaultLadder,
 			MaxRes: *defaultMaxRes,
 			Target: encode.Target(*defaultTarget),
 		}
 		w := watcher.New(*sourceDir, *watchInterval, mgr, defaults)
 		go w.Run()
-		log.Printf("watcher: monitoring %s every %s (target=%s codec=%s)",
-			*sourceDir, *watchInterval, *defaultTarget, *defaultCodec)
+		log.Printf("watcher: monitoring %s every %s (enabled=%v, target=%s codec=%s)",
+			*sourceDir, *watchInterval, mgr.WatcherEnabled(), *defaultTarget, *defaultCodec)
 	}
 
 	go awswatch.Run(context.Background(), awswatch.Config{
@@ -106,6 +116,9 @@ func main() {
 		MaxLifetime:         *awsMaxLifetime,
 		AutoTerminateStale:  *awsAutoTerminate,
 		FailedStagingMaxAge: 1 * time.Hour,
+		// Keep one small box warm during active cloud-batch runs so the
+		// packaging tail doesn't cold-start; 0 disables (min_vcpus stays 0).
+		WarmMinVCPUs: intEnv("WARM_MIN_VCPUS", 2),
 	})
 
 	srv := api.NewServer(mgr)

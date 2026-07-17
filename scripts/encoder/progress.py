@@ -61,6 +61,27 @@ def emit_stage(key: str, status: str, percent: float = 0.0) -> None:
     )
 
 
+def emit_boot_ami() -> None:
+    """Report the AMI this worker's instance actually booted from, via IMDS
+    (free, no IAM). The Go server compares it to the pre-baked worker AMI to
+    decide whether the cache was hit — a definitive signal, not a timing guess.
+    No-op off-instance (local encodes)."""
+    import urllib.request
+    try:
+        tok = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token", method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+        token = urllib.request.urlopen(tok, timeout=2).read().decode()
+        req = urllib.request.Request(
+            "http://169.254.169.254/latest/meta-data/ami-id",
+            headers={"X-aws-ec2-metadata-token": token})
+        ami = urllib.request.urlopen(req, timeout=2).read().decode().strip()
+    except Exception:  # noqa: BLE001 — not on EC2, or IMDS unavailable
+        return
+    if ami:
+        print(f"[[ENCODER-BOOT ami={ami}]]", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # ffmpeg progress parser
 # ---------------------------------------------------------------------------

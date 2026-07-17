@@ -7,20 +7,27 @@ optional `audio.mp4`. Segmentation, DASH packaging, fragment
 sidecars, and HLS manifests still run — resume lets the user redo
 only the packaging/manifest work without re-encoding.
 
-This module is a pure discovery layer: it scans the directory,
-figures out which (codec, tier) combinations have usable MP4s, and
-returns a structured view the orchestrator can turn into a plan.
+This module is a pure discovery layer: it scans the directory for
+`{codec}_{label}.mp4` variant files, figures out which (codec, label)
+combinations have usable MP4s, and returns a structured view the
+orchestrator can turn into a plan. It is ladder-agnostic — it reads
+whatever labels are on disk, so it works for any ladder (legacy or
+apple, with its ordinal-suffixed labels like `1080p_1`).
 """
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from encoder.ladder import LADDER, Tier
-
 
 SUPPORTED_CODECS = ("hevc", "h264", "av1")
+
+# Per-chunk encodes are `{codec}_{label}_chunkNNN.mp4`; the concat phase
+# joins them into the whole-variant `{codec}_{label}.mp4`. Resume reuses
+# only whole-variant files, so chunk files are excluded from discovery.
+_CHUNK_RE = re.compile(r"_chunk\d+$")
 
 
 def _is_complete(mp4: Path) -> bool:
@@ -48,9 +55,9 @@ def _is_complete(mp4: Path) -> bool:
 
 @dataclass(frozen=True)
 class ResumeInventory:
-    # Codec → list of tiers that have complete (size-verified) MP4s.
-    # Only codecs with at least one complete tier appear here.
-    available: dict[str, list[Tier]]
+    # Codec → list of rung labels that have complete (size-verified) MP4s.
+    # Only codecs with at least one complete variant appear here.
+    available: dict[str, list[str]]
     # True if `<dir>/audio.mp4` is complete (has a matching .done).
     has_audio: bool
     # Partial files detected (MP4 exists but no/mismatched .done). Kept
@@ -78,20 +85,24 @@ def discover(resume_dir: Path) -> ResumeInventory:
     if not resume_dir.is_dir():
         raise ResumeError(f"resume directory not found: {resume_dir}")
 
-    available: dict[str, list[Tier]] = {}
+    available: dict[str, list[str]] = {}
     partial: list[str] = []
     for codec in SUPPORTED_CODECS:
-        tiers_for_codec: list[Tier] = []
-        for tier in LADDER:
-            candidate = resume_dir / f"{codec}_{tier.name}.mp4"
-            if not candidate.is_file() or candidate.stat().st_size == 0:
+        labels_for_codec: list[str] = []
+        # Scan for {codec}_{label}.mp4 (excluding per-chunk files). Sorted so
+        # the label order is stable across runs.
+        for candidate in sorted(resume_dir.glob(f"{codec}_*.mp4")):
+            label = candidate.stem[len(codec) + 1:]
+            if not label or _CHUNK_RE.search(label):
+                continue
+            if candidate.stat().st_size == 0:
                 continue
             if _is_complete(candidate):
-                tiers_for_codec.append(tier)
+                labels_for_codec.append(label)
             else:
-                partial.append(f"{codec}_{tier.name}.mp4")
-        if tiers_for_codec:
-            available[codec] = tiers_for_codec
+                partial.append(candidate.name)
+        if labels_for_codec:
+            available[codec] = labels_for_codec
 
     audio_path = resume_dir / "audio.mp4"
     if audio_path.is_file() and audio_path.stat().st_size > 0:

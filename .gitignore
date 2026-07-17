@@ -3,3 +3,9 @@
 .DS_Store
 __pycache__/
 *.pyc
+
+# Auto-generated agent memory/session journal — local only, not source.
+.memsearch/
+
+# Playwright MCP browser-automation console logs — local only, not source.
+.playwright-mcp/

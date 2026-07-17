@@ -38,7 +38,12 @@ func NewServer(mgr *encode.Manager) *Server {
 		),
 	}
 	s.Mux.HandleFunc("GET /api/version", s.getVersion)
+	s.Mux.HandleFunc("GET /api/settings", s.getSettings)
+	s.Mux.HandleFunc("POST /api/settings", s.putSettings)
 	s.Mux.HandleFunc("GET /api/sources", s.listSources)
+	s.Mux.HandleFunc("GET /api/ladders", s.getLadders)
+	s.Mux.HandleFunc("POST /api/ladders", s.putLadder)
+	s.Mux.HandleFunc("DELETE /api/ladders/{name}", s.deleteLadder)
 	s.Mux.HandleFunc("GET /api/outputs", s.listOutputs)
 	s.Mux.HandleFunc("GET /api/outputs/{name}", s.listOutputContents)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/playlists", s.listPlaylists)
@@ -56,6 +61,10 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/aws/inventory", s.awsInventory)
 	s.Mux.HandleFunc("POST /api/aws/clear", s.awsClearAll)
 	s.Mux.HandleFunc("POST /api/aws/jobs/{id}/cleanup", s.awsCleanupJob)
+	// Cloud-batch release controls (Step Functions executions + Batch jobs).
+	s.Mux.HandleFunc("POST /api/aws/executions/stop", s.awsStopExecution)
+	s.Mux.HandleFunc("POST /api/aws/batch-jobs/terminate", s.awsTerminateBatchJob)
+	s.Mux.HandleFunc("POST /api/aws/batch/stop-all", s.awsBatchStopAll)
 	// Serve encode logs
 	s.Mux.Handle("GET /logs/", http.StripPrefix("/logs/", http.FileServer(http.Dir(filepath.Join(mgr.TmpDir, "logs")))))
 	// Serve encoded output files (segments, manifests) for HLS.js playback
@@ -147,6 +156,29 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.Manager.Jobs())
+}
+
+// getSettings returns the persisted global settings (currently just the
+// watcher on/off toggle).
+func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.Manager.Settings())
+}
+
+// putSettings applies a partial settings update. Only fields present in the
+// body are changed; the watcher toggle persists across restarts.
+func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
+	// Pointer fields so we can tell "set to false" from "omitted".
+	var body struct {
+		WatcherEnabled *bool `json:"watcher_enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request: "+err.Error(), 400)
+		return
+	}
+	if body.WatcherEnabled != nil {
+		s.Manager.SetWatcherEnabled(*body.WatcherEnabled)
+	}
+	writeJSON(w, s.Manager.Settings())
 }
 
 func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
@@ -387,6 +419,41 @@ type outputDir struct {
 	HlsFormat   string   `json:"hls_format"`
 	Partial     string   `json:"partial"`
 	Padding     string   `json:"padding"`
+}
+
+// getLadders returns all ladder definitions (built-in + user-defined) keyed by
+// name. The UI populates the encode-options dropdown and the Ladders tab from
+// this. Seed ladders carry "seed": true and are read-only.
+func (s *Server) getLadders(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.Manager.Ladders.List())
+}
+
+// putLadder creates or replaces a user-defined ladder. Body is a LadderDef
+// plus a "name". Built-in ladders are read-only (the store rejects them).
+func (s *Server) putLadder(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+		encode.LadderDef
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), 400)
+		return
+	}
+	if err := s.Manager.Ladders.Put(req.Name, req.LadderDef); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	writeJSON(w, s.Manager.Ladders.List())
+}
+
+// deleteLadder removes a user-defined ladder. Built-in ladders can't be deleted.
+func (s *Server) deleteLadder(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := s.Manager.Ladders.Delete(name); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	writeJSON(w, s.Manager.Ladders.List())
 }
 
 func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {
@@ -794,6 +861,63 @@ func (s *Server) awsCleanupJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := runPythonCloud("cleanup", "--job-id", id)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+// awsStopExecution stops one Step Functions execution (aborts its Batch jobs).
+func (s *Server) awsStopExecution(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Arn string `json:"arn"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Arn == "" {
+		http.Error(w, `bad request: {"arn": "..."} required`, 400)
+		return
+	}
+	// Guard against arg injection: execution ARNs are a fixed shape.
+	if !strings.HasPrefix(body.Arn, "arn:aws:states:") {
+		http.Error(w, "invalid execution arn", 400)
+		return
+	}
+	out, err := runPythonCloud("batch_admin", "stop-execution", "--arn", body.Arn)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+// awsTerminateBatchJob terminates one Batch job.
+func (s *Server) awsTerminateBatchJob(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
+		http.Error(w, `bad request: {"id": "..."} required`, 400)
+		return
+	}
+	if strings.ContainsAny(body.ID, "/\\ ") {
+		http.Error(w, "invalid job id", 400)
+		return
+	}
+	out, err := runPythonCloud("batch_admin", "terminate-job", "--id", body.ID)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+// awsBatchStopAll stops every running execution and terminates every active
+// Batch job — the cloud-batch equivalent of the legacy "clear all" sweep.
+func (s *Server) awsBatchStopAll(w http.ResponseWriter, r *http.Request) {
+	out, err := runPythonCloud("batch_admin", "stop-all")
 	if err != nil {
 		http.Error(w, err.Error(), 502)
 		return

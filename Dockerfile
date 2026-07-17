@@ -81,4 +81,8 @@ ENV PYTHONPATH=/app/scripts
 
 WORKDIR /app
 EXPOSE 8080
-ENTRYPOINT ["encoder"]
+# CMD (not ENTRYPOINT) so the default run starts the server, but AWS Batch —
+# whose containerProperties can override `command` but not the entrypoint —
+# can run `python3 -m encoder.cli_local phase ...` directly. The local worker
+# path overrides the entrypoint via `docker run --entrypoint`, which still works.
+CMD ["encoder"]

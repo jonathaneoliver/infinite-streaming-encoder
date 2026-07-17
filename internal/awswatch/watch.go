@@ -38,6 +38,12 @@ type Config struct {
 	// the Retry UI a runway to resume from prior work without letting
 	// staging accumulate indefinitely. Zero disables.
 	FailedStagingMaxAge time.Duration
+	// WarmMinVCPUs keeps the Batch compute environment's minvCpus at this
+	// value while a cloud-batch run is active (a RUNNING execution or active
+	// Batch job), then resets it to 0 when idle — so the packaging tail lands
+	// on a hot instance instead of cold-starting. Zero disables the feature
+	// (min_vcpus is left at whatever Terraform set).
+	WarmMinVCPUs int
 }
 
 type inventoryDoc struct {
@@ -53,8 +59,16 @@ type inventoryDoc struct {
 		RunningInstances   int     `json:"running_instances"`
 		OrphanVolumes      int     `json:"orphan_volumes"`
 		EstimatedHourlyUSD float64 `json:"estimated_hourly_usd"`
+		RunningExecutions  int     `json:"running_executions"`
+		ActiveBatchJobs    int     `json:"active_batch_jobs"`
 	} `json:"summary"`
 }
+
+// lastSetMinVCPUs tracks the min_vcpus we last pushed to Batch so we only call
+// UpdateComputeEnvironment on a change. -1 = unknown (force a set on first tick,
+// which also resets any value leaked by a crash mid-run). Accessed only from
+// the single awswatch goroutine, so no lock needed.
+var lastSetMinVCPUs = -1
 
 // Run polls the AWS inventory on `cfg.Interval` until ctx is cancelled.
 // Returns immediately if cfg.Interval == 0.
@@ -88,6 +102,12 @@ func runCheck(cfg Config) {
 		log.Printf("awswatch: inventory fetch failed: %v", err)
 		return
 	}
+
+	// Warm-fleet control: keep min_vcpus > 0 while a run is active so the
+	// packaging tail lands on a hot box; drop to 0 when idle. Runs before the
+	// quiet-path early return so the reset-to-0 still happens at zero fleet.
+	reconcileWarmCapacity(cfg, inv)
+
 	if inv.Summary.RunningInstances == 0 && inv.Summary.OrphanVolumes == 0 {
 		// Quiet — but still run the staging GC since failed prefixes
 		// aren't reflected in the inventory summary.
@@ -135,6 +155,53 @@ func runCheck(cfg Config) {
 			log.Printf("awswatch: gc_failed_staging failed: %v", err)
 		}
 	}
+}
+
+// reconcileWarmCapacity sets the compute environment's min_vcpus to WarmMinVCPUs
+// while a run is active and to 0 when idle, calling Batch only on a change.
+func reconcileWarmCapacity(cfg Config, inv *inventoryDoc) {
+	if cfg.WarmMinVCPUs <= 0 {
+		return // feature disabled
+	}
+	active := inv.Summary.RunningExecutions > 0 || inv.Summary.ActiveBatchJobs > 0
+	desired := 0
+	if active {
+		desired = cfg.WarmMinVCPUs
+	}
+	if desired == lastSetMinVCPUs {
+		return
+	}
+	if err := setMinVCPUs(desired); err != nil {
+		log.Printf("awswatch: set min_vcpus=%d failed: %v", desired, err)
+		return
+	}
+	reason := "idle, draining to zero"
+	if active {
+		reason = "run active, keeping a box warm"
+	}
+	log.Printf("awswatch: min_vcpus -> %d (%s)", desired, reason)
+	lastSetMinVCPUs = desired
+}
+
+func setMinVCPUs(n int) error {
+	cmd := exec.Command("python3", "-m", "encoder.cloud.compute_env",
+		"--set-min-vcpus", strconv.Itoa(n))
+	cmd.Env = os.Environ()
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return &pyError{module: "compute_env", code: ee.ExitCode(),
+				stderr: strings.TrimSpace(string(ee.Stderr))}
+		}
+		return err
+	}
+	var doc struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(out, &doc) == nil && doc.Error != "" {
+		return &pyError{module: "compute_env", stderr: doc.Error}
+	}
+	return nil
 }
 
 func gcFailedStaging(maxAge time.Duration) error {

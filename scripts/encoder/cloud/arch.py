@@ -59,7 +59,10 @@ ARCH_PROFILES: dict[str, ArchProfile] = {
 }
 
 
-DEFAULT_ARCH = "intel"
+# Graviton by default: it's the cheapest, and the worker image we push to ECR
+# is arm64 — so an x86 default would launch an instance the image can't exec.
+# Matches the Batch target (also Graviton).
+DEFAULT_ARCH = "graviton"
 
 
 def profile_for(arch: str | None) -> ArchProfile:

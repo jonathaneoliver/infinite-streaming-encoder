@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,78 @@ import (
 	"sync"
 	"time"
 )
+
+// defaultChunkDurationSeconds mirrors scripts/encoder/chunking
+// .DEFAULT_CHUNK_DURATION_S. The control plane computes chunk_count the same
+// way the Python phase does (from the same clip duration + chunk size) so the
+// two never disagree.
+const defaultChunkDurationSeconds = 30.0
+
+// wholeVariantChunkSeconds is a large multiple of the 6s segment duration used
+// for "whole variant" (no chunking): any real clip is shorter, so it collapses
+// to a single chunk, and it still passes chunking.py's "multiple of segment"
+// validation. 86400 = 24h = 14400 x 6.
+const wholeVariantChunkSeconds = 86400.0
+
+// chunkDurationSeconds resolves the configured chunk size. Empty => default
+// 30s; "whole"/"0" => one chunk per variant; otherwise the parsed seconds.
+func (c JobConfig) chunkDurationSeconds() float64 {
+	switch c.ChunkDuration {
+	case "":
+		return defaultChunkDurationSeconds
+	case "whole", "0":
+		return wholeVariantChunkSeconds
+	default:
+		if v, err := strconv.ParseFloat(c.ChunkDuration, 64); err == nil && v > 0 {
+			return v
+		}
+		return defaultChunkDurationSeconds
+	}
+}
+
+// chunkCountForDuration mirrors chunking.chunk_count: ceil(dur/chunk), min 1.
+func chunkCountForDuration(durationS, chunkS float64) int {
+	if durationS <= 0 || chunkS <= 0 {
+		return 1
+	}
+	n := int(math.Ceil(durationS/chunkS - 1e-6))
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// probeDurationSeconds shells out to ffprobe (baked into the worker image) to
+// read a clip's duration. On any failure it returns an error and callers fall
+// back to a single whole-clip chunk.
+func probeDurationSeconds(path string) (float64, error) {
+	cmd := exec.Command("ffprobe", "-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+}
+
+// probeSourceWidth reads a clip's video width via ffprobe, so the ladder can
+// be capped at the source resolution (never upscale). Returns 0 on failure —
+// callers treat that as "unknown, don't cap".
+func probeSourceWidth(path string) int {
+	cmd := exec.Command("ffprobe", "-v", "error",
+		"-select_streams", "v:0", "-show_entries", "stream=width",
+		"-of", "default=noprint_wrappers=1:nokey=1", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	w, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0
+	}
+	return w
+}
 
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\[\?[0-9;]*[a-zA-Z]|\x1b[()][0-9A-B]|\x1b\][^\x07]*\x07|\r`)
 
@@ -37,6 +110,11 @@ var (
 	// Stages into StagesHistory (so end-of-job timing still has all
 	// phases), clear Stages, and stamp CurrentFile / FileIndex / TotalFiles.
 	fileMarkerRe = regexp.MustCompile(`^\[\[ENCODER-FILE index=(\d+) total=(\d+) name=(.+)\]\]$`)
+	// ENCODER-BOOT reports the AMI the worker's instance actually booted
+	// from (via IMDS). We compare it to WORKER_AMI_ID (the pre-baked worker
+	// AMI) to flag whether the image was already resident — a definitive
+	// "AMI cache hit" signal for the UI, independent of timing.
+	bootMarkerRe = regexp.MustCompile(`^\[\[ENCODER-BOOT ami=(\S+)\]\]$`)
 )
 
 // parseMarker returns true when the line was a recognised progress marker
@@ -104,6 +182,7 @@ func (j *Job) parseMarker(line string) bool {
 		percent, _ := strconv.ParseFloat(m[3], 64)
 		now := time.Now()
 		j.mu.Lock()
+		found := false
 		for i := range j.Stages {
 			if j.Stages[i].Key == key {
 				// Stamp StartedAt the first time the stage goes running;
@@ -120,8 +199,23 @@ func (j *Job) parseMarker(line string) bool {
 				}
 				j.Stages[i].Status = status
 				j.Stages[i].Percent = percent
+				found = true
 				break
 			}
+		}
+		if !found {
+			// A stage key not in the plan — e.g. the per-chunk encode stages
+			// (encode:<codec>:<tier>:chunk<N>) that the cloud-batch translator
+			// emits dynamically as the Map fans out, which the UI groups into
+			// the chunk grid. Append it so it renders instead of being dropped.
+			st := StageProgress{Key: key, Label: key, Status: status, Percent: percent}
+			if status == "running" {
+				st.StartedAt = &now
+			}
+			if status == "done" || status == "failed" {
+				st.EndedAt = &now
+			}
+			j.Stages = append(j.Stages, st)
 		}
 		j.mu.Unlock()
 		return true
@@ -130,6 +224,16 @@ func (j *Job) parseMarker(line string) bool {
 		idx, _ := strconv.Atoi(m[1])
 		total, _ := strconv.Atoi(m[2])
 		j.startFile(strings.TrimSpace(m[3]), idx, total)
+		return true
+	}
+	if m := bootMarkerRe.FindStringSubmatch(line); m != nil {
+		ami := m[1]
+		j.mu.Lock()
+		j.BootAMI = ami
+		// Pre-baked when the instance's AMI matches the worker AMI we baked
+		// (WORKER_AMI_ID, passed in by the Makefile). Empty env => unknown.
+		j.PrebakedAMI = ami != "" && ami == os.Getenv("WORKER_AMI_ID")
+		j.mu.Unlock()
 		return true
 	}
 	// Non-consuming matches: capture sideband info but still let the
@@ -194,8 +298,9 @@ func splitLinesOrCR(data []byte, atEOF bool) (advance int, token []byte, err err
 type Target string
 
 const (
-	TargetCloud Target = "cloud"
-	TargetLocal Target = "local"
+	TargetCloud      Target = "cloud"
+	TargetLocal      Target = "local"
+	TargetCloudBatch Target = "cloud-batch"
 )
 
 type JobStatus string
@@ -211,16 +316,35 @@ const (
 type JobConfig struct {
 	Files           []string `json:"files"`
 	Codec           string   `json:"codec"`
+	// Ladder selects the bitrate ladder by name (legacy | apple | apple-uniq |
+	// any custom ladder). Empty defaults to "legacy". Threaded to the local
+	// encoder via --ladder and resolved by buildSFNInput for the cloud path.
+	Ladder          string   `json:"ladder,omitempty"`
 	MaxRes          string   `json:"max_res"`
 	Target          Target   `json:"target"`
 	Time            string   `json:"time"`
 	SegmentDuration string   `json:"segment_duration"`
 	PartialDuration string   `json:"partial_duration"`
+	// ChunkDuration tunes the cloud-batch encode granularity: "" = 30s
+	// chunks (max parallelism), "whole" = one job per variant (max
+	// efficiency, less fleet overhead), or a seconds value (multiple of the
+	// 6s segment duration). Only affects the cloud-batch target.
+	ChunkDuration string `json:"chunk_duration,omitempty"`
 	GopDuration     string   `json:"gop_duration"`
 	HlsFormat       string   `json:"hls_format"`
 	Padding         string   `json:"padding"`
 	KeepMezzanine   bool     `json:"keep_mezzanine"`
 	ForceReencode   bool     `json:"force_reencode"`
+	// HevcSinglePass forces HEVC to encode single-pass. Two-pass is a codec
+	// property, applied automatically: HEVC (libx265) is two-pass by default
+	// (the accurate-average path — its single-pass VBR drifts below target),
+	// H264 (libx264) is always single-pass (its VBV already hits target, so
+	// two-pass just doubles time), AV1 has no two-pass path. So the default
+	// (false) does the right thing per codec with no user decision. Set true
+	// only to run HEVC single-pass (~2x faster) for a bitrate comparison.
+	// Local passes --hevc-single-pass to cli_local.py; cloud bakes the
+	// per-codec decision into each variant's TWO_PASS via the SFN input.
+	HevcSinglePass bool `json:"hevc_single_pass,omitempty"`
 	// CPU architecture for cloud encodes: "intel" | "amd" | "graviton".
 	// Empty defaults to intel. Ignored for local encodes (which always
 	// run on the host's native architecture).
@@ -263,6 +387,13 @@ type Job struct {
 	EndedAt   *time.Time `json:"ended_at,omitempty"`
 	Progress  string     `json:"progress"`
 	Error     string     `json:"error,omitempty"`
+
+	// BootAMI is the AMI a cloud worker's instance actually booted from
+	// (from the [[ENCODER-BOOT]] marker); PrebakedAMI is true when that
+	// matches the pre-baked worker AMI, i.e. the image was already resident
+	// and the ECR pull was skipped. Drives the "pre-baked AMI" UI badge.
+	BootAMI     string `json:"boot_ami,omitempty"`
+	PrebakedAMI bool   `json:"prebaked_ami,omitempty"`
 
 	// Stages is populated from [[ENCODER-PLAN]] + [[ENCODER-STAGE]]
 	// markers the Python orchestrator emits. Empty when the job hasn't
@@ -357,6 +488,20 @@ type Manager struct {
 	// Image used for detached worker containers.
 	EncoderImage string
 
+	// State Machine ARN for the cloud-batch target. Empty when no
+	// Batch infrastructure is deployed yet (the cloud-batch target
+	// then errors cleanly at submit time).
+	StateMachineArn string
+
+	// Ladders is the persisted ladder store (built-in + user-defined). Owns
+	// $TmpDir/ladders.json; resolves the concrete rungs for the cloud path.
+	Ladders *LadderStore
+
+	// Persisted global settings (e.g. watcher on/off) owned at
+	// $TmpDir/settings.json. Survives restarts so a UI toggle sticks.
+	settingsMu sync.Mutex
+	settings   Settings
+
 	sem         chan struct{}
 	subscribers []chan *Job
 	subMu       sync.Mutex
@@ -372,8 +517,9 @@ type ManagerConfig struct {
 	HostOutputDir string
 	HostTmpDir    string
 	HostAWSDir    string
-	EncoderImage  string
-	MaxConcurrent int
+	EncoderImage    string
+	StateMachineArn string
+	MaxConcurrent   int
 }
 
 func NewManager(cfg ManagerConfig) *Manager {
@@ -385,17 +531,19 @@ func NewManager(cfg ManagerConfig) *Manager {
 	}
 	os.MkdirAll(cfg.TmpDir, 0755)
 	return &Manager{
-		SourceDir:     cfg.SourceDir,
-		OutputDir:     cfg.OutputDir,
-		TmpDir:        cfg.TmpDir,
-		ScriptsDir:    cfg.ScriptsDir,
-		DockerImage:   cfg.DockerImage,
-		HostSourceDir: cfg.HostSourceDir,
-		HostOutputDir: cfg.HostOutputDir,
-		HostTmpDir:    cfg.HostTmpDir,
-		HostAWSDir:    cfg.HostAWSDir,
-		EncoderImage:  cfg.EncoderImage,
-		sem:           make(chan struct{}, cfg.MaxConcurrent),
+		Ladders:         LoadLadderStore(filepath.Join(cfg.TmpDir, "ladders.json")),
+		SourceDir:       cfg.SourceDir,
+		OutputDir:       cfg.OutputDir,
+		TmpDir:          cfg.TmpDir,
+		ScriptsDir:      cfg.ScriptsDir,
+		DockerImage:     cfg.DockerImage,
+		HostSourceDir:   cfg.HostSourceDir,
+		HostOutputDir:   cfg.HostOutputDir,
+		HostTmpDir:      cfg.HostTmpDir,
+		HostAWSDir:      cfg.HostAWSDir,
+		EncoderImage:    cfg.EncoderImage,
+		StateMachineArn: cfg.StateMachineArn,
+		sem:             make(chan struct{}, cfg.MaxConcurrent),
 	}
 }
 
@@ -929,6 +1077,9 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	if cfg.Codec != "" {
 		args = append(args, "--codec", cfg.Codec)
 	}
+	if cfg.Ladder != "" {
+		args = append(args, "--ladder", cfg.Ladder)
+	}
 	if cfg.MaxRes != "" {
 		args = append(args, "--max-res", cfg.MaxRes)
 	}
@@ -957,6 +1108,9 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	}
 	if cfg.KeepMezzanine {
 		args = append(args, "--keep-mezzanine")
+	}
+	if cfg.HevcSinglePass {
+		args = append(args, "--hevc-single-pass")
 	}
 	// CPU arch only makes sense for cloud encodes (local runs on the
 	// host's own architecture), and cli_local.py doesn't accept the
@@ -999,6 +1153,9 @@ func (cfg *JobConfig) cloudBatchArgs(sourceDir, outputDir string, filenames []st
 	if cfg.Codec != "" {
 		args = append(args, "--codec", cfg.Codec)
 	}
+	if cfg.Ladder != "" {
+		args = append(args, "--ladder", cfg.Ladder)
+	}
 	if cfg.MaxRes != "" {
 		args = append(args, "--max-res", cfg.MaxRes)
 	}
@@ -1028,6 +1185,9 @@ func (cfg *JobConfig) cloudBatchArgs(sourceDir, outputDir string, filenames []st
 	if cfg.KeepMezzanine {
 		args = append(args, "--keep-mezzanine")
 	}
+	if cfg.HevcSinglePass {
+		args = append(args, "--hevc-single-pass")
+	}
 	if cfg.CpuArch != "" {
 		args = append(args, "--cpu-arch", cfg.CpuArch)
 	}
@@ -1051,6 +1211,9 @@ func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int)
 	// clips. Local jobs still run one worker per file.
 	if job.Config.Target == TargetCloud {
 		return m.encodeCloudBatch(job, tmpDir, script, startIdx)
+	}
+	if job.Config.Target == TargetCloudBatch {
+		return m.encodeCloudBatchSFN(job, tmpDir, startIdx)
 	}
 
 	total := len(job.Config.Files)
@@ -1136,6 +1299,282 @@ func (m *Manager) encodeCloudBatch(job *Job, tmpDir, script string, startIdx int
 		return fmt.Errorf("cloud batch: %w", err)
 	}
 	return nil
+}
+
+// encodeCloudBatchSFN drives the AWS Batch + Step Functions pipeline
+// defined under infra/terraform/. For each input file:
+//   1. Upload to s3://bucket/jobs/<go-job-id>-<idx>/input/<clip>
+//   2. Build state-machine input JSON (s3_input, s3_prefix, variants[])
+//   3. `cli_batch.py submit` -> prints execution ARN
+//   4. `cli_batch.py poll` -> blocks, emits ENCODER-STAGE markers
+//      until SUCCEEDED/FAILED, then downloads output_*/ trees into
+//      the job's tmpDir for moveTmpToOutput to pick up
+//
+// Spot interrupts are handled inside the state machine's retry
+// policies — Batch reruns the failing phase on fresh capacity. The
+// Go side only cares about the terminal SUCCEEDED / FAILED outcome.
+func (m *Manager) encodeCloudBatchSFN(job *Job, tmpDir string, startIdx int) error {
+	if m.StateMachineArn == "" {
+		return fmt.Errorf("STATE_MACHINE_ARN not configured; can't submit cloud-batch jobs")
+	}
+	bucket := os.Getenv("S3_BUCKET")
+	if bucket == "" {
+		return fmt.Errorf("S3_BUCKET not configured")
+	}
+
+	total := len(job.Config.Files)
+	for i := startIdx; i < total; i++ {
+		m.persistState(job, i)
+
+		f := job.Config.Files[i]
+		job.Progress = fmt.Sprintf("cloud-batch %d/%d: %s", i+1, total, f)
+		job.startFile(f, i+1, total)
+		m.notify(job)
+
+		if err := m.runOneCloudBatchSFN(job, tmpDir, f, bucket); err != nil {
+			return fmt.Errorf("%s: %w", f, err)
+		}
+	}
+	return nil
+}
+
+// runOneCloudBatchSFN submits + polls a single clip's state-machine
+// execution. Shells out to cli_batch.py for both phases (rather than
+// importing an AWS SDK for Go) to keep AWS usage in one language.
+func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string) error {
+	// Unique S3 prefix per (manager-job, file-index) so retries of
+	// the same Go job can reuse the prefix (input doesn't re-upload).
+	prefix := fmt.Sprintf("jobs/%s-%s", job.ID, strings.TrimSuffix(filename, filepath.Ext(filename)))
+	s3Prefix := fmt.Sprintf("s3://%s/%s", bucket, prefix)
+	s3Input := fmt.Sprintf("%s/input/%s", s3Prefix, filename)
+
+	// Upload the clip (skip if already present via aws CLI's size check).
+	job.AppendLog(fmt.Sprintf("[cloud-batch] uploading %s → %s", filename, s3Input))
+	localSrc := filepath.Join(m.SourceDir, filename)
+	upload := exec.Command("aws", "s3", "cp", localSrc, s3Input, "--only-show-errors")
+	upload.Env = os.Environ()
+	if out, err := upload.CombinedOutput(); err != nil {
+		return fmt.Errorf("aws s3 cp: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	// Build the state-machine input document.
+	// Probe the source duration to plan chunks. ffprobe runs in the worker
+	// image; if it's unavailable (e.g. local dev), fall back to a single
+	// whole-clip chunk so the pipeline still works.
+	chunkS := job.Config.chunkDurationSeconds()
+	nChunks := 1
+	if durationS, err := probeDurationSeconds(localSrc); err != nil {
+		job.AppendLog(fmt.Sprintf("[cloud-batch] ffprobe failed (%v); encoding %s as one chunk", err, filename))
+	} else {
+		nChunks = chunkCountForDuration(durationS, chunkS)
+		grain := fmt.Sprintf("%.0fs chunks", chunkS)
+		if chunkS >= wholeVariantChunkSeconds {
+			grain = "whole variant"
+		}
+		job.AppendLog(fmt.Sprintf("[cloud-batch] %s: %.1fs → %d chunk(s) (%s)", filename, durationS, nChunks, grain))
+	}
+
+	// Probe the source width so the ladder is capped at native resolution
+	// (never upscale). 0 => unknown, don't cap.
+	srcWidth := probeSourceWidth(localSrc)
+	if srcWidth > 0 {
+		job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
+	}
+	inputJSON := buildSFNInput(m.Ladders, s3Input, s3Prefix, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, nChunks, srcWidth, chunkS)
+	inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
+	if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
+		return fmt.Errorf("write input json: %w", err)
+	}
+
+	// Submit.
+	submit := exec.Command("python3", "-m", "encoder.cli_batch", "submit",
+		"--state-machine-arn", m.StateMachineArn,
+		"--input-json", inputPath)
+	submit.Env = os.Environ()
+	out, err := submit.Output()
+	if err != nil {
+		return fmt.Errorf("cli_batch submit: %w", err)
+	}
+	execArn := strings.TrimSpace(string(out))
+	job.AppendLog(fmt.Sprintf("[cloud-batch] execution ARN: %s", execArn))
+
+	// Poll + stream progress back into the job log.
+	poll := exec.Command("python3", "-m", "encoder.cli_batch", "poll",
+		"--execution-arn", execArn,
+		"--s3-prefix", s3Prefix,
+		"--local-dir", filepath.Join(tmpDir, job.Config.OutputStem(filename)))
+	poll.Env = os.Environ()
+	stdout, err := poll.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	poll.Stderr = os.Stderr
+	if err := poll.Start(); err != nil {
+		return err
+	}
+
+	// Cancel watcher. A cloud-batch job's only live local process is this
+	// poll subprocess — there's no worker container — so Manager.Cancel
+	// can't stop it directly; it only sets the cancel flag. Watch that flag
+	// here: on cancel, abort the Step Functions execution (which cascades
+	// to its in-flight + queued Batch jobs) and kill the poll so the scan
+	// loop below unblocks and run() finalizes the job as cancelled.
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopWatch:
+				return
+			case <-ticker.C:
+				if job.IsCancelled() {
+					job.AppendLog("[cloud-batch] cancel requested — aborting execution")
+					m.notify(job)
+					stop := exec.Command("python3", "-m", "encoder.cloud.batch_admin",
+						"stop-execution", "--arn", execArn)
+					stop.Env = os.Environ()
+					if o, e := stop.CombinedOutput(); e != nil {
+						job.AppendLog(fmt.Sprintf("[cloud-batch] stop-execution failed: %v: %s",
+							e, strings.TrimSpace(string(o))))
+					}
+					if poll.Process != nil {
+						poll.Process.Kill()
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := stripANSI(scanner.Text())
+		if !job.parseMarker(line) {
+			job.AppendLog(line)
+		}
+		m.notify(job)
+	}
+	// When cancelled we killed the poll on purpose — swallow the resulting
+	// wait error and let run() observe IsCancelled() and finalize the job
+	// as cancelled rather than failed.
+	if err := poll.Wait(); err != nil && !job.IsCancelled() {
+		return fmt.Errorf("cli_batch poll: %w", err)
+	}
+	return nil
+}
+
+// buildSFNInput renders the JSON doc the state machine expects. Picks
+// which (codec, tier) combinations to fan out over based on the
+// JobConfig's Codec + MaxRes.
+func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, maxRes string, hevcSinglePass bool, nChunks, sourceWidth int, chunkS float64) string {
+	if ladderName == "" {
+		ladderName = "apple-uniq-live"
+	}
+	// Ladder-level VBV, defaulted to match ladder.py (124% / 0.25×).
+	ladderDef, _ := store.Get(ladderName)
+	maxratePct := ladderDef.MaxratePercent
+	if maxratePct <= 0 {
+		maxratePct = 124
+	}
+	bufMult := ladderDef.BufsizeMultiplier
+	if bufMult <= 0 {
+		bufMult = 0.25
+	}
+	codecs := []string{"h264", "hevc"}
+	switch codecSel {
+	case "h264":
+		codecs = []string{"h264"}
+	case "hevc":
+		codecs = []string{"hevc"}
+	}
+	// Build the per-codec rung list from the ladder store. resolveLadderRungs
+	// caps each codec at the source width (no upscale) and --max-res, and
+	// assigns ordinal labels for repeated resolutions — identical to
+	// ladder.select_rungs, so cloud and local agree on {codec}_{label}.
+	var variants []sfnVariant
+	doH264, doHevc := false, false
+	for _, c := range codecs {
+		rungs := store.resolveRungs(ladderName, c, maxRes, sourceWidth)
+		if len(rungs) == 0 {
+			continue
+		}
+		switch c {
+		case "h264":
+			doH264 = true
+		case "hevc":
+			doHevc = true
+		}
+		for _, r := range rungs {
+			vcpu, mem := variantResourcesForHeight(r.Height)
+			rank := resHeightRank(r.Height)
+			prio := rank * 10
+			// Two-pass is HEVC-only and automatic: H264's single-pass VBV
+			// already hits target average, so it never two-passes; HEVC
+			// two-passes by default unless the user asked for a single-pass
+			// comparison run (hevcSinglePass).
+			twoPass := c == "hevc" && !hevcSinglePass
+			if c == "hevc" {
+				prio++ // HEVC just ahead of H.264 within a resolution (slower)
+			}
+			variants = append(variants, sfnVariant{
+				Codec:      c,
+				Label:      r.Label,
+				Width:      strconv.Itoa(r.Width),
+				Height:     strconv.Itoa(r.Height),
+				Bitrate:    strconv.Itoa(r.Bitrate),
+				Preset:     r.Preset,
+				VCPU:       vcpu,
+				Memory:     mem,
+				Priority:   prio,
+				TwoPass:    strconv.FormatBool(twoPass),
+				heightRank: rank,
+			})
+		}
+	}
+	// Submit slowest-first (high resolution, then HEVC before H.264) so the
+	// long poles enter the queue early; schedulingPriority enforces it, but a
+	// good submission order helps too.
+	sortRungsSlowestFirst(variants)
+	// chunk_indices drives the state machine's inner Map: each variant fans
+	// out one encode job per chunk index, then a concat-variant job joins
+	// them. A single-chunk clip (nChunks == 1) still flows through this path —
+	// chunk 0 covers the whole clip and concat is a passthrough — so there's
+	// no special case. Same for all variants (they share the clip duration).
+	if nChunks < 1 {
+		nChunks = 1
+	}
+	chunkIndices := make([]int, nChunks)
+	for i := range chunkIndices {
+		chunkIndices[i] = i
+	}
+	doc := map[string]any{
+		"s3_input":      s3Input,
+		"s3_prefix":     s3Prefix,
+		"variants":      variants,
+		"chunk_indices": chunkIndices,
+		"do_h264":       doH264,
+		"do_hevc":       doHevc,
+		// Chunk size (seconds) the encode + concat workers plan against, so
+		// they agree with chunk_indices above. String for a container env var.
+		"chunk_duration": strconv.FormatFloat(chunkS, 'f', -1, 64),
+		// True when the clip splits into >1 chunk. Single-chunk (whole-variant)
+		// runs skip the chunk fan-out + concat entirely: the SFN encodes the
+		// whole variant in one job (chunk_index=-1) writing the un-suffixed
+		// {codec}_{label}.mp4 directly. String for the SFN Choice comparison.
+		"chunked": strconv.FormatBool(nChunks > 1),
+		// Ladder-level VBV shaping, applied to every variant's encode (the
+		// worker reads these as MAXRATE_PERCENT / BUFSIZE_MULT env). Threaded
+		// so a custom ladder's VBV is honored in the cloud, not just locally.
+		"maxrate_percent":    strconv.Itoa(maxratePct),
+		"bufsize_multiplier": strconv.FormatFloat(bufMult, 'f', -1, 64),
+		// NOTE: two_pass is per-variant now (see the variant struct above),
+		// not a top-level field — HEVC two-passes, H264 doesn't, in one run.
+	}
+	b, _ := json.Marshal(doc)
+	return string(b)
 }
 
 // resolveCodec checks which codecs are already encoded in OutputDir and returns
@@ -1243,6 +1682,11 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 		// prior mezzanines / variants — the work_dir is on the host
 		// filesystem, not inside the ephemeral container layer.
 		"-e", "TMPDIR=" + m.TmpDir,
+		// Point the Python encoder at the persisted ladder store (mounted via
+		// TmpDir) so custom/edited ladders resolve for local encodes too. The
+		// file is written by the control plane; cloud variant jobs don't need
+		// it (they get concrete rungs from the SFN).
+		"-e", "LADDER_STORE=" + filepath.Join(m.TmpDir, "ladders.json"),
 		"--entrypoint", script,
 	}
 	// Cloud jobs drive AWS from inside the worker; pass the credentials
