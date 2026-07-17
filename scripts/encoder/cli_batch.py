@@ -201,34 +201,29 @@ def _report_task_failure(details: dict) -> None:
         print(f"    (could not fetch container log: {e})", flush=True)
 
 
-# Step Function step name → ENCODER-STAGE key. These match the labels
-# the legacy cloud target already emits, so the existing UI works
-# unchanged.
+# Step Function step name → ENCODER-STAGE key, for the phases that are their
+# own SFN step. The packaging phases (package / fragments / hls) are now a single
+# per-codec package-all job; their sub-stages arrive via live log tailing of the
+# running container (_tail_progress), not from history.
 _STEP_TO_STAGE: dict[str, str] = {
     "Mezzanine": "mezzanine",
     "Audio": "audio",
-    "PackageH264": "package:h264",
-    "HlsH264": "hls:h264",
-    "ByterangesH264": "fragments:h264",
-    "PackageHevc": "package:hevc",
-    "HlsHevc": "hls:hevc",
-    "ByterangesHevc": "fragments:hevc",
 }
 
 
-def _emit_plan() -> None:
-    """Emit the same plan the Go UI already renders for cloud jobs.
-    Variant stages are emitted dynamically as Map iterations start
-    (we don't know the exact variant list here — the Step Function's
-    input has it)."""
-    stages = [
-        {"key": k, "label": k.replace(":", " ")}
-        for k in [
-            "mezzanine", "audio",
-            "package:h264", "hls:h264", "fragments:h264",
-            "package:hevc", "hls:hevc", "fragments:hevc",
-        ]
-    ]
+def _emit_plan(do_h264: bool = True, do_hevc: bool = True) -> None:
+    """Announce the pipeline stages for THIS run. Only the codecs actually being
+    encoded are listed, so a h264-only run doesn't render empty hevc rows.
+    Package order is package -> fragments -> hls (the LL-HLS playlists embed the
+    fragment byteranges, so hls must run last). The trailing download:outputs
+    stage is the driver's own S3 -> local sync-back of the finished package.
+    Variant encode stages are emitted dynamically as Map iterations start."""
+    keys = ["mezzanine", "audio"]
+    for codec, on in (("h264", do_h264), ("hevc", do_hevc)):
+        if on:
+            keys += [f"package:{codec}", f"fragments:{codec}", f"hls:{codec}"]
+    keys.append("download:outputs")
+    stages = [{"key": k, "label": k.replace(":", " ")} for k in keys]
     print(f"[[ENCODER-PLAN {json.dumps(stages)}]]", flush=True)
 
 
@@ -345,38 +340,25 @@ def _chunk_identity(input_json: str) -> tuple[str, str, int] | None:
     return None
 
 
-def _concat_identity(input_json: str) -> tuple[str, str] | None:
-    """(codec, label) from a ConcatVariant state's input, or None."""
-    try:
-        d = json.loads(input_json)
-        codec, label = d.get("codec"), d.get("label")
-        if codec and label:
-            return codec, label
-    except (ValueError, TypeError):
-        pass
-    return None
-
-
 def _translate_events(events: list[dict], seen: set[int]) -> None:
     """Translate Step Functions history events into ENCODER-STAGE markers.
     `seen` tracks already-emitted event ids so repeat polls don't double-emit.
 
-    Fixed phases (Mezzanine / Audio / Package* / Hls* / Byteranges*) map by
-    state name via _STEP_TO_STAGE. The variant fan-out is a nested Map — an
-    inner Map of EncodeChunk tasks per (codec, tier), then a ConcatVariant —
-    so each chunk becomes `encode:<codec>:<tier>:chunk<N>` (which the UI groups
-    into the per-variant chunk grid) and the join becomes `concat:<codec>:<tier>`.
+    Mezzanine / Audio map by state name via _STEP_TO_STAGE. The variant fan-out
+    is a nested Map of EncodeChunk tasks per (codec, tier), so each chunk becomes
+    `encode:<codec>:<tier>:chunk<N>` (which the UI groups into the per-variant
+    chunk grid). Chunks are joined + packaged inside the package-all job, whose
+    package/fragments/hls sub-stages arrive via live log tailing, not history.
 
-    A state's codec/tier/chunk_index live in its *entered* event's input; the
-    *exited* event carries no input, so we index every EncodeChunk/ConcatVariant
-    enter by event id and, for an exit, walk previousEventId back to its enter.
-    The full history is passed each poll, so those maps are always complete.
+    A chunk's codec/tier/chunk_index live in its *entered* event's input; the
+    *exited* event carries no input, so we index every EncodeChunk enter by event
+    id and, for an exit, walk previousEventId back to its enter. The full history
+    is passed each poll, so the map is always complete.
     """
     by_id = {e["id"]: e for e in events}
 
     # Index enter events (they carry the input with codec/tier/chunk_index).
     chunk_enter: dict[int, tuple[str, str, int]] = {}
-    concat_enter: dict[int, tuple[str, str]] = {}
     for e in events:
         if e["type"] != "TaskStateEntered":
             continue
@@ -386,10 +368,6 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
             idn = _chunk_identity(inp)
             if idn:
                 chunk_enter[e["id"]] = idn
-        elif name == "ConcatVariant":
-            idn = _concat_identity(inp)
-            if idn:
-                concat_enter[e["id"]] = idn
 
     def _enter_of(exit_ev: dict, table: dict) -> tuple | None:
         """Follow previousEventId from an exit event back to its matching
@@ -422,12 +400,6 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
                     c, t, ci = idn
                     _emit_stage(f"encode:{c}:{t}:chunk{ci}", "running", 0.0)
                     _narrate(f"▶ encode {c} {t} chunk{ci} submitted")
-            elif name == "ConcatVariant":
-                idn = concat_enter.get(ev["id"])
-                if idn:
-                    c, t = idn
-                    _emit_stage(f"concat:{c}:{t}", "running", 0.0)
-                    _narrate(f"▶ concat {c} {t} submitted")
 
         elif etype == "TaskStateExited":
             name = ev.get("stateExitedEventDetails", {}).get("name", "")
@@ -444,13 +416,6 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
                     _narrate(f"✓ encode {c} {t} chunk{ci} done")
                     _report_reclaims(ev, f"encode {c} {t} chunk{ci}")
                     _forward_container_timing(ev)
-            elif name == "ConcatVariant":
-                idn = _enter_of(ev, concat_enter)
-                if idn:
-                    c, t = idn
-                    _emit_stage(f"concat:{c}:{t}", "done", 100.0)
-                    _narrate(f"✓ concat {c} {t} done")
-                    _report_reclaims(ev, f"concat {c} {t}")
 
         elif etype == "TaskFailed":
             _report_task_failure(ev.get("taskFailedEventDetails", {}))
@@ -465,22 +430,50 @@ def _download_outputs(s3_prefix: str, local_dir: Path) -> int:
     bucket, _, base_key = rest.partition("/")
     s3 = _s3()
     local_dir.mkdir(parents=True, exist_ok=True)
-    count = 0
+
+    # List everything first so the sync-back can drive a real progress bar
+    # (weighted by bytes — segment counts vary wildly in size). This runs in the
+    # driver, whose stdout is forwarded straight to the app, so the marker needs
+    # no CloudWatch round-trip.
+    objs: list[tuple[str, int]] = []
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=f"{base_key}/output_"):
         for obj in page.get("Contents", []):
-            key = obj["Key"]
-            rel = key[len(base_key) + 1:]
-            dst = local_dir / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            s3.download_file(bucket, key, str(dst))
-            count += 1
-    return count
+            objs.append((obj["Key"], obj.get("Size", 0)))
+
+    total_bytes = sum(s for _, s in objs) or 1
+    done_bytes = 0
+    last_pct = -1.0
+    if objs:
+        _emit_stage("download:outputs", "running", 0.0)
+    for key, size in objs:
+        rel = key[len(base_key) + 1:]
+        dst = local_dir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        s3.download_file(bucket, key, str(dst))
+        done_bytes += size
+        pct = done_bytes / total_bytes * 100.0
+        if pct - last_pct >= 1.0:  # throttle: at most ~100 markers
+            _emit_stage("download:outputs", "running", pct)
+            last_pct = pct
+    if objs:
+        _emit_stage("download:outputs", "done", 100.0)
+    return len(objs)
 
 
 def cmd_poll(args: argparse.Namespace) -> int:
     sfn = _sfn()
-    _emit_plan()
+    # Read the execution input up front so the plan lists only the codecs we're
+    # actually encoding (do_h264 / do_hevc from buildSFNInput).
+    do_h264 = do_hevc = True
+    try:
+        inp = json.loads(sfn.describe_execution(
+            executionArn=args.execution_arn).get("input") or "{}")
+        do_h264 = bool(inp.get("do_h264", True))
+        do_hevc = bool(inp.get("do_hevc", True))
+    except (ClientError, ValueError, TypeError):
+        pass
+    _emit_plan(do_h264, do_hevc)
 
     seen: set[int] = set()
     log_state: dict[str, int] = {}  # stream -> last-forwarded timestamp
@@ -528,6 +521,13 @@ def cmd_poll(args: argparse.Namespace) -> int:
 
         if status in ("SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"):
             if status == "SUCCEEDED":
+                # Safety net: the packaging sub-stages come from live tailing;
+                # if the last tail poll missed a "done" marker, force them
+                # complete now so no packaging row is left stuck at "running".
+                for codec, on in (("h264", do_h264), ("hevc", do_hevc)):
+                    if on:
+                        for k in ("package", "fragments", "hls"):
+                            _emit_stage(f"{k}:{codec}", "done", 100.0)
                 print(f"    downloading outputs from {args.s3_prefix}", flush=True)
                 n = _download_outputs(args.s3_prefix, Path(args.local_dir))
                 print(f"    downloaded {n} files", flush=True)

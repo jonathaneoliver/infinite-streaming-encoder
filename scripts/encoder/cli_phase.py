@@ -689,17 +689,30 @@ def phase_package_all(args: argparse.Namespace) -> int:
 
     labels_present: list[str] = []
 
+    # The package stage goes "running" the moment the job starts and its bar
+    # advances as each variant is fetched (0->90%), so the long download + concat
+    # isn't a dark gap before Shaka runs; package() finishes the remaining 90->100.
+    chunked_bases = [b for b in sorted(chunk_last) if b not in whole_labels]
+    total_dl = len(whole_labels) + len(chunked_bases)
+    done_dl = 0
+
+    def _dl_progress() -> None:
+        pct = (done_dl / total_dl * 90.0) if total_dl else 0.0
+        emit_stage(f"package:{args.codec}", "running", pct)
+
+    _dl_progress()
+
     # Whole variants: download the joined mp4 directly.
     for label in sorted(whole_labels):
         uri = args.s3_variants.rstrip("/") + f"/{args.codec}_{label}.mp4"
         if _download_if_complete(uri, work / f"{args.codec}_{label}.mp4"):
             labels_present.append(label)
+        done_dl += 1
+        _dl_progress()
 
     # Chunked variants: pull every chunk, concat locally (stream copy), then
     # drop the chunk files so they don't inflate disk during packaging.
-    for base in sorted(chunk_last):
-        if base in whole_labels:
-            continue  # already have the joined file
+    for base in chunked_bases:
         n = chunk_last[base] + 1
         for i in range(n):
             name = f"{args.codec}_{base}_chunk{i:03d}.mp4"
@@ -716,6 +729,8 @@ def phase_package_all(args: argparse.Namespace) -> int:
             (work / name).unlink(missing_ok=True)
             (work / f"{name}.done").unlink(missing_ok=True)
         labels_present.append(base)
+        done_dl += 1
+        _dl_progress()
 
     labels_present = sorted(set(labels_present))
     if not labels_present:
@@ -736,7 +751,7 @@ def phase_package_all(args: argparse.Namespace) -> int:
     pkg_dir = work / stem
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
-    emit_stage(f"package:{args.codec}", "running", 0.0)
+    emit_stage(f"package:{args.codec}", "running", 90.0)
     package(PackageSpec(
         tmp_dir=work, output_dir=pkg_dir, codec=args.codec,
         labels=tuple(labels_present), segment_duration_s=_SEGMENT_DURATION_S,
