@@ -149,7 +149,13 @@ resource "aws_batch_job_definition" "variant" {
     command = [
       "python3", "-m", "encoder.cli_local", "phase", "variant",
       "--codec", "Ref::codec",
-      "--tier", "Ref::tier",
+      # Concrete rung resolved by the control plane from the ladder store —
+      # the worker needs no ladder knowledge, so user-defined ladders work.
+      "--label", "Ref::label",
+      "--width", "Ref::width",
+      "--height", "Ref::height",
+      "--bitrate", "Ref::bitrate",
+      "--preset", "Ref::preset",
       "--chunk-index", "Ref::chunk_index",
       "--s3-mezz", "Ref::s3_mezz",
       "--s3-out", "Ref::s3_out",
@@ -194,7 +200,7 @@ resource "aws_batch_job_definition" "concat" {
     command = [
       "python3", "-m", "encoder.cli_local", "phase", "concat-variant",
       "--codec", "Ref::codec",
-      "--tier", "Ref::tier",
+      "--label", "Ref::label",
       "--s3-mezz", "Ref::s3_mezz",
       "--s3-chunks", "Ref::s3_chunks",
       "--s3-out", "Ref::s3_out",

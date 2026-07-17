@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -317,6 +316,10 @@ const (
 type JobConfig struct {
 	Files           []string `json:"files"`
 	Codec           string   `json:"codec"`
+	// Ladder selects the bitrate ladder by name (legacy | apple | apple-uniq |
+	// any custom ladder). Empty defaults to "legacy". Threaded to the local
+	// encoder via --ladder and resolved by buildSFNInput for the cloud path.
+	Ladder          string   `json:"ladder,omitempty"`
 	MaxRes          string   `json:"max_res"`
 	Target          Target   `json:"target"`
 	Time            string   `json:"time"`
@@ -1064,6 +1067,9 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	if cfg.Codec != "" {
 		args = append(args, "--codec", cfg.Codec)
 	}
+	if cfg.Ladder != "" {
+		args = append(args, "--ladder", cfg.Ladder)
+	}
 	if cfg.MaxRes != "" {
 		args = append(args, "--max-res", cfg.MaxRes)
 	}
@@ -1136,6 +1142,9 @@ func (cfg *JobConfig) cloudBatchArgs(sourceDir, outputDir string, filenames []st
 	// local path uses.
 	if cfg.Codec != "" {
 		args = append(args, "--codec", cfg.Codec)
+	}
+	if cfg.Ladder != "" {
+		args = append(args, "--ladder", cfg.Ladder)
 	}
 	if cfg.MaxRes != "" {
 		args = append(args, "--max-res", cfg.MaxRes)
@@ -1361,7 +1370,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 	if srcWidth > 0 {
 		job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
 	}
-	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, nChunks, srcWidth, chunkS)
+	inputJSON := buildSFNInput(s3Input, s3Prefix, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, nChunks, srcWidth, chunkS)
 	inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 	if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 		return fmt.Errorf("write input json: %w", err)
@@ -1450,33 +1459,9 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 // buildSFNInput renders the JSON doc the state machine expects. Picks
 // which (codec, tier) combinations to fan out over based on the
 // JobConfig's Codec + MaxRes.
-func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, hevcSinglePass bool, nChunks, sourceWidth int, chunkS float64) string {
-	tiers := []string{"360p", "540p", "720p", "1080p", "1440p", "2160p"}
-	if maxRes != "" {
-		for i, t := range tiers {
-			if t == maxRes {
-				tiers = tiers[:i+1]
-				break
-			}
-		}
-	}
-	// Cap at the source resolution — never upscale (mirrors select_tiers in
-	// ladder.py). Without this the cloud-batch path would encode e.g. 1440p and
-	// 2160p variants from a 1080p source: the most expensive jobs (4K HEVC),
-	// producing only an upscaled copy of the same detail. sourceWidth==0 means
-	// the probe failed → don't cap.
-	if sourceWidth > 0 {
-		tierWidth := map[string]int{
-			"360p": 640, "540p": 960, "720p": 1280,
-			"1080p": 1920, "1440p": 2560, "2160p": 3840,
-		}
-		var capped []string
-		for _, t := range tiers {
-			if tierWidth[t] <= sourceWidth {
-				capped = append(capped, t)
-			}
-		}
-		tiers = capped
+func buildSFNInput(s3Input, s3Prefix, ladderName, codecSel, maxRes string, hevcSinglePass bool, nChunks, sourceWidth int, chunkS float64) string {
+	if ladderName == "" {
+		ladderName = "legacy"
 	}
 	codecs := []string{"h264", "hevc"}
 	switch codecSel {
@@ -1485,52 +1470,54 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, hevcSinglePass bo
 	case "hevc":
 		codecs = []string{"hevc"}
 	}
-	type variant struct {
-		Codec  string `json:"codec"`
-		Tier   string `json:"tier"`
-		VCPU   string `json:"vcpu"`
-		Memory string `json:"memory"`
-		// Batch schedulingPriority (higher = scheduled first). Derived from
-		// tier (×10) + a nudge for HEVC, so 4K/HEVC chunks win the next free
-		// CPU over small ones — enforced by the queue's fair-share policy. Int
-		// (not string) so it lands as a number in SchedulingPriorityOverride.
-		Priority int `json:"priority"`
-		// TwoPass is a per-codec property (not a global run setting): HEVC
-		// two-passes by default (accurate average), H264 never does. Injected
-		// as the TWO_PASS env on each variant's encode jobs by the SFN. String
-		// ("true"/"false") so it drops straight into a container env value.
-		TwoPass string `json:"two_pass"`
-	}
-	tierRank := map[string]int{"360p": 1, "540p": 2, "720p": 3, "1080p": 4, "1440p": 5, "2160p": 6}
-	var variants []variant
+	// Build the per-codec rung list from the ladder store. resolveLadderRungs
+	// caps each codec at the source width (no upscale) and --max-res, and
+	// assigns ordinal labels for repeated resolutions — identical to
+	// ladder.select_rungs, so cloud and local agree on {codec}_{label}.
+	var variants []sfnVariant
+	doH264, doHevc := false, false
 	for _, c := range codecs {
-		for _, t := range tiers {
-			vcpu, mem := variantResources(t)
-			prio := tierRank[t] * 10
+		rungs := resolveLadderRungs(ladderName, c, maxRes, sourceWidth)
+		if len(rungs) == 0 {
+			continue
+		}
+		switch c {
+		case "h264":
+			doH264 = true
+		case "hevc":
+			doHevc = true
+		}
+		for _, r := range rungs {
+			vcpu, mem := variantResourcesForHeight(r.Height)
+			rank := resHeightRank(r.Height)
+			prio := rank * 10
 			// Two-pass is HEVC-only and automatic: H264's single-pass VBV
 			// already hits target average, so it never two-passes; HEVC
-			// two-passes by default (accurate average) unless the user asked
-			// for a single-pass comparison run (hevcSinglePass).
+			// two-passes by default unless the user asked for a single-pass
+			// comparison run (hevcSinglePass).
 			twoPass := c == "hevc" && !hevcSinglePass
 			if c == "hevc" {
-				prio++ // HEVC just ahead of H.264 within a tier (it's slower)
+				prio++ // HEVC just ahead of H.264 within a resolution (slower)
 			}
-			variants = append(variants, variant{
-				Codec: c, Tier: t, VCPU: vcpu, Memory: mem, Priority: prio,
-				TwoPass: strconv.FormatBool(twoPass),
+			variants = append(variants, sfnVariant{
+				Codec:      c,
+				Label:      r.Label,
+				Width:      strconv.Itoa(r.Width),
+				Height:     strconv.Itoa(r.Height),
+				Bitrate:    strconv.Itoa(r.Bitrate),
+				Preset:     r.Preset,
+				VCPU:       vcpu,
+				Memory:     mem,
+				Priority:   prio,
+				TwoPass:    strconv.FormatBool(twoPass),
+				heightRank: rank,
 			})
 		}
 	}
-	// Also submit slowest-first (order in this list = submission order) so the
-	// long poles enter the queue early; the schedulingPriority above is what
-	// actually enforces it, but a good submission order helps too. Order: tier
-	// resolution DESC, then HEVC before H.264.
-	sort.SliceStable(variants, func(i, j int) bool {
-		if tierRank[variants[i].Tier] != tierRank[variants[j].Tier] {
-			return tierRank[variants[i].Tier] > tierRank[variants[j].Tier]
-		}
-		return variants[i].Codec == "hevc" && variants[j].Codec != "hevc"
-	})
+	// Submit slowest-first (high resolution, then HEVC before H.264) so the
+	// long poles enter the queue early; schedulingPriority enforces it, but a
+	// good submission order helps too.
+	sortRungsSlowestFirst(variants)
 	// chunk_indices drives the state machine's inner Map: each variant fans
 	// out one encode job per chunk index, then a concat-variant job joins
 	// them. A single-chunk clip (nChunks == 1) still flows through this path —
@@ -1542,19 +1529,6 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, hevcSinglePass bo
 	chunkIndices := make([]int, nChunks)
 	for i := range chunkIndices {
 		chunkIndices[i] = i
-	}
-	// Per-codec packaging flags. The PerCodec stage packages both codecs
-	// unconditionally unless told otherwise; these let its Choice guards
-	// skip the branch for a codec that wasn't encoded (else it fails with
-	// "no <codec> variants found" on a single-codec job).
-	doH264, doHevc := false, false
-	for _, c := range codecs {
-		switch c {
-		case "h264":
-			doH264 = true
-		case "hevc":
-			doHevc = true
-		}
 	}
 	doc := map[string]any{
 		"s3_input":      s3Input,
@@ -1571,27 +1545,6 @@ func buildSFNInput(s3Input, s3Prefix, codecSel, maxRes string, hevcSinglePass bo
 	}
 	b, _ := json.Marshal(doc)
 	return string(b)
-}
-
-// variantResources sizes a chunk encode job to its tier and returns Batch
-// resourceRequirements values (strings, as Batch expects) that override the
-// job def's default at submit time. Small tiers request little so many pack
-// onto one Graviton instance (more concurrent slots, less queue-wait); only
-// 4K needs the big allocation. On an 8 vCPU / 16 GiB c7g.2xlarge that's ~4
-// small chunks, ~2 mid, or 1 large per instance.
-func variantResources(tier string) (vcpu, memory string) {
-	switch tier {
-	case "360p", "540p":
-		return "2", "4096"
-	case "720p", "1080p":
-		return "4", "8192"
-	default: // 1440p, 2160p
-		// Measured: libx265 at 4K keeps only ~2.9 cores busy, so 8 vCPU sat
-		// ~37% idle-but-reserved. 4 vCPU / 8 GiB matches the c7g 1:2 ratio,
-		// so two 4K chunks pack onto one instance — ~same speed, half the
-		// machines. Bump back up if a heavier preset OOMs at 8 GiB.
-		return "4", "8192"
-	}
 }
 
 // resolveCodec checks which codecs are already encoded in OutputDir and returns

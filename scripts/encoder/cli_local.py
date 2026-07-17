@@ -35,7 +35,8 @@ from encoder.hls import (
     TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls, generate_ts_hls,
 )
 from encoder.ladder import (
-    LADDER, Tier, parse_bitrate_override, select_tiers,
+    Rung, get_ladder, label_height, ladder_bufsize_multiplier,
+    ladder_maxrate_percent, parse_bitrate_override, select_rungs,
 )
 from encoder.mezzanine import MezzanineSpec, create_mezzanine
 from encoder.packager import PackageSpec, package
@@ -70,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--codec", default="both",
                    choices=("h264", "hevc", "av1", "both", "all"))
+    # Ladder by name (legacy | apple | apple-uniq | any custom ladder). Not
+    # restricted to `choices` so user-defined ladders work; validated via
+    # get_ladder at run time.
+    p.add_argument("--ladder", default="legacy", dest="ladder",
+                   help="encoding ladder name (default: legacy)")
     p.add_argument("--max-res", default=None, dest="max_res",
                    choices=("360p", "540p", "720p", "1080p", "1440p", "2160p"))
     p.add_argument("--time", type=float, default=None, dest="time_limit_s",
@@ -151,23 +157,22 @@ def _codec_list(selection: str) -> list[str]:
 
 def _emit_plan(
     *,
-    tiers: list[Tier],
-    codecs: list[str],
+    rungs_by_codec: dict[str, list[Rung]],
     has_audio: bool,
     want_fmp4: bool,
     want_ts: bool,
 ) -> None:
     """Announce every stage the pipeline will visit, in display order."""
     stages: list[Stage] = [Stage(key="mezzanine", label="mezzanine")]
-    for tier in tiers:
-        for codec in codecs:
+    for codec, rungs in rungs_by_codec.items():
+        for rung in rungs:
             stages.append(Stage(
-                key=variant_stage_key(codec, tier.name),
-                label=f"encode {codec} {tier.name}",
+                key=variant_stage_key(codec, rung.label),
+                label=f"encode {codec} {rung.label}",
             ))
     if has_audio:
         stages.append(Stage(key="audio", label="audio"))
-    for codec in codecs:
+    for codec in rungs_by_codec:
         stages.append(Stage(key=f"package:{codec}", label=f"package {codec}"))
         if want_fmp4:
             stages.append(Stage(key=f"fragments:{codec}",
@@ -218,19 +223,35 @@ def run_full(args: argparse.Namespace) -> int:
     stem = _output_stem(input_path, args.output)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pre-compute the tier/codec plan so we can announce all stages up front
-    # and the UI can render a fully-laid-out table before any encode starts.
-    tiers = select_tiers(args.max_res, info.width)
-    if not tiers:
-        print("Error: no tiers fit this source resolution", file=sys.stderr)
+    # Resolve the ladder and pre-compute the per-codec rung plan so we can
+    # announce all stages up front and the UI can render a fully-laid-out
+    # table before any encode starts. Per-codec because a ladder can give
+    # each codec a different rung set (the Apple ladders do).
+    try:
+        ladder_def = get_ladder(args.ladder)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    ovr_hevc = parse_bitrate_override(args.bitrate_override_hevc)
+    ovr_h264 = parse_bitrate_override(args.bitrate_override_h264)
+    overrides = {"hevc": ovr_hevc, "h264": ovr_h264, "av1": {}}
+
+    rungs_by_codec: dict[str, list[Rung]] = {}
+    for codec in _codec_list(args.codec):
+        rungs = select_rungs(ladder_def, codec, args.max_res, info.width,
+                             overrides[codec])
+        if rungs:
+            rungs_by_codec[codec] = rungs
+    if not rungs_by_codec:
+        print("Error: no ladder rungs fit this source resolution",
+              file=sys.stderr)
         return 1
 
-    codecs = _codec_list(args.codec)
     want_fmp4 = args.hls_format in ("fmp4", "both")
     want_ts = args.hls_format in ("ts", "both")
 
     _emit_plan(
-        tiers=tiers, codecs=codecs, has_audio=info.has_audio,
+        rungs_by_codec=rungs_by_codec, has_audio=info.has_audio,
         want_fmp4=want_fmp4, want_ts=want_ts,
     )
 
@@ -279,7 +300,9 @@ def run_full(args: argparse.Namespace) -> int:
         mezz_info = probe(mezz_path)
         effective_duration_s = mezz_info.duration_s or info.duration_s
 
-        print(f"[phase 2b] tiers: {[t.name for t in tiers]}", flush=True)
+        print(f"[phase 2b] ladder={args.ladder} rungs: "
+              + "; ".join(f"{c}=[{','.join(r.label for r in rr)}]"
+                          for c, rr in rungs_by_codec.items()), flush=True)
 
         pad_boundary = multi_duration_lcm(
             args.segment_duration_s, args.partial_duration_s, args.gop_duration_s,
@@ -305,17 +328,15 @@ def run_full(args: argparse.Namespace) -> int:
             gop_duration_s=args.gop_duration_s,
             content_duration_s=effective_duration_s,
             padding_duration_s=video_pad_s,
+            maxrate_percent=ladder_maxrate_percent(ladder_def),
+            bufsize_multiplier=ladder_bufsize_multiplier(ladder_def),
             hevc_two_pass=not args.hevc_single_pass,
         )
-        ovr_hevc = parse_bitrate_override(args.bitrate_override_hevc)
-        ovr_h264 = parse_bitrate_override(args.bitrate_override_h264)
 
-        print(f"[phase 3] encoding variants: codec={args.codec}", flush=True)
+        print(f"[phase 3] encoding variants: codec={args.codec} "
+              f"ladder={args.ladder}", flush=True)
         t0 = time.monotonic()
-        encode_all(
-            encode_ctx, tiers, args.codec,
-            bitrate_override_hevc=ovr_hevc, bitrate_override_h264=ovr_h264,
-        )
+        encode_all(encode_ctx, rungs_by_codec)
         print(f"[phase 3] done in {time.monotonic() - t0:.1f}s", flush=True)
 
         if info.has_audio:
@@ -336,7 +357,8 @@ def run_full(args: argparse.Namespace) -> int:
                     duration_s=effective_duration_s + audio_pad_s,
                 )
 
-        for codec in codecs:
+        for codec, rungs in rungs_by_codec.items():
+            labels = tuple(r.label for r in rungs)
             pkg_dir = _codec_package_dir(args.output_dir, stem, codec)
             print(f"[phase 5] packaging {codec} → {pkg_dir.name}", flush=True)
             emit_stage(f"package:{codec}", "running", 0.0)
@@ -344,7 +366,7 @@ def run_full(args: argparse.Namespace) -> int:
                 tmp_dir=work_dir,
                 output_dir=pkg_dir,
                 codec=codec,
-                tiers=tuple(tiers),
+                labels=labels,
                 segment_duration_s=args.segment_duration_s,
                 partial_duration_s=args.partial_duration_s,
                 include_audio=info.has_audio,
@@ -372,7 +394,7 @@ def run_full(args: argparse.Namespace) -> int:
                     tmp_dir=work_dir,
                     ts_output_dir=ts_dir,
                     codec=codec,
-                    tiers=tuple(tiers),
+                    labels=labels,
                     segment_duration_s=args.segment_duration_s,
                     include_audio=info.has_audio,
                 ))
@@ -384,9 +406,9 @@ def run_full(args: argparse.Namespace) -> int:
             shutil.copy(mezz_path, mezzanine_out / "mezzanine.mp4")
             if info.has_audio:
                 shutil.copy(work_dir / "audio.mp4", mezzanine_out / "audio.mp4")
-            for codec in _codec_list(args.codec):
-                for tier in tiers:
-                    src = work_dir / f"{codec}_{tier.name}.mp4"
+            for codec, rungs in rungs_by_codec.items():
+                for rung in rungs:
+                    src = work_dir / f"{codec}_{rung.label}.mp4"
                     if src.is_file():
                         shutil.copy(src, mezzanine_out / src.name)
 
@@ -480,17 +502,18 @@ def run_resume(args: argparse.Namespace) -> int:
         return run_full(args)
     codec_selection = resolve_codec_selection(inventory, args.codec or None)
 
-    # Use the union of tiers available across the selected codecs.
+    # Package each codec from whatever labels it has on disk (per-codec, since
+    # a ladder can give codecs different rung sets). --max-res caps by the
+    # rung's encoded height, parsed from its label ("1080p_2" -> 1080).
     selected_codecs = _codec_list(codec_selection)
-    tiers: list[Tier] = []
-    seen: set[str] = set()
-    for codec in selected_codecs:
-        for tier in inventory.available.get(codec, []):
-            if tier.name not in seen:
-                tiers.append(tier)
-                seen.add(tier.name)
-    if args.max_res:
-        tiers = [t for t in tiers if LADDER.index(t) <= [x.name for x in LADDER].index(args.max_res)]
+    max_h = {"360p": 360, "540p": 540, "720p": 720,
+             "1080p": 1080, "1440p": 1440, "2160p": 2160}.get(args.max_res or "")
+
+    def _labels_for(codec: str) -> list[str]:
+        labels = inventory.available.get(codec, [])
+        if max_h is not None:
+            labels = [lbl for lbl in labels if label_height(lbl) <= max_h]
+        return labels
 
     stem = args.output or resume_dir.name
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -499,11 +522,15 @@ def run_resume(args: argparse.Namespace) -> int:
     want_ts = args.hls_format in ("ts", "both")
 
     for codec in selected_codecs:
+        labels = _labels_for(codec)
+        if not labels:
+            continue
         pkg_dir = _codec_package_dir(args.output_dir, stem, codec)
-        print(f"[resume] packaging {codec} → {pkg_dir.name}", flush=True)
+        print(f"[resume] packaging {codec} → {pkg_dir.name} "
+              f"({len(labels)} rungs)", flush=True)
         package(PackageSpec(
             tmp_dir=resume_dir, output_dir=pkg_dir, codec=codec,
-            tiers=tuple(tiers),
+            labels=tuple(labels),
             segment_duration_s=args.segment_duration_s,
             partial_duration_s=args.partial_duration_s,
             include_audio=inventory.has_audio,
@@ -517,7 +544,7 @@ def run_resume(args: argparse.Namespace) -> int:
             ts_dir = _ts_package_dir(args.output_dir, stem, codec)
             generate_ts_hls(TsHlsSpec(
                 tmp_dir=resume_dir, ts_output_dir=ts_dir, codec=codec,
-                tiers=tuple(tiers),
+                labels=tuple(labels),
                 segment_duration_s=args.segment_duration_s,
                 include_audio=inventory.has_audio,
             ))

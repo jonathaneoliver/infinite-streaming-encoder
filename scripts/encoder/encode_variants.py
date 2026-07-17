@@ -11,7 +11,6 @@ import subprocess
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Iterable
 
 from encoder.burnin import BurninContext, build_filter, rate_label
 from encoder.chunking import Chunk
@@ -19,19 +18,19 @@ from encoder.gop import keyint
 from encoder.ladder import (
     BUFSIZE_MULTIPLIER,
     DEFAULT_MAXRATE_PERCENT,
-    Tier,
-    resolve_bitrate,
+    Rung,
 )
 from encoder.progress import emit_stage, run_ffmpeg_with_progress
 
 
-def variant_stage_key(codec: str, tier_name: str, chunk_index: int | None = None) -> str:
+def variant_stage_key(codec: str, label: str, chunk_index: int | None = None) -> str:
     """Stable stage key the Go server uses to identify a single variant.
 
-    With `chunk_index` set (chunked encode), the key gains a `:chunkN` suffix
-    so each chunk's progress is tracked independently.
+    `label` is the rung's identity ("1080p", or "1080p_1" for an apple dup
+    rung). With `chunk_index` set (chunked encode), the key gains a `:chunkN`
+    suffix so each chunk's progress is tracked independently.
     """
-    base = f"encode:{codec}:{tier_name}"
+    base = f"encode:{codec}:{label}"
     return base if chunk_index is None else f"{base}:chunk{chunk_index}"
 
 
@@ -52,6 +51,9 @@ class EncodeContext:
     content_duration_s: float   # pre-padding duration, for PADDING label enable
     padding_duration_s: float   # 0.0 = no padding applied
     maxrate_percent: int = DEFAULT_MAXRATE_PERCENT
+    # VBV bufsize as a multiple of each rung's target bitrate. Ladder-level
+    # "bufsize_multiplier" flows in here; default matches the historical 2x.
+    bufsize_multiplier: float = BUFSIZE_MULTIPLIER
     # Two-pass software encode for libx265 (ports smashing #965). Two-pass
     # is a *codec* property, not a global toggle: HEVC (libx265) needs it,
     # H264 (libx264) does not, and AV1 (libsvtav1) has no two-pass path.
@@ -77,15 +79,16 @@ class EncodeError(RuntimeError):
     pass
 
 
-def _variant_path(output_dir: Path, codec: str, tier: Tier) -> Path:
-    # Matches bash: $TEMP_DIR/${codec}_${res_name}.mp4
-    return output_dir / f"{codec}_{tier.name}.mp4"
+def _variant_path(output_dir: Path, codec: str, label: str) -> Path:
+    # $TEMP_DIR/${codec}_${label}.mp4 — label is the rung identity
+    # ("1080p", or "1080p_1" for an apple dup rung).
+    return output_dir / f"{codec}_{label}.mp4"
 
 
-def _chunk_path(output_dir: Path, codec: str, tier: Tier, chunk_index: int) -> Path:
+def _chunk_path(output_dir: Path, codec: str, label: str, chunk_index: int) -> Path:
     """Per-chunk output, e.g. hevc_1080p_chunk003.mp4. The concat phase joins
     these into the whole-variant _variant_path before packaging."""
-    return output_dir / f"{codec}_{tier.name}_chunk{chunk_index:03d}.mp4"
+    return output_dir / f"{codec}_{label}_chunk{chunk_index:03d}.mp4"
 
 
 def _pass_suffix(pass_num: int | None, stats_path: Path | None) -> str:
@@ -148,22 +151,20 @@ def _codec_specific_args(
     raise EncodeError(f"unsupported codec: {codec}")
 
 
-def _stats_path(output_dir: Path, codec: str, tier: Tier,
+def _stats_path(output_dir: Path, codec: str, label: str,
                 chunk: Chunk | None = None) -> Path:
     """ffmpeg two-pass stats log for a variant (or one of its chunks). Lives
     beside the output in the ephemeral work dir; ffmpeg also writes a
     `<log>.mbtree` sibling. Chunk-specific so parallel chunk encodes never
     share a stats file."""
     suffix = "" if chunk is None else f"_chunk{chunk.index:03d}"
-    return output_dir / f"{codec}_{tier.name}{suffix}_2pass.log"
+    return output_dir / f"{codec}_{label}{suffix}_2pass.log"
 
 
 def build_ffmpeg_cmd(
     ctx: EncodeContext,
     codec: str,
-    tier: Tier,
-    target_kbps: int,
-    bitrate_override: dict[str, int],
+    rung: Rung,
     pass_num: int | None = None,
     chunk: Chunk | None = None,
 ) -> list[str]:
@@ -188,13 +189,14 @@ def build_ffmpeg_cmd(
     encoder emits an IDR at the window start (frame 0 of a fresh encode) and
     closed 1s GOPs thereafter, so chunk boundaries land on IDRs.
     """
+    target_kbps = rung.bitrate
     k = keyint(ctx.fps, ctx.gop_duration_s)
     maxrate_k = int(target_kbps * ctx.maxrate_percent / 100)
-    bufsize_k = target_kbps * BUFSIZE_MULTIPLIER
+    bufsize_k = int(target_kbps * ctx.bufsize_multiplier)
 
     filter_str = build_filter(BurninContext(
         codec=codec,
-        tier=tier,
+        tier=rung,
         fps=ctx.fps,
         rate_label=rate_label(target_kbps, ctx.maxrate_percent),
         encoder_label="SW",
@@ -204,10 +206,10 @@ def build_ffmpeg_cmd(
     ))
 
     if chunk is None:
-        out_path = _variant_path(ctx.output_dir, codec, tier)
+        out_path = _variant_path(ctx.output_dir, codec, rung.label)
     else:
-        out_path = _chunk_path(ctx.output_dir, codec, tier, chunk.index)
-    stats_path = _stats_path(ctx.output_dir, codec, tier, chunk) if pass_num else None
+        out_path = _chunk_path(ctx.output_dir, codec, rung.label, chunk.index)
+    stats_path = _stats_path(ctx.output_dir, codec, rung.label, chunk) if pass_num else None
 
     cmd = ["ffmpeg", "-y"]
     if chunk is not None:
@@ -217,7 +219,7 @@ def build_ffmpeg_cmd(
         "-i", str(ctx.mezzanine_path),
         "-vf", filter_str,
     ]
-    cmd += _codec_specific_args(codec, target_kbps, k, tier.preset,
+    cmd += _codec_specific_args(codec, target_kbps, k, rung.preset,
                                 pass_num=pass_num, stats_path=stats_path)
     cmd += [
         "-b:v", f"{target_kbps}k",
@@ -242,28 +244,27 @@ def build_ffmpeg_cmd(
 def encode_variant(
     ctx: EncodeContext,
     codec: str,
-    tier: Tier,
-    bitrate_override: dict[str, int] | None = None,
+    rung: Rung,
     chunk: Chunk | None = None,
 ) -> Path:
-    """Encode one (codec, tier) combination. Returns the output path.
+    """Encode one (codec, rung) combination. Returns the output path.
 
-    With `chunk` set, encodes only that time window into `_chunk_path`
-    (the resumable unit for spot encoding); the concat phase later joins
-    the chunks into the whole `_variant_path`. Without it, encodes the
-    whole clip as before.
+    The rung already carries its final target bitrate (any --bitrate-override
+    was applied when the ladder was selected). With `chunk` set, encodes only
+    that time window into `_chunk_path` (the resumable unit for spot
+    encoding); the concat phase later joins the chunks into the whole
+    `_variant_path`. Without it, encodes the whole clip as before.
     """
-    bitrate_override = bitrate_override or {}
-    target_kbps = resolve_bitrate(tier, codec, bitrate_override)
+    target_kbps = rung.bitrate
 
     if chunk is None:
-        out_path = _variant_path(ctx.output_dir, codec, tier)
-        stage_key = variant_stage_key(codec, tier.name)
+        out_path = _variant_path(ctx.output_dir, codec, rung.label)
+        stage_key = variant_stage_key(codec, rung.label)
         # Whole-clip progress spans content + any padding.
         total_duration_s = ctx.content_duration_s + ctx.padding_duration_s
     else:
-        out_path = _chunk_path(ctx.output_dir, codec, tier, chunk.index)
-        stage_key = variant_stage_key(codec, tier.name, chunk.index)
+        out_path = _chunk_path(ctx.output_dir, codec, rung.label, chunk.index)
+        stage_key = variant_stage_key(codec, rung.label, chunk.index)
         # Chunk progress spans just this window.
         total_duration_s = chunk.duration_s
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -280,28 +281,25 @@ def encode_variant(
             # Both passes reuse the same filter + rate control. With a
             # chunk, this runs per chunk against its own stats file.
             run_ffmpeg_with_progress(
-                build_ffmpeg_cmd(ctx, codec, tier, target_kbps,
-                                 bitrate_override, pass_num=1, chunk=chunk),
+                build_ffmpeg_cmd(ctx, codec, rung, pass_num=1, chunk=chunk),
                 duration_s=total_duration_s,
                 stage_key=stage_key,
             )
             run_ffmpeg_with_progress(
-                build_ffmpeg_cmd(ctx, codec, tier, target_kbps,
-                                 bitrate_override, pass_num=2, chunk=chunk),
+                build_ffmpeg_cmd(ctx, codec, rung, pass_num=2, chunk=chunk),
                 duration_s=total_duration_s,
                 stage_key=stage_key,
             )
         else:
             run_ffmpeg_with_progress(
-                build_ffmpeg_cmd(ctx, codec, tier, target_kbps,
-                                 bitrate_override, chunk=chunk),
+                build_ffmpeg_cmd(ctx, codec, rung, chunk=chunk),
                 duration_s=total_duration_s,
                 stage_key=stage_key,
             )
     except subprocess.CalledProcessError as e:
         where = f" chunk{chunk.index}" if chunk is not None else ""
         raise EncodeError(
-            f"encode failed: {codec} {tier.name}{where} @ {target_kbps}kbps "
+            f"encode failed: {codec} {rung.label}{where} @ {target_kbps}kbps "
             f"(ffmpeg exit {e.returncode})"
         ) from e
 
@@ -317,15 +315,15 @@ def encode_variant(
     return out_path
 
 
-def concat_stage_key(codec: str, tier_name: str) -> str:
+def concat_stage_key(codec: str, label: str) -> str:
     """Stage key for the per-variant chunk-concat step."""
-    return f"concat:{codec}:{tier_name}"
+    return f"concat:{codec}:{label}"
 
 
 def concat_chunks(
     output_dir: Path,
     codec: str,
-    tier: Tier,
+    label: str,
     n_chunks: int,
 ) -> Path:
     """Join the `n_chunks` per-chunk encodes into the whole-variant mp4 via
@@ -338,20 +336,20 @@ def concat_chunks(
     """
     if n_chunks < 1:
         raise EncodeError(f"concat needs at least one chunk, got {n_chunks}")
-    chunk_paths = [_chunk_path(output_dir, codec, tier, i) for i in range(n_chunks)]
+    chunk_paths = [_chunk_path(output_dir, codec, label, i) for i in range(n_chunks)]
     incomplete = [p.name for p in chunk_paths if not _is_complete(p)]
     if incomplete:
         raise EncodeError(
-            f"cannot concat {codec} {tier.name}: incomplete/missing chunks {incomplete}"
+            f"cannot concat {codec} {label}: incomplete/missing chunks {incomplete}"
         )
 
     # concat demuxer reads a list file of single-quoted absolute paths.
-    list_file = output_dir / f"{codec}_{tier.name}_concat.txt"
+    list_file = output_dir / f"{codec}_{label}_concat.txt"
     list_file.write_text(
         "".join(f"file '{p.resolve().as_posix()}'\n" for p in chunk_paths)
     )
 
-    out_path = _variant_path(output_dir, codec, tier)
+    out_path = _variant_path(output_dir, codec, label)
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0",
@@ -365,12 +363,12 @@ def concat_chunks(
 
     # Concat is a fast stream copy — a running/done stage is enough, no need
     # for duration-based progress (which the phase doesn't have on hand).
-    stage_key = concat_stage_key(codec, tier.name)
+    stage_key = concat_stage_key(codec, label)
     emit_stage(stage_key, "running", 0.0)
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise EncodeError(
-            f"concat failed: {codec} {tier.name} (ffmpeg exit {proc.returncode})\n"
+            f"concat failed: {codec} {label} (ffmpeg exit {proc.returncode})\n"
             f"{proc.stderr[-1500:]}"
         )
     emit_stage(stage_key, "done", 100.0)
@@ -403,41 +401,41 @@ def codec_list(selection: str) -> list[str]:
 
 def encode_all(
     ctx: EncodeContext,
-    tiers: Iterable[Tier],
-    codec_selection: str,
-    bitrate_override_h264: dict[str, int] | None = None,
-    bitrate_override_hevc: dict[str, int] | None = None,
+    rungs_by_codec: dict[str, list[Rung]],
 ) -> list[Path]:
-    """Encode every (tier, codec) pair and return the output paths.
+    """Encode every (codec, rung) pair and return the output paths.
+
+    `rungs_by_codec` maps each selected codec to its ladder rungs (already
+    filtered by source/max-res and with any bitrate override baked in — see
+    ladder.select_rungs). Per-codec rung lists let a ladder give H264 and
+    HEVC different resolutions/rung counts (the Apple ladders do).
 
     Runs sequentially — parallelism happens at the Go-server level (one
     worker container per file; multiple jobs can run concurrently via
     MAX_CONCURRENT), not inside a single variant loop.
     """
-    codecs = codec_list(codec_selection)
-    overrides = {"h264": bitrate_override_h264 or {},
-                 "hevc": bitrate_override_hevc or {},
-                 "av1": {}}
     outputs: list[Path] = []
-    for tier in tiers:
-        for codec in codecs:
-            out = _variant_path(ctx.output_dir, codec, tier)
+    # Encode rung-major (all codecs of a rung together) to mirror the old
+    # tier-major order — mostly cosmetic for progress display.
+    for codec, rungs in rungs_by_codec.items():
+        for rung in rungs:
+            out = _variant_path(ctx.output_dir, codec, rung.label)
             # Skip variants that are already fully encoded — the .done
             # sidecar's size must match the MP4's current size, so a
             # file rsynced mid-write (common after spot interrupt)
             # doesn't trigger a false skip.
             if _is_complete(out):
-                print(f"[resume] skipping {codec} {tier.name} "
+                print(f"[resume] skipping {codec} {rung.label} "
                       f"— already complete ({out.name})", flush=True)
                 # Emit "skipped" so the UI flips this variant's bar to
                 # the distinct reused-style (gray hash pattern + "reused"
                 # label) rather than the green done-style it'd get from
                 # a fresh encode. Makes it obvious at a glance which
                 # stages were picked up from the prior run.
-                emit_stage(variant_stage_key(codec, tier.name), "skipped", 100.0)
+                emit_stage(variant_stage_key(codec, rung.label), "skipped", 100.0)
                 outputs.append(out)
                 continue
-            outputs.append(encode_variant(ctx, codec, tier, overrides[codec]))
+            outputs.append(encode_variant(ctx, codec, rung))
     return outputs
 
 

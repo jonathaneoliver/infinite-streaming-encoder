@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fractions import Fraction
 
-from encoder.ladder import Tier
+from encoder.ladder import Rung
 
 
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -30,7 +30,7 @@ INITIAL_TIMECODE = r"00\:00\:00\:00"
 @dataclass(frozen=True)
 class BurninContext:
     codec: str                # "hevc"/"h264"/"av1"
-    tier: Tier
+    tier: Rung
     fps: Fraction             # for timecode rate
     rate_label: str           # "AVG~4.50Mbps / PEAK<=5.58Mbps" or similar
     encoder_label: str        # e.g. "SW"
@@ -113,7 +113,9 @@ def build_filter(ctx: BurninContext) -> str:
     y_encoder = y_codec_res + tier.fontsize_label + 5
     y_watermark = y_encoder + tier.fontsize_label + 5
 
-    codec_res_label = f"{ctx.codec.upper()} {tier.name} | {float(ctx.fps):.2f}fps"
+    # res_name (not label): apple dup rungs (1080p_1/1080p_2) both display
+    # as their true resolution "1080p" in the burn-in overlay.
+    codec_res_label = f"{ctx.codec.upper()} {tier.res_name} | {float(ctx.fps):.2f}fps"
 
     overlays = [
         _drawtext(

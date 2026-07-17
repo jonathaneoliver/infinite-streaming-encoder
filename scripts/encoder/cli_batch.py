@@ -312,24 +312,25 @@ def cmd_submit(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def _chunk_identity(input_json: str) -> tuple[str, str, int] | None:
-    """(codec, tier, chunk_index) from an EncodeChunk state's input, or None."""
+    """(codec, label, chunk_index) from an EncodeChunk state's input, or None.
+    `label` is the rung identity ("1080p" or "1080p_1" for an apple dup)."""
     try:
         d = json.loads(input_json)
-        codec, tier, ci = d.get("codec"), d.get("tier"), d.get("chunk_index")
-        if codec and tier and ci is not None:
-            return codec, tier, int(ci)
+        codec, label, ci = d.get("codec"), d.get("label"), d.get("chunk_index")
+        if codec and label and ci is not None:
+            return codec, label, int(ci)
     except (ValueError, TypeError):
         pass
     return None
 
 
 def _concat_identity(input_json: str) -> tuple[str, str] | None:
-    """(codec, tier) from a ConcatVariant state's input, or None."""
+    """(codec, label) from a ConcatVariant state's input, or None."""
     try:
         d = json.loads(input_json)
-        codec, tier = d.get("codec"), d.get("tier")
-        if codec and tier:
-            return codec, tier
+        codec, label = d.get("codec"), d.get("label")
+        if codec and label:
+            return codec, label
     except (ValueError, TypeError):
         pass
     return None

@@ -79,7 +79,11 @@
               "MaxConcurrency": 6,
               "ItemSelector": {
                 "codec.$": "$$.Map.Item.Value.codec",
-                "tier.$": "$$.Map.Item.Value.tier",
+                "label.$": "$$.Map.Item.Value.label",
+                "width.$": "$$.Map.Item.Value.width",
+                "height.$": "$$.Map.Item.Value.height",
+                "bitrate.$": "$$.Map.Item.Value.bitrate",
+                "preset.$": "$$.Map.Item.Value.preset",
                 "vcpu.$": "$$.Map.Item.Value.vcpu",
                 "memory.$": "$$.Map.Item.Value.memory",
                 "priority.$": "$$.Map.Item.Value.priority",
@@ -97,7 +101,11 @@
                     "ItemsPath": "$.chunk_indices",
                     "ItemSelector": {
                       "codec.$": "$.codec",
-                      "tier.$": "$.tier",
+                      "label.$": "$.label",
+                      "width.$": "$.width",
+                      "height.$": "$.height",
+                      "bitrate.$": "$.bitrate",
+                      "preset.$": "$.preset",
                       "vcpu.$": "$.vcpu",
                       "memory.$": "$.memory",
                       "priority.$": "$.priority",
@@ -113,14 +121,18 @@
                           "Type": "Task",
                           "Resource": "arn:aws:states:::batch:submitJob.sync",
                           "Parameters": {
-                            "JobName.$": "States.Format('var-{}-{}-c{}-{}', $.codec, $.tier, $.chunk_index, $$.Execution.Name)",
+                            "JobName.$": "States.Format('var-{}-{}-c{}-{}', $.codec, $.label, $.chunk_index, $$.Execution.Name)",
                             "JobQueue": "${job_queue_arn}",
                             "JobDefinition": "${variant_def}",
                             "ShareIdentifier": "encode",
                             "SchedulingPriorityOverride.$": "$.priority",
                             "Parameters": {
                               "codec.$": "$.codec",
-                              "tier.$": "$.tier",
+                              "label.$": "$.label",
+                              "width.$": "$.width",
+                              "height.$": "$.height",
+                              "bitrate.$": "$.bitrate",
+                              "preset.$": "$.preset",
                               "chunk_index.$": "States.Format('{}', $.chunk_index)",
                               "s3_mezz.$": "$.s3_prefix",
                               "s3_out.$": "$.s3_prefix"
@@ -148,14 +160,14 @@
                     "Type": "Task",
                     "Resource": "arn:aws:states:::batch:submitJob.sync",
                     "Parameters": {
-                      "JobName.$": "States.Format('concat-{}-{}-{}', $.codec, $.tier, $$.Execution.Name)",
+                      "JobName.$": "States.Format('concat-{}-{}-{}', $.codec, $.label, $$.Execution.Name)",
                       "JobQueue": "${job_queue_arn}",
                       "JobDefinition": "${concat_def}",
                       "ShareIdentifier": "encode",
                       "SchedulingPriorityOverride": 50,
                       "Parameters": {
                         "codec.$": "$.codec",
-                        "tier.$": "$.tier",
+                        "label.$": "$.label",
                         "s3_mezz.$": "$.s3_prefix",
                         "s3_chunks.$": "$.s3_prefix",
                         "s3_out.$": "$.s3_prefix"

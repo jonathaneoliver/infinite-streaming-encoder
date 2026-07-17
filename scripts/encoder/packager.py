@@ -20,16 +20,15 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from encoder.ladder import Tier
 from encoder.manifests import convert_segmentlist
 
 
 @dataclass(frozen=True)
 class PackageSpec:
-    tmp_dir: Path            # holds {codec}_{res}.mp4 + audio.mp4
-    output_dir: Path         # final DASH package directory
-    codec: str               # "h264" | "hevc" | "av1"
-    tiers: tuple[Tier, ...]  # resolutions to include
+    tmp_dir: Path             # holds {codec}_{label}.mp4 + audio.mp4
+    output_dir: Path          # final DASH package directory
+    codec: str                # "h264" | "hevc" | "av1"
+    labels: tuple[str, ...]   # rung labels to include ("1080p", "1080p_1", ...)
     segment_duration_s: float
     partial_duration_s: float
     include_audio: bool
@@ -48,12 +47,12 @@ def build_packager_cmd(spec: PackageSpec) -> list[str]:
     """
     cmd: list[str] = ["packager"]
 
-    for tier in spec.tiers:
-        in_file = spec.tmp_dir / f"{spec.codec}_{tier.name}.mp4"
+    for label in spec.labels:
+        in_file = spec.tmp_dir / f"{spec.codec}_{label}.mp4"
         cmd.append(
             f"in={in_file},stream=video,"
-            f"init_segment={tier.name}/init.mp4,"
-            f"segment_template={tier.name}/segment_$Number%05d$.m4s"
+            f"init_segment={label}/init.mp4,"
+            f"segment_template={label}/segment_$Number%05d$.m4s"
         )
 
     if spec.include_audio:
@@ -82,8 +81,8 @@ def package(spec: PackageSpec) -> Path:
     expect. Raises PackagerError on any failure.
     """
     spec.output_dir.mkdir(parents=True, exist_ok=True)
-    for tier in spec.tiers:
-        (spec.output_dir / tier.name).mkdir(exist_ok=True)
+    for label in spec.labels:
+        (spec.output_dir / label).mkdir(exist_ok=True)
     if spec.include_audio:
         (spec.output_dir / "audio").mkdir(exist_ok=True)
 

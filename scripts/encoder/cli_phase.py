@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import resource
 import shutil
 import sys
@@ -44,7 +45,7 @@ from encoder.ffprobe import probe
 from encoder.hls import (
     TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls,
 )
-from encoder.ladder import LADDER, Tier, select_tiers
+from encoder.ladder import Rung, burnin_for_height, label_res_name
 from encoder.mezzanine import MezzanineSpec, create_mezzanine
 from encoder.packager import PackageSpec, package
 from encoder.padding import multi_duration_lcm, plan_padding
@@ -223,11 +224,25 @@ def _chunk_duration_s() -> float:
         return DEFAULT_CHUNK_DURATION_S
 
 
-def _tier_by_name(name: str) -> Tier:
-    for t in LADDER:
-        if t.name == name:
-            return t
-    raise ValueError(f"unknown tier: {name}")
+# Per-chunk encode files ({codec}_{label}_chunkNNN.mp4); excluded when
+# discovering whole-variant labels for packaging.
+_CHUNK_RE = re.compile(r"_chunk\d+$")
+
+
+def _rung_from_args(args: argparse.Namespace) -> Rung:
+    """Reconstruct the concrete rung the Go control plane resolved for this
+    variant job. Geometry + bitrate come straight from the SFN input (Go owns
+    the ladder store and resolves each rung, so the worker needs no ladder
+    knowledge — this is what lets user-defined ladders work in the cloud);
+    burn-in is derived from height.
+    """
+    ftc, flbl, x, ytc, ylbl = burnin_for_height(args.height)
+    return Rung(
+        label=args.label, res_name=label_res_name(args.label),
+        width=args.width, height=args.height, bitrate=args.bitrate,
+        preset=args.preset, fontsize_tc=ftc, fontsize_label=flbl,
+        burnin_x=x, burnin_y_tc=ytc, burnin_y_label=ylbl,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -326,13 +341,13 @@ def phase_variant(args: argparse.Namespace) -> int:
     # the fetch and the encode. S3 only exposes complete objects, so existence
     # == a valid finished output. FORCE_REENCODE overrides.
     ci_suffix = "" if args.chunk_index is None else f"_chunk{args.chunk_index:03d}"
-    out_name = f"{args.codec}_{args.tier}{ci_suffix}.mp4"
+    out_name = f"{args.codec}_{args.label}{ci_suffix}.mp4"
     out_uri = args.s3_out.rstrip("/") + f"/{out_name}"
     ci = "" if args.chunk_index is None else f":chunk{args.chunk_index}"
     if not _env_flag("FORCE_REENCODE") and _s3_exists(out_uri):
         print(f"[phase variant] reusing {out_name} — already in S3, "
               f"skipping fetch + encode", flush=True)
-        timer.emit(f"encode:{args.codec}:{args.tier}{ci}", cpu_s="0.00", reused="1")
+        timer.emit(f"encode:{args.codec}:{args.label}{ci}", cpu_s="0.00", reused="1")
         return 0
 
     mezz_uri = args.s3_mezz.rstrip("/") + "/mezzanine.mp4"
@@ -343,7 +358,7 @@ def phase_variant(args: argparse.Namespace) -> int:
         return 1
     timer.mark("fetch")
 
-    tier = _tier_by_name(args.tier)
+    rung = _rung_from_args(args)
     info = probe(mezz_local)
     timer.mark("probe")
 
@@ -388,7 +403,7 @@ def phase_variant(args: argparse.Namespace) -> int:
     # wall-time) per tier, this is the real utilization — i.e. how much of
     # the vCPU we pay for is crunching video vs sitting idle-reserved.
     ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
-    out_path = encode_variant(ctx, args.codec, tier, chunk=chunk)
+    out_path = encode_variant(ctx, args.codec, rung, chunk=chunk)
     ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu_s = (ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime)
     timer.mark("encode")
@@ -401,7 +416,7 @@ def phase_variant(args: argparse.Namespace) -> int:
     timer.mark("upload")
 
     ci = "" if chunk is None else f":chunk{chunk.index}"
-    timer.emit(f"encode:{args.codec}:{args.tier}{ci}", cpu_s=f"{cpu_s:.2f}")
+    timer.emit(f"encode:{args.codec}:{args.label}{ci}", cpu_s=f"{cpu_s:.2f}")
     return 0
 
 
@@ -412,7 +427,6 @@ def phase_variant(args: argparse.Namespace) -> int:
 
 def phase_concat_variant(args: argparse.Namespace) -> int:
     work = _prepare_work_dir()
-    tier = _tier_by_name(args.tier)
 
     # Derive the chunk count from the mezzanine duration — the same source
     # the variant phase used to plan chunks, so the two never disagree.
@@ -425,16 +439,16 @@ def phase_concat_variant(args: argparse.Namespace) -> int:
 
     # Pull every chunk file down (verifying its .done sidecar).
     for i in range(n_chunks):
-        name = f"{args.codec}_{args.tier}_chunk{i:03d}.mp4"
+        name = f"{args.codec}_{args.label}_chunk{i:03d}.mp4"
         uri = args.s3_chunks.rstrip("/") + f"/{name}"
         if not _download_if_complete(uri, work / name):
             print(f"error: chunk {name} missing or incomplete at {uri}",
                   file=sys.stderr)
             return 1
 
-    out_path = concat_chunks(work, args.codec, tier, n_chunks)
+    out_path = concat_chunks(work, args.codec, args.label, n_chunks)
 
-    out_uri = args.s3_out.rstrip("/") + f"/{args.codec}_{args.tier}.mp4"
+    out_uri = args.s3_out.rstrip("/") + f"/{args.codec}_{args.label}.mp4"
     print(f"[phase concat-variant] joined {n_chunks} chunk(s) → {out_uri}",
           flush=True)
     _upload_with_done(out_path, out_uri)
@@ -500,22 +514,33 @@ def phase_audio(args: argparse.Namespace) -> int:
 def phase_package(args: argparse.Namespace) -> int:
     work = _prepare_work_dir()
 
-    # Probe the first variant we can download so we can feed select_tiers
-    # a real source width. For now we always expect all 6 tiers; if the
-    # source was smaller we'd need extra signalling from the Step Function.
-    tiers_present: list[Tier] = []
-    for tier in LADDER:
-        uri = args.s3_variants.rstrip("/") + f"/{args.codec}_{tier.name}.mp4"
-        dst = work / f"{args.codec}_{tier.name}.mp4"
-        try:
-            if _download_if_complete(uri, dst):
-                tiers_present.append(tier)
-        except ClientError as e:
-            if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+    # Discover which rungs were actually encoded by LISTING S3 for
+    # {codec}_{label}.mp4 objects (ladder-agnostic — works for any ladder,
+    # including apple's ordinal labels like 1080p_1). Per-chunk files
+    # ({codec}_{label}_chunkNNN.mp4) are excluded; concat already joined them.
+    bucket, base_key = _parse(args.s3_variants.rstrip("/"))
+    prefix = f"{base_key}/{args.codec}_"
+    labels: list[str] = []
+    paginator = _s3().get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            name = obj["Key"].rsplit("/", 1)[-1]
+            if not name.endswith(".mp4"):
                 continue
-            raise
+            label = name[len(args.codec) + 1:-4]  # strip "{codec}_" and ".mp4"
+            if not label or _CHUNK_RE.search(label):
+                continue
+            labels.append(label)
+    labels = sorted(set(labels))
 
-    if not tiers_present:
+    labels_present: list[str] = []
+    for label in labels:
+        uri = args.s3_variants.rstrip("/") + f"/{args.codec}_{label}.mp4"
+        dst = work / f"{args.codec}_{label}.mp4"
+        if _download_if_complete(uri, dst):
+            labels_present.append(label)
+
+    if not labels_present:
         print(f"error: no {args.codec} variants found under {args.s3_variants}",
               file=sys.stderr)
         return 1
@@ -540,7 +565,7 @@ def phase_package(args: argparse.Namespace) -> int:
         tmp_dir=work,
         output_dir=pkg_dir,
         codec=args.codec,
-        tiers=tuple(tiers_present),
+        labels=tuple(labels_present),
         segment_duration_s=_SEGMENT_DURATION_S,
         partial_duration_s=_PARTIAL_DURATION_S,
         include_audio=has_audio,
@@ -641,8 +666,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     v = sub.add_parser("variant")
     v.add_argument("--codec", required=True, choices=("h264", "hevc", "av1"))
-    v.add_argument("--tier", required=True,
-                   choices=("360p", "540p", "720p", "1080p", "1440p", "2160p"))
+    # The concrete rung, resolved by the Go control plane from the ladder
+    # store (so the worker needs no ladder knowledge — custom ladders work).
+    v.add_argument("--label", required=True,
+                   help="rung identity, e.g. 1080p or 1080p_1 (apple dup)")
+    v.add_argument("--width", required=True, type=int)
+    v.add_argument("--height", required=True, type=int)
+    v.add_argument("--bitrate", required=True, type=int, help="target kbps")
+    v.add_argument("--preset", default="medium")
     v.add_argument("--s3-mezz", required=True, dest="s3_mezz")
     v.add_argument("--s3-out", required=True, dest="s3_out")
     v.add_argument("--two-pass", action="store_true", dest="two_pass",
@@ -654,8 +685,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     cv = sub.add_parser("concat-variant")
     cv.add_argument("--codec", required=True, choices=("h264", "hevc", "av1"))
-    cv.add_argument("--tier", required=True,
-                    choices=("360p", "540p", "720p", "1080p", "1440p", "2160p"))
+    cv.add_argument("--label", required=True,
+                    help="rung identity, e.g. 1080p or 1080p_1 (apple dup)")
     cv.add_argument("--s3-mezz", required=True, dest="s3_mezz",
                     help="prefix holding mezzanine.mp4 (used to derive chunk count)")
     cv.add_argument("--s3-chunks", required=True, dest="s3_chunks",
