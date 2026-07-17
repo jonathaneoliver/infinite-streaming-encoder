@@ -816,13 +816,19 @@ function _ladderBandsSVG(d) {
     const AX = 60, TOP = 26, BOT = 14, COLW = 180, H = 470;
     const W = AX + present.length * COLW + 12;
     const plotH = H - TOP - BOT;
-    const lgLo = Math.log(lo * 0.9), lgHi = Math.log(hi * 1.1);
-    const y = v => TOP + (1 - (Math.log(v) - lgLo) / (lgHi - lgLo)) * plotH;
-    const ticks = [100, 250, 500, 1000, 2000, 5000, 10000, 20000, 40000].filter(t => t >= lo * 0.9 && t <= hi * 1.1);
+    // Linear bitrate axis from 0 — so a bar's HEIGHT is its kbps span
+    // (peak − avg) at a constant pixels-per-kbps, directly comparable
+    // across rungs (log would distort the band widths).
+    const dHi = hi * 1.04;
+    const y = v => TOP + (1 - v / dHi) * plotH;
+    const step = [100, 250, 500, 1000, 2000, 2500, 5000, 10000, 20000, 50000].find(s => dHi / s <= 8) || 50000;
+    const ticks = [];
+    for (let t = 0; t <= dHi; t += step) ticks.push(t);
     const grid = ticks.map(t => {
         const yy = y(t).toFixed(1);
+        const lbl = t === 0 ? '0' : (t >= 1000 ? (t / 1000) + 'M' : t + 'k');
         return `<line x1="${AX}" y1="${yy}" x2="${W - 6}" y2="${yy}" stroke="#333"/>`
-            + `<text x="${AX - 6}" y="${(+yy + 3.5).toFixed(1)}" fill="#888" font-size="10" text-anchor="end">${t >= 1000 ? (t / 1000) + 'M' : t + 'k'}</text>`;
+            + `<text x="${AX - 6}" y="${(+yy + 3.5).toFixed(1)}" fill="#888" font-size="10" text-anchor="end">${lbl}</text>`;
     }).join('');
     const barW = COLW * 0.52;
     const cols = present.map((c, ci) => {
@@ -865,7 +871,7 @@ function renderLaddersTab() {
           <div style="display:flex;gap:32px;flex-wrap:wrap;align-items:flex-start">
             <div>${_alignedLadderTable(d)}</div>
             <div style="flex:1;min-width:360px">
-              <div style="color:#888;font-size:12px;margin-bottom:2px">bitrate (log) ↑ · one column per codec · bar = avg→peak · colour = resolution — bars overlapping within a column sit too close in delivered bandwidth</div>
+              <div style="color:#888;font-size:12px;margin-bottom:2px">bitrate (linear) ↑ · one column per codec · bar height = avg→peak span · colour = resolution — bars overlapping within a column sit too close in delivered bandwidth</div>
               ${_ladderBandsSVG(d)}
             </div>
           </div>
