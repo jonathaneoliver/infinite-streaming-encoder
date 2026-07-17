@@ -478,6 +478,8 @@ def _record_fleet_samples(hourly_usd: float, fleet: dict) -> dict:
     history = [{
         "t": s[0],
         "util": round((s[2] / s[3]) if len(s) >= 4 and s[3] else 0.0, 3),
+        "used": s[2] if len(s) >= 3 else 0,
+        "total": s[3] if len(s) >= 4 else 0,
         "queued": s[4] if len(s) >= 5 else 0,
         "running": s[5] if len(s) >= 6 else 0,
         "hourly": s[1],

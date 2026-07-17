@@ -2123,12 +2123,16 @@ function _sparkline(vals, color, opts) {
 function _fleetSparks(history) {
     if (!history || history.length < 2) return '';
     const util = history.map(s => Math.round((s.util || 0) * 100));
+    const used = history.map(s => s.used || 0);
     const jobs = history.map(s => (s.queued || 0) + (s.running || 0));
     const cost = history.map(s => s.hourly || 0);
+    const totalMax = Math.max(...history.map(s => s.total || 0), 1);
+    const curTotal = history[history.length - 1].total || 0;
     const cell = (label, spark, cur) =>
         `<div style="font-size:11px;color:#888">${label}<br>${spark} <span style="color:#ccc">${cur}</span></div>`;
     return `<div style="display:flex;gap:26px;flex-wrap:wrap;margin:4px 0 14px">
       ${cell('utilization (2h)', _sparkline(util, '#4a90d9', { min: 0, max: 100 }), util[util.length - 1] + '%')}
+      ${cell('vCPU used (2h)', _sparkline(used, '#9b59b6', { min: 0, max: totalMax }), used[used.length - 1] + ' / ' + curTotal)}
       ${cell('jobs queued+running', _sparkline(jobs, '#e0883a', { min: 0 }), jobs[jobs.length - 1])}
       ${cell('$/hr', _sparkline(cost, '#6ab04c', { min: 0 }), '$' + (cost[cost.length - 1] || 0).toFixed(2))}
     </div>`;
