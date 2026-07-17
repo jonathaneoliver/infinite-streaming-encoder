@@ -45,6 +45,7 @@ type LadderStore struct {
 // the store persists a copy so both languages read the same file thereafter.
 func defaultSeedLadders() map[string]LadderDef {
 	legacyHEVC := [][]int{{640, 360, 300}, {960, 540, 1001}, {1280, 720, 1662}, {1920, 1080, 4273}, {2560, 1440, 10547}, {3840, 2160, 16458}}
+	appleH264 := [][]int{{416, 234, 145}, {640, 360, 365}, {768, 432, 730}, {768, 432, 1100}, {960, 540, 2000}, {1280, 720, 3000}, {1280, 720, 4500}, {1920, 1080, 6000}, {1920, 1080, 7800}}
 	appleHEVC := [][]int{{640, 360, 145}, {768, 432, 300}, {960, 540, 600}, {960, 540, 900}, {960, 540, 1600}, {1280, 720, 2400}, {1280, 720, 3400}, {1920, 1080, 4500}, {1920, 1080, 5800}, {2560, 1440, 8100}, {3840, 2160, 11600}, {3840, 2160, 16800}}
 	appleUniqHEVC := [][]int{{640, 360, 145}, {768, 432, 300}, {832, 468, 600}, {896, 504, 900}, {960, 540, 1600}, {1216, 684, 2400}, {1280, 720, 3400}, {1856, 1044, 4500}, {1920, 1080, 5800}, {2560, 1440, 8100}, {3776, 2124, 11600}, {3840, 2160, 16800}}
 	return map[string]LadderDef{
@@ -61,7 +62,18 @@ func defaultSeedLadders() map[string]LadderDef {
 			Description: "Apple HLS Authoring Spec bitrates — per-codec, multi-rung.",
 			Seed:        true,
 			Codecs: map[string][][]int{
-				"h264": {{416, 234, 145}, {640, 360, 365}, {768, 432, 730}, {768, 432, 1100}, {960, 540, 2000}, {1280, 720, 3000}, {1280, 720, 4500}, {1920, 1080, 6000}, {1920, 1080, 7800}},
+				"h264": appleH264,
+				"hevc": appleHEVC,
+				"av1":  appleHEVC,
+			},
+		},
+		"live": {
+			Description: "Apple bitrates under Apple's live/linear VBV: peak <= 1.25x avg. maxrate 110% + tight 0.10x buffer keep delivered peak <=~1.20x even at 1s segments.",
+			Seed:              true,
+			MaxratePercent:    110,
+			BufsizeMultiplier: 0.10,
+			Codecs: map[string][][]int{
+				"h264": appleH264,
 				"hevc": appleHEVC,
 				"av1":  appleHEVC,
 			},
