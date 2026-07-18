@@ -798,7 +798,10 @@ function _alignedLadderTable(d) {
             (cellByKey[key] = cellByKey[key] || {})[c] = { b: r.b, step: i > 0 ? r.b / rungs[i - 1].b : null };
         });
     });
-    const keys = Object.keys(cellByKey).sort((a, b) => meta[b].h - meta[a].h || meta[a].n - meta[b].n);
+    // Descending: highest resolution first, and within the same resolution the
+    // higher-bitrate rung first (n is assigned low→high bitrate above, so sort n
+    // descending). A ladder table should always read top = biggest.
+    const keys = Object.keys(cellByKey).sort((a, b) => meta[b].h - meta[a].h || meta[b].n - meta[a].n);
     const th = `<th style="text-align:left;padding:4px 16px 6px 0">Resolution</th>`
         + present.map(c => `<th style="text-align:right;padding:4px 0 6px 18px">${c}</th>`).join('');
     const cellHtml = cell => {
