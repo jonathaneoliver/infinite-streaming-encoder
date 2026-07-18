@@ -62,6 +62,8 @@ def _batch():
 
 # var-<codec>-<tier>-c<N>-<execName> — the chunk job name from the SFN template.
 _CHUNK_JOBNAME_RE = re.compile(r"^var-([^-]+)-([^-]+)-c(\d+)-")
+# var-<codec>-<tier>-whole-<execName> — the whole-variant (single-chunk) job.
+_WHOLE_JOBNAME_RE = re.compile(r"^var-([^-]+)-([^-]+)-whole-")
 
 
 def _reflect_batch_status(exec_name: str) -> None:
@@ -87,6 +89,10 @@ def _reflect_batch_status(exec_name: str) -> None:
             if m:
                 c, t, ci = m.group(1), m.group(2), int(m.group(3))
                 _emit_stage(f"encode:{c}:{t}:chunk{ci}", stage_status, 0.0)
+                continue
+            w = _WHOLE_JOBNAME_RE.match(name)
+            if w:
+                _emit_stage(f"encode:{w.group(1)}:{w.group(2)}", stage_status, 0.0)
 
     # RUNNABLE -> queued, STARTING -> running (0%). RUNNING is deliberately NOT
     # reflected here: once the container is up it emits its own ENCODER-STAGE
@@ -111,6 +117,9 @@ def _short_label(jobname: str) -> str:
     m = _CHUNK_JOBNAME_RE.match(jobname)
     if m:
         return f"{m.group(1)} {m.group(2)} chunk{m.group(3)}"
+    w = _WHOLE_JOBNAME_RE.match(jobname)
+    if w:
+        return f"{w.group(1)} {w.group(2)}"
     return {"mezz": "mezzanine", "audio": "audio", "pkg": "package",
             "hls": "hls", "br": "fragments", "concat": "concat",
             }.get(jobname.split("-", 1)[0], jobname.split("-", 1)[0])
@@ -340,15 +349,32 @@ def _chunk_identity(input_json: str) -> tuple[str, str, int] | None:
     return None
 
 
+def _whole_identity(input_json: str) -> tuple[str, str] | None:
+    """(codec, label) from an EncodeWhole state's input, or None. Whole-variant
+    (single-chunk) runs have no chunk_index; their stage key is the unsuffixed
+    encode:<codec>:<label> that run_ffmpeg_with_progress emits on the worker."""
+    try:
+        d = json.loads(input_json)
+        codec, label = d.get("codec"), d.get("label")
+        if codec and label:
+            return codec, label
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
 def _translate_events(events: list[dict], seen: set[int]) -> None:
     """Translate Step Functions history events into ENCODER-STAGE markers.
     `seen` tracks already-emitted event ids so repeat polls don't double-emit.
 
-    Mezzanine / Audio map by state name via _STEP_TO_STAGE. The variant fan-out
-    is a nested Map of EncodeChunk tasks per (codec, tier), so each chunk becomes
-    `encode:<codec>:<tier>:chunk<N>` (which the UI groups into the per-variant
-    chunk grid). Chunks are joined + packaged inside the package-all job, whose
-    package/fragments/hls sub-stages arrive via live log tailing, not history.
+    Mezzanine / Audio map by state name via _STEP_TO_STAGE. Each variant is
+    either an EncodeWhole task (single-chunk mode -> `encode:<codec>:<tier>`) or a
+    nested Map of EncodeChunk tasks (-> `encode:<codec>:<tier>:chunk<N>`, grouped
+    into the per-variant chunk grid). Both get their completion from the state's
+    *exit* event here — crucial for EncodeWhole, whose worker-side `done` marker
+    would otherwise be missed once the job leaves RUNNING between log-tail polls
+    (leaving the bar stuck at ~99%). Chunks are joined + packaged inside the
+    package-all job, whose sub-stages arrive via live log tailing, not history.
 
     A chunk's codec/tier/chunk_index live in its *entered* event's input; the
     *exited* event carries no input, so we index every EncodeChunk enter by event
@@ -359,6 +385,7 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
 
     # Index enter events (they carry the input with codec/tier/chunk_index).
     chunk_enter: dict[int, tuple[str, str, int]] = {}
+    whole_enter: dict[int, tuple[str, str]] = {}
     for e in events:
         if e["type"] != "TaskStateEntered":
             continue
@@ -368,6 +395,10 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
             idn = _chunk_identity(inp)
             if idn:
                 chunk_enter[e["id"]] = idn
+        elif name == "EncodeWhole":
+            idn = _whole_identity(inp)
+            if idn:
+                whole_enter[e["id"]] = idn
 
     def _enter_of(exit_ev: dict, table: dict) -> tuple | None:
         """Follow previousEventId from an exit event back to its matching
@@ -400,6 +431,12 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
                     c, t, ci = idn
                     _emit_stage(f"encode:{c}:{t}:chunk{ci}", "running", 0.0)
                     _narrate(f"▶ encode {c} {t} chunk{ci} submitted")
+            elif name == "EncodeWhole":
+                idn = whole_enter.get(ev["id"])
+                if idn:
+                    c, t = idn
+                    _emit_stage(f"encode:{c}:{t}", "running", 0.0)
+                    _narrate(f"▶ encode {c} {t} submitted")
 
         elif etype == "TaskStateExited":
             name = ev.get("stateExitedEventDetails", {}).get("name", "")
@@ -415,6 +452,14 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
                     _emit_stage(f"encode:{c}:{t}:chunk{ci}", "done", 100.0)
                     _narrate(f"✓ encode {c} {t} chunk{ci} done")
                     _report_reclaims(ev, f"encode {c} {t} chunk{ci}")
+                    _forward_container_timing(ev)
+            elif name == "EncodeWhole":
+                idn = _enter_of(ev, whole_enter)
+                if idn:
+                    c, t = idn
+                    _emit_stage(f"encode:{c}:{t}", "done", 100.0)
+                    _narrate(f"✓ encode {c} {t} done")
+                    _report_reclaims(ev, f"encode {c} {t}")
                     _forward_container_timing(ev)
 
         elif etype == "TaskFailed":
