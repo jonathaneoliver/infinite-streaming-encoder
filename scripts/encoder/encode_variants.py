@@ -104,6 +104,31 @@ def _pass_suffix(pass_num: int | None, stats_path: Path | None) -> str:
     return f":pass={pass_num}:stats={stats_path}"
 
 
+def _cgroup_cpu_quota() -> int | None:
+    """Effective vCPU count from the container's CPU cgroup quota (v2 cpu.max,
+    else v1 cfs_quota/period), rounded to a whole CPU. None when unconstrained
+    (no cgroup / 'max') — e.g. local runs — so callers fall back to all host CPUs.
+    Batch caps each job to its allocated vCPUs via this quota, so it's the right
+    size for the encoder's thread pool."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:  # cgroup v2
+            quota, period = f.read().split()[:2]
+        if quota != "max":
+            return max(1, round(int(quota) / int(period)))
+    except (OSError, ValueError):
+        pass
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:  # cgroup v1
+            quota = int(f.read().strip())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+            period = int(f.read().strip())
+        if quota > 0:
+            return max(1, round(quota / period))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def _codec_specific_args(
     codec: str,
     target_kbps: int,
@@ -113,20 +138,27 @@ def _codec_specific_args(
     stats_path: Path | None = None,
 ) -> list[str]:
     maxrate_k = target_kbps  # placeholder — real value is set in build_ffmpeg_cmd
+    # Size the encoder's threads to the container's CPU quota. Batch cgroup-caps
+    # each job to its allocated vCPUs, but `pools=*` / `-threads 0` would size to
+    # ALL host cores — so two co-located jobs each spin up a host-wide pool and
+    # thrash (16 threads throttled into 8 cores). Matching the quota keeps each
+    # encode inside its slice. None (local, no cgroup) keeps the all-cores default.
+    n = _cgroup_cpu_quota()
+    threads = str(n) if n else "0"
+    pools = str(n) if n else "*"
     if codec == "hevc":
-        # `pools=*` = use every host CPU for the x265 thread pool. The bash
-        # script had `pools=+`, which isn't a valid value — x265 silently
-        # skipped the pool ("No thread pool allocated"), leaving encodes on
-        # just the 3 default frame threads. Switch to `*` for actual
-        # parallelism. Revisit if MAX_CONCURRENT > 1: multiple jobs each
-        # grabbing all cores will thrash; at that point hard-code a count
-        # like pools=4 per encode.
+        # `pools` sizes the x265 thread pool. The bash script had `pools=+`
+        # (invalid — x265 silently skipped the pool, running on just 3 default
+        # frame threads); we now use `pools={quota}` from the CPU cgroup so each
+        # encode's pool matches its allocated vCPUs. This is the "hard-code a
+        # count" the old TODO called for: with jobs packed 2+/box, `pools=*`
+        # sized every pool to all host cores and the co-located encodes thrashed.
         return [
             "-c:v", "libx265",
             "-preset", preset,
-            "-threads", "0",
+            "-threads", threads,
             "-x265-params",
-            f"keyint={k}:min-keyint={k}:scenecut=0:open-gop=0:pools=*:frame-threads=0"
+            f"keyint={k}:min-keyint={k}:scenecut=0:open-gop=0:pools={pools}:frame-threads=0"
             + _pass_suffix(pass_num, stats_path),
             "-pix_fmt", "yuv420p",
         ]
@@ -134,7 +166,7 @@ def _codec_specific_args(
         return [
             "-c:v", "libx264",
             "-preset", preset,
-            "-threads", "0",
+            "-threads", threads,
             "-x264-params",
             f"keyint={k}:min-keyint={k}:scenecut=0:open-gop=0"
             + _pass_suffix(pass_num, stats_path),
