@@ -2155,10 +2155,15 @@ function _fleetInstanceRow(i, maxV) {
     // the fleet, so a 4-vCPU box's bar is half a 8-vCPU box's — bars only span
     // the full width when every box has the same vCPU count.
     const barW = maxV ? cap / maxV * 100 : 100;
+    // Per-machine CPU% trend (2h, from EC2 CloudWatch) inline in the header.
+    const cpuVals = i.cw_cpu || [];
+    const cpuSpark = cpuVals.length >= 2
+        ? `<span title="this box's CPU% over 2h (CloudWatch)">CPU ${_sparkline(cpuVals, '#e0555a', { min: 0, max: 100, w: 54, h: 13 })} <span style="color:#ccc">${cpuVals[cpuVals.length - 1]}%</span></span> · `
+        : '';
     return `<div>
       <div style="display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-bottom:2px">
         <span>${escapeHtml(i.type || '')} <span style="color:#666">${escapeHtml((i.id || '').slice(-6))}</span>${badge}</span>
-        <span>${rightLabel} · ${formatDuration(i.age_seconds || 0)}</span>
+        <span>${cpuSpark}${rightLabel} · ${formatDuration(i.age_seconds || 0)}</span>
       </div>
       <div style="height:16px;width:${barW}%;background:#20252f;border-radius:4px;overflow:hidden;display:flex" title="${cap} vCPU">${parts}</div>
       ${jobList}

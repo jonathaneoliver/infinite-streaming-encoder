@@ -472,6 +472,45 @@ def _fleet_cw_series(cluster_name: str) -> dict:
     return out
 
 
+def _annotate_instance_cpu(instances: list[dict]) -> None:
+    """Attach a 2h CPU% sparkline series (cw_cpu) to each running instance from
+    EC2 CloudWatch, all in one batched GetMetricData call. Best-effort — no
+    datapoints (fresh box / basic-monitoring lag) just leaves it unset."""
+    running = [i for i in instances if i.get("state") == "running"]
+    if not running:
+        return
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=2)
+    by_qid = {}
+    queries = []
+    for n, inst in enumerate(running):
+        qid = f"c{n}"
+        by_qid[qid] = inst
+        queries.append({
+            "Id": qid,
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "AWS/EC2", "MetricName": "CPUUtilization",
+                    "Dimensions": [{"Name": "InstanceId", "Value": inst["id"]}],
+                },
+                "Period": 300, "Stat": "Average",
+            },
+            "ReturnData": True,
+        })
+    try:
+        cw = cloudwatch_client()
+        for i in range(0, len(queries), 500):  # GetMetricData caps at 500/call
+            resp = cw.get_metric_data(
+                MetricDataQueries=queries[i:i + 500], StartTime=start,
+                EndTime=now, ScanBy="TimestampAscending")
+            for r in resp.get("MetricDataResults", []):
+                inst = by_qid.get(r["Id"])
+                if inst is not None and r.get("Values"):
+                    inst["cw_cpu"] = [round(v) for v in r["Values"]]
+    except ClientError:
+        pass
+
+
 def _annotate_init_states(instances: list[dict]) -> None:
     """Tag each running EC2 box with its ECS lifecycle state so the fleet view
     shows what a box is doing *before* a job lands on it, not just "idle":
@@ -609,6 +648,7 @@ def collect() -> dict[str, Any]:
     # 24h spend. _enrich_fleet annotates `instances` in place.
     fleet = _enrich_fleet(batch_jobs, instances)
     _annotate_init_states(instances)  # booting / pulling / idle per box
+    _annotate_instance_cpu(instances)  # per-machine CPU% sparkline series
     fleet["estimated_hourly_usd"] = round(hourly_total, 4)
     _sampled = _record_fleet_samples(hourly_total, fleet)
     fleet["spend_24h_usd"] = _sampled["spend_24h_usd"]
