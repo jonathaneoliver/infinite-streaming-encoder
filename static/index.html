@@ -2088,12 +2088,19 @@ function _jobFriendly(name) {
 }
 
 // Colour a fleet-packing segment by the codec in the Batch job name.
+function _hashStr(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return Math.abs(h); }
 function _jobColor(name) {
     name = name || '';
-    if (name.includes('hevc')) return _CODEC_COLOR.hevc;
-    if (name.includes('av1')) return _CODEC_COLOR.av1;
-    if (name.includes('h264')) return _CODEC_COLOR.h264;
-    return '#5a6472'; // mezz/audio/package/etc
+    // Codec picks the HUE (so codec stays recognisable at a glance); a hash of
+    // the full job name varies the LIGHTNESS so adjacent same-codec jobs (e.g.
+    // hevc chunk 3 vs chunk 4) render as distinguishable shades.
+    let hue, sat = 60;
+    if (name.includes('hevc')) hue = 28;        // orange
+    else if (name.includes('av1')) hue = 275;   // purple
+    else if (name.includes('h264')) hue = 205;  // blue
+    else { hue = 220; sat = 12; }               // grey — mezz/audio/package
+    const light = 42 + (_hashStr(name) % 28);   // 42–69%
+    return `hsl(${hue}, ${sat}%, ${light}%)`;
 }
 
 // Lifecycle badges for a box's ECS state before/without a running job.
@@ -2192,8 +2199,12 @@ function _fleetSparks(fleet) {
     // visible. CPU shares the same y-scale as vCPU-used so the gap reads true.
     const cw = (fleet || {}).cw || {};
     const cpuCores = cw.cpu_cores || [], memGiB = cw.mem_gib || [];
-    const cwCpu = cpuCores.length >= 2
-        ? cell('CPU used · actual (2h)', _sparkline(cpuCores, '#e0555a', { min: 0, max: totalMax }), cpuCores[cpuCores.length - 1] + ' cores')
+    // Actual CPU as a % of total available vCPU (same 0-100 scale as the
+    // allocated "utilization" line) so the two read as allocated vs actual.
+    const cpuPct = curTotal ? cpuCores.map(c => Math.round(c / curTotal * 100)) : [];
+    const lastCores = cpuCores.length ? cpuCores[cpuCores.length - 1] : 0;
+    const cwCpu = cpuPct.length >= 2
+        ? cell('CPU · actual (2h)', _sparkline(cpuPct, '#e0555a', { min: 0, max: 100 }), cpuPct[cpuPct.length - 1] + '% · ' + lastCores + ' cores')
         : '';
     const cwMem = memGiB.length >= 2
         ? cell('memory · actual (2h)', _sparkline(memGiB, '#4ab0a0', { min: 0 }), memGiB[memGiB.length - 1] + ' GiB')
