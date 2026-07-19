@@ -299,34 +299,60 @@ def _forward_container_timing(exit_ev: dict) -> None:
 # submit
 # ---------------------------------------------------------------------------
 
-def _execution_name(input_doc: str) -> str | None:
-    """A readable, unique execution name derived from the S3 job prefix
-    ({jobid}-{stem}) instead of AWS's UUID, so the console + app show e.g.
-    "1784319521959-insane_fpv_shots-a1b2c3". Sanitized to [A-Za-z0-9_-],
-    truncated, with a short random suffix to guarantee uniqueness (retries /
-    resume reusing a job id never collide). Also flows into the Batch job
-    names (which the app already parses phase-first, so the tail is ignored)."""
+def _execution_name_base(input_doc: str) -> str | None:
+    """The stable per-job prefix ({jobid}-{stem}) from the S3 job prefix,
+    sanitized to [A-Za-z0-9_-]. Every execution for a given job shares this
+    prefix (a short random suffix makes each one unique), so it doubles as a
+    filter for finding this job's prior executions."""
     import re
-    import uuid
     try:
         prefix = json.loads(input_doc).get("s3_prefix", "")
     except (ValueError, TypeError):
         return None
-    base = prefix.rstrip("/").rsplit("/", 1)[-1]
-    base = re.sub(r"[^A-Za-z0-9_-]", "_", base)[:60].strip("_-")
-    if not base:
-        return None
-    return f"{base}-{uuid.uuid4().hex[:6]}"
+    base = re.sub(r"[^A-Za-z0-9_-]", "_",
+                  prefix.rstrip("/").rsplit("/", 1)[-1])[:60].strip("_-")
+    return base or None
+
+
+def _execution_name(input_doc: str) -> str | None:
+    """A readable, unique execution name: {jobid}-{stem}-{rand6}. Flows into the
+    Batch job names (which the app parses phase-first, so the tail is ignored)."""
+    import uuid
+    base = _execution_name_base(input_doc)
+    return f"{base}-{uuid.uuid4().hex[:6]}" if base else None
+
+
+def _stop_prior_executions(sfn, sm_arn: str, name_prefix: str) -> None:
+    """Abort any still-RUNNING executions for this job (same {jobid}-{stem}
+    prefix) before starting a new one. Without this, a driver killed mid-run
+    (a server restart kills the cli_batch subprocess without stopping the SFN
+    execution) leaves the execution running orphaned, and the re-submitted job
+    starts a second one — piling up duplicate executions that all keep spending
+    on Batch capacity. Best-effort."""
+    try:
+        paginator = sfn.get_paginator("list_executions")
+        for page in paginator.paginate(stateMachineArn=sm_arn, statusFilter="RUNNING"):
+            for e in page.get("executions", []):
+                if e["name"].startswith(name_prefix):
+                    sfn.stop_execution(
+                        executionArn=e["executionArn"], error="Superseded",
+                        cause="superseded by a re-submission of the same job")
+    except ClientError:
+        pass
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
     sfn = _sfn()
     with open(args.input_json) as f:
         input_doc = f.read()
+    base = _execution_name_base(input_doc)
+    if base:
+        # Kill any orphaned/prior execution for this job first.
+        _stop_prior_executions(sfn, args.state_machine_arn, base + "-")
     kwargs = {"stateMachineArn": args.state_machine_arn, "input": input_doc}
-    name = _execution_name(input_doc)
-    if name:
-        kwargs["name"] = name
+    if base:
+        import uuid
+        kwargs["name"] = f"{base}-{uuid.uuid4().hex[:6]}"
     resp = sfn.start_execution(**kwargs)
     print(resp["executionArn"], flush=True)
     return 0
