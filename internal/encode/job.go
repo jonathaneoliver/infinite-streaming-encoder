@@ -1621,7 +1621,7 @@ func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, 
 			doHevc = true
 		}
 		for _, r := range rungs {
-			vcpu, mem := variantResourcesForHeight(r.Height)
+			vcpu, mem := variantResourcesFor(c, r.Height)
 			rank := resHeightRank(r.Height)
 			prio := rank * 10
 			// Two-pass is HEVC-only and automatic: H264's single-pass VBV

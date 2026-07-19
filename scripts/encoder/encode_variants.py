@@ -175,7 +175,10 @@ def _codec_specific_args(
     if codec == "av1":
         return [
             "-c:v", "libsvtav1",
-            "-preset", "8",
+            # preset 6 (was 8): SVT-AV1 parallelizes across more cores at slower
+            # presets and gives better quality — 6 scales onto a big Graviton box
+            # (where x265 stalls at ~2 cores) at a modest speed cost vs 8.
+            "-preset", "6",
             "-svtav1-params", f"keyint={k}:scd=0",
             "-g", str(k),
             "-force_key_frames", f"expr:gte(n,n_forced*{k})",

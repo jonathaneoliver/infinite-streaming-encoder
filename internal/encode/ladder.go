@@ -66,22 +66,29 @@ func resHeightRank(height int) int {
 	}
 }
 
-// variantResourcesForHeight sizes a chunk encode job to its resolution,
-// returning Batch resourceRequirements (strings). Mirrors the old
-// variantResources but keyed on pixel height so it works for any ladder's
-// rung resolutions (incl. apple's non-standard heights).
-// Memory is deliberately set BELOW the naive 1:2 vCPU:GiB ratio so jobs pack by
-// vCPU. A c*.2xlarge is 8 vCPU / 16 GiB, but only ~15.2 GiB is schedulable after
-// the OS + ECS agent reserve. At the old 8 GiB, two 4-vCPU jobs (16 GiB) didn't
-// fit — only one landed, leaving 4 vCPU idle and halving fleet utilization.
-// 7 GiB lets two 4-vCPU jobs pack (14 GiB) and fill the box; 3.5 GiB lets four
-// 2-vCPU jobs pack. Well within a 4K libx265 encode's actual footprint (~2-4 GiB).
-func variantResourcesForHeight(height int) (vcpu, memory string) {
-	switch {
-	case height <= 540:
-		return "2", "3584" // 4 per 16-GiB box
-	default: // 720p and up
-		return "4", "7168" // 2 per 16-GiB box
+// variantResourcesFor sizes a variant/chunk encode job by CODEC, not just
+// resolution — because on Batch the vCPU request is a packing + fair-share
+// weight (Batch uses CPU shares, not a hard cap), so the right value is how
+// many cores that encoder actually drives. Measured on Graviton .2xlarge:
+//   - x265 (HEVC) tops out ~2-2.4 cores even at 4K → request 2 vCPU so ~4 pack
+//     per 8-core box, filling the cores a single x265 can't use.
+//   - x264 (H264) scales to ~7 cores → 4 vCPU (packs 2 per box).
+//   - SVT-AV1 self-parallelizes across many cores → give it a whole box (8).
+// Small resolutions are cheap for every codec, so a 2-vCPU floor applies.
+// Memory is kept well below the naive 1:2 vCPU:GiB ratio so jobs pack by vCPU;
+// even 4K HEVC peaked at ~2.2 GiB and h264 1080p at ~0.9 GiB (measured via
+// ru_maxrss), so 3 GiB is generous and never the binding constraint.
+func variantResourcesFor(codec string, height int) (vcpu, memory string) {
+	if height <= 540 {
+		return "2", "3072" // small res is cheap for any codec
+	}
+	switch codec {
+	case "hevc":
+		return "2", "3072" // x265 caps ~2 cores → pack ~4 per box
+	case "av1":
+		return "8", "6144" // SVT-AV1 scales → give it a whole .2xlarge
+	default: // h264
+		return "4", "3072" // x264 scales to ~7 → pack 2 per box
 	}
 }
 
