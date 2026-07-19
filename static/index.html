@@ -2102,19 +2102,22 @@ const _FLEET_STATE = {
     pulling: { c: '#4a90d9', t: '⋯ pulling image', tip: 'task placed — pulling image / starting container' },
     idle:    { c: '#d0a24a', t: '◦ idle', tip: 'running but no jobs — a scale-down candidate' },
 };
-function _fleetInstanceRow(i) {
+function _fleetInstanceRow(i, maxV) {
     const cap = i.vcpus || 0;
     const used = i.used_vcpus || 0;
     const idle = (i.idle_vcpus != null) ? i.idle_vcpus : Math.max(0, cap - used);
     const jobs = i.jobs || [];
     const starting = j => /^(STARTING|STARTUP|PROVISIONING|PENDING|SUBMITTED|RUNNABLE)$/i.test(j.status || '');
-    const seg = (w, color, title, extra) => `<div style="width:${w}%;background:${color};${extra || ''}" title="${escapeHtml(title)}"></div>`;
+    const seg = (w, color, title, extra) => `<div style="width:${w}%;background:${color};box-sizing:border-box;${extra || ''}" title="${escapeHtml(title)}"></div>`;
     // A job still STARTING (its container is pulling the image) renders dimmed +
     // striped, so you can see the box warming up for it before it's RUNNING.
     const stripe = c => `background-image:repeating-linear-gradient(45deg,${c} 0 6px,transparent 6px 12px)`;
+    // A track-coloured right border puts a vertical break between adjacent jobs
+    // so you can see each one (esp. when they differ in vCPU width).
+    const divider = 'border-right:2px solid #20252f;';
     let parts = jobs.map(j => seg(cap ? (j.vcpu || 0) / cap * 100 : 0, _jobColor(j.name),
         `${_jobFriendly(j.name)} — ${j.vcpu} vCPU${starting(j) ? ' (starting — pulling image)' : ''}`,
-        starting(j) ? 'opacity:.5;' + stripe('rgba(255,255,255,.3)') : '')).join('');
+        divider + (starting(j) ? 'opacity:.5;' + stripe('rgba(255,255,255,.3)') : ''))).join('');
 
     // Box lifecycle state from ECS (booting / pulling before any job lands).
     // Only surfaced as a box-level badge when there are NO jobs to list —
@@ -2141,12 +2144,16 @@ function _fleetInstanceRow(i) {
               + `${escapeHtml(_jobFriendly(j.name))} <span style="color:#666">${j.vcpu}v${starting(j) ? ' · starting' : ''}</span></span>`).join('')
           + `</div>`
         : '';
+    // Bar length is proportional to the box's vCPU count vs the biggest box in
+    // the fleet, so a 4-vCPU box's bar is half a 8-vCPU box's — bars only span
+    // the full width when every box has the same vCPU count.
+    const barW = maxV ? cap / maxV * 100 : 100;
     return `<div>
       <div style="display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-bottom:2px">
         <span>${escapeHtml(i.type || '')} <span style="color:#666">${escapeHtml((i.id || '').slice(-6))}</span>${badge}</span>
         <span>${rightLabel} · ${formatDuration(i.age_seconds || 0)}</span>
       </div>
-      <div style="height:16px;background:#20252f;border-radius:4px;overflow:hidden;display:flex">${parts}</div>
+      <div style="height:16px;width:${barW}%;background:#20252f;border-radius:4px;overflow:hidden;display:flex" title="${cap} vCPU">${parts}</div>
       ${jobList}
     </div>`;
 }
@@ -2227,7 +2234,8 @@ function renderFleet(fleet, instances) {
         const note = (used > 0 && !mapped)
             ? `<div style="color:#d0a24a;font-size:12px;margin-bottom:8px">per-instance placement unavailable (grant ecs:DescribeContainerInstances) — showing fleet totals only</div>`
             : '';
-        const rows = running.map(_fleetInstanceRow).join('');
+        const maxV = Math.max(...running.map(i => i.vcpus || 0), 1);
+        const rows = running.map(i => _fleetInstanceRow(i, maxV)).join('');
         panelHtml = bar + _fleetSparks(fleet) + note + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
     }
 
