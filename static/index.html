@@ -1594,6 +1594,20 @@ function updateStagesTable(row, stages) {
     table.style.display = '';
 
     const rows = groupStagesForDisplay(stages);
+    // Order: fixed phases in pipeline order; encode variants by DESCENDING
+    // resolution (slowest / most-complex first, matching submission order) so
+    // the biggest variants sit at the top.
+    const _rowKey = r => r.kind === 'chunks' ? ('encode:' + r.codec + ':' + r.tier) : r.s.key;
+    const _phaseRank = k =>
+        k.startsWith('upload') ? 0 : k.startsWith('mezzanine') ? 1 : k.startsWith('audio') ? 2 :
+        k.startsWith('encode:') ? 3 : k.startsWith('package') ? 4 : k.startsWith('fragments') ? 5 :
+        k.startsWith('hls') ? 6 : k.startsWith('download') ? 7 : 8;
+    const _rowHeight = r => parseInt((r.kind === 'chunks' ? r.tier : (r.s.key.split(':')[2] || '')), 10) || 0;
+    rows.sort((a, b) => {  // stable sort keeps same-height / same-phase ties in arrival order
+        const pa = _phaseRank(_rowKey(a)), pb = _phaseRank(_rowKey(b));
+        if (pa !== pb) return pa - pb;
+        return pa === 3 ? _rowHeight(b) - _rowHeight(a) : 0;
+    });
     // Structural signature: rebuild the tbody only when the row set changes.
     const sig = rows.map(r => r.kind === 'chunks'
         ? 'c:' + r.codec + ':' + r.tier + ':' + r.cells.length + (r.concat ? ':j' : '')
