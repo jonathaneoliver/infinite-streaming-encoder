@@ -34,29 +34,30 @@ ARCH_PROFILES: dict[str, ArchProfile] = {
     "intel": ArchProfile(
         key="intel",
         label="Intel Xeon",
-        primary="c7i.8xlarge",
+        primary="c7i.2xlarge",
         # c7a is AMD — swap out if you're strict about Intel-only. Left
         # in as a capacity fallback: if a c-family c7i AZ is dry but a
         # c7a one isn't, we'd rather encode than fail.
-        fallbacks="c7a.8xlarge,c6i.8xlarge",
+        fallbacks="c7a.2xlarge,c6i.2xlarge",
         ami_arch="x86_64",
     ),
     "amd": ArchProfile(
         key="amd",
         label="AMD EPYC",
-        primary="c7a.8xlarge",
-        fallbacks="c7i.8xlarge,c6a.8xlarge",
+        primary="c7a.2xlarge",
+        fallbacks="c7i.2xlarge,c6a.2xlarge",
         ami_arch="x86_64",
     ),
     "graviton": ArchProfile(
         key="graviton",
         label="AWS Graviton (ARM)",
-        # Same family preference order as the cloud-batch compute env
-        # ([c8g, c7g, c6g]): c8g (Graviton4) first, then c7g, then c6g. Sizes
-        # stay .8xlarge here — the legacy path runs the whole ladder on one big
-        # box, vs Batch packing many .2xlarge.
-        primary="c8g.8xlarge",
-        fallbacks="c7g.8xlarge,c6g.8xlarge",
+        # Family preference matches the cloud-batch compute env ([c8g, c7g,
+        # c6g]): c8g (Graviton4) first, then c7g, then c6g. Size is .2xlarge
+        # (8 vCPU): cli_local encodes variants SEQUENTIALLY, so a single variant
+        # only ever uses ~2 (x265) to ~7 (x264) cores — a bigger box just sits
+        # idle. 8 vCPU fits the widest single-variant demand.
+        primary="c8g.2xlarge",
+        fallbacks="c7g.2xlarge,c6g.2xlarge",
         ami_arch="arm64",
     ),
 }
