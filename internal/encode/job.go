@@ -2,6 +2,7 @@ package encode
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -116,6 +117,73 @@ var (
 	// "AMI cache hit" signal for the UI, independent of timing.
 	bootMarkerRe = regexp.MustCompile(`^\[\[ENCODER-BOOT ami=(\S+)\]\]$`)
 )
+
+// upsertStage sets (or creates) a stage by key with the given label, status and
+// percent, stamping StartedAt/EndedAt on transitions. For Go-side stages (the
+// input upload) that aren't part of the worker's PLAN. Set before the worker's
+// PLAN arrives, so the plan MERGE (parseMarker) keeps it as the leading stage.
+func (j *Job) upsertStage(key, label, status string, percent float64) {
+	now := time.Now()
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for i := range j.Stages {
+		if j.Stages[i].Key == key {
+			if j.Stages[i].StartedAt == nil && status == "running" {
+				j.Stages[i].StartedAt = &now
+			}
+			if j.Stages[i].EndedAt == nil && (status == "done" || status == "failed") {
+				j.Stages[i].EndedAt = &now
+			}
+			j.Stages[i].Status = status
+			j.Stages[i].Percent = percent
+			return
+		}
+	}
+	st := StageProgress{Key: key, Label: label, Status: status, Percent: percent}
+	if status == "running" {
+		st.StartedAt = &now
+	}
+	if status == "done" || status == "failed" {
+		st.EndedAt = &now
+	}
+	j.Stages = append(j.Stages, st)
+}
+
+// awsCpProgressRe matches an `aws s3 cp` progress line, e.g.
+// "Completed 256.0 MiB/1.2 GiB (50.0 MiB/s) with 1 file(s) remaining".
+var awsCpProgressRe = regexp.MustCompile(`Completed ([\d.]+) (\w+)/([\d.]+) (\w+)`)
+
+// parseAwsCpProgress extracts an overall percent from an aws-cli progress line.
+func parseAwsCpProgress(line string) (float64, bool) {
+	m := awsCpProgressRe.FindStringSubmatch(line)
+	if m == nil {
+		return 0, false
+	}
+	done := sizeToBytes(m[1], m[2])
+	total := sizeToBytes(m[3], m[4])
+	if total <= 0 {
+		return 0, false
+	}
+	return math.Min(100, done/total*100), true
+}
+
+func sizeToBytes(num, unit string) float64 {
+	f, err := strconv.ParseFloat(num, 64)
+	if err != nil {
+		return 0
+	}
+	switch unit {
+	case "KiB":
+		f *= 1 << 10
+	case "MiB":
+		f *= 1 << 20
+	case "GiB":
+		f *= 1 << 30
+	case "TiB":
+		f *= 1 << 40
+	}
+	return f
+}
 
 // parseMarker returns true when the line was a recognised progress marker
 // (and was applied to the job), so the caller can skip appending it to
@@ -1349,13 +1417,58 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string)
 	s3Input := fmt.Sprintf("%s/input/%s", s3Prefix, filename)
 
 	// Upload the clip (skip if already present via aws CLI's size check).
+	// Stream the aws-cli progress into an `upload:inputs` stage so the UI shows
+	// a live bar for the local->S3 copy — the mirror of the download:outputs
+	// bar on the sync-back. Set before the worker's PLAN arrives so it renders
+	// as the leading stage.
 	job.AppendLog(fmt.Sprintf("[cloud-batch] uploading %s → %s", filename, s3Input))
+	job.upsertStage("upload:inputs", "upload inputs", "running", 0)
+	m.notify(job)
 	localSrc := filepath.Join(m.SourceDir, filename)
-	upload := exec.Command("aws", "s3", "cp", localSrc, s3Input, "--only-show-errors")
+	upload := exec.Command("aws", "s3", "cp", localSrc, s3Input) // no --only-show-errors: we want the progress lines
 	upload.Env = os.Environ()
-	if out, err := upload.CombinedOutput(); err != nil {
-		return fmt.Errorf("aws s3 cp: %w: %s", err, strings.TrimSpace(string(out)))
+	stderr, pipeErr := upload.StderrPipe()
+	if pipeErr != nil {
+		return fmt.Errorf("aws s3 cp stderr pipe: %w", pipeErr)
 	}
+	if err := upload.Start(); err != nil {
+		job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
+		m.notify(job)
+		return fmt.Errorf("aws s3 cp start: %w", err)
+	}
+	// aws s3 cp updates its progress in place with '\r'; split on both \r and \n
+	// so intermediate updates are seen, not just the final \n-terminated line.
+	upScanner := bufio.NewScanner(stderr)
+	upScanner.Buffer(make([]byte, 64*1024), 1<<20)
+	upScanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+		if atEOF && len(data) == 0 {
+			return 0, nil, nil
+		}
+		if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+			return i + 1, data[:i], nil
+		}
+		if atEOF {
+			return len(data), data, nil
+		}
+		return 0, nil, nil
+	})
+	var lastErr string
+	for upScanner.Scan() {
+		line := strings.TrimSpace(upScanner.Text())
+		if pct, ok := parseAwsCpProgress(line); ok {
+			job.upsertStage("upload:inputs", "upload inputs", "running", pct)
+			m.notify(job)
+		} else if line != "" && !strings.HasPrefix(line, "Completed") {
+			lastErr = line // keep the tail of any non-progress (error) output
+		}
+	}
+	if err := upload.Wait(); err != nil {
+		job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
+		m.notify(job)
+		return fmt.Errorf("aws s3 cp: %w: %s", err, lastErr)
+	}
+	job.upsertStage("upload:inputs", "upload inputs", "done", 100)
+	m.notify(job)
 
 	// Build the state-machine input document.
 	// Probe the source duration to plan chunks. ffprobe runs in the worker
