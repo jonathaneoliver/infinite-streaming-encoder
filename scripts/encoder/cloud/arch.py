@@ -51,9 +51,12 @@ ARCH_PROFILES: dict[str, ArchProfile] = {
     "graviton": ArchProfile(
         key="graviton",
         label="AWS Graviton (ARM)",
-        primary="c7g.8xlarge",
-        # c8g is newer / not in every region; c6g is a solid backup.
-        fallbacks="c8g.8xlarge,c6g.8xlarge",
+        # Same family preference order as the cloud-batch compute env
+        # ([c8g, c7g, c6g]): c8g (Graviton4) first, then c7g, then c6g. Sizes
+        # stay .8xlarge here — the legacy path runs the whole ladder on one big
+        # box, vs Batch packing many .2xlarge.
+        primary="c8g.8xlarge",
+        fallbacks="c7g.8xlarge,c6g.8xlarge",
         ami_arch="arm64",
     ),
 }

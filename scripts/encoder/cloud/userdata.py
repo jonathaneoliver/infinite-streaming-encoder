@@ -214,6 +214,11 @@ stage remote:pull done 100
 
 mkdir -p /work/input /work/output /work/tmp
 
+# Fetch the ladder store (user-defined ladders) if the local side shipped it,
+# so a custom --ladder resolves in the container (LADDER_STORE=/work/ladders.json
+# on the docker run below). Absent → cli_local falls back to seed ladders.
+aws s3 cp {s3}/ladders.json /work/ladders.json --region {region} 2>/dev/null || true
+
 # Fetch inputs from our own prefix. On a fresh job the local side
 # uploaded them before launch; on a retry the prior run's inputs
 # are still there (same prefix). Then opportunistically sync tmp/
@@ -265,6 +270,7 @@ for bn in {basenames}; do
         -w /work/output \\
         -e TMPDIR=/work/tmp \\
         -e PYTHONPATH=/app/scripts \\
+        -e LADDER_STORE=/work/ladders.json \\
         --entrypoint python3 \\
         {image} \\
         -m encoder.cli_local \\

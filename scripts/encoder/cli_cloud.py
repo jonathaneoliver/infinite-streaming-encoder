@@ -81,6 +81,22 @@ def _env(key: str, fallback: str = "") -> str:
     return v if v else fallback
 
 
+def _upload_ladder_store(s3_prefix: str) -> None:
+    """Upload the local ladder store (ladders.json) to {s3_prefix}/ladders.json
+    so the remote worker can resolve user-defined ladders. Best-effort: no store
+    or an upload error just leaves the remote on seed ladders."""
+    from encoder.ladder import _store_path
+    path = _store_path()
+    if not path or not os.path.isfile(path):
+        return
+    bucket, _, base = s3_prefix[len("s3://"):].partition("/")
+    try:
+        s3_client().upload_file(path, bucket, f"{base}/ladders.json")
+        print(f"  ladder store:   {path} → {s3_prefix}/ladders.json", flush=True)
+    except Exception as e:  # noqa: BLE001 — never fail the run over the store
+        print(f"  (ladder store upload skipped: {e})", flush=True)
+
+
 def _default_job_id() -> str:
     # Matches bash: YYYYMMDDTHHMMSSZ-$$ but use pid for tiebreak.
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -386,6 +402,12 @@ def main() -> int:
         emit_stage("cloud:upload", "skipped", 100.0)
     else:
         upload_inputs(args.input, s3_prefix, stage_key="cloud:upload")
+        # Ship the ladder store so the remote resolves user-defined ladders —
+        # its baked image only has the seed ladders, so a custom `--ladder` name
+        # would otherwise fail with "unknown ladder". The userdata downloads it
+        # to /work/ladders.json and sets LADDER_STORE; a missing file just falls
+        # back to seeds (see ladder.load_ladders).
+        _upload_ladder_store(s3_prefix)
         emit_stage("cloud:upload", "done", 100.0)
 
     # Poll for completion
