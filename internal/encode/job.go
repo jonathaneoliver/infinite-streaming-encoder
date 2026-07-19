@@ -382,27 +382,27 @@ const (
 )
 
 type JobConfig struct {
-	Files           []string `json:"files"`
-	Codec           string   `json:"codec"`
+	Files []string `json:"files"`
+	Codec string   `json:"codec"`
 	// Ladder selects the bitrate ladder by name (legacy | apple | apple-uniq |
 	// any custom ladder). Empty defaults to "legacy". Threaded to the local
 	// encoder via --ladder and resolved by buildSFNInput for the cloud path.
-	Ladder          string   `json:"ladder,omitempty"`
-	MaxRes          string   `json:"max_res"`
-	Target          Target   `json:"target"`
-	Time            string   `json:"time"`
-	SegmentDuration string   `json:"segment_duration"`
-	PartialDuration string   `json:"partial_duration"`
+	Ladder          string `json:"ladder,omitempty"`
+	MaxRes          string `json:"max_res"`
+	Target          Target `json:"target"`
+	Time            string `json:"time"`
+	SegmentDuration string `json:"segment_duration"`
+	PartialDuration string `json:"partial_duration"`
 	// ChunkDuration tunes the cloud-batch encode granularity: "" = 30s
 	// chunks (max parallelism), "whole" = one job per variant (max
 	// efficiency, less fleet overhead), or a seconds value (multiple of the
 	// 6s segment duration). Only affects the cloud-batch target.
 	ChunkDuration string `json:"chunk_duration,omitempty"`
-	GopDuration     string   `json:"gop_duration"`
-	HlsFormat       string   `json:"hls_format"`
-	Padding         string   `json:"padding"`
-	KeepMezzanine   bool     `json:"keep_mezzanine"`
-	ForceReencode   bool     `json:"force_reencode"`
+	GopDuration   string `json:"gop_duration"`
+	HlsFormat     string `json:"hls_format"`
+	Padding       string `json:"padding"`
+	KeepMezzanine bool   `json:"keep_mezzanine"`
+	ForceReencode bool   `json:"force_reencode"`
 	// HevcSinglePass forces HEVC to encode single-pass. Two-pass is a codec
 	// property, applied automatically: HEVC (libx265) is two-pass by default
 	// (the accurate-average path — its single-pass VBR drifts below target),
@@ -496,6 +496,23 @@ type Job struct {
 	mu        sync.Mutex
 	logLines  []string
 	cancelled bool
+	// cloudExecArn is the SFN execution ARN of the CURRENT cloud-batch file's
+	// running execution. Persisted so Reconcile can re-attach to it after a
+	// restart (poll the running execution) instead of submitting a duplicate.
+	// Empty for local jobs and before the first submit.
+	cloudExecArn string
+}
+
+func (j *Job) CloudExecArn() string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.cloudExecArn
+}
+
+func (j *Job) setCloudExecArn(arn string) {
+	j.mu.Lock()
+	j.cloudExecArn = arn
+	j.mu.Unlock()
 }
 
 type FileStages struct {
@@ -576,15 +593,15 @@ type Manager struct {
 }
 
 type ManagerConfig struct {
-	SourceDir     string
-	OutputDir     string
-	TmpDir        string
-	ScriptsDir    string
-	DockerImage   string
-	HostSourceDir string
-	HostOutputDir string
-	HostTmpDir    string
-	HostAWSDir    string
+	SourceDir       string
+	OutputDir       string
+	TmpDir          string
+	ScriptsDir      string
+	DockerImage     string
+	HostSourceDir   string
+	HostOutputDir   string
+	HostTmpDir      string
+	HostAWSDir      string
 	EncoderImage    string
 	StateMachineArn string
 	MaxConcurrent   int
@@ -1371,12 +1388,12 @@ func (m *Manager) encodeCloudBatch(job *Job, tmpDir, script string, startIdx int
 
 // encodeCloudBatchSFN drives the AWS Batch + Step Functions pipeline
 // defined under infra/terraform/. For each input file:
-//   1. Upload to s3://bucket/jobs/<go-job-id>-<idx>/input/<clip>
-//   2. Build state-machine input JSON (s3_input, s3_prefix, variants[])
-//   3. `cli_batch.py submit` -> prints execution ARN
-//   4. `cli_batch.py poll` -> blocks, emits ENCODER-STAGE markers
-//      until SUCCEEDED/FAILED, then downloads output_*/ trees into
-//      the job's tmpDir for moveTmpToOutput to pick up
+//  1. Upload to s3://bucket/jobs/<go-job-id>-<idx>/input/<clip>
+//  2. Build state-machine input JSON (s3_input, s3_prefix, variants[])
+//  3. `cli_batch.py submit` -> prints execution ARN
+//  4. `cli_batch.py poll` -> blocks, emits ENCODER-STAGE markers
+//     until SUCCEEDED/FAILED, then downloads output_*/ trees into
+//     the job's tmpDir for moveTmpToOutput to pick up
 //
 // Spot interrupts are handled inside the state machine's retry
 // policies — Batch reruns the failing phase on fresh capacity. The
@@ -1399,117 +1416,153 @@ func (m *Manager) encodeCloudBatchSFN(job *Job, tmpDir string, startIdx int) err
 		job.startFile(f, i+1, total)
 		m.notify(job)
 
-		if err := m.runOneCloudBatchSFN(job, tmpDir, f, bucket); err != nil {
+		if err := m.runOneCloudBatchSFN(job, tmpDir, f, bucket, i); err != nil {
 			return fmt.Errorf("%s: %w", f, err)
 		}
+		// This file's execution finished — clear the ARN so the next file
+		// starts a fresh execution (and a restart between files won't reattach
+		// to this now-complete one).
+		job.setCloudExecArn("")
 	}
 	return nil
+}
+
+// cloudExecutionResumable reports whether a persisted SFN execution ARN is
+// still worth re-attaching to: RUNNING (resume polling it) or SUCCEEDED (poll
+// just downloads the finished outputs). Terminal-failure / aborted / not-found
+// → false, so runOneCloudBatchSFN resubmits a fresh execution instead.
+func (m *Manager) cloudExecutionResumable(arn string) bool {
+	out, err := exec.Command("python3", "-m", "encoder.cloud.batch_admin",
+		"execution-status", "--arn", arn).Output()
+	if err != nil {
+		return false
+	}
+	var r struct {
+		Status string `json:"status"`
+	}
+	if json.Unmarshal(out, &r) != nil {
+		return false
+	}
+	return r.Status == "RUNNING" || r.Status == "SUCCEEDED"
 }
 
 // runOneCloudBatchSFN submits + polls a single clip's state-machine
 // execution. Shells out to cli_batch.py for both phases (rather than
 // importing an AWS SDK for Go) to keep AWS usage in one language.
-func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string) error {
+func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string, fileIdx int) error {
 	// Unique S3 prefix per (manager-job, file-index) so retries of
 	// the same Go job can reuse the prefix (input doesn't re-upload).
 	prefix := fmt.Sprintf("jobs/%s-%s", job.ID, strings.TrimSuffix(filename, filepath.Ext(filename)))
 	s3Prefix := fmt.Sprintf("s3://%s/%s", bucket, prefix)
 	s3Input := fmt.Sprintf("%s/input/%s", s3Prefix, filename)
 
-	// Upload the clip (skip if already present via aws CLI's size check).
-	// Stream the aws-cli progress into an `upload:inputs` stage so the UI shows
-	// a live bar for the local->S3 copy — the mirror of the download:outputs
-	// bar on the sync-back. Set before the worker's PLAN arrives so it renders
-	// as the leading stage.
-	job.AppendLog(fmt.Sprintf("[cloud-batch] uploading %s → %s", filename, s3Input))
-	job.upsertStage("upload:inputs", "upload inputs", "running", 0)
-	m.notify(job)
-	localSrc := filepath.Join(m.SourceDir, filename)
-	upload := exec.Command("aws", "s3", "cp", localSrc, s3Input) // no --only-show-errors: we want the progress lines
-	upload.Env = os.Environ()
-	stderr, pipeErr := upload.StderrPipe()
-	if pipeErr != nil {
-		return fmt.Errorf("aws s3 cp stderr pipe: %w", pipeErr)
-	}
-	if err := upload.Start(); err != nil {
-		job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
+	// Re-attach to a still-running execution left by a pre-restart run instead
+	// of re-uploading + re-submitting (which would orphan the old execution and
+	// duplicate the work). Only if the persisted ARN is still RUNNING/SUCCEEDED.
+	execArn := job.CloudExecArn()
+	if execArn != "" && m.cloudExecutionResumable(execArn) {
+		job.AppendLog("[cloud-batch] reattaching to execution " + execArn)
 		m.notify(job)
-		return fmt.Errorf("aws s3 cp start: %w", err)
-	}
-	// aws s3 cp updates its progress in place with '\r'; split on both \r and \n
-	// so intermediate updates are seen, not just the final \n-terminated line.
-	upScanner := bufio.NewScanner(stderr)
-	upScanner.Buffer(make([]byte, 64*1024), 1<<20)
-	upScanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
-		if atEOF && len(data) == 0 {
-			return 0, nil, nil
-		}
-		if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
-			return i + 1, data[:i], nil
-		}
-		if atEOF {
-			return len(data), data, nil
-		}
-		return 0, nil, nil
-	})
-	var lastErr string
-	for upScanner.Scan() {
-		line := strings.TrimSpace(upScanner.Text())
-		if pct, ok := parseAwsCpProgress(line); ok {
-			job.upsertStage("upload:inputs", "upload inputs", "running", pct)
-			m.notify(job)
-		} else if line != "" && !strings.HasPrefix(line, "Completed") {
-			lastErr = line // keep the tail of any non-progress (error) output
-		}
-	}
-	if err := upload.Wait(); err != nil {
-		job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
-		m.notify(job)
-		return fmt.Errorf("aws s3 cp: %w: %s", err, lastErr)
-	}
-	job.upsertStage("upload:inputs", "upload inputs", "done", 100)
-	m.notify(job)
-
-	// Build the state-machine input document.
-	// Probe the source duration to plan chunks. ffprobe runs in the worker
-	// image; if it's unavailable (e.g. local dev), fall back to a single
-	// whole-clip chunk so the pipeline still works.
-	chunkS := job.Config.chunkDurationSeconds()
-	nChunks := 1
-	if durationS, err := probeDurationSeconds(localSrc); err != nil {
-		job.AppendLog(fmt.Sprintf("[cloud-batch] ffprobe failed (%v); encoding %s as one chunk", err, filename))
 	} else {
-		nChunks = chunkCountForDuration(durationS, chunkS)
-		grain := fmt.Sprintf("%.0fs chunks", chunkS)
-		if chunkS >= wholeVariantChunkSeconds {
-			grain = "whole variant"
+
+		// Upload the clip (skip if already present via aws CLI's size check).
+		// Stream the aws-cli progress into an `upload:inputs` stage so the UI shows
+		// a live bar for the local->S3 copy — the mirror of the download:outputs
+		// bar on the sync-back. Set before the worker's PLAN arrives so it renders
+		// as the leading stage.
+		job.AppendLog(fmt.Sprintf("[cloud-batch] uploading %s → %s", filename, s3Input))
+		job.upsertStage("upload:inputs", "upload inputs", "running", 0)
+		m.notify(job)
+		localSrc := filepath.Join(m.SourceDir, filename)
+		upload := exec.Command("aws", "s3", "cp", localSrc, s3Input) // no --only-show-errors: we want the progress lines
+		upload.Env = os.Environ()
+		stderr, pipeErr := upload.StderrPipe()
+		if pipeErr != nil {
+			return fmt.Errorf("aws s3 cp stderr pipe: %w", pipeErr)
 		}
-		job.AppendLog(fmt.Sprintf("[cloud-batch] %s: %.1fs → %d chunk(s) (%s)", filename, durationS, nChunks, grain))
-	}
+		if err := upload.Start(); err != nil {
+			job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
+			m.notify(job)
+			return fmt.Errorf("aws s3 cp start: %w", err)
+		}
+		// aws s3 cp updates its progress in place with '\r'; split on both \r and \n
+		// so intermediate updates are seen, not just the final \n-terminated line.
+		upScanner := bufio.NewScanner(stderr)
+		upScanner.Buffer(make([]byte, 64*1024), 1<<20)
+		upScanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+			if atEOF && len(data) == 0 {
+				return 0, nil, nil
+			}
+			if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+				return i + 1, data[:i], nil
+			}
+			if atEOF {
+				return len(data), data, nil
+			}
+			return 0, nil, nil
+		})
+		var lastErr string
+		for upScanner.Scan() {
+			line := strings.TrimSpace(upScanner.Text())
+			if pct, ok := parseAwsCpProgress(line); ok {
+				job.upsertStage("upload:inputs", "upload inputs", "running", pct)
+				m.notify(job)
+			} else if line != "" && !strings.HasPrefix(line, "Completed") {
+				lastErr = line // keep the tail of any non-progress (error) output
+			}
+		}
+		if err := upload.Wait(); err != nil {
+			job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
+			m.notify(job)
+			return fmt.Errorf("aws s3 cp: %w: %s", err, lastErr)
+		}
+		job.upsertStage("upload:inputs", "upload inputs", "done", 100)
+		m.notify(job)
 
-	// Probe the source width so the ladder is capped at native resolution
-	// (never upscale). 0 => unknown, don't cap.
-	srcWidth := probeSourceWidth(localSrc)
-	if srcWidth > 0 {
-		job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
-	}
-	inputJSON := buildSFNInput(m.Ladders, s3Input, s3Prefix, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, nChunks, srcWidth, chunkS)
-	inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
-	if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
-		return fmt.Errorf("write input json: %w", err)
-	}
+		// Build the state-machine input document.
+		// Probe the source duration to plan chunks. ffprobe runs in the worker
+		// image; if it's unavailable (e.g. local dev), fall back to a single
+		// whole-clip chunk so the pipeline still works.
+		chunkS := job.Config.chunkDurationSeconds()
+		nChunks := 1
+		if durationS, err := probeDurationSeconds(localSrc); err != nil {
+			job.AppendLog(fmt.Sprintf("[cloud-batch] ffprobe failed (%v); encoding %s as one chunk", err, filename))
+		} else {
+			nChunks = chunkCountForDuration(durationS, chunkS)
+			grain := fmt.Sprintf("%.0fs chunks", chunkS)
+			if chunkS >= wholeVariantChunkSeconds {
+				grain = "whole variant"
+			}
+			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: %.1fs → %d chunk(s) (%s)", filename, durationS, nChunks, grain))
+		}
 
-	// Submit.
-	submit := exec.Command("python3", "-m", "encoder.cli_batch", "submit",
-		"--state-machine-arn", m.StateMachineArn,
-		"--input-json", inputPath)
-	submit.Env = os.Environ()
-	out, err := submit.Output()
-	if err != nil {
-		return fmt.Errorf("cli_batch submit: %w", err)
+		// Probe the source width so the ladder is capped at native resolution
+		// (never upscale). 0 => unknown, don't cap.
+		srcWidth := probeSourceWidth(localSrc)
+		if srcWidth > 0 {
+			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
+		}
+		inputJSON := buildSFNInput(m.Ladders, s3Input, s3Prefix, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, nChunks, srcWidth, chunkS)
+		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
+		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
+			return fmt.Errorf("write input json: %w", err)
+		}
+
+		// Submit.
+		submit := exec.Command("python3", "-m", "encoder.cli_batch", "submit",
+			"--state-machine-arn", m.StateMachineArn,
+			"--input-json", inputPath)
+		submit.Env = os.Environ()
+		out, err := submit.Output()
+		if err != nil {
+			return fmt.Errorf("cli_batch submit: %w", err)
+		}
+		execArn = strings.TrimSpace(string(out))
+		job.AppendLog(fmt.Sprintf("[cloud-batch] execution ARN: %s", execArn))
+		// Persist the ARN so a restart re-attaches to THIS execution.
+		job.setCloudExecArn(execArn)
+		m.persistState(job, fileIdx)
 	}
-	execArn := strings.TrimSpace(string(out))
-	job.AppendLog(fmt.Sprintf("[cloud-batch] execution ARN: %s", execArn))
 
 	// Poll + stream progress back into the job log.
 	poll := exec.Command("python3", "-m", "encoder.cli_batch", "poll",
@@ -1715,19 +1768,37 @@ func (m *Manager) resolveCodec(cfg JobConfig, filename string) string {
 	}
 	if cfg.Codec == "all" {
 		missing := []string{}
-		if needH264 { missing = append(missing, "h264") }
-		if needHEVC { missing = append(missing, "hevc") }
-		if needAV1 { missing = append(missing, "av1") }
-		if len(missing) == 3 { return "all" }
-		if len(missing) == 2 && needH264 && needHEVC { return "both" }
-		if len(missing) == 1 { return missing[0] }
+		if needH264 {
+			missing = append(missing, "h264")
+		}
+		if needHEVC {
+			missing = append(missing, "hevc")
+		}
+		if needAV1 {
+			missing = append(missing, "av1")
+		}
+		if len(missing) == 3 {
+			return "all"
+		}
+		if len(missing) == 2 && needH264 && needHEVC {
+			return "both"
+		}
+		if len(missing) == 1 {
+			return missing[0]
+		}
 		// 2 of 3 but not h264+hevc — encode individually
 		return strings.Join(missing, ",")
 	}
 	if cfg.Codec == "both" {
-		if needH264 && needHEVC { return "both" }
-		if needH264 { return "h264" }
-		if needHEVC { return "hevc" }
+		if needH264 && needHEVC {
+			return "both"
+		}
+		if needH264 {
+			return "h264"
+		}
+		if needHEVC {
+			return "hevc"
+		}
 		return ""
 	}
 	return cfg.Codec
@@ -1926,6 +1997,9 @@ type persistedState struct {
 	Config         JobConfig `json:"config"`
 	StartedAt      time.Time `json:"started_at"`
 	CurrentFileIdx int       `json:"current_file_idx"`
+	// CloudExecArn lets Reconcile re-attach to a cloud-batch job's still-running
+	// SFN execution after a restart instead of submitting a duplicate.
+	CloudExecArn string `json:"cloud_exec_arn,omitempty"`
 }
 
 func (m *Manager) statePath(jobID string) string {
@@ -1939,6 +2013,7 @@ func (m *Manager) persistState(job *Job, fileIdx int) {
 		Config:         job.Config,
 		StartedAt:      job.StartedAt,
 		CurrentFileIdx: fileIdx,
+		CloudExecArn:   job.CloudExecArn(),
 	})
 	if err != nil {
 		return
@@ -1991,6 +2066,9 @@ func (m *Manager) Reconcile() {
 			StartedAt: s.StartedAt,
 			Progress:  "resuming after restart",
 		}
+		// Seed the cloud-batch execution ARN so runOneCloudBatchSFN re-attaches
+		// to the still-running SFN execution rather than submitting a duplicate.
+		job.setCloudExecArn(s.CloudExecArn)
 		m.mu.Lock()
 		m.jobs = append(m.jobs, job)
 		m.mu.Unlock()

@@ -30,6 +30,15 @@ def _stop_execution(arn: str) -> dict:
     return {"stopped_execution": arn}
 
 
+def _execution_status(arn: str) -> dict:
+    """RUNNING / SUCCEEDED / FAILED / ABORTED / TIMED_OUT, or NOT_FOUND when the
+    ARN no longer resolves — lets the Go server decide reattach vs resubmit."""
+    try:
+        return {"status": sfn_client().describe_execution(executionArn=arn)["status"]}
+    except ClientError:
+        return {"status": "NOT_FOUND"}
+
+
 def _terminate_job(job_id: str) -> dict:
     batch_client().terminate_job(jobId=job_id, reason=_REASON)
     return {"terminated_job": job_id}
@@ -77,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd", required=True)
     se = sub.add_parser("stop-execution"); se.add_argument("--arn", required=True)
+    est = sub.add_parser("execution-status"); est.add_argument("--arn", required=True)
     tj = sub.add_parser("terminate-job"); tj.add_argument("--id", required=True, dest="job_id")
     sub.add_parser("stop-all")
     args = p.parse_args(argv)
@@ -84,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "stop-execution":
             report = _stop_execution(args.arn)
+        elif args.cmd == "execution-status":
+            report = _execution_status(args.arn)
         elif args.cmd == "terminate-job":
             report = _terminate_job(args.job_id)
         else:

@@ -479,6 +479,13 @@ def _annotate_instance_cpu(instances: list[dict]) -> None:
     running = [i for i in instances if i.get("state") == "running"]
     if not running:
         return
+    # Enable detailed (1-min) monitoring so a fresh box's CPU sparkline appears
+    # in ~2 min instead of ~10 (basic monitoring is 5-min). Idempotent + cheap
+    # (~$0.003/instance-hour, dies with the spot box).
+    try:
+        ec2_client().monitor_instances(InstanceIds=[i["id"] for i in running])
+    except ClientError:
+        pass
     now = datetime.now(timezone.utc)
     start = now - timedelta(hours=2)
     by_qid = {}
