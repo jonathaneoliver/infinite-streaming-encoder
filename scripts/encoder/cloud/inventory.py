@@ -32,14 +32,14 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from botocore.exceptions import ClientError
 
 from encoder.cloud.aws import (
-    APP_TAG_KEY, APP_TAG_VALUE, app_tag_filter, batch_client, ec2_client,
-    ecs_client, region, s3_client, sfn_client,
+    APP_TAG_KEY, APP_TAG_VALUE, app_tag_filter, batch_client, cloudwatch_client,
+    ec2_client, ecs_client, region, s3_client, sfn_client,
 )
 
 
@@ -432,6 +432,46 @@ def _enrich_fleet(batch_jobs: list[dict], instances: list[dict]) -> dict[str, An
     }
 
 
+def _ecs_cluster_name() -> str | None:
+    """Container-Insights ClusterName for the encoder Batch compute env."""
+    try:
+        from encoder.cloud.compute_env import _encoder_ce
+        ce = _encoder_ce()
+        if not ce:
+            return None
+        ces = batch_client().describe_compute_environments(
+            computeEnvironments=[ce]).get("computeEnvironments", [])
+        arn = ces[0].get("ecsClusterArn") if ces else None
+        return arn.rsplit("/", 1)[-1] if arn else None
+    except ClientError:
+        return None
+
+
+def _fleet_cw_series(cluster_name: str) -> dict:
+    """2h of ACTUAL fleet CPU (cores) + memory (GiB) from Container Insights, as
+    sparkline series — the real usage that complements the self-tracked
+    allocated-vCPU history (shows the allocated-vs-used gap live). Needs
+    Container Insights enabled on the cluster; best-effort, empty on any error.
+    CpuUtilized is in CPU units (1024 = 1 vCPU); MemoryUtilized is MiB."""
+    cw = cloudwatch_client()
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=2)
+    out: dict[str, list[float]] = {"cpu_cores": [], "mem_gib": []}
+    for metric, key, div in (("CpuUtilized", "cpu_cores", 1024.0),
+                             ("MemoryUtilized", "mem_gib", 1024.0)):
+        try:
+            dp = cw.get_metric_statistics(
+                Namespace="ECS/ContainerInsights", MetricName=metric,
+                Dimensions=[{"Name": "ClusterName", "Value": cluster_name}],
+                StartTime=start, EndTime=now, Period=300, Statistics=["Average"],
+            ).get("Datapoints", [])
+            dp.sort(key=lambda p: p["Timestamp"])
+            out[key] = [round(p["Average"] / div, 1) for p in dp]
+        except ClientError:
+            pass
+    return out
+
+
 def _annotate_init_states(instances: list[dict]) -> None:
     """Tag each running EC2 box with its ECS lifecycle state so the fleet view
     shows what a box is doing *before* a job lands on it, not just "idle":
@@ -573,6 +613,13 @@ def collect() -> dict[str, Any]:
     _sampled = _record_fleet_samples(hourly_total, fleet)
     fleet["spend_24h_usd"] = _sampled["spend_24h_usd"]
     fleet["history"] = _sampled["history"]
+    # Actual CPU (cores) + memory (GiB) from CloudWatch Container Insights, for
+    # the "real usage vs allocated" sparklines. Only when a box is up (else the
+    # cluster metrics are empty and it's a wasted call).
+    if any(i.get("state") == "running" for i in instances):
+        cluster = _ecs_cluster_name()
+        if cluster:
+            fleet["cw"] = _fleet_cw_series(cluster)
 
     return {
         "fleet": fleet,
