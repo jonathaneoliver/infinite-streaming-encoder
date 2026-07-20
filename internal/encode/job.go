@@ -1628,15 +1628,18 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// Source-keyed mezzanine: if a prior job of the SAME source already
 		// produced the mezzanine (mezz/<key>/), skip BOTH the raw upload and the
 		// mezzanine job — variants read it straight from there (one copy, no
-		// duplicate storage). Force re-encode always re-uploads (it may re-run
-		// the mezzanine, which needs the raw source).
+		// duplicate storage). This applies even under ForceReencode: the mezzanine
+		// is a stream-copy of the source, a pure function of the source file
+		// (the cache key is sha1(name|size|mtime)), independent of codec/ladder —
+		// so reusing it is always correct. ForceReencode redoes the variant
+		// OUTPUTS, not the source mezzanine. To force the mezzanine to regenerate,
+		// clear the mezz cache (source changes bump the key automatically).
 		localSrc := filepath.Join(m.SourceDir, filename)
 		s3Mezz := s3Prefix // fallback: mezzanine stays in the job prefix
 		cacheHit := false
 		if key, ok := sourceMezzKey(localSrc); ok {
 			s3Mezz = fmt.Sprintf("s3://%s/mezz/%s", bucket, key)
-			if !job.Config.ForceReencode &&
-				s3ObjectExists(s3Mezz+"/mezzanine.mp4") &&
+			if s3ObjectExists(s3Mezz+"/mezzanine.mp4") &&
 				s3ObjectExists(s3Mezz+"/mezzanine.mp4.done") {
 				cacheHit = true
 			}
