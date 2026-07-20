@@ -25,8 +25,7 @@ type ladderRung struct {
 // sfnVariant is one entry in the SFN input's "variants" list. All the
 // worker-facing fields are strings because Batch job Parameters (Ref::x) are
 // string substitutions; Priority stays an int (SchedulingPriorityOverride
-// wants a number). heightRank is internal (submission-order sort only) and is
-// not marshaled.
+// wants a number) and is the predicted encode wall time — see predictedPriority.
 type sfnVariant struct {
 	Codec    string `json:"codec"`
 	Label    string `json:"label"`
@@ -46,32 +45,12 @@ type sfnVariant struct {
 	ChunkIndices  []int  `json:"chunk_indices"`
 	ChunkDuration string `json:"chunk_duration"`
 	Chunked       string `json:"chunked"`
-	heightRank    int    `json:"-"`
 }
 
 // maxResHeight maps a --max-res tier name to its pixel height for capping.
 var maxResHeight = map[string]int{
 	"360p": 360, "540p": 540, "720p": 720,
 	"1080p": 1080, "1440p": 1440, "2160p": 2160,
-}
-
-// resHeightRank maps a resolution name to a small rank for scheduling priority
-// (higher resolution = higher rank = scheduled first).
-func resHeightRank(height int) int {
-	switch {
-	case height <= 360:
-		return 1
-	case height <= 540:
-		return 2
-	case height <= 720:
-		return 3
-	case height <= 1080:
-		return 4
-	case height <= 1440:
-		return 5
-	default:
-		return 6
-	}
 }
 
 // variantResourcesFor sizes a variant/chunk encode job by CODEC, not just
@@ -109,13 +88,14 @@ func variantResourcesFor(codec string, height int) (vcpu, memory string) {
 	}
 }
 
-// sortRungsSlowestFirst orders variants so the long poles (high resolution,
-// then HEVC over H.264) enter the queue first. Scheduling priority enforces
-// it, but submission order helps too.
+// sortRungsSlowestFirst orders variants by descending Priority (predicted
+// encode wall time) so the long poles enter the queue first — matching the
+// SchedulingPriorityOverride Batch sees. Submission order only breaks ties that
+// the scheduler leaves open; HEVC wins an exact tie (typically slower to seek).
 func sortRungsSlowestFirst(v []sfnVariant) {
 	sort.SliceStable(v, func(i, j int) bool {
-		if v[i].heightRank != v[j].heightRank {
-			return v[i].heightRank > v[j].heightRank
+		if v[i].Priority != v[j].Priority {
+			return v[i].Priority > v[j].Priority
 		}
 		return v[i].Codec == "hevc" && v[j].Codec != "hevc"
 	})

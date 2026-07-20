@@ -1665,6 +1665,27 @@ func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, co
 	}
 }
 
+// predictedPriority ranks a variant by its predicted encode WALL time
+// (content ÷ learned-or-seeded speed) so the slowest variant gets the highest
+// Batch SchedulingPriorityOverride and enters the fleet first. Reuses the same
+// speed model as the dynamic chunk selector, so ordering sharpens as speeds are
+// learned. Clamped to Batch's [1, 9999] priority range. When the clip duration
+// is unknown (0), content falls back to 1 so variants still rank by 1/speed.
+func predictedPriority(speeds *EncodeSpeedStore, codec string, height int, twoPass bool, clipS float64) int {
+	content := clipS
+	if content <= 0 {
+		content = 1
+	}
+	p := int(math.Round(content / speeds.Speed(codec, height, twoPass)))
+	if p < 1 {
+		p = 1
+	}
+	if p > 9999 {
+		p = 9999
+	}
+	return p
+}
+
 // chunkPlanLine explains one variant's chunk-size decision for the job log:
 // how many chunks, the per-chunk length, and — for the dynamic selector — the
 // speed (learned or seeded) and target that produced it. This is what makes a
@@ -1748,16 +1769,17 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		}
 		for _, r := range rungs {
 			vcpu, mem := variantResourcesFor(c, r.Height)
-			rank := resHeightRank(r.Height)
-			prio := rank * 10
 			// Two-pass is HEVC-only and automatic: H264's single-pass VBV
 			// already hits target average, so it never two-passes; HEVC
 			// two-passes by default unless the user asked for a single-pass
 			// comparison run (hevcSinglePass).
 			twoPass := c == "hevc" && !hevcSinglePass
-			if c == "hevc" {
-				prio++ // HEVC just ahead of H.264 within a resolution (slower)
-			}
+			// Priority = predicted encode WALL time (content ÷ learned speed):
+			// the slowest variant enters the fleet first. Subsumes the old
+			// resolution-tier + HEVC-bump heuristic — pixels, codec, and pass
+			// all fold into the speed model, so 1080p sorts ahead of 1044p and
+			// 4K HEVC 2-pass far ahead of any H.264, self-correcting as learned.
+			prio := predictedPriority(speeds, c, r.Height, twoPass, clipDurationS)
 			// Per-variant chunking: size this variant's chunks (dynamic by
 			// complexity, or the job's fixed/whole config), then enumerate them.
 			cs := variantChunkSeconds(chunkCfg, clipDurationS, speeds, c, r.Height, twoPass)
@@ -1783,7 +1805,6 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 				ChunkIndices:  idx,
 				ChunkDuration: strconv.FormatFloat(cs, 'f', -1, 64),
 				Chunked:       strconv.FormatBool(nc > 1),
-				heightRank:    rank,
 			})
 		}
 	}
