@@ -14,7 +14,7 @@
         "SchedulingPriorityOverride": 99,
         "Parameters": {
           "s3_in.$": "$.s3_input",
-          "s3_out.$": "$.s3_prefix"
+          "s3_out.$": "$.s3_mezz"
         },
         "ContainerOverrides": {
           "Environment": [
@@ -60,7 +60,7 @@
                 "ShareIdentifier": "encode",
                 "SchedulingPriorityOverride": 55,
                 "Parameters": {
-                  "s3_mezz.$": "$.s3_prefix",
+                  "s3_mezz.$": "$.s3_mezz",
                   "s3_out.$": "$.s3_prefix"
                 }
               },
@@ -88,6 +88,7 @@
                 "memory.$": "$$.Map.Item.Value.memory",
                 "priority.$": "$$.Map.Item.Value.priority",
                 "s3_prefix.$": "$.s3_prefix",
+                "s3_mezz.$": "$.s3_mezz",
                 "two_pass.$": "$$.Map.Item.Value.two_pass",
                 "chunk_indices.$": "$$.Map.Item.Value.chunk_indices",
                 "chunk_duration.$": "$$.Map.Item.Value.chunk_duration",
@@ -123,7 +124,7 @@
                         "bitrate.$": "$.bitrate",
                         "preset.$": "$.preset",
                         "chunk_index": "-1",
-                        "s3_mezz.$": "$.s3_prefix",
+                        "s3_mezz.$": "$.s3_mezz",
                         "s3_out.$": "$.s3_prefix"
                       },
                       "ContainerOverrides": {
@@ -157,6 +158,7 @@
                       "memory.$": "$.memory",
                       "priority.$": "$.priority",
                       "s3_prefix.$": "$.s3_prefix",
+                      "s3_mezz.$": "$.s3_mezz",
                       "two_pass.$": "$.two_pass",
                       "chunk_index.$": "$$.Map.Item.Value",
                       "chunk_duration.$": "$.chunk_duration",
@@ -183,7 +185,7 @@
                               "bitrate.$": "$.bitrate",
                               "preset.$": "$.preset",
                               "chunk_index.$": "States.Format('{}', $.chunk_index)",
-                              "s3_mezz.$": "$.s3_prefix",
+                              "s3_mezz.$": "$.s3_mezz",
                               "s3_out.$": "$.s3_prefix"
                             },
                             "ContainerOverrides": {

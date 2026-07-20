@@ -47,6 +47,26 @@ resource "aws_s3_bucket_lifecycle_configuration" "staging" {
       days_after_initiation = 3
     }
   }
+
+  # Source-keyed mezzanine cache (mezz/<key>/mezzanine.mp4): reused across jobs
+  # to skip the re-upload + mezzanine job for a source encoded again. Bounded to
+  # recent files by its own TTL so it never accumulates cost.
+  rule {
+    id     = "expire-mezz-cache"
+    status = "Enabled"
+
+    filter {
+      prefix = "mezz/"
+    }
+
+    expiration {
+      days = var.mezz_cache_retention_days
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 3
+    }
+  }
 }
 
 module "network" {

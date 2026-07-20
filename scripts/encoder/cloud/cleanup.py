@@ -347,13 +347,15 @@ def sweep_all() -> CleanupReport:
     orphan_volumes = _describe_app_volumes(ec2, job_id=None, only_orphans=True)
     _delete_volumes(ec2, orphan_volumes, report)
 
-    # S3 staging: everything under s3://bucket/jobs/. We don't filter
-    # by Application tag here — object-level tags would require an
-    # extra GetObjectTagging call per object and the prefix is owned
-    # by this app by convention.
+    # S3 staging: everything under s3://bucket/jobs/ (per-job staging) AND
+    # s3://bucket/mezz/ (the source-keyed mezzanine cache). We don't filter by
+    # Application tag here — object-level tags would require an extra
+    # GetObjectTagging call per object and both prefixes are owned by this app
+    # by convention. "Clear all AWS resources" must wipe the mezz cache too.
     bucket = _s3_bucket_from_env()
     if bucket:
         _delete_s3_prefix(bucket, "jobs/", report, job_id=None)
+        _delete_s3_prefix(bucket, "mezz/", report, job_id=None)
     return report
 
 

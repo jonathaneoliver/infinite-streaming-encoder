@@ -58,3 +58,15 @@ EOT
   type        = number
   default     = 7
 }
+
+variable "mezz_cache_retention_days" {
+  description = <<EOT
+Days before a cached mezzanine under s3://<s3_bucket>/mezz/ is auto-expired.
+The mezzanine is source-keyed (name+size+mtime) and reused across jobs so a
+re-encode of the same source skips the upload + mezzanine job. Keep it long
+enough to cover an iterate-on-one-clip session; the TTL bounds the "recent
+files only" cache so storage never accumulates.
+EOT
+  type        = number
+  default     = 14
+}

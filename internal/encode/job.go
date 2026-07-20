@@ -3,6 +3,8 @@ package encode
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -1475,59 +1477,79 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		m.notify(job)
 	} else {
 
-		// Upload the clip (skip if already present via aws CLI's size check).
-		// Stream the aws-cli progress into an `upload:inputs` stage so the UI shows
-		// a live bar for the local->S3 copy — the mirror of the download:outputs
-		// bar on the sync-back. Set before the worker's PLAN arrives so it renders
-		// as the leading stage.
-		job.AppendLog(fmt.Sprintf("[cloud-batch] uploading %s → %s", filename, s3Input))
-		job.upsertStage("upload:inputs", "upload inputs", "running", 0)
-		m.notify(job)
+		// Source-keyed mezzanine: if a prior job of the SAME source already
+		// produced the mezzanine (mezz/<key>/), skip BOTH the raw upload and the
+		// mezzanine job — variants read it straight from there (one copy, no
+		// duplicate storage). Force re-encode always re-uploads (it may re-run
+		// the mezzanine, which needs the raw source).
 		localSrc := filepath.Join(m.SourceDir, filename)
-		upload := exec.Command("aws", "s3", "cp", localSrc, s3Input) // no --only-show-errors: we want the progress lines
-		upload.Env = os.Environ()
-		stderr, pipeErr := upload.StderrPipe()
-		if pipeErr != nil {
-			return fmt.Errorf("aws s3 cp stderr pipe: %w", pipeErr)
+		s3Mezz := s3Prefix // fallback: mezzanine stays in the job prefix
+		cacheHit := false
+		if key, ok := sourceMezzKey(localSrc); ok {
+			s3Mezz = fmt.Sprintf("s3://%s/mezz/%s", bucket, key)
+			if !job.Config.ForceReencode &&
+				s3ObjectExists(s3Mezz+"/mezzanine.mp4") &&
+				s3ObjectExists(s3Mezz+"/mezzanine.mp4.done") {
+				cacheHit = true
+			}
 		}
-		if err := upload.Start(); err != nil {
-			job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
+		if cacheHit {
+			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: mezzanine cache hit — reusing %s, skipping upload + mezzanine", filename, s3Mezz))
+			job.upsertStage("upload:inputs", "upload inputs", "skipped", 100)
 			m.notify(job)
-			return fmt.Errorf("aws s3 cp start: %w", err)
 		}
-		// aws s3 cp updates its progress in place with '\r'; split on both \r and \n
-		// so intermediate updates are seen, not just the final \n-terminated line.
-		upScanner := bufio.NewScanner(stderr)
-		upScanner.Buffer(make([]byte, 64*1024), 1<<20)
-		upScanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
-			if atEOF && len(data) == 0 {
-				return 0, nil, nil
+		if !cacheHit {
+			// Upload the clip. Stream the aws-cli progress into an `upload:inputs`
+			// stage so the UI shows a live bar for the local->S3 copy — the mirror
+			// of the download:outputs bar on the sync-back.
+			job.AppendLog(fmt.Sprintf("[cloud-batch] uploading %s → %s", filename, s3Input))
+			job.upsertStage("upload:inputs", "upload inputs", "running", 0)
+			m.notify(job)
+			upload := exec.Command("aws", "s3", "cp", localSrc, s3Input) // no --only-show-errors: we want the progress lines
+			upload.Env = os.Environ()
+			stderr, pipeErr := upload.StderrPipe()
+			if pipeErr != nil {
+				return fmt.Errorf("aws s3 cp stderr pipe: %w", pipeErr)
 			}
-			if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
-				return i + 1, data[:i], nil
-			}
-			if atEOF {
-				return len(data), data, nil
-			}
-			return 0, nil, nil
-		})
-		var lastErr string
-		for upScanner.Scan() {
-			line := strings.TrimSpace(upScanner.Text())
-			if pct, ok := parseAwsCpProgress(line); ok {
-				job.upsertStage("upload:inputs", "upload inputs", "running", pct)
+			if err := upload.Start(); err != nil {
+				job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
 				m.notify(job)
-			} else if line != "" && !strings.HasPrefix(line, "Completed") {
-				lastErr = line // keep the tail of any non-progress (error) output
+				return fmt.Errorf("aws s3 cp start: %w", err)
 			}
-		}
-		if err := upload.Wait(); err != nil {
-			job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
+			// aws s3 cp updates its progress in place with '\r'; split on both \r and \n
+			// so intermediate updates are seen, not just the final \n-terminated line.
+			upScanner := bufio.NewScanner(stderr)
+			upScanner.Buffer(make([]byte, 64*1024), 1<<20)
+			upScanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+				if atEOF && len(data) == 0 {
+					return 0, nil, nil
+				}
+				if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+					return i + 1, data[:i], nil
+				}
+				if atEOF {
+					return len(data), data, nil
+				}
+				return 0, nil, nil
+			})
+			var lastErr string
+			for upScanner.Scan() {
+				line := strings.TrimSpace(upScanner.Text())
+				if pct, ok := parseAwsCpProgress(line); ok {
+					job.upsertStage("upload:inputs", "upload inputs", "running", pct)
+					m.notify(job)
+				} else if line != "" && !strings.HasPrefix(line, "Completed") {
+					lastErr = line // keep the tail of any non-progress (error) output
+				}
+			}
+			if err := upload.Wait(); err != nil {
+				job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
+				m.notify(job)
+				return fmt.Errorf("aws s3 cp: %w: %s", err, lastErr)
+			}
+			job.upsertStage("upload:inputs", "upload inputs", "done", 100)
 			m.notify(job)
-			return fmt.Errorf("aws s3 cp: %w: %s", err, lastErr)
-		}
-		job.upsertStage("upload:inputs", "upload inputs", "done", 100)
-		m.notify(job)
+		} // end if !cacheHit (upload)
 
 		// Build the state-machine input document.
 		// Probe the source duration so each variant can size its own chunks
@@ -1547,7 +1569,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		if srcWidth > 0 {
 			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
 		}
-		inputJSON := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, srcWidth, durationS, job.Config.ChunkDuration, job.AppendLog)
+		inputJSON := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, srcWidth, durationS, job.Config.ChunkDuration, job.AppendLog)
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 			return fmt.Errorf("write input json: %w", err)
@@ -1733,7 +1755,32 @@ func chunkModeLabel(cfg string) string {
 	}
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, ladderName, codecSel, maxRes string, hevcSinglePass bool, sourceWidth int, clipDurationS float64, chunkCfg string, logf func(string)) string {
+// sourceMezzKey derives a stable source-identity key for the mezzanine cache
+// from the file's name + size + mtime — cheap (a stat, no reading the file).
+// Any change to those re-mezzanines. Returns false if the file can't be stat'd.
+func sourceMezzKey(path string) (string, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	sum := sha1.Sum([]byte(fmt.Sprintf("%s|%d|%d",
+		filepath.Base(path), fi.Size(), fi.ModTime().UnixNano())))
+	return hex.EncodeToString(sum[:])[:16], true
+}
+
+// s3ObjectExists reports whether an s3://bucket/key object exists (aws-cli
+// head-object; exit 0 == present). Best-effort — any error reads as absent.
+func s3ObjectExists(uri string) bool {
+	bucket, key, ok := strings.Cut(strings.TrimPrefix(uri, "s3://"), "/")
+	if !ok || bucket == "" || key == "" {
+		return false
+	}
+	cmd := exec.Command("aws", "s3api", "head-object", "--bucket", bucket, "--key", key)
+	cmd.Env = os.Environ()
+	return cmd.Run() == nil
+}
+
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass bool, sourceWidth int, clipDurationS float64, chunkCfg string, logf func(string)) string {
 	if ladderName == "" {
 		ladderName = "apple-uniq-live"
 	}
@@ -1832,10 +1879,15 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	doc := map[string]any{
 		"s3_input":  s3Input,
 		"s3_prefix": s3Prefix,
-		"variants":  variants,
-		"do_h264":   doH264,
-		"do_hevc":   doHevc,
-		"do_av1":    doAV1,
+		// Source-keyed mezzanine home (mezz/<key>/), reused across jobs so the
+		// same source skips the upload + mezzanine job. Falls back to s3_prefix
+		// when the key can't be computed. Read by mezzanine (out), variants +
+		// audio (in); variant/output writes still go to s3_prefix.
+		"s3_mezz":  s3Mezz,
+		"variants": variants,
+		"do_h264":  doH264,
+		"do_hevc":  doHevc,
+		"do_av1":   doAV1,
 		// Ladder-level VBV shaping, applied to every variant's encode (the
 		// worker reads these as MAXRATE_PERCENT / BUFSIZE_MULT env). Threaded
 		// so a custom ladder's VBV is honored in the cloud, not just locally.
