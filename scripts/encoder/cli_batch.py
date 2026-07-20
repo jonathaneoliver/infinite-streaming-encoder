@@ -60,6 +60,43 @@ def _batch():
     return boto3.client("batch", region_name=_region())
 
 
+def _ecs():
+    return boto3.client("ecs", region_name=_region())
+
+
+# containerInstanceArn -> EC2 instance-id, resolved once per instance. The ARN
+# is stable per machine, so a cache hit avoids re-describing; on missing ecs perm
+# we fall back to a short slug of the ARN (still a stable per-machine key, which
+# is all the chunk-plot colouring needs).
+_HOST_CACHE: dict = {}
+
+
+def _ec2_for_container_instance(ci_arn: str) -> str:
+    """Map an ECS container-instance ARN to its EC2 instance-id (cached).
+    Falls back to the last 8 chars of the ARN if ecs:DescribeContainerInstances
+    isn't granted — a per-machine key is all the caller needs for colouring."""
+    if not ci_arn:
+        return ""
+    if ci_arn in _HOST_CACHE:
+        return _HOST_CACHE[ci_arn]
+    # arn:aws:ecs:region:acct:container-instance/<cluster>/<id>
+    slug = ci_arn.rsplit("/", 1)[-1][:8]
+    resolved = slug
+    try:
+        parts = ci_arn.split(":container-instance/", 1)[-1].split("/")
+        cluster = parts[0] if len(parts) == 2 else None
+        if cluster:
+            r = _ecs().describe_container_instances(
+                cluster=cluster, containerInstances=[ci_arn])
+            cis = r.get("containerInstances", [])
+            if cis and cis[0].get("ec2InstanceId"):
+                resolved = cis[0]["ec2InstanceId"]
+    except (ClientError, KeyError, IndexError):
+        pass
+    _HOST_CACHE[ci_arn] = resolved
+    return resolved
+
+
 # var-<codec>-<tier>-c<N>-<execName> — the chunk job name from the SFN template.
 _CHUNK_JOBNAME_RE = re.compile(r"^var-([^-]+)-([^-]+)-c(\d+)-")
 # var-<codec>-<tier>-whole-<execName> — the whole-variant (single-chunk) job.
@@ -144,9 +181,21 @@ def _forward_running_logs(exec_name: str, log_state: dict) -> None:
         except ClientError:
             continue
         for j in jobs:
-            stream = j.get("container", {}).get("logStreamName")
+            container = j.get("container", {})
+            stream = container.get("logStreamName")
             if stream:
                 _tail_progress(stream, _short_label(j.get("jobName", "")), log_state)
+            # Report which machine this chunk/variant landed on, once per stage
+            # key, so the UI can colour the chunk plot by instance (and reveal
+            # heavy chunks co-located on one box). Best-effort/cosmetic.
+            key = _stage_from_jobname(j.get("jobName", ""))
+            ci_arn = container.get("containerInstanceArn")
+            if key and ci_arn:
+                seen_key = "_host:" + key
+                inst = _ec2_for_container_instance(ci_arn)
+                if inst and log_state.get(seen_key) != inst:
+                    log_state[seen_key] = inst
+                    _emit_host(key, inst)
 
 
 def _tail_progress(stream: str, label: str, log_state: dict) -> None:
@@ -241,6 +290,12 @@ def _emit_plan(do_h264: bool = True, do_hevc: bool = True) -> None:
 def _emit_stage(key: str, status: str, percent: float = 0.0) -> None:
     print(f"[[ENCODER-STAGE key={key} status={status} percent={percent:.1f}]]",
           flush=True)
+
+
+def _emit_host(key: str, instance: str) -> None:
+    """Report the machine a stage's Batch job landed on, for the chunk plot's
+    per-instance colouring. Emitted once per (key, instance) by the log poller."""
+    print(f"[[ENCODER-HOST key={key} instance={instance}]]", flush=True)
 
 
 def _narrate(msg: str) -> None:

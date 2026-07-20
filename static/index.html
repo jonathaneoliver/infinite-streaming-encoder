@@ -112,7 +112,16 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    %, so a running chunk shows real progress instead of a pulse; a completed
    chunked row is solid green at the same height as a completed whole row. */
 .chunk-grid { display: flex; flex-wrap: nowrap; gap: 2px; align-items: center; width: 100%; }
-.chunk-cell { flex: 1 1 0; min-width: 3px; height: 6px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
+.chunk-cell { position: relative; flex: 1 1 0; min-width: 3px; height: 8px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
+/* 2px bottom stripe coloured by the instance the chunk ran on — painted over
+   the status fill (z-index) so it stays visible even when the chunk is done.
+   Same colour across cells => same machine, so a mono-coloured plot reveals
+   heavy chunks co-located on one box. */
+.chunk-cell-host { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; z-index: 1; background: transparent; pointer-events: none; }
+/* Whole-variant encode rows have no chunk grid, so the instance shows as a dot
+   before the label — same palette as the chunk stripes, so a whole encode and a
+   chunk sharing a colour ran on the same box. */
+.host-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: transparent; }
 /* display:block so width/height apply — it's a <span> inside the cell, and
    inline elements ignore both (unlike the whole-variant fill, which is a div). */
 .chunk-cell-fill { display: block; height: 100%; width: 0; background: #4361ee; transition: width 0.3s ease; }
@@ -1561,6 +1570,24 @@ function jobRowHtml(j) {
     `;
 }
 
+// Stable colour per instance for the chunk plot. Chunks sharing a colour ran
+// on the same machine, so a row — or the whole plot — in one colour reveals
+// heavy chunks co-located on a single box. Assigned in first-seen order; the
+// palette deliberately avoids the status fills (blue/green/red) so the stripe
+// reads as "which machine", not "what state".
+const _INSTANCE_PALETTE = ['#4cc9f0', '#f4a261', '#b5179e', '#e9c46a', '#7209b7',
+    '#2a9d8f', '#ff8fab', '#90be6d', '#c77dff', '#f28482', '#48cae4', '#bc6c25'];
+const _instanceColors = {};
+let _instanceColorNext = 0;
+function instanceColor(inst) {
+    if (!inst) return null;
+    if (!(inst in _instanceColors)) {
+        _instanceColors[inst] = _INSTANCE_PALETTE[_instanceColorNext % _INSTANCE_PALETTE.length];
+        _instanceColorNext++;
+    }
+    return _instanceColors[inst];
+}
+
 // Match a per-chunk encode stage key: encode:<codec>:<tier>:chunk<N>.
 const CHUNK_KEY_RE = /^encode:([^:]+):([^:]+):chunk(\d+)$/;
 // Match the per-variant concat stage key: concat:<codec>:<tier>.
@@ -1645,13 +1672,16 @@ function updateStagesTable(row, stages) {
                 // the same as the chunked rows below.
                 const label = (r.s.label && r.s.label.startsWith('encode:'))
                     ? r.s.label.replace(/:/g, ' ') : r.s.label;
+                // Encode rows (whole variants) carry an instance → prefix a dot
+                // placeholder; other phases (mezz/audio/pkg) have no host, no dot.
+                const dot = r.s.key.startsWith('encode:') ? '<span class="host-dot"></span>' : '';
                 return `<tr data-stage-key="${escapeHtml(r.s.key)}">
-                    <td class="stage-label">${escapeHtml(label)}</td>
+                    <td class="stage-label">${dot}${escapeHtml(label)}</td>
                     <td class="stage-bar"><div class="stage-bar-track"><div class="stage-bar-fill"></div></div></td>
                     <td class="stage-pct"></td></tr>`;
             }
             const cells = r.cells.map(c =>
-                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" title="chunk ${c.index}"><span class="chunk-cell-fill"></span></span>`).join('');
+                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" title="chunk ${c.index}"><span class="chunk-cell-fill"></span><i class="chunk-cell-host"></i></span>`).join('');
             // The join is implicit in the solid bar (concat is folded into
             // package-all), so no separate join glyph is drawn. Any concat stage
             // is still absorbed into this group (below) so it doesn't spawn a row.
@@ -1670,6 +1700,13 @@ function updateStagesTable(row, stages) {
             const tr = tbody.querySelector(`tr[data-stage-key="${s.key}"]`);
             if (!tr) continue;
             tr.className = 'stage-' + s.status;
+            // Colour the instance dot on encode rows once the job is placed.
+            const dot = tr.querySelector('.host-dot');
+            if (dot) {
+                const color = instanceColor(s.instance);
+                dot.style.background = color || 'transparent';
+                dot.title = s.instance || '';
+            }
             const reclaimed = s.status === 'reclaimed';
             const fill = tr.querySelector('.stage-bar-fill');
             // reclaimed → fill the bar red (spot taken, waiting to restart);
@@ -1708,6 +1745,11 @@ function updateStagesTable(row, stages) {
                         : st === 'failed' ? ' chunk-failed'
                         : st === 'reclaimed' ? ' chunk-reclaimed' : '');
             }
+            // Bottom stripe = which machine this chunk landed on (once placed).
+            const host = cell.querySelector('.chunk-cell-host');
+            const color = instanceColor(c.s.instance);
+            if (host) host.style.background = color || 'transparent';
+            if (color) cell.title = `chunk ${c.index} · ${c.s.instance}`;
         }
         // Aggregate % across chunks so a chunked row reads like a whole row
         // ("100%") instead of a chunk count — the join is implicit, not shown.

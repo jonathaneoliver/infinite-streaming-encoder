@@ -85,6 +85,10 @@ func stripANSI(s string) string {
 var (
 	planMarkerRe  = regexp.MustCompile(`^\[\[ENCODER-PLAN (.+)\]\]$`)
 	stageMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=([0-9.]+)\]\]$`)
+	// ENCODER-HOST reports the machine (EC2 instance-id, or a stable ARN slug)
+	// a stage's Batch job landed on — used to colour the chunk plot by instance
+	// so co-located heavy chunks are visible. Emitted once per (stage, instance).
+	hostMarkerRe = regexp.MustCompile(`^\[\[ENCODER-HOST key=(\S+) instance=(\S+)\]\]$`)
 	// Cloud cli_cloud.py prints its computed S3 job id in the plan
 	// header (`  job_id:         20260420T203910Z-1`). That's the prefix
 	// under `s3://.../jobs/` — we capture it so the retry endpoint can
@@ -304,6 +308,18 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Unlock()
 		return true
 	}
+	if m := hostMarkerRe.FindStringSubmatch(line); m != nil {
+		key, inst := m[1], m[2]
+		j.mu.Lock()
+		for i := range j.Stages {
+			if j.Stages[i].Key == key {
+				j.Stages[i].Instance = inst
+				break
+			}
+		}
+		j.mu.Unlock()
+		return true
+	}
 	if m := fileMarkerRe.FindStringSubmatch(line); m != nil {
 		idx, _ := strconv.Atoi(m[1])
 		total, _ := strconv.Atoi(m[2])
@@ -519,6 +535,10 @@ type StageProgress struct {
 	Label   string  `json:"label"`
 	Status  string  `json:"status"` // pending | running | done | failed
 	Percent float64 `json:"percent"`
+	// Instance is the machine (EC2 instance-id, or a stable ARN slug) this
+	// stage's Batch job ran on — set from ENCODER-HOST, used by the UI to
+	// colour the chunk plot by instance. Empty until the job is placed.
+	Instance string `json:"instance,omitempty"`
 	// Timestamps of state transitions. StartedAt is set the first time
 	// the stage sees `status=running`; EndedAt is set when it reaches
 	// a terminal state (done|failed). Used to build the end-of-job
