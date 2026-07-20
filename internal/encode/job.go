@@ -120,6 +120,11 @@ var (
 	// job end. Keyed by exec so a reattach that re-emits is idempotent (the Job
 	// sums per-exec, last value wins). Drives "saved by using spot".
 	costMarkerRe = regexp.MustCompile(`^\[\[ENCODER-COST exec=(\S+) spot_usd=([0-9.]+) ondemand_usd=([0-9.]+) saved_usd=([0-9.]+) vcpu_hours=([0-9.]+)\]\]$`)
+	// ENCODER-STATS reports one execution's run-efficiency stats at job end
+	// (encode wall span, total vCPU-hours, the slowest single chunk = makespan
+	// floor, job count, and the compute-env max vCPUs). The Job derives avg
+	// concurrency + efficiency from these. Keyed by exec for idempotent reattach.
+	statsMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STATS exec=(\S+) wall_s=([0-9.]+) vcpu_h=([0-9.]+) longest_s=([0-9.]+) slowest=(\S+) jobs=(\d+) max_vcpus=(\d+)\]\]$`)
 )
 
 // learnSpeed folds an ENCODER-SPEED marker into the learned-speed model. Returns
@@ -351,6 +356,22 @@ func (j *Job) parseMarker(line string) bool {
 		j.recordCost(m[1], spot, ondemand, saved, vh)
 		return true
 	}
+	if m := statsMarkerRe.FindStringSubmatch(line); m != nil {
+		wall, _ := strconv.ParseFloat(m[2], 64)
+		vcpuH, _ := strconv.ParseFloat(m[3], 64)
+		longest, _ := strconv.ParseFloat(m[4], 64)
+		jobs, _ := strconv.Atoi(m[6])
+		maxV, _ := strconv.Atoi(m[7])
+		slowest := m[5]
+		if slowest == "-" { // driver's "no slowest" sentinel
+			slowest = ""
+		}
+		j.recordRunStats(m[1], runStat{
+			wallS: wall, vcpuH: vcpuH, slowestS: longest,
+			slowest: slowest, jobs: jobs, maxVcpus: maxV,
+		})
+		return true
+	}
 	// Non-consuming matches: capture sideband info but still let the
 	// line flow into the raw log buffer (return false).
 	if m := cloudJobIDRe.FindStringSubmatch(line); m != nil {
@@ -398,6 +419,49 @@ func (j *Job) recordReclaim(key string, count, lost, total float64) {
 
 // recordCost folds one execution's ENCODER-COST into the job. Keyed by exec so
 // a reattach re-emitting is idempotent; job totals sum across files/executions.
+// runStat is one execution's efficiency stats from ENCODER-STATS.
+type runStat struct {
+	wallS, vcpuH, slowestS float64
+	slowest                string
+	jobs, maxVcpus         int
+}
+
+// recordRunStats folds one execution's ENCODER-STATS into the job. Multi-file
+// jobs run one execution per file (sequentially), so wall/vCPU-hours/jobs SUM,
+// the slowest chunk is the MAX across files, and max-vCPUs is the last seen;
+// concurrency + efficiency are recomputed from the summed totals. Keyed by exec
+// so a reattach that re-emits the marker overwrites rather than double-counts.
+func (j *Job) recordRunStats(exec string, s runStat) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.statsByExec == nil {
+		j.statsByExec = map[string]runStat{}
+	}
+	j.statsByExec[exec] = s
+	var wall, vcpuH, slowestS float64
+	var jobs, maxV int
+	var slowest string
+	for _, v := range j.statsByExec {
+		wall += v.wallS
+		vcpuH += v.vcpuH
+		jobs += v.jobs
+		if v.maxVcpus > 0 {
+			maxV = v.maxVcpus
+		}
+		if v.slowestS > slowestS {
+			slowestS, slowest = v.slowestS, v.slowest
+		}
+	}
+	j.EncodeWallS, j.CPUVcpuH, j.JobCount, j.MaxVcpus = wall, vcpuH, jobs, maxV
+	j.SlowestJob, j.SlowestJobS = slowest, slowestS
+	if wall > 0 {
+		j.AvgConcurrency = vcpuH * 3600.0 / wall
+		if maxV > 0 {
+			j.EfficiencyPct = j.AvgConcurrency / float64(maxV) * 100.0
+		}
+	}
+}
+
 func (j *Job) recordCost(exec string, spot, ondemand, saved, vcpuH float64) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -580,6 +644,24 @@ type Job struct {
 	SavedUSD    float64 `json:"saved_usd,omitempty"`
 	// per-execution [spot, ondemand, saved, vcpu_h], summed across files; not serialized.
 	costByExec map[string][4]float64
+
+	// Run efficiency stats (from ENCODER-STATS, computed by the driver from Batch
+	// at job end). EncodeWallS = the Batch encode span (denominator for
+	// concurrency, distinct from the end-to-end job wall which includes upload +
+	// sync); CPUVcpuH = total vCPU-hours of compute; AvgConcurrency = vCPU-hours ÷
+	// encode-wall-hours (avg vCPUs kept busy); EfficiencyPct = AvgConcurrency ÷
+	// max vCPUs (how well the fleet ceiling was used); SlowestJob/SlowestJobS =
+	// the single longest chunk (the makespan floor); JobCount = Batch jobs.
+	EncodeWallS    float64 `json:"encode_wall_s,omitempty"`
+	CPUVcpuH       float64 `json:"cpu_vcpu_h,omitempty"`
+	AvgConcurrency float64 `json:"avg_concurrency,omitempty"`
+	EfficiencyPct  float64 `json:"efficiency_pct,omitempty"`
+	SlowestJob     string  `json:"slowest_job,omitempty"`
+	SlowestJobS    float64 `json:"slowest_job_s,omitempty"`
+	JobCount       int     `json:"job_count,omitempty"`
+	MaxVcpus       int     `json:"max_vcpus,omitempty"`
+	// per-execution stats, summed/maxed across files; not serialized.
+	statsByExec map[string]runStat
 
 	// Stages is populated from [[ENCODER-PLAN]] + [[ENCODER-STAGE]]
 	// markers the Python orchestrator emits. Empty when the job hasn't

@@ -725,45 +725,100 @@ _SPOT_VCPU_HR = 0.011
 _ONDEMAND_VCPU_HR = 0.037
 
 
-def _emit_cost_summary(exec_name: str) -> None:
-    """At job end, sum the execution's Batch compute (vCPU x runtime) and emit
-    ENCODER-COST: spot vs on-demand cost + savings, so the control plane can
-    accumulate 'saved by using spot' and log a per-job line. exec= keeps it
-    idempotent across a reattach (the Go side keys on it)."""
+def _job_vcpu(job: dict) -> float:
+    for rr in job.get("container", {}).get("resourceRequirements", []):
+        if rr.get("type") == "VCPU":
+            try:
+                return float(rr["value"])
+            except (KeyError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def _collect_exec_jobs(exec_name: str) -> list:
+    """All terminal Batch jobs of one execution, fully described. Paginates
+    list_jobs (a single page caps at 100 — the old cost summary silently
+    dropped everything past the first page and, worse, read 0 when the terminal
+    states hadn't propagated yet). Retries a few times so a just-finished run's
+    jobs have settled before we sum them."""
     queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
     batch = _batch()
-    vcpu_s = 0.0
-    for status in ("SUCCEEDED", "FAILED"):
-        try:
-            ids = [j["jobId"] for j in
-                   batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", [])
-                   if exec_name in j.get("jobName", "")]
-        except ClientError:
-            continue
+    for attempt in range(6):
+        ids = []
+        for status in ("SUCCEEDED", "FAILED"):
+            tok = None
+            while True:
+                try:
+                    kw = dict(jobQueue=queue, jobStatus=status, maxResults=100)
+                    if tok:
+                        kw["nextToken"] = tok
+                    r = batch.list_jobs(**kw)
+                except ClientError:
+                    break
+                ids += [j["jobId"] for j in r.get("jobSummaryList", [])
+                        if exec_name in j.get("jobName", "")]
+                tok = r.get("nextToken")
+                if not tok:
+                    break
+        jobs = []
         for i in range(0, len(ids), 100):
             try:
-                jobs = batch.describe_jobs(jobs=ids[i:i + 100]).get("jobs", [])
+                jobs += batch.describe_jobs(jobs=ids[i:i + 100]).get("jobs", [])
             except ClientError:
                 continue
-            for job in jobs:
-                v = 0.0
-                for rr in job.get("container", {}).get("resourceRequirements", []):
-                    if rr.get("type") == "VCPU":
-                        try:
-                            v = float(rr["value"])
-                        except (KeyError, ValueError):
-                            v = 0.0
-                st, sp = job.get("startedAt"), job.get("stoppedAt")
-                if v and isinstance(st, (int, float)) and isinstance(sp, (int, float)) and sp > st:
-                    vcpu_s += v * (sp - st) / 1000.0
+        # Any job with a real runtime means the states have propagated.
+        if any(isinstance(j.get("startedAt"), (int, float)) and
+               isinstance(j.get("stoppedAt"), (int, float)) for j in jobs):
+            return jobs
+        time.sleep(2)
+    return jobs
+
+
+def _emit_cost_summary(exec_name: str) -> None:
+    """At job end, sum the execution's Batch compute and emit two markers the
+    control plane consumes: ENCODER-COST (spot-vs-on-demand savings, accumulated
+    into 'saved by using spot') and ENCODER-STATS (run efficiency: encode wall,
+    vCPU-hours, the slowest single chunk = makespan floor, job count, max vCPUs).
+    exec= keeps both idempotent across a reattach."""
+    jobs = _collect_exec_jobs(exec_name)
+    vcpu_s = 0.0
+    mn = mx = None
+    longest_s = 0.0
+    slowest = ""
+    n = 0
+    for job in jobs:
+        v = _job_vcpu(job)
+        st, sp = job.get("startedAt"), job.get("stoppedAt")
+        if v and isinstance(st, (int, float)) and isinstance(sp, (int, float)) and sp > st:
+            dur = (sp - st) / 1000.0
+            vcpu_s += v * dur
+            n += 1
+            mn = st if mn is None else min(mn, st)
+            mx = sp if mx is None else max(mx, sp)
+            if dur > longest_s:
+                longest_s = dur
+                slowest = _stage_from_jobname(job.get("jobName", "")) or job.get("jobName", "")
     vh = vcpu_s / 3600.0
+    wall_s = (mx - mn) / 1000.0 if mn is not None else 0.0
     spot, ondemand = vh * _SPOT_VCPU_HR, vh * _ONDEMAND_VCPU_HR
     saved = ondemand - spot
+    try:
+        from encoder.cloud.compute_env import get_vcpus
+        max_vcpus = int(get_vcpus().get("max_vcpus") or 0)
+    except Exception:  # noqa: BLE001 — best-effort
+        max_vcpus = 0
     print(f"[[ENCODER-COST exec={exec_name} spot_usd={spot:.4f} "
           f"ondemand_usd={ondemand:.4f} saved_usd={saved:.4f} vcpu_hours={vh:.2f}]]",
           flush=True)
+    print(f"[[ENCODER-STATS exec={exec_name} wall_s={wall_s:.1f} vcpu_h={vh:.3f} "
+          f"longest_s={longest_s:.1f} slowest={slowest or '-'} jobs={n} "
+          f"max_vcpus={max_vcpus}]]", flush=True)
+    conc = (vcpu_s / wall_s) if wall_s else 0.0
+    eff = (conc / max_vcpus * 100.0) if max_vcpus else 0.0
     _narrate(f"💰 saved ${saved:.2f} using spot — {vh:.1f} vCPU-hr "
              f"(${spot:.2f} spot vs ${ondemand:.2f} on-demand)")
+    _narrate(f"📊 {n} jobs · {vh:.1f} vCPU-hr · avg {conc:.0f} vCPUs busy "
+             f"({eff:.0f}% of {max_vcpus}) · slowest chunk {longest_s / 60:.1f} min")
 
 
 def cmd_poll(args: argparse.Namespace) -> int:

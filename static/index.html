@@ -117,6 +117,11 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    before the label — same palette as the chunk fills, so a whole encode and a
    chunk sharing a colour ran on the same box. */
 .host-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: transparent; }
+/* End-of-run efficiency stats, shown under the stages once ENCODER-STATS lands. */
+.job-stats { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; padding: 9px 12px; background: #141b2b; border-radius: 6px; font-size: 12px; }
+.job-stat { color: #8a9bb5; white-space: nowrap; }
+.job-stat b { color: #e2e9f5; font-weight: 600; }
+.job-stat .u { color: #5d6b82; font-weight: 400; }
 /* display:block so width/height apply — it's a <span> inside the cell, and
    inline elements ignore both (unlike the whole-variant fill, which is a div).
    The fill's COLOUR is the machine the chunk ran on (set inline in JS) so
@@ -1534,6 +1539,32 @@ function _jobConfigHtml(c) {
     return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px">${chips.join('')}</div>`;
 }
 
+// End-of-run efficiency stats block, fed by ENCODER-STATS (+ the job's own
+// timing). Total = end-to-end wall (upload → done); encode wall = the Batch
+// span; CPU = vCPU-hours of compute; avg busy = vCPU-hours ÷ encode-wall-hours;
+// efficiency = avg busy ÷ max vCPUs; slowest chunk = the makespan floor.
+function renderJobStats(el, j) {
+    if (!el) return;
+    if (!(j.cpu_vcpu_h > 0)) { el.style.display = 'none'; return; }
+    const totalS = (j.started_at && j.ended_at)
+        ? (new Date(j.ended_at).getTime() - new Date(j.started_at).getTime()) / 1000
+        : (j.started_at ? (Date.now() - new Date(j.started_at).getTime()) / 1000 : 0);
+    const stat = (label, val) => `<span class="job-stat">${label} <b>${val}</b></span>`;
+    const slowest = (j.slowest_job || '').replace(/:/g, ' ').replace(/^encode /, '');
+    el.innerHTML =
+          stat('total', formatDuration(totalS))
+        + (j.encode_wall_s ? stat('encode wall', formatDuration(j.encode_wall_s)) : '')
+        + stat('CPU', j.cpu_vcpu_h.toFixed(1) + ' <span class="u">vCPU-hr</span>')
+        + (j.job_count ? stat('jobs', j.job_count) : '')
+        + stat('avg busy', (j.avg_concurrency || 0).toFixed(0) + ' <span class="u">of ' + (j.max_vcpus || '?') + ' vCPU</span>')
+        + stat('efficiency', (j.efficiency_pct || 0).toFixed(0) + '%')
+        + (j.slowest_job ? stat('slowest chunk', escapeHtml(slowest) + ' <span class="u">' + formatDuration(j.slowest_job_s || 0) + '</span>') : '')
+        + (j.saved_usd > 0 ? stat('cost', '$' + (j.spot_usd || 0).toFixed(2) + ' <span class="u">spot · saved $' + j.saved_usd.toFixed(2) + '</span>') : '');
+    el.title = 'efficiency = avg vCPUs busy ÷ max vCPUs (how full the fleet ran). '
+        + 'slowest chunk = the makespan floor — nothing finishes faster than this one chunk.';
+    el.style.display = '';
+}
+
 function jobRowHtml(j) {
     const cloudBadge = (j.config.target === 'cloud' || j.config.target === 'cloud-batch')
         ? `<span class="job-cloud-badge" onclick="switchTab('aws')" title="Click to view AWS resources">☁ cloud</span>`
@@ -1556,6 +1587,7 @@ function jobRowHtml(j) {
             <div class="job-error" style="color:#ef476f;font-size:0.8rem;margin-top:4px;display:none"></div>
             <div class="current-file" style="display:none;font-size:0.85rem;color:#8cf;margin-top:8px;font-weight:600"></div>
             <table class="stages-table" style="display:none"><tbody></tbody></table>
+            <div class="job-stats" style="display:none"></div>
             <div class="job-actions">
                 <span class="log-toggle" onclick="toggleLog('${j.id}')">Show log</span>
             </div>
@@ -1838,6 +1870,8 @@ function updateJobRow(row, j) {
             sv.style.display = 'none';
         }
     }
+
+    renderJobStats(row.querySelector('.job-stats'), j);
 
     const err = row.querySelector('.job-error');
     if (j.error) {
