@@ -88,6 +88,14 @@ func resHeightRank(height int) int {
 // even 4K HEVC peaked at ~2.2 GiB and h264 1080p at ~0.9 GiB (measured via
 // ru_maxrss), so 3 GiB is generous and never the binding constraint.
 func variantResourcesFor(codec string, height int) (vcpu, memory string) {
+	// h264: give every encode a whole .2xlarge (8 vCPU) so no two h264 jobs
+	// co-locate. x264 scales to ~7 cores, and co-location was throttling the
+	// heavy tiers — 1080p+1044p shared one box and each took ~700s (0.48x)
+	// vs a lone 360p at 2.82x. Whole-box isolation measures uncontended speed;
+	// packing density can be revisited once the learned model has clean numbers.
+	if codec == "h264" {
+		return "8", "3072"
+	}
 	if height <= 540 {
 		return "2", "3072" // small res is cheap for any codec
 	}
@@ -96,8 +104,8 @@ func variantResourcesFor(codec string, height int) (vcpu, memory string) {
 		return "2", "3072" // x265 caps ~2 cores → pack ~4 per box
 	case "av1":
 		return "8", "6144" // SVT-AV1 scales → give it a whole .2xlarge
-	default: // h264
-		return "4", "3072" // x264 scales to ~7 → pack 2 per box
+	default:
+		return "4", "3072"
 	}
 }
 
