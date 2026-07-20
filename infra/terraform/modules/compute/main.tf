@@ -166,6 +166,9 @@ resource "aws_batch_compute_environment" "spot_graviton" {
       # box during a run, drop to 0 when idle) via UpdateComputeEnvironment;
       # don't let apply clobber it back to the config value.
       compute_resources[0].min_vcpus,
+      # max_vcpus is toggled at runtime from the AWS panel (current vs 2x) via
+      # UpdateComputeEnvironment; ignore so apply doesn't reset the ceiling.
+      compute_resources[0].max_vcpus,
     ]
   }
 }

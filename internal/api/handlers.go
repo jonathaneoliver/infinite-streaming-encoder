@@ -62,6 +62,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("POST /api/aws/clear", s.awsClearAll)
 	s.Mux.HandleFunc("POST /api/aws/jobs/{id}/cleanup", s.awsCleanupJob)
 	s.Mux.HandleFunc("POST /api/aws/s3/delete-prefix", s.awsDeleteS3Prefix)
+	s.Mux.HandleFunc("POST /api/aws/max-vcpus", s.awsSetMaxVCPUs)
 	// Cloud-batch release controls (Step Functions executions + Batch jobs).
 	s.Mux.HandleFunc("POST /api/aws/executions/stop", s.awsStopExecution)
 	s.Mux.HandleFunc("POST /api/aws/batch-jobs/terminate", s.awsTerminateBatchJob)
@@ -883,6 +884,25 @@ func (s *Server) awsDeleteS3Prefix(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := runPythonCloud("cleanup", "--delete-prefix", body.Prefix)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+// awsSetMaxVCPUs changes the Batch compute env's maxvCpus ceiling live (the AWS
+// panel's current-vs-2x toggle). Terraform ignores max_vcpus so it isn't reset.
+func (s *Server) awsSetMaxVCPUs(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		MaxVCPUs int `json:"max_vcpus"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.MaxVCPUs <= 0 {
+		http.Error(w, `bad request: {"max_vcpus": N} required`, 400)
+		return
+	}
+	out, err := runPythonCloud("compute_env", "--set-max-vcpus", strconv.Itoa(body.MaxVCPUs))
 	if err != nil {
 		http.Error(w, err.Error(), 502)
 		return

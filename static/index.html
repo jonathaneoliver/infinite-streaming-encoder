@@ -537,6 +537,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <div class="aws-metric-value" id="aws-reclaim-pct">—</div>
             </div>
             <div class="aws-metric">
+                <div class="aws-metric-label" title="Batch compute-env max vCPUs. 2x runs ~twice as many machines → roughly half the wall-clock for ~the same total cost (down to the slowest single chunk).">Max vCPUs</div>
+                <div class="aws-metric-value" id="aws-maxvcpu" style="font-size:0.9rem">—</div>
+            </div>
+            <div class="aws-metric">
                 <div class="aws-metric-label">Region</div>
                 <div class="aws-metric-value" id="aws-region">—</div>
             </div>
@@ -2055,6 +2059,7 @@ function renderAws(data) {
     rEl.textContent = rpct.toFixed(1) + '%';
     rEl.className = 'aws-metric-value' + (rpct >= 10 ? ' warn' : rpct > 0 ? '' : ' ok');
     rEl.title = (s.reclaim_24h_lost_min || 0).toFixed(1) + ' min of encoding lost to reclaims in the last 24h';
+    renderMaxVcpuRadio(s.max_vcpus || 0);
     document.getElementById('aws-region').textContent = data.region || '—';
 
     renderFleet(data.fleet || {}, data.instances || []);
@@ -2481,6 +2486,34 @@ function renderAwsS3(prefixes) {
             <tbody>${rows}</tbody>
         </table>
     `;
+}
+
+// Max-vCPUs radio: current (1x) vs 2x. Base is the configured 48-vCPU default;
+// the live ceiling (from the fleet summary) picks which option is selected.
+const _MAXVCPU_BASE = 48;
+function renderMaxVcpuRadio(live) {
+    const el = document.getElementById('aws-maxvcpu');
+    if (!el) return;
+    if (!live) { el.textContent = '—'; return; }
+    const opts = [_MAXVCPU_BASE, _MAXVCPU_BASE * 2];
+    el.innerHTML = opts.map(v =>
+        `<label style="margin-right:10px;cursor:pointer;white-space:nowrap">
+           <input type="radio" name="maxvcpu" value="${v}" ${v === live ? 'checked' : ''}
+             onchange="setMaxVcpus(${v})" style="width:auto;min-width:0;vertical-align:middle"> ${v} ${v === _MAXVCPU_BASE ? '(1×)' : '(2×)'}
+         </label>`).join('');
+}
+
+async function setMaxVcpus(v) {
+    try {
+        const res = await fetch('/api/aws/max-vcpus', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ max_vcpus: v }),
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
+        await refreshAws();
+    } catch (e) {
+        alert('Set max vCPUs failed: ' + e.message);
+    }
 }
 
 async function deleteS3Prefix(prefix) {

@@ -635,6 +635,16 @@ def _record_fleet_samples(hourly_usd: float, fleet: dict) -> dict:
     return {"spend_24h_usd": round(spend, 4), "history": history}
 
 
+def _current_max_vcpus():
+    """The encoder compute env's current maxvCpus, for the AWS panel's max-vCPUs
+    radio (current vs 2x). None if it can't be read (don't break inventory)."""
+    try:
+        from encoder.cloud.compute_env import get_vcpus
+        return get_vcpus().get("max_vcpus")
+    except Exception:  # noqa: BLE001 — best-effort
+        return None
+
+
 def _spot_and_reclaim_stats() -> dict:
     """Accumulated 'saved by using spot' + trailing-24h reclaim-waste %, read
     from the Go server's spot_samples.json (one entry per finished cloud-batch
@@ -727,6 +737,7 @@ def collect() -> dict[str, Any]:
             "saved_24h_usd": fleet.get("saved_24h_usd", 0),
             "reclaim_24h_pct": fleet.get("reclaim_24h_pct", 0),
             "reclaim_24h_lost_min": fleet.get("reclaim_24h_lost_min", 0),
+            "max_vcpus": _current_max_vcpus(),
             "running_executions": len(running_executions),
             "active_batch_jobs": len(active_batch_jobs),
         },
