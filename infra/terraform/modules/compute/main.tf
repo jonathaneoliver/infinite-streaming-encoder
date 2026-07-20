@@ -1,11 +1,12 @@
 # Batch compute environment on Graviton spot. Spot-aware scheduling
 # ("SPOT_CAPACITY_OPTIMIZED" allocation strategy) is the whole reason
 # we moved to Batch — AWS picks the pool with the most available
-# capacity instead of our client-side heuristics. Instance families
-# are c8g (Graviton4), c7g (Graviton3), then c6g (Graviton2) — newest/
-# fastest ARM64 compute first, falling back down the generations when the
-# newer pools are tight (c6g pools are the deepest/cheapest). No GPU, no
-# memory-heavy r-families.
+# capacity instead of our client-side heuristics. Instance families are
+# c8g (Graviton4) and c7g (Graviton3). c6g (Graviton2) was dropped: it runs
+# x264 ~1.6-1.8x slower (Graviton3 doubled SIMD width + added SVE, and x264 is
+# NEON/SIMD-bound), so landing a long-pole variant on c6g nearly doubled its
+# wall time — not worth the deeper/cheaper spot pools. No GPU, no memory-heavy
+# r-families. Re-add "c6g" here if c8g/c7g spot capacity ever gets too tight.
 
 # Spot fleet service role — Batch/EC2 uses this to manage the
 # underlying Spot Fleet request.
@@ -108,7 +109,6 @@ resource "aws_batch_compute_environment" "spot_graviton" {
     instance_type = [
       "c8g",
       "c7g",
-      "c6g",
     ]
 
     subnets            = var.subnet_ids
