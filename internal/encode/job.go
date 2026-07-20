@@ -28,22 +28,6 @@ const defaultChunkDurationSeconds = 30.0
 // validation. 86400 = 24h = 14400 x 6.
 const wholeVariantChunkSeconds = 86400.0
 
-// chunkDurationSeconds resolves the configured chunk size. Empty => default
-// 30s; "whole"/"0" => one chunk per variant; otherwise the parsed seconds.
-func (c JobConfig) chunkDurationSeconds() float64 {
-	switch c.ChunkDuration {
-	case "":
-		return defaultChunkDurationSeconds
-	case "whole", "0":
-		return wholeVariantChunkSeconds
-	default:
-		if v, err := strconv.ParseFloat(c.ChunkDuration, 64); err == nil && v > 0 {
-			return v
-		}
-		return defaultChunkDurationSeconds
-	}
-}
-
 // chunkCountForDuration mirrors chunking.chunk_count: ceil(dur/chunk), min 1.
 func chunkCountForDuration(durationS, chunkS float64) int {
 	if durationS <= 0 || chunkS <= 0 {
@@ -116,7 +100,27 @@ var (
 	// AMI) to flag whether the image was already resident — a definitive
 	// "AMI cache hit" signal for the UI, independent of timing.
 	bootMarkerRe = regexp.MustCompile(`^\[\[ENCODER-BOOT ami=(\S+)\]\]$`)
+	// ENCODER-SPEED reports a completed encode's content-seconds vs wall-seconds
+	// so the control plane can learn each (codec, height, pass)'s speed for the
+	// dynamic chunk selector. Consumed by Manager.learnSpeed (not per-job).
+	speedMarkerRe = regexp.MustCompile(`^\[\[ENCODER-SPEED codec=(\S+) height=(\d+) two_pass=([01]) content_s=([0-9.]+) encode_s=([0-9.]+)\]\]$`)
 )
+
+// learnSpeed folds an ENCODER-SPEED marker into the learned-speed model. Returns
+// true when the line was such a marker (so the caller skips logging it).
+func (m *Manager) learnSpeed(line string) bool {
+	sm := speedMarkerRe.FindStringSubmatch(line)
+	if sm == nil {
+		return false
+	}
+	height, _ := strconv.Atoi(sm[2])
+	contentS, _ := strconv.ParseFloat(sm[4], 64)
+	encodeS, _ := strconv.ParseFloat(sm[5], 64)
+	if m.Speeds != nil {
+		m.Speeds.Update(sm[1], height, sm[3] == "1", contentS, encodeS)
+	}
+	return true
+}
 
 // upsertStage sets (or creates) a stage by key with the given label, status and
 // percent, stamping StartedAt/EndedAt on transitions. For Go-side stages (the
@@ -393,10 +397,11 @@ type JobConfig struct {
 	Time            string `json:"time"`
 	SegmentDuration string `json:"segment_duration"`
 	PartialDuration string `json:"partial_duration"`
-	// ChunkDuration tunes the cloud-batch encode granularity: "" = 30s
-	// chunks (max parallelism), "whole" = one job per variant (max
-	// efficiency, less fleet overhead), or a seconds value (multiple of the
-	// 6s segment duration). Only affects the cloud-batch target.
+	// ChunkDuration tunes the cloud-batch encode granularity: "" or "dynamic"
+	// = size each variant's chunks by learned encode speed (slow → 30s floor,
+	// cheap → whole clip, so all variants finish ~together); "whole" = one job
+	// per variant (max efficiency, no joins); or a fixed seconds value
+	// (multiple of the 6s segment duration). Only affects the cloud-batch target.
 	ChunkDuration string `json:"chunk_duration,omitempty"`
 	GopDuration   string `json:"gop_duration"`
 	HlsFormat     string `json:"hls_format"`
@@ -582,6 +587,10 @@ type Manager struct {
 	// $TmpDir/ladders.json; resolves the concrete rungs for the cloud path.
 	Ladders *LadderStore
 
+	// Speeds learns per-variant encode speed (content/wall) from completed
+	// encodes ($TmpDir/encode_speeds.json); the dynamic chunk selector uses it.
+	Speeds *EncodeSpeedStore
+
 	// Persisted global settings (e.g. watcher on/off) owned at
 	// $TmpDir/settings.json. Survives restarts so a UI toggle sticks.
 	settingsMu sync.Mutex
@@ -617,6 +626,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 	os.MkdirAll(cfg.TmpDir, 0755)
 	return &Manager{
 		Ladders:         LoadLadderStore(filepath.Join(cfg.TmpDir, "ladders.json")),
+		Speeds:          LoadEncodeSpeedStore(filepath.Join(cfg.TmpDir, "encode_speeds.json")),
 		SourceDir:       cfg.SourceDir,
 		OutputDir:       cfg.OutputDir,
 		TmpDir:          cfg.TmpDir,
@@ -1520,20 +1530,15 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		m.notify(job)
 
 		// Build the state-machine input document.
-		// Probe the source duration to plan chunks. ffprobe runs in the worker
-		// image; if it's unavailable (e.g. local dev), fall back to a single
-		// whole-clip chunk so the pipeline still works.
-		chunkS := job.Config.chunkDurationSeconds()
-		nChunks := 1
-		if durationS, err := probeDurationSeconds(localSrc); err != nil {
-			job.AppendLog(fmt.Sprintf("[cloud-batch] ffprobe failed (%v); encoding %s as one chunk", err, filename))
+		// Probe the source duration so each variant can size its own chunks
+		// (buildSFNInput does the per-variant planning). ffprobe runs in the
+		// worker image; if unavailable, 0 duration collapses to whole variants.
+		durationS := 0.0
+		if d, err := probeDurationSeconds(localSrc); err != nil {
+			job.AppendLog(fmt.Sprintf("[cloud-batch] ffprobe failed (%v); encoding %s as whole variants", err, filename))
 		} else {
-			nChunks = chunkCountForDuration(durationS, chunkS)
-			grain := fmt.Sprintf("%.0fs chunks", chunkS)
-			if chunkS >= wholeVariantChunkSeconds {
-				grain = "whole variant"
-			}
-			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: %.1fs → %d chunk(s) (%s)", filename, durationS, nChunks, grain))
+			durationS = d
+			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: %.1fs — chunking mode %q (per-variant by complexity)", filename, durationS, chunkModeLabel(job.Config.ChunkDuration)))
 		}
 
 		// Probe the source width so the ladder is capped at native resolution
@@ -1542,7 +1547,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		if srcWidth > 0 {
 			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
 		}
-		inputJSON := buildSFNInput(m.Ladders, s3Input, s3Prefix, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, nChunks, srcWidth, chunkS)
+		inputJSON := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, srcWidth, durationS, job.Config.ChunkDuration)
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 			return fmt.Errorf("write input json: %w", err)
@@ -1618,6 +1623,9 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := stripANSI(scanner.Text())
+		if m.learnSpeed(line) {
+			continue // telemetry for the dynamic chunk selector, not a log line
+		}
 		if !job.parseMarker(line) {
 			job.AppendLog(line)
 		}
@@ -1635,7 +1643,41 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 // buildSFNInput renders the JSON doc the state machine expects. Picks
 // which (codec, tier) combinations to fan out over based on the
 // JobConfig's Codec + MaxRes.
-func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, maxRes string, hevcSinglePass bool, nChunks, sourceWidth int, chunkS float64) string {
+// variantChunkSeconds resolves one variant's chunk length from the job's
+// ChunkDuration config: "dynamic" (also the default when unset) sizes it by
+// learned encode speed (slow → 30s floor, cheap → whole clip); "whole" → one
+// chunk; a number → that fixed size. clipS==0 (duration unknown) collapses to
+// whole downstream.
+func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, codec string, height int, twoPass bool) float64 {
+	switch cfg {
+	case "dynamic", "":
+		return dynamicChunkSeconds(speeds, codec, height, twoPass, clipS)
+	case "whole":
+		if clipS > 0 {
+			return clipS
+		}
+		return wholeVariantChunkSeconds
+	default:
+		if v, err := strconv.ParseFloat(cfg, 64); err == nil && v > 0 {
+			return v
+		}
+		return defaultChunkDurationSeconds
+	}
+}
+
+// chunkModeLabel is a human-readable name for a ChunkDuration config value.
+func chunkModeLabel(cfg string) string {
+	switch cfg {
+	case "dynamic", "":
+		return "dynamic"
+	case "whole":
+		return "whole"
+	default:
+		return cfg + "s"
+	}
+}
+
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, ladderName, codecSel, maxRes string, hevcSinglePass bool, sourceWidth int, clipDurationS float64, chunkCfg string) string {
 	if ladderName == "" {
 		ladderName = "apple-uniq-live"
 	}
@@ -1685,18 +1727,29 @@ func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, 
 			if c == "hevc" {
 				prio++ // HEVC just ahead of H.264 within a resolution (slower)
 			}
+			// Per-variant chunking: size this variant's chunks (dynamic by
+			// complexity, or the job's fixed/whole config), then enumerate them.
+			cs := variantChunkSeconds(chunkCfg, clipDurationS, speeds, c, r.Height, twoPass)
+			nc := chunkCountForDuration(clipDurationS, cs)
+			idx := make([]int, nc)
+			for k := range idx {
+				idx[k] = k
+			}
 			variants = append(variants, sfnVariant{
-				Codec:      c,
-				Label:      r.Label,
-				Width:      strconv.Itoa(r.Width),
-				Height:     strconv.Itoa(r.Height),
-				Bitrate:    strconv.Itoa(r.Bitrate),
-				Preset:     r.Preset,
-				VCPU:       vcpu,
-				Memory:     mem,
-				Priority:   prio,
-				TwoPass:    strconv.FormatBool(twoPass),
-				heightRank: rank,
+				Codec:         c,
+				Label:         r.Label,
+				Width:         strconv.Itoa(r.Width),
+				Height:        strconv.Itoa(r.Height),
+				Bitrate:       strconv.Itoa(r.Bitrate),
+				Preset:        r.Preset,
+				VCPU:          vcpu,
+				Memory:        mem,
+				Priority:      prio,
+				TwoPass:       strconv.FormatBool(twoPass),
+				ChunkIndices:  idx,
+				ChunkDuration: strconv.FormatFloat(cs, 'f', -1, 64),
+				Chunked:       strconv.FormatBool(nc > 1),
+				heightRank:    rank,
 			})
 		}
 	}
@@ -1704,40 +1757,24 @@ func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, 
 	// long poles enter the queue early; schedulingPriority enforces it, but a
 	// good submission order helps too.
 	sortRungsSlowestFirst(variants)
-	// chunk_indices drives the state machine's inner Map: each variant fans
-	// out one encode job per chunk index, then a concat-variant job joins
-	// them. A single-chunk clip (nChunks == 1) still flows through this path —
-	// chunk 0 covers the whole clip and concat is a passthrough — so there's
-	// no special case. Same for all variants (they share the clip duration).
-	if nChunks < 1 {
-		nChunks = 1
-	}
-	chunkIndices := make([]int, nChunks)
-	for i := range chunkIndices {
-		chunkIndices[i] = i
-	}
+	// chunk_indices / chunk_duration / chunked are PER-VARIANT now (on each
+	// sfnVariant above): each variant sizes its own chunks by complexity, so the
+	// SFN Map reads them off the item, not a shared top-level value. A variant
+	// that resolves to a single chunk flows through the whole-variant path
+	// (chunk_index=-1, no concat) via its own "chunked":"false".
 	doc := map[string]any{
-		"s3_input":      s3Input,
-		"s3_prefix":     s3Prefix,
-		"variants":      variants,
-		"chunk_indices": chunkIndices,
-		"do_h264":       doH264,
-		"do_hevc":       doHevc,
-		// Chunk size (seconds) the encode + concat workers plan against, so
-		// they agree with chunk_indices above. String for a container env var.
-		"chunk_duration": strconv.FormatFloat(chunkS, 'f', -1, 64),
-		// True when the clip splits into >1 chunk. Single-chunk (whole-variant)
-		// runs skip the chunk fan-out + concat entirely: the SFN encodes the
-		// whole variant in one job (chunk_index=-1) writing the un-suffixed
-		// {codec}_{label}.mp4 directly. String for the SFN Choice comparison.
-		"chunked": strconv.FormatBool(nChunks > 1),
+		"s3_input":  s3Input,
+		"s3_prefix": s3Prefix,
+		"variants":  variants,
+		"do_h264":   doH264,
+		"do_hevc":   doHevc,
 		// Ladder-level VBV shaping, applied to every variant's encode (the
 		// worker reads these as MAXRATE_PERCENT / BUFSIZE_MULT env). Threaded
 		// so a custom ladder's VBV is honored in the cloud, not just locally.
 		"maxrate_percent":    strconv.Itoa(maxratePct),
 		"bufsize_multiplier": strconv.FormatFloat(bufMult, 'f', -1, 64),
-		// NOTE: two_pass is per-variant now (see the variant struct above),
-		// not a top-level field — HEVC two-passes, H264 doesn't, in one run.
+		// NOTE: two_pass + chunk_* are per-variant now (see the variant struct),
+		// not top-level — variants differ in codec/pass AND chunk length.
 	}
 	b, _ := json.Marshal(doc)
 	return string(b)
@@ -1937,6 +1974,9 @@ func (m *Manager) attachAndWait(job *Job, name string) error {
 		line := scanner.Text()
 		if line == "" {
 			continue
+		}
+		if m.learnSpeed(line) {
+			continue // dynamic-chunk-selector telemetry, not a log line
 		}
 		// Structured progress markers update Job.Stages and are suppressed
 		// from the log buffer so the viewer stays readable. Anything else

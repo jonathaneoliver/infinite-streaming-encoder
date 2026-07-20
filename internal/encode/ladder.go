@@ -28,17 +28,25 @@ type ladderRung struct {
 // wants a number). heightRank is internal (submission-order sort only) and is
 // not marshaled.
 type sfnVariant struct {
-	Codec      string `json:"codec"`
-	Label      string `json:"label"`
-	Width      string `json:"width"`
-	Height     string `json:"height"`
-	Bitrate    string `json:"bitrate"`
-	Preset     string `json:"preset"`
-	VCPU       string `json:"vcpu"`
-	Memory     string `json:"memory"`
-	Priority   int    `json:"priority"`
-	TwoPass    string `json:"two_pass"`
-	heightRank int    `json:"-"`
+	Codec    string `json:"codec"`
+	Label    string `json:"label"`
+	Width    string `json:"width"`
+	Height   string `json:"height"`
+	Bitrate  string `json:"bitrate"`
+	Preset   string `json:"preset"`
+	VCPU     string `json:"vcpu"`
+	Memory   string `json:"memory"`
+	Priority int    `json:"priority"`
+	TwoPass  string `json:"two_pass"`
+	// Per-variant chunking (dynamic chunk selector): each variant sizes its own
+	// chunks by complexity, so a slow 4K HEVC gets many 30s chunks while a cheap
+	// H264 runs whole. ChunkIndices is [0..n-1]; ChunkDuration is the chunk size
+	// in seconds (string, for the container env); Chunked is "true"/"false" for
+	// the SFN Choice. The SFN reads these off each Map item, not top-level.
+	ChunkIndices  []int  `json:"chunk_indices"`
+	ChunkDuration string `json:"chunk_duration"`
+	Chunked       string `json:"chunked"`
+	heightRank    int    `json:"-"`
 }
 
 // maxResHeight maps a --max-res tier name to its pixel height for capping.
@@ -74,6 +82,7 @@ func resHeightRank(height int) int {
 //     per 8-core box, filling the cores a single x265 can't use.
 //   - x264 (H264) scales to ~7 cores → 4 vCPU (packs 2 per box).
 //   - SVT-AV1 self-parallelizes across many cores → give it a whole box (8).
+//
 // Small resolutions are cheap for every codec, so a 2-vCPU floor applies.
 // Memory is kept well below the naive 1:2 vCPU:GiB ratio so jobs pack by vCPU;
 // even 4K HEVC peaked at ~2.2 GiB and h264 1080p at ~0.9 GiB (measured via

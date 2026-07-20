@@ -449,7 +449,9 @@ def phase_variant(args: argparse.Namespace) -> int:
     # wall-time) per tier, this is the real utilization — i.e. how much of
     # the vCPU we pay for is crunching video vs sitting idle-reserved.
     ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    _enc_t0 = time.monotonic()
     out_path = encode_variant(ctx, args.codec, rung, chunk=chunk)
+    encode_wall_s = time.monotonic() - _enc_t0
     ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu_s = (ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime)
     # Peak resident memory of the ffmpeg child(ren) — ru_maxrss is the max RSS
@@ -477,6 +479,16 @@ def phase_variant(args: argparse.Namespace) -> int:
     ci = "" if chunk is None else f":chunk{chunk.index}"
     timer.emit(f"encode:{args.codec}:{args.label}{ci}",
                cpu_s=f"{cpu_s:.2f}", mem_mib=f"{peak_mib:.0f}")
+
+    # Feed the control plane's learned-speed model (drives the dynamic chunk
+    # selector): content-seconds encoded vs encode wall-seconds for this
+    # (codec, height, pass). The Go server's Manager.learnSpeed consumes it.
+    content_s = (chunk.end_s - chunk.start_s) if chunk is not None else info.duration_s
+    two_pass = 1 if (args.codec == "hevc" and ctx.hevc_two_pass) else 0
+    if encode_wall_s > 0 and content_s > 0:
+        print(f"[[ENCODER-SPEED codec={args.codec} height={rung.height} "
+              f"two_pass={two_pass} content_s={content_s:.1f} "
+              f"encode_s={encode_wall_s:.1f}]]", flush=True)
     return 0
 
 

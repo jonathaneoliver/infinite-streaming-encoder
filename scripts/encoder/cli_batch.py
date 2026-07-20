@@ -163,9 +163,11 @@ def _tail_progress(stream: str, label: str, log_state: dict) -> None:
     for e in events:
         log_state[stream] = max(log_state.get(stream, 0), e.get("timestamp", 0))
         msg = e.get("message", "").rstrip()
-        if msg.startswith("[[ENCODER-BOOT ") or msg.startswith("[[ENCODER-STAGE "):
+        if (msg.startswith("[[ENCODER-BOOT ") or msg.startswith("[[ENCODER-STAGE ")
+                or msg.startswith("[[ENCODER-SPEED ")):
             # Verbatim so the Go scanner parses it — ENCODER-STAGE carries the
-            # live ffmpeg % for this chunk/variant, driving the progress bars.
+            # live ffmpeg % for this chunk/variant, driving the progress bars;
+            # ENCODER-SPEED feeds the control plane's learned dynamic-chunk model.
             print(msg, flush=True)
         elif _PROGRESS_RE.search(msg):
             _narrate(f"{label}: {msg}")

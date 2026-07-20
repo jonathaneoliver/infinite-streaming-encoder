@@ -89,11 +89,11 @@
                 "priority.$": "$$.Map.Item.Value.priority",
                 "s3_prefix.$": "$.s3_prefix",
                 "two_pass.$": "$$.Map.Item.Value.two_pass",
-                "chunk_indices.$": "$.chunk_indices",
-                "chunk_duration.$": "$.chunk_duration",
+                "chunk_indices.$": "$$.Map.Item.Value.chunk_indices",
+                "chunk_duration.$": "$$.Map.Item.Value.chunk_duration",
                 "maxrate_percent.$": "$.maxrate_percent",
                 "bufsize_multiplier.$": "$.bufsize_multiplier",
-                "chunked.$": "$.chunked"
+                "chunked.$": "$$.Map.Item.Value.chunked"
               },
               "ItemProcessor": {
                 "StartAt": "Chunked",

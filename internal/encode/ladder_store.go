@@ -20,10 +20,10 @@ import (
 // LadderDef is one ladder: per-codec rung lists plus optional VBV shaping.
 // JSON-shaped for the store file and the API.
 type LadderDef struct {
-	Description       string    `json:"description,omitempty"`
-	Seed              bool      `json:"seed,omitempty"`
-	MaxratePercent    int       `json:"maxrate_percent,omitempty"`
-	BufsizeMultiplier float64   `json:"bufsize_multiplier,omitempty"`
+	Description       string  `json:"description,omitempty"`
+	Seed              bool    `json:"seed,omitempty"`
+	MaxratePercent    int     `json:"maxrate_percent,omitempty"`
+	BufsizeMultiplier float64 `json:"bufsize_multiplier,omitempty"`
 	// Codecs maps a codec ("h264"/"hevc"/"av1") to its rungs, each a
 	// [width, height, bitrate_kbps] triple. Preset defaults to "medium".
 	Codecs map[string][][]int `json:"codecs"`
@@ -78,7 +78,7 @@ func defaultSeedLadders() map[string]LadderDef {
 			},
 		},
 		"apple-uniq-live": {
-			Description: "apple-uniq bitrates under Apple's live/linear VBV: peak <= 1.25x avg. maxrate 110% + tight 0.10x buffer keep delivered peak <=~1.20x even at 1s segments; unique resolutions keep the bands distinct.",
+			Description:       "apple-uniq bitrates under Apple's live/linear VBV: peak <= 1.25x avg. maxrate 110% + tight 0.10x buffer keep delivered peak <=~1.20x even at 1s segments; unique resolutions keep the bands distinct.",
 			Seed:              true,
 			MaxratePercent:    110,
 			BufsizeMultiplier: 0.10,
