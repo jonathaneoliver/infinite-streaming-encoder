@@ -1601,10 +1601,14 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 				return
 			case <-ticker.C:
 				if job.IsCancelled() {
-					job.AppendLog("[cloud-batch] cancel requested — aborting execution")
+					job.AppendLog("[cloud-batch] cancel requested — aborting execution + terminating its Batch jobs")
 					m.notify(job)
+					// --terminate-jobs: stopping the execution alone leaves its
+					// in-flight submitJob.sync jobs running (orphaned) until they
+					// finish; terminate them so in-progress chunks stop now and
+					// the fleet frees up promptly.
 					stop := exec.Command("python3", "-m", "encoder.cloud.batch_admin",
-						"stop-execution", "--arn", execArn)
+						"stop-execution", "--arn", execArn, "--terminate-jobs")
 					stop.Env = os.Environ()
 					if o, e := stop.CombinedOutput(); e != nil {
 						job.AppendLog(fmt.Sprintf("[cloud-batch] stop-execution failed: %v: %s",
