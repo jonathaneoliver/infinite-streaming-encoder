@@ -1,7 +1,16 @@
 {
   "Comment": "Encoder pipeline: mezzanine -> fan-out variants + audio -> per-codec package/HLS/byteranges.",
-  "StartAt": "Mezzanine",
+  "StartAt": "MezzCheck",
   "States": {
+
+    "MezzCheck": {
+      "Comment": "Skip the mezzanine job entirely when a prior job of the same source already produced it (mezz_cached from buildSFNInput) — variants + audio read it straight from the source-keyed cache (s3_mezz).",
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.mezz_cached", "BooleanEquals": true, "Next": "FanOut" }
+      ],
+      "Default": "Mezzanine"
+    },
 
     "Mezzanine": {
       "Type": "Task",
