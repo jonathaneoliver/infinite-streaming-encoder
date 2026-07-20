@@ -114,7 +114,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 /* queued = submitted to Batch but waiting for a slot: tint the empty track
    amber so it's distinct from a not-yet-submitted (dark) chunk. */
 .chunk-cell.chunk-queued { background: #4a3a1a; }
-.chunk-cell-fill { height: 100%; width: 0; background: #4361ee; transition: width 0.3s ease; }
+/* display:block so width/height apply — it's a <span> inside the cell, and
+   inline elements ignore both (unlike the whole-variant fill, which is a div). */
+.chunk-cell-fill { display: block; height: 100%; width: 0; background: #4361ee; transition: width 0.3s ease; }
 .chunk-cell-fill.chunk-done { background: #06d6a0; }
 .chunk-cell-fill.chunk-failed { background: #ef476f; }
 .chunk-concat { flex: 0 0 auto; margin-left: 7px; color: #667; font-size: 0.85rem; line-height: 1; }
@@ -1664,32 +1666,29 @@ function updateStagesTable(row, stages) {
         // Chunk group: colour each cell by its chunk's status.
         const tr = tbody.querySelector(`tr[data-chunk-group="${r.codec + ':' + r.tier}"]`);
         if (!tr) continue;
-        let done = 0;
+        let sumPct = 0;
         for (const c of r.cells) {
             const cell = tr.querySelector(`.chunk-cell[data-chunk-key="${c.key}"]`);
             if (!cell) continue;
             const st = c.s.status;
+            const pct = (st === 'done' || st === 'skipped') ? 100
+                : (st === 'pending' || st === 'queued') ? 0 : c.s.percent;
+            sumPct += pct;
             // Track tint marks only the queued (waiting-for-slot) state; the
             // fill shows the chunk's own progress like a whole-variant bar.
             cell.className = 'chunk-cell' + (st === 'queued' ? ' chunk-queued' : '');
             const fill = cell.querySelector('.chunk-cell-fill');
             if (fill) {
-                const pct = (st === 'done' || st === 'skipped') ? 100
-                    : (st === 'pending' || st === 'queued') ? 0 : c.s.percent;
                 fill.style.width = pct.toFixed(1) + '%';
                 fill.className = 'chunk-cell-fill'
                     + ((st === 'done' || st === 'skipped') ? ' chunk-done'
                         : st === 'failed' ? ' chunk-failed' : '');
             }
-            if (st === 'done' || st === 'skipped') done++;
         }
-        if (r.concat) {
-            const el = tr.querySelector('.chunk-concat');
-            if (el) el.className = 'chunk-concat' + (r.concat.status === 'pending' ? '' : ' concat-' + r.concat.status);
-        }
-        const joined = r.concat && (r.concat.status === 'done');
+        // Aggregate % across chunks so a chunked row reads like a whole row
+        // ("100%") instead of a chunk count — the join is implicit, not shown.
         tr.querySelector('.chunk-count').textContent =
-            joined ? 'joined' : `${done}/${r.cells.length}`;
+            (r.cells.length ? sumPct / r.cells.length : 0).toFixed(0) + '%';
     }
 }
 
