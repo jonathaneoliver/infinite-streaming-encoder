@@ -635,6 +635,32 @@ def _record_fleet_samples(hourly_usd: float, fleet: dict) -> dict:
     return {"spend_24h_usd": round(spend, 4), "history": history}
 
 
+def _spot_and_reclaim_stats() -> dict:
+    """Accumulated 'saved by using spot' + trailing-24h reclaim-waste %, read
+    from the Go server's spot_samples.json (one entry per finished cloud-batch
+    job: ts, lost_s, total_s, spot_usd, ondemand_usd, saved_usd)."""
+    path = os.environ.get("SPOT_LOG") or os.path.join(
+        os.environ.get("TMP_DIR") or os.environ.get("TMPDIR") or "/tmp",
+        "spot_samples.json")
+    try:
+        with open(path) as f:
+            samples = json.load(f)
+    except (OSError, ValueError):
+        samples = []
+    now = datetime.now(timezone.utc).timestamp()
+    cut = now - 24 * 3600
+    def _sum(field, since=None):
+        return sum(s.get(field, 0) for s in samples
+                   if (since is None or s.get("ts", 0) >= since))
+    lost_24h, total_24h = _sum("lost_s", cut), _sum("total_s", cut)
+    return {
+        "saved_total_usd": round(_sum("saved_usd"), 2),
+        "saved_24h_usd": round(_sum("saved_usd", cut), 2),
+        "reclaim_24h_lost_min": round(lost_24h / 60.0, 1),
+        "reclaim_24h_pct": round(lost_24h / total_24h * 100.0, 1) if total_24h > 0 else 0.0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Public entry
 # ---------------------------------------------------------------------------
@@ -670,6 +696,7 @@ def collect() -> dict[str, Any]:
     _sampled = _record_fleet_samples(hourly_total, fleet)
     fleet["spend_24h_usd"] = _sampled["spend_24h_usd"]
     fleet["history"] = _sampled["history"]
+    fleet.update(_spot_and_reclaim_stats())  # saved_total_usd, reclaim_24h_pct, …
     # Actual CPU (cores) + memory (GiB) from CloudWatch Container Insights, for
     # the "real usage vs allocated" sparklines. Only when a box is up (else the
     # cluster metrics are empty and it's a wasted call).
@@ -696,6 +723,10 @@ def collect() -> dict[str, Any]:
             "total_s3_bytes": total_s3_bytes,
             "estimated_hourly_usd": round(hourly_total, 4),
             "spend_24h_usd": fleet["spend_24h_usd"],
+            "saved_total_usd": fleet.get("saved_total_usd", 0),
+            "saved_24h_usd": fleet.get("saved_24h_usd", 0),
+            "reclaim_24h_pct": fleet.get("reclaim_24h_pct", 0),
+            "reclaim_24h_lost_min": fleet.get("reclaim_24h_lost_min", 0),
             "running_executions": len(running_executions),
             "active_batch_jobs": len(active_batch_jobs),
         },

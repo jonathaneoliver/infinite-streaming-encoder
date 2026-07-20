@@ -35,6 +35,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .job-cloud-badge:hover { background: rgba(255, 169, 77, 0.3); }
 .job-ami-badge { display: inline-block; color: #06d6a0; background: rgba(6, 214, 160, 0.15); border: 1px solid #06d6a0; border-radius: 3px; padding: 0 6px; margin-left: 8px; font-size: 0.7rem; vertical-align: middle; }
 .job-reclaim-badge { display: inline-block; color: #ef476f; background: rgba(239, 71, 111, 0.15); border: 1px solid #ef476f; border-radius: 3px; padding: 0 6px; margin-left: 8px; font-size: 0.7rem; vertical-align: middle; }
+.job-saved-badge { display: inline-block; color: #06d6a0; background: rgba(6, 214, 160, 0.15); border: 1px solid #06d6a0; border-radius: 3px; padding: 0 6px; margin-left: 8px; font-size: 0.7rem; vertical-align: middle; }
 .encode-options > legend { padding: 0 8px; color: #888; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; }
 .encode-options > .controls { margin-top: 0; }
 .control-group { display: flex; flex-direction: column; gap: 4px; }
@@ -526,6 +527,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="aws-metric">
                 <div class="aws-metric-label" title="Self-tracked: burn rate integrated over the trailing 24h">Spent (last 24h)</div>
                 <div class="aws-metric-value" id="aws-spend-24h">—</div>
+            </div>
+            <div class="aws-metric">
+                <div class="aws-metric-label" title="Accumulated (on-demand − spot) cost across all finished cloud-batch jobs — what running on spot has saved you">Saved by spot (total)</div>
+                <div class="aws-metric-value ok" id="aws-saved">—</div>
+            </div>
+            <div class="aws-metric">
+                <div class="aws-metric-label" title="Trailing 24h: encode-minutes thrown away by spot reclaims ÷ total encode-minutes. High = reclaims are eating your spot savings.">Reclaim waste (24h)</div>
+                <div class="aws-metric-value" id="aws-reclaim-pct">—</div>
             </div>
             <div class="aws-metric">
                 <div class="aws-metric-label">Region</div>
@@ -1527,6 +1536,7 @@ function jobRowHtml(j) {
                     ${cloudBadge}
                     <span class="job-ami-badge" style="display:none"></span>
                     <span class="job-reclaim-badge" style="display:none"></span>
+                    <span class="job-saved-badge" style="display:none"></span>
                 </div>
                 <span class="job-status status-${j.status}">${j.status.toUpperCase()}</span>
             </div>
@@ -1740,6 +1750,19 @@ function updateJobRow(row, j) {
             rc.style.display = '';
         } else {
             rc.style.display = 'none';
+        }
+    }
+
+    // Saved by using spot (on-demand − spot cost) for this job.
+    const sv = row.querySelector('.job-saved-badge');
+    if (sv) {
+        if (j.saved_usd > 0) {
+            sv.textContent = `💰 saved $${j.saved_usd.toFixed(2)} on spot`;
+            sv.title = `This job cost $${(j.spot_usd || 0).toFixed(2)} on spot vs `
+                + `$${(j.ondemand_usd || 0).toFixed(2)} on-demand — spot saved $${j.saved_usd.toFixed(2)}.`;
+            sv.style.display = '';
+        } else {
+            sv.style.display = 'none';
         }
     }
 
@@ -2026,6 +2049,12 @@ function renderAws(data) {
     hourlyEl.textContent = '$' + hourly.toFixed(2);
     hourlyEl.className = 'aws-metric-value' + (hourly > 0 ? ' warn' : ' ok');
     document.getElementById('aws-spend-24h').textContent = '$' + (s.spend_24h_usd || 0).toFixed(2);
+    document.getElementById('aws-saved').textContent = '$' + (s.saved_total_usd || 0).toFixed(2);
+    const rpct = s.reclaim_24h_pct || 0;
+    const rEl = document.getElementById('aws-reclaim-pct');
+    rEl.textContent = rpct.toFixed(1) + '%';
+    rEl.className = 'aws-metric-value' + (rpct >= 10 ? ' warn' : rpct > 0 ? '' : ' ok');
+    rEl.title = (s.reclaim_24h_lost_min || 0).toFixed(1) + ' min of encoding lost to reclaims in the last 24h';
     document.getElementById('aws-region').textContent = data.region || '—';
 
     renderFleet(data.fleet || {}, data.instances || []);

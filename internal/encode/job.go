@@ -112,6 +112,10 @@ var (
 	// Emitted per chunk (even zero-reclaim) so the job's %-wasted ratio is
 	// exact. Per-stage values are cumulative; the Job max-merges them.
 	reclaimMarkerRe = regexp.MustCompile(`^\[\[ENCODER-RECLAIM key=(\S+) count=(\d+) lost_s=([0-9.]+) total_s=([0-9.]+)\]\]$`)
+	// ENCODER-COST reports one execution's spot-vs-on-demand cost + savings at
+	// job end. Keyed by exec so a reattach that re-emits is idempotent (the Job
+	// sums per-exec, last value wins). Drives "saved by using spot".
+	costMarkerRe = regexp.MustCompile(`^\[\[ENCODER-COST exec=(\S+) spot_usd=([0-9.]+) ondemand_usd=([0-9.]+) saved_usd=([0-9.]+) vcpu_hours=([0-9.]+)\]\]$`)
 )
 
 // learnSpeed folds an ENCODER-SPEED marker into the learned-speed model. Returns
@@ -323,6 +327,14 @@ func (j *Job) parseMarker(line string) bool {
 		j.recordReclaim(m[1], count, lost, total)
 		return true
 	}
+	if m := costMarkerRe.FindStringSubmatch(line); m != nil {
+		spot, _ := strconv.ParseFloat(m[2], 64)
+		ondemand, _ := strconv.ParseFloat(m[3], 64)
+		saved, _ := strconv.ParseFloat(m[4], 64)
+		vh, _ := strconv.ParseFloat(m[5], 64)
+		j.recordCost(m[1], spot, ondemand, saved, vh)
+		return true
+	}
 	// Non-consuming matches: capture sideband info but still let the
 	// line flow into the raw log buffer (return false).
 	if m := cloudJobIDRe.FindStringSubmatch(line); m != nil {
@@ -366,6 +378,24 @@ func (j *Job) recordReclaim(key string, count, lost, total float64) {
 		t += v[2]
 	}
 	j.ReclaimCount, j.ReclaimLostS, j.EncodeTotalS = int(c), l, t
+}
+
+// recordCost folds one execution's ENCODER-COST into the job. Keyed by exec so
+// a reattach re-emitting is idempotent; job totals sum across files/executions.
+func (j *Job) recordCost(exec string, spot, ondemand, saved, vcpuH float64) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.costByExec == nil {
+		j.costByExec = map[string][4]float64{}
+	}
+	j.costByExec[exec] = [4]float64{spot, ondemand, saved, vcpuH}
+	var s, o, sv float64
+	for _, v := range j.costByExec {
+		s += v[0]
+		o += v[1]
+		sv += v[2]
+	}
+	j.SpotUSD, j.OnDemandUSD, j.SavedUSD = s, o, sv
 }
 
 // startFile archives the current Stages (so end-of-job timing can still
@@ -522,6 +552,14 @@ type Job struct {
 	EncodeTotalS float64 `json:"encode_total_s,omitempty"`
 	// per-stage cumulative [count, lost_s, total_s], max-merged; not serialized.
 	reclaimByStage map[string][3]float64
+
+	// Spot-vs-on-demand cost (from ENCODER-COST). SpotUSD is what this job cost
+	// on the spot fleet; SavedUSD = OnDemandUSD - SpotUSD (what spot avoided).
+	SpotUSD     float64 `json:"spot_usd,omitempty"`
+	OnDemandUSD float64 `json:"ondemand_usd,omitempty"`
+	SavedUSD    float64 `json:"saved_usd,omitempty"`
+	// per-execution [spot, ondemand, saved, vcpu_h], summed across files; not serialized.
+	costByExec map[string][4]float64
 
 	// Stages is populated from [[ENCODER-PLAN]] + [[ENCODER-STAGE]]
 	// markers the Python orchestrator emits. Empty when the job hasn't
@@ -835,8 +873,45 @@ func (m *Manager) run(job *Job, startIdx int) {
 		os.RemoveAll(jobTmpDir)
 	}
 	m.removePersistedState(job.ID)
+	m.persistSpotSample(job)
 	m.writeHistory(job)
 	m.notify(job)
+}
+
+// persistSpotSample appends this finished cloud-batch job's spot-vs-on-demand
+// cost and reclaim-waste to a rolling log in TmpDir (host-mounted, survives
+// restarts) so the AWS view can show the accumulated "saved by spot" and the
+// trailing-24h reclaim-waste %. No-op for jobs without cost/reclaim data.
+func (m *Manager) persistSpotSample(job *Job) {
+	if job.EncodeTotalS <= 0 && job.SavedUSD <= 0 {
+		return
+	}
+	type sample struct {
+		Ts          int64   `json:"ts"`
+		LostS       float64 `json:"lost_s"`
+		TotalS      float64 `json:"total_s"`
+		SpotUSD     float64 `json:"spot_usd"`
+		OnDemandUSD float64 `json:"ondemand_usd"`
+		SavedUSD    float64 `json:"saved_usd"`
+	}
+	path := filepath.Join(m.TmpDir, "spot_samples.json")
+	var samples []sample
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &samples)
+	}
+	samples = append(samples, sample{
+		Ts: time.Now().Unix(), LostS: job.ReclaimLostS, TotalS: job.EncodeTotalS,
+		SpotUSD: job.SpotUSD, OnDemandUSD: job.OnDemandUSD, SavedUSD: job.SavedUSD,
+	})
+	if len(samples) > 5000 {
+		samples = samples[len(samples)-5000:]
+	}
+	if data, err := json.MarshalIndent(samples, "", " "); err == nil {
+		tmp := path + ".tmp"
+		if os.WriteFile(tmp, data, 0644) == nil {
+			_ = os.Rename(tmp, path)
+		}
+	}
 }
 
 // preserveTmpForFailure moves jobTmpDir to $TMP_DIR/failed/<job_id>/ so the

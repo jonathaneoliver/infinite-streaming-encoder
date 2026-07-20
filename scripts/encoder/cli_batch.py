@@ -663,6 +663,54 @@ def _download_outputs(s3_prefix: str, local_dir: Path) -> int:
     return len(objs)
 
 
+# Blended Graviton per-vCPU-hour rates, us-west-2 (c7g/c8g .2xlarge/.4xlarge).
+# cloud-batch always runs on the SPOT compute env, so every run's savings = the
+# on-demand price it avoided. Estimates — good enough for "saved by spot".
+_SPOT_VCPU_HR = 0.011
+_ONDEMAND_VCPU_HR = 0.037
+
+
+def _emit_cost_summary(exec_name: str) -> None:
+    """At job end, sum the execution's Batch compute (vCPU x runtime) and emit
+    ENCODER-COST: spot vs on-demand cost + savings, so the control plane can
+    accumulate 'saved by using spot' and log a per-job line. exec= keeps it
+    idempotent across a reattach (the Go side keys on it)."""
+    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    batch = _batch()
+    vcpu_s = 0.0
+    for status in ("SUCCEEDED", "FAILED"):
+        try:
+            ids = [j["jobId"] for j in
+                   batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", [])
+                   if exec_name in j.get("jobName", "")]
+        except ClientError:
+            continue
+        for i in range(0, len(ids), 100):
+            try:
+                jobs = batch.describe_jobs(jobs=ids[i:i + 100]).get("jobs", [])
+            except ClientError:
+                continue
+            for job in jobs:
+                v = 0.0
+                for rr in job.get("container", {}).get("resourceRequirements", []):
+                    if rr.get("type") == "VCPU":
+                        try:
+                            v = float(rr["value"])
+                        except (KeyError, ValueError):
+                            v = 0.0
+                st, sp = job.get("startedAt"), job.get("stoppedAt")
+                if v and isinstance(st, (int, float)) and isinstance(sp, (int, float)) and sp > st:
+                    vcpu_s += v * (sp - st) / 1000.0
+    vh = vcpu_s / 3600.0
+    spot, ondemand = vh * _SPOT_VCPU_HR, vh * _ONDEMAND_VCPU_HR
+    saved = ondemand - spot
+    print(f"[[ENCODER-COST exec={exec_name} spot_usd={spot:.4f} "
+          f"ondemand_usd={ondemand:.4f} saved_usd={saved:.4f} vcpu_hours={vh:.2f}]]",
+          flush=True)
+    _narrate(f"💰 saved ${saved:.2f} using spot — {vh:.1f} vCPU-hr "
+             f"(${spot:.2f} spot vs ${ondemand:.2f} on-demand)")
+
+
 def cmd_poll(args: argparse.Namespace) -> int:
     sfn = _sfn()
     # Read the execution input up front so the plan lists only the codecs we're
@@ -739,6 +787,10 @@ def cmd_poll(args: argparse.Namespace) -> int:
                 print(f"    downloading outputs from {args.s3_prefix}", flush=True)
                 n = _download_outputs(args.s3_prefix, Path(args.local_dir))
                 print(f"    downloaded {n} files", flush=True)
+                try:
+                    _emit_cost_summary(exec_name)  # spot-vs-on-demand savings
+                except Exception:  # noqa: BLE001 — cost summary is best-effort
+                    pass
                 return 0
             print(f"!!! execution ended with status {status}: "
                   f"{desc.get('cause', '')}", file=sys.stderr)
