@@ -112,20 +112,16 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    %, so a running chunk shows real progress instead of a pulse; a completed
    chunked row is solid green at the same height as a completed whole row. */
 .chunk-grid { display: flex; flex-wrap: nowrap; gap: 2px; align-items: center; width: 100%; }
-.chunk-cell { position: relative; flex: 1 1 0; min-width: 3px; height: 8px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
-/* 2px bottom stripe coloured by the instance the chunk ran on — painted over
-   the status fill (z-index) so it stays visible even when the chunk is done.
-   Same colour across cells => same machine, so a mono-coloured plot reveals
-   heavy chunks co-located on one box. */
-.chunk-cell-host { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; z-index: 1; background: transparent; pointer-events: none; }
+.chunk-cell { position: relative; flex: 1 1 0; min-width: 3px; height: 10px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
 /* Whole-variant encode rows have no chunk grid, so the instance shows as a dot
-   before the label — same palette as the chunk stripes, so a whole encode and a
+   before the label — same palette as the chunk fills, so a whole encode and a
    chunk sharing a colour ran on the same box. */
-.host-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: transparent; }
+.host-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: transparent; }
 /* display:block so width/height apply — it's a <span> inside the cell, and
-   inline elements ignore both (unlike the whole-variant fill, which is a div). */
+   inline elements ignore both (unlike the whole-variant fill, which is a div).
+   The fill's COLOUR is the machine the chunk ran on (set inline in JS) so
+   co-located chunks are unmistakable; width is progress; red states win. */
 .chunk-cell-fill { display: block; height: 100%; width: 0; background: #4361ee; transition: width 0.3s ease; }
-.chunk-cell-fill.chunk-done { background: #06d6a0; }
 .chunk-cell-fill.chunk-failed { background: #ef476f; }
 /* reclaimed = AWS took the spot instance; red + pulse (encoding thrown away,
    waiting to restart on fresh capacity) until the retry begins encoding. */
@@ -467,12 +463,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
 <!-- JOBS TAB -->
 <div id="tab-jobs" class="tab-content">
-    <div class="panel" id="jobs-fleet-panel" style="display:none">
+    <div class="panel" id="jobs-fleet-panel">
         <h2>Fleet</h2>
-        <div id="jobs-fleet-full" title="Live cloud fleet — per-instance packing, utilization, and lifecycle (from the AWS inventory)"></div>
-    </div>
-    <div class="panel" id="jobs-aws-metrics-panel">
         <div class="aws-summary" id="jobs-aws-metrics"></div>
+        <div id="jobs-fleet-full" title="Live cloud fleet — per-instance packing, utilization, and lifecycle (from the AWS inventory)"></div>
     </div>
     <div class="panel">
         <h2>Jobs</h2>
@@ -1588,6 +1582,33 @@ function instanceColor(inst) {
     return _instanceColors[inst];
 }
 
+// Elapsed wall time for a stage/chunk from its transition timestamps: "took 4m"
+// once ended, "running 90s" while live, "" before it starts.
+function stageElapsed(s) {
+    if (!s || !s.started_at) return '';
+    const start = new Date(s.started_at).getTime();
+    if (isNaN(start)) return '';
+    const end = s.ended_at ? new Date(s.ended_at).getTime() : Date.now();
+    const sec = Math.max(0, (end - start) / 1000);
+    return (s.ended_at ? 'took ' : 'running ') + formatDuration(sec);
+}
+
+// Rich hover text for a progress/chunk bar: what it is, its state, %, the
+// machine it ran on, and how long it's taken. Shown as a native title tooltip.
+function stageTooltip(s, indexLabel) {
+    const parts = [];
+    if (indexLabel) parts.push(indexLabel);
+    if (s.label && s.label !== indexLabel) parts.push(s.label.replace(/:/g, ' '));
+    parts.push('status: ' + (s.status || 'pending'));
+    if (s.status !== 'pending' && s.status !== 'skipped' && typeof s.percent === 'number')
+        parts.push(s.percent.toFixed(0) + '%');
+    if (s.status === 'skipped') parts.push('reused from cache');
+    if (s.instance) parts.push('machine: ' + s.instance);
+    const el = stageElapsed(s);
+    if (el) parts.push(el);
+    return parts.join(' · ');
+}
+
 // Match a per-chunk encode stage key: encode:<codec>:<tier>:chunk<N>.
 const CHUNK_KEY_RE = /^encode:([^:]+):([^:]+):chunk(\d+)$/;
 // Match the per-variant concat stage key: concat:<codec>:<tier>.
@@ -1681,7 +1702,7 @@ function updateStagesTable(row, stages) {
                     <td class="stage-pct"></td></tr>`;
             }
             const cells = r.cells.map(c =>
-                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" title="chunk ${c.index}"><span class="chunk-cell-fill"></span><i class="chunk-cell-host"></i></span>`).join('');
+                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" title="chunk ${c.index}"><span class="chunk-cell-fill"></span></span>`).join('');
             // The join is implicit in the solid bar (concat is folded into
             // package-all), so no separate join glyph is drawn. Any concat stage
             // is still absorbed into this group (below) so it doesn't spawn a row.
@@ -1722,6 +1743,8 @@ function updateStagesTable(row, stages) {
                 : s.status === 'skipped' ? 'reused'
                 : reclaimed ? '⚠ reclaimed'
                 : s.percent.toFixed(0) + '%';
+            const bar = tr.querySelector('.stage-bar');
+            if (bar) bar.title = stageTooltip(s);
             continue;
         }
         // Chunk group: colour each cell by its chunk's status.
@@ -1738,18 +1761,18 @@ function updateStagesTable(row, stages) {
             sumPct += prog;
             const fill = cell.querySelector('.chunk-cell-fill');
             if (fill) {
+                const isRed = (st === 'failed' || st === 'reclaimed');
                 // reclaimed → fill red (waiting to restart); else show progress.
                 fill.style.width = (st === 'reclaimed' ? 100 : prog).toFixed(1) + '%';
                 fill.className = 'chunk-cell-fill'
-                    + ((st === 'done' || st === 'skipped') ? ' chunk-done'
-                        : st === 'failed' ? ' chunk-failed'
+                    + (st === 'failed' ? ' chunk-failed'
                         : st === 'reclaimed' ? ' chunk-reclaimed' : '');
+                // The fill COLOUR is the machine this chunk ran on — bold and
+                // unmissable so co-located chunks pop; red states keep their
+                // class colour (clear the inline so the class wins).
+                fill.style.background = isRed ? '' : (instanceColor(c.s.instance) || '#4361ee');
             }
-            // Bottom stripe = which machine this chunk landed on (once placed).
-            const host = cell.querySelector('.chunk-cell-host');
-            const color = instanceColor(c.s.instance);
-            if (host) host.style.background = color || 'transparent';
-            if (color) cell.title = `chunk ${c.index} · ${c.s.instance}`;
+            cell.title = stageTooltip(c.s, 'chunk ' + c.index);
         }
         // Aggregate % across chunks so a chunked row reads like a whole row
         // ("100%") instead of a chunk count — the join is implicit, not shown.
@@ -2304,9 +2327,16 @@ function _fleetInstanceRow(i, maxV) {
             ? _sparkline(cpuVals, '#e0555a', { min: 0, max: 100, w: 54, h: 13 }) + ' ' : '';
         cpuSpark = `<span title="this box's CPU% (CloudWatch)">CPU ${spark}<span style="color:#ccc">${cpuVals[cpuVals.length - 1]}%</span></span> · `;
     }
+    // Swatch keyed by the SAME instanceColor() the chunk plot uses, so a box
+    // here and its chunks below share one colour — the machine a chunk ran on is
+    // traceable to this fleet row at a glance.
+    const hostColor = i.id ? instanceColor(i.id) : null;
+    const swatch = hostColor
+        ? `<span title="machine ${escapeHtml(i.id)} — matches its chunk colour in the plot" style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${hostColor};vertical-align:middle;margin-right:6px"></span>`
+        : '';
     return `<div>
       <div style="display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-bottom:2px">
-        <span>${escapeHtml(i.type || '')} <span style="color:#666">${escapeHtml((i.id || '').slice(-6))}</span>${badge}</span>
+        <span>${swatch}${escapeHtml(i.type || '')} <span style="color:#666">${escapeHtml((i.id || '').slice(-6))}</span>${badge}</span>
         <span>${cpuSpark}${rightLabel} · ${formatDuration(i.age_seconds || 0)}</span>
       </div>
       <div style="height:16px;width:${barW}%;background:#20252f;border-radius:4px;overflow:hidden;display:flex" title="${cap} vCPU">${parts}</div>
@@ -2402,14 +2432,12 @@ function renderFleet(fleet, instances) {
     const el = document.getElementById('aws-fleet');
     if (el) el.innerHTML = panelHtml;
 
-    // Jobs page: show the same full panel above the jobs list; hide it entirely
-    // when there's no fleet so the page isn't cluttered while idle.
-    const jp = document.getElementById('jobs-fleet-panel');
+    // Jobs page: the Fleet panel stays visible so its metrics row (rendered by
+    // renderJobsMetrics, right under the title) is always an at-a-glance status.
+    // The per-instance display below carries its own "No active fleet" empty
+    // state while idle, so the panel isn't blank.
     const jff = document.getElementById('jobs-fleet-full');
-    if (jp && jff) {
-        if (running.length || total) { jff.innerHTML = panelHtml; jp.style.display = ''; }
-        else { jp.style.display = 'none'; }
-    }
+    if (jff) jff.innerHTML = panelHtml;
 }
 
 function renderAwsInstances(instances) {
