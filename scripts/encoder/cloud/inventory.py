@@ -579,8 +579,13 @@ def _record_fleet_samples(hourly_usd: float, fleet: dict) -> dict:
     Sample record: [ts, hourly_usd, used_vcpus, total_vcpus, queued, running].
     Old 2-field [ts, hourly] records are tolerated for backward compat.
     """
+    # Persist to the app's host-mounted TMP_DIR (survives server restarts) —
+    # NOT the container's ephemeral /tmp, which every restart/deploy wipes,
+    # resetting the trailing-24h integral to "since last restart". TMPDIR is the
+    # standard-lib fallback (usually unset here); /tmp is the last resort.
     path = os.environ.get("COST_LOG") or os.path.join(
-        os.environ.get("TMPDIR") or "/tmp", "cost_samples.json")
+        os.environ.get("TMP_DIR") or os.environ.get("TMPDIR") or "/tmp",
+        "cost_samples.json")
     now = datetime.now(timezone.utc).timestamp()
     cutoff = now - 24 * 3600
     samples: list[list] = []
