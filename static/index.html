@@ -328,7 +328,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <label title="How the cloud-batch target splits each variant. Dynamic sizes each variant's chunks by its learned encode speed — ~4 min of encode work per chunk (min 30s), so slow 4K HEVC splits into many chunks while cheap H264 runs whole and pays no join cost. Fixed sizes: smaller chunks = more parallel jobs (faster wall-clock, more fleet overhead); whole variant = one job per tier (most efficient, least parallel).">Chunking (cloud)</label>
                 <select id="chunk-duration">
                     <option value="dynamic" selected>Dynamic (per-variant, learned)</option>
-                    <option value="30">30s chunks (max parallelism)</option>
+                    <option value="12">12s chunks (max parallelism)</option>
+                    <option value="30">30s chunks</option>
                     <option value="60">60s chunks</option>
                     <option value="300">5m chunks</option>
                     <option value="whole">Whole variant (max efficiency)</option>

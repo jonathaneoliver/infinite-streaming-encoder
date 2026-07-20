@@ -57,8 +57,13 @@ var maxResHeight = map[string]int{
 // resolution — because on Batch the vCPU request is a packing + fair-share
 // weight (Batch uses CPU shares, not a hard cap), so the right value is how
 // many cores that encoder actually drives. Measured on Graviton .2xlarge:
-//   - x265 (HEVC) tops out ~2-2.4 cores even at 4K → request 2 vCPU so ~4 pack
-//     per 8-core box, filling the cores a single x265 can't use.
+//   - x265 (HEVC) core scaling RISES with resolution — ~2 cores at 1080p but
+//     many more at 1440p/4K (more CTUs + WPP rows, especially 2-pass). So the
+//     vCPU request is resolution-aware: 2 (≤1080p) / 4 (1440p) / 8 (≥2160p).
+//     This both gives the 4K long pole its cores AND stops Batch's bin-packer
+//     from stacking heavy chunks onto one box (a flat 2 vCPU let ~8 4K chunks
+//     pack a 16-vCPU .4xlarge, where they oversubscribed cores and serialized).
+//     The vCPU request is the only anti-affinity lever Batch exposes.
 //   - x264 (H264) scales to ~7 cores → 4 vCPU (packs 2 per box).
 //   - SVT-AV1 self-parallelizes across many cores → give it a whole box (8).
 //
@@ -81,7 +86,17 @@ func variantResourcesFor(codec string, height int) (vcpu, memory string) {
 	}
 	switch codec {
 	case "hevc":
-		return "2", "3072" // x265 caps ~2 cores → pack ~4 per box
+		// Resolution-aware: x265 uses more cores as resolution climbs, and a
+		// bigger request also forces Batch to spread the heavy chunks (≤1-2 per
+		// instance) instead of stacking them.
+		switch {
+		case height <= 1080:
+			return "2", "3072" // x265 genuinely caps ~2 cores here → pack ~4 per box
+		case height <= 1440:
+			return "4", "3072"
+		default: // 2160p+: ~a whole .2xlarge / half a .4xlarge → forced spread + cores
+			return "8", "4096" // 2-pass 4K peaked ~2.2 GiB; 4 GiB leaves headroom, still packs by vCPU
+		}
 	case "av1":
 		return "8", "6144" // SVT-AV1 scales → give it a whole .2xlarge
 	default:

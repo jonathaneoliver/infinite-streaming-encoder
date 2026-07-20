@@ -11,14 +11,16 @@ import (
 // Dynamic-chunking knobs (per the design):
 //   - aim for ~4 min of encode WALL time per chunk, so all variants' chunks
 //     finish around the same time;
-//   - never smaller than a 30s content chunk (bounds join count / cold-starts).
+//   - never smaller than a 12s content chunk (bounds join count / cold-starts).
 const (
 	dynamicTargetWallSeconds = 240.0
 	// dynamicMinChunkSeconds is both the floor and the quantum: dynamic chunk
-	// lengths are whole multiples of it (30s, 60s, 90s, …). 30 is itself a
+	// lengths are whole multiples of it (12s, 24s, 36s, …). 12 is itself a
 	// multiple of the 6s segment duration, so every resulting size satisfies
-	// the worker's plan_chunks._validate alignment contract for free.
-	dynamicMinChunkSeconds = 30.0
+	// the worker's plan_chunks._validate alignment contract for free. A smaller
+	// floor than the old 30s lets the heaviest rungs (4K HEVC 2-pass) subdivide
+	// into a shorter atomic long pole and a finer tail the fleet can pack.
+	dynamicMinChunkSeconds = 12.0
 )
 
 // EncodeSpeedStore learns each variant's encode SPEED — content-seconds encoded
@@ -128,12 +130,13 @@ func (s *EncodeSpeedStore) Update(codec string, height int, twoPass bool, conten
 }
 
 // dynamicChunkSeconds sizes one variant's chunk length: target wall time ×
-// learned speed, clamped to [30s, clip]. Slow variants clamp to 30s (most
-// parallel); fast variants reach the whole clip (one chunk, no joins).
+// learned speed, clamped to [dynamicMinChunkSeconds, clip]. Slow variants clamp
+// to the floor (most parallel); fast variants reach the whole clip (one chunk,
+// no joins).
 func dynamicChunkSeconds(speeds *EncodeSpeedStore, codec string, height int, twoPass bool, clipDurationS float64) float64 {
 	c := dynamicTargetWallSeconds * speeds.Speed(codec, height, twoPass)
-	// Quantize to a whole multiple of the 30s minimum (30/60/90/…), floored at
-	// the minimum. Keeps sizes clean and segment-aligned (30 | 6).
+	// Quantize to a whole multiple of the minimum (12/24/36/…), floored at the
+	// minimum. Keeps sizes clean and segment-aligned (12 | 6).
 	c = math.Round(c/dynamicMinChunkSeconds) * dynamicMinChunkSeconds
 	if c < dynamicMinChunkSeconds {
 		c = dynamicMinChunkSeconds

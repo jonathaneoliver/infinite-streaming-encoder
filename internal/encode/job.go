@@ -1799,7 +1799,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 // JobConfig's Codec + MaxRes.
 // variantChunkSeconds resolves one variant's chunk length from the job's
 // ChunkDuration config: "dynamic" (also the default when unset) sizes it by
-// learned encode speed (slow → 30s floor, cheap → whole clip); "whole" → one
+// learned encode speed (slow → 12s floor, cheap → whole clip); "whole" → one
 // chunk; a number → that fixed size. clipS==0 (duration unknown) collapses to
 // whole downstream.
 func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, codec string, height int, twoPass bool) float64 {
