@@ -190,15 +190,13 @@ ecr-login:
 	  docker login --username AWS --password-stdin $(ECR_REGISTRY)
 
 ecr-push: ecr-login   ## build arm64 (Graviton) + push the worker image to ECR
-	# Registry-backed layer cache: buildx's container builder doesn't durably
-	# reuse the local Docker cache, so without this a script-only change can
-	# rebuild the heavy ffmpeg/Shaka layers from scratch (minutes). Pull/push a
-	# :buildcache image so those layers are reused across builds and machines.
-	# image-manifest + oci-mediatypes make the cache manifest ECR-compatible.
+	# The default buildx "docker" driver already caches layers in the local
+	# daemon across builds, so an incremental (script-only) build reuses the
+	# heavy ffmpeg/Shaka layers. External registry cache (--cache-to) needs a
+	# docker-container buildx builder; not worth it on one host, adopt only if
+	# builds move to multiple machines/CI.
 	docker buildx build --platform linux/arm64 \
 		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(IMAGE_TAG) \
-		--cache-from type=registry,ref=$(ECR_REPO):buildcache \
-		--cache-to type=registry,ref=$(ECR_REPO):buildcache,mode=max,image-manifest=true,oci-mediatypes=true \
 		--tag $(ECR_REPO):latest --tag $(ECR_REPO):$(IMAGE_TAG) --push .
 	@echo "Pushed $(ECR_REPO):latest :$(IMAGE_TAG) (linux/arm64)"
 
