@@ -89,6 +89,15 @@ func (s *EncodeSpeedStore) Speed(codec string, height int, twoPass bool) float64
 	return math.Max(sp, 0.001)
 }
 
+// SpeedDetail returns the speed plus how many learned samples back it (0 =
+// seeded from the model, not yet observed). For chunk-plan logging.
+func (s *EncodeSpeedStore) SpeedDetail(codec string, height int, twoPass bool) (float64, int) {
+	s.mu.Lock()
+	n := s.samples[speedKey(codec, height, twoPass)]
+	s.mu.Unlock()
+	return s.Speed(codec, height, twoPass), n
+}
+
 // Update folds a completed encode's (content_s / wall_s) into a rolling average
 // and persists. Ignored for non-positive inputs.
 func (s *EncodeSpeedStore) Update(codec string, height int, twoPass bool, contentS, wallS float64) {

@@ -1547,7 +1547,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		if srcWidth > 0 {
 			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
 		}
-		inputJSON := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, srcWidth, durationS, job.Config.ChunkDuration)
+		inputJSON := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, srcWidth, durationS, job.Config.ChunkDuration, job.AppendLog)
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 			return fmt.Errorf("write input json: %w", err)
@@ -1665,6 +1665,37 @@ func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, co
 	}
 }
 
+// chunkPlanLine explains one variant's chunk-size decision for the job log:
+// how many chunks, the per-chunk length, and — for the dynamic selector — the
+// speed (learned or seeded) and target that produced it. This is what makes a
+// "why is h264 1080p one whole chunk?" question answerable from the log alone.
+func chunkPlanLine(cfg, codec, label string, height int, twoPass bool, speeds *EncodeSpeedStore, chunkS float64, count int, clipS float64) string {
+	pass := "1-pass"
+	if twoPass {
+		pass = "2-pass"
+	}
+	mode := fmt.Sprintf("%d chunks", count)
+	if count == 1 {
+		mode = "1 chunk (whole)"
+	}
+	head := fmt.Sprintf("[cloud-batch] chunk plan %s %s %s: %s — %.0fs/chunk",
+		codec, label, pass, mode, chunkS)
+	switch cfg {
+	case "dynamic", "":
+		sp, n := speeds.SpeedDetail(codec, height, twoPass)
+		src := fmt.Sprintf("seeded %.3gx", sp)
+		if n > 0 {
+			src = fmt.Sprintf("learned %.3gx (%d samples)", sp, n)
+		}
+		return fmt.Sprintf("%s [dynamic: %s realtime × %.0fs target → %.0fs, clip %.0fs, min %.0fs]",
+			head, src, dynamicTargetWallSeconds, math.Round(dynamicTargetWallSeconds*sp), clipS, dynamicMinChunkSeconds)
+	case "whole":
+		return head + " [whole]"
+	default:
+		return head + " [fixed " + cfg + "s]"
+	}
+}
+
 // chunkModeLabel is a human-readable name for a ChunkDuration config value.
 func chunkModeLabel(cfg string) string {
 	switch cfg {
@@ -1677,7 +1708,7 @@ func chunkModeLabel(cfg string) string {
 	}
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, ladderName, codecSel, maxRes string, hevcSinglePass bool, sourceWidth int, clipDurationS float64, chunkCfg string) string {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, ladderName, codecSel, maxRes string, hevcSinglePass bool, sourceWidth int, clipDurationS float64, chunkCfg string, logf func(string)) string {
 	if ladderName == "" {
 		ladderName = "apple-uniq-live"
 	}
@@ -1734,6 +1765,9 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			idx := make([]int, nc)
 			for k := range idx {
 				idx[k] = k
+			}
+			if logf != nil {
+				logf(chunkPlanLine(chunkCfg, c, r.Label, r.Height, twoPass, speeds, cs, nc, clipDurationS))
 			}
 			variants = append(variants, sfnVariant{
 				Codec:         c,
