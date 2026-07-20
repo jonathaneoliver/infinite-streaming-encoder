@@ -110,11 +110,16 @@ class _Xfer:
     the poll loop's live-log forwarder can render a download/upload bar
     without drowning the app log. Emits at most every 2s, plus on completion."""
 
-    def __init__(self, label: str, total: int):
+    def __init__(self, label: str, total: int,
+                 stage: tuple[str, float, float] | None = None):
         self.label = label
         self.total = max(total, 1)
         self.done = 0
         self._last = 0.0
+        # (stage_key, pct_lo, pct_hi): also drive that stage's bar into the
+        # given sub-band, so a slow download/upload moves the mezzanine/audio
+        # stage instead of it sitting at 0 (or 100) the whole transfer.
+        self.stage = stage
 
     def __call__(self, n: int) -> None:
         self.done += n
@@ -126,24 +131,30 @@ class _Xfer:
         print(f"[progress] {self.label}: {pct}% "
               f"({self.done / 1048576:.1f}/{self.total / 1048576:.1f} MB)",
               flush=True)
+        if self.stage:
+            key, lo, hi = self.stage
+            emit_stage(key, "running", lo + pct / 100.0 * (hi - lo))
 
 
-def _download(uri: str, dst: Path, progress: bool = True) -> None:
+def _download(uri: str, dst: Path, progress: bool = True,
+              stage: tuple[str, float, float] | None = None) -> None:
     bucket, key = _parse(uri)
     dst.parent.mkdir(parents=True, exist_ok=True)
     cb = None
     if progress:
         try:
             total = _s3().head_object(Bucket=bucket, Key=key)["ContentLength"]
-            cb = _Xfer(f"downloading {Path(key).name}", total)
+            cb = _Xfer(f"downloading {Path(key).name}", total, stage=stage)
         except Exception:  # noqa: BLE001 — progress is best-effort
             cb = None
     _s3().download_file(bucket, key, str(dst), Callback=cb)
 
 
-def _upload(src: Path, uri: str, progress: bool = True) -> None:
+def _upload(src: Path, uri: str, progress: bool = True,
+            stage: tuple[str, float, float] | None = None) -> None:
     bucket, key = _parse(uri)
-    cb = _Xfer(f"uploading {Path(key).name}", src.stat().st_size) if progress else None
+    cb = _Xfer(f"uploading {Path(key).name}", src.stat().st_size,
+               stage=stage) if progress else None
     _s3().upload_file(str(src), bucket, key, Callback=cb)
 
 
@@ -170,15 +181,17 @@ def _write_done(path: Path) -> None:
     tmp.rename(marker)
 
 
-def _upload_with_done(local: Path, s3_uri: str) -> None:
+def _upload_with_done(local: Path, s3_uri: str,
+                      stage: tuple[str, float, float] | None = None) -> None:
     """Upload a file + its .done sidecar so consumers can verify."""
     _write_done(local)
-    _upload(local, s3_uri)
+    _upload(local, s3_uri, stage=stage)
     _upload(local.with_suffix(local.suffix + ".done"), s3_uri + ".done",
             progress=False)
 
 
-def _download_if_complete(s3_uri: str, dst: Path) -> bool:
+def _download_if_complete(s3_uri: str, dst: Path,
+                          stage: tuple[str, float, float] | None = None) -> bool:
     """Download `s3_uri` + its .done sidecar into dst. Returns True iff
     both landed and the .done recorded size matches the file size.
 
@@ -187,7 +200,7 @@ def _download_if_complete(s3_uri: str, dst: Path) -> bool:
     fails, the object was overwritten mid-upload or partial and the
     downstream phase should abort rather than continue.
     """
-    _download(s3_uri, dst)
+    _download(s3_uri, dst, stage=stage)
     marker_s3 = s3_uri + ".done"
     marker_local = dst.with_suffix(dst.suffix + ".done")
     try:
@@ -304,13 +317,14 @@ def phase_mezzanine(args: argparse.Namespace) -> int:
     _, src_key = _parse(src_uri)
     src_basename = src_key.rsplit("/", 1)[-1]
     local_in = work / src_basename
+    # One continuous mezzanine bar: download 0-45%, stream-copy 45-55%,
+    # upload 55-100% (the download + upload of the ~full-size file dominate).
     print(f"[phase mezzanine] downloading {src_uri}", flush=True)
-    _download(src_uri, local_in)
+    _download(src_uri, local_in, stage=("mezzanine", 0.0, 45.0))
 
     out_path = work / "mezzanine.mp4"
     info = probe(local_in)
 
-    emit_stage("mezzanine", "running", 0.0)
     create_mezzanine(
         MezzanineSpec(
             input_path=local_in,
@@ -319,12 +333,13 @@ def phase_mezzanine(args: argparse.Namespace) -> int:
         ),
         stage_key="mezzanine",
         duration_s=info.duration_s,
+        pct_lo=45.0, pct_hi=55.0, terminal=False,
     )
-    emit_stage("mezzanine", "done", 100.0)
 
     out_uri = args.s3_out.rstrip("/") + "/mezzanine.mp4"
     print(f"[phase mezzanine] uploading {out_uri}", flush=True)
-    _upload_with_done(out_path, out_uri)
+    _upload_with_done(out_path, out_uri, stage=("mezzanine", 55.0, 100.0))
+    emit_stage("mezzanine", "done", 100.0)
     return 0
 
 
@@ -510,10 +525,13 @@ def phase_audio(args: argparse.Namespace) -> int:
         emit_stage("audio", "done", 100.0)
         return 0
 
+    # One continuous audio bar: mezzanine download 0-70% (the bulk), transcode
+    # 70-95%, audio upload 95-100%.
     mezz_uri = args.s3_mezz.rstrip("/") + "/mezzanine.mp4"
     mezz_local = work / "mezzanine.mp4"
     print(f"[phase audio] downloading {mezz_uri}", flush=True)
-    if not _download_if_complete(mezz_uri, mezz_local):
+    if not _download_if_complete(mezz_uri, mezz_local,
+                                 stage=("audio", 0.0, 70.0)):
         print("error: mezzanine.done missing or size mismatch", file=sys.stderr)
         return 1
 
@@ -526,7 +544,6 @@ def phase_audio(args: argparse.Namespace) -> int:
         return 0
 
     out_path = work / "audio.mp4"
-    emit_stage("audio", "running", 0.0)
     create_audio(
         AudioSpec(
             mezzanine_path=mezz_local,
@@ -535,11 +552,12 @@ def phase_audio(args: argparse.Namespace) -> int:
         ),
         stage_key="audio",
         duration_s=info.duration_s,
+        pct_lo=70.0, pct_hi=95.0, terminal=False,
     )
-    emit_stage("audio", "done", 100.0)
 
     out_uri = args.s3_out.rstrip("/") + "/audio.mp4"
-    _upload_with_done(out_path, out_uri)
+    _upload_with_done(out_path, out_uri, stage=("audio", 95.0, 100.0))
+    emit_stage("audio", "done", 100.0)
     return 0
 
 

@@ -71,20 +71,26 @@ def build_ffmpeg_cmd(spec: MezzanineSpec) -> list[str]:
 
 
 def create_mezzanine(spec: MezzanineSpec, stage_key: str = "mezzanine",
-                     duration_s: float = 0.0) -> Path:
+                     duration_s: float = 0.0,
+                     pct_lo: float = 0.0, pct_hi: float = 100.0,
+                     terminal: bool = True) -> Path:
     """Run the ffmpeg stream copy and return the resulting mezzanine path.
 
     When `duration_s` is provided, live progress is emitted as
     ENCODER-STAGE markers under `stage_key`. Passing 0 (the default)
     keeps the old behaviour where ffmpeg inherits stderr and stats
-    stream directly into the log.
+    stream directly into the log. `pct_lo`/`pct_hi`/`terminal` place the
+    copy's progress in a sub-band of the stage (the phase brackets it with
+    download before and upload after).
     """
     spec.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = build_ffmpeg_cmd(spec)
     try:
         if duration_s > 0:
-            run_ffmpeg_with_progress(cmd, duration_s, stage_key)
+            run_ffmpeg_with_progress(cmd, duration_s, stage_key,
+                                     pct_lo=pct_lo, pct_hi=pct_hi,
+                                     terminal=terminal)
         else:
             subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
