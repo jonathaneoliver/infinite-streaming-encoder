@@ -61,6 +61,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/aws/inventory", s.awsInventory)
 	s.Mux.HandleFunc("POST /api/aws/clear", s.awsClearAll)
 	s.Mux.HandleFunc("POST /api/aws/jobs/{id}/cleanup", s.awsCleanupJob)
+	s.Mux.HandleFunc("POST /api/aws/s3/delete-prefix", s.awsDeleteS3Prefix)
 	// Cloud-batch release controls (Step Functions executions + Batch jobs).
 	s.Mux.HandleFunc("POST /api/aws/executions/stop", s.awsStopExecution)
 	s.Mux.HandleFunc("POST /api/aws/batch-jobs/terminate", s.awsTerminateBatchJob)
@@ -870,6 +871,26 @@ func (s *Server) awsCleanupJob(w http.ResponseWriter, r *http.Request) {
 }
 
 // awsStopExecution stops one Step Functions execution (aborts its Batch jobs).
+// awsDeleteS3Prefix deletes every object under one S3 staging prefix — a job's
+// staging or a single mezz-cache entry. cleanup.py restricts it to jobs/ or
+// mezz/, so a bad prefix can't reach arbitrary keys.
+func (s *Server) awsDeleteS3Prefix(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Prefix string `json:"prefix"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Prefix == "" {
+		http.Error(w, `bad request: {"prefix": "..."} required`, 400)
+		return
+	}
+	out, err := runPythonCloud("cleanup", "--delete-prefix", body.Prefix)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
 func (s *Server) awsStopExecution(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Arn string `json:"arn"`

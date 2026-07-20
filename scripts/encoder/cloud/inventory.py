@@ -205,28 +205,32 @@ def _spot_view(req: dict) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _s3_prefix_inventory(bucket: str | None) -> list[dict[str, Any]]:
-    """Per-job S3 prefix sizes under s3://<bucket>/jobs/."""
+    """Per-prefix S3 sizes under s3://<bucket>/jobs/ (per-job staging) AND
+    s3://<bucket>/mezz/ (the source-keyed mezzanine cache) — so the cached
+    mezzanines are visible in the S3 Staging view and can be deleted there."""
     if not bucket:
         return []
     s3 = s3_client()
     paginator = s3.get_paginator("list_objects_v2")
 
     by_prefix: dict[str, dict[str, int]] = {}
-    try:
-        for page in paginator.paginate(Bucket=bucket, Prefix="jobs/"):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                # keys look like jobs/<job_id>/input/clip.mp4 etc.
-                parts = key.split("/", 2)
-                if len(parts) < 2:
-                    continue
-                prefix = f"{parts[0]}/{parts[1]}/"
-                bucket_stats = by_prefix.setdefault(prefix,
-                                                   {"count": 0, "bytes": 0})
-                bucket_stats["count"] += 1
-                bucket_stats["bytes"] += obj.get("Size", 0)
-    except ClientError as e:
-        return [{"prefix": f"s3://{bucket}/jobs/", "error": str(e)}]
+    for root in ("jobs/", "mezz/"):
+        try:
+            for page in paginator.paginate(Bucket=bucket, Prefix=root):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    # keys look like jobs/<job_id>/input/clip.mp4 or
+                    # mezz/<source_key>/mezzanine.mp4 — group by the first two.
+                    parts = key.split("/", 2)
+                    if len(parts) < 2:
+                        continue
+                    prefix = f"{parts[0]}/{parts[1]}/"
+                    bucket_stats = by_prefix.setdefault(prefix,
+                                                       {"count": 0, "bytes": 0})
+                    bucket_stats["count"] += 1
+                    bucket_stats["bytes"] += obj.get("Size", 0)
+        except ClientError:
+            continue  # one root failing shouldn't hide the other
 
     out: list[dict[str, Any]] = []
     for prefix, stats in sorted(by_prefix.items()):
@@ -237,6 +241,7 @@ def _s3_prefix_inventory(bucket: str | None) -> list[dict[str, Any]]:
             "object_count": stats["count"],
             "size_bytes": stats["bytes"],
             "job_id": job_id,
+            "kind": parts[0],  # "jobs" | "mezz" — UI labels the cache distinctly
         })
     return out
 

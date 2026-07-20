@@ -2423,17 +2423,27 @@ function renderAwsS3(prefixes) {
         el.innerHTML = '<div class="aws-empty">No S3 staging.</div>';
         return;
     }
-    const rows = prefixes.map(p => `
+    const rows = prefixes.map(p => {
+        const isMezz = p.kind === 'mezz';
+        // mezz-cache entries delete by prefix (no job to terminate); job
+        // staging deletes via the job cleanup path.
+        const jobCell = isMezz
+            ? '<span style="color:#e0883a" title="Source-keyed mezzanine cache — safe to delete; auto-expires on its TTL">mezz-cache</span>'
+            : escapeHtml(p.job_id || '—');
+        const del = isMezz
+            ? `<span class="aws-row-action" onclick="deleteS3Prefix('${escapeAttr(p.prefix)}')">delete</span>`
+            : (p.job_id
+                ? `<span class="aws-row-action" onclick="cleanupJob('${escapeAttr(p.job_id)}','')">delete</span>`
+                : '—');
+        return `
         <tr>
             <td>${escapeHtml(p.prefix)}</td>
             <td>${formatBytes(p.size_bytes || 0)}</td>
             <td>${p.object_count || 0}</td>
-            <td>${escapeHtml(p.job_id || '—')}</td>
-            <td>${p.job_id
-                ? `<span class="aws-row-action" onclick="cleanupJob('${escapeAttr(p.job_id)}','')">delete</span>`
-                : '—'}</td>
-        </tr>
-    `).join('');
+            <td>${jobCell}</td>
+            <td>${del}</td>
+        </tr>`;
+    }).join('');
     el.innerHTML = `
         <table class="aws-table">
             <thead><tr>
@@ -2442,6 +2452,20 @@ function renderAwsS3(prefixes) {
             <tbody>${rows}</tbody>
         </table>
     `;
+}
+
+async function deleteS3Prefix(prefix) {
+    if (!confirm('Delete all objects under ' + prefix + '?')) return;
+    try {
+        const res = await fetch('/api/aws/s3/delete-prefix', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prefix }),
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
+        await refreshAws();
+    } catch (e) {
+        alert('Delete failed: ' + e.message);
+    }
 }
 
 async function cleanupJob(jobId, instanceHint) {

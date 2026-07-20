@@ -472,11 +472,35 @@ def backfill_tags() -> CleanupReport:
     return report
 
 
+def delete_prefix(prefix: str) -> CleanupReport:
+    """Delete every object under one S3 prefix — the UI uses this to remove a
+    single mezz-cache entry (or a job's staging) without an emergency clear-all.
+    Restricted to the app's own prefixes (jobs/ or mezz/) so it can't be pointed
+    at arbitrary keys."""
+    p = prefix.strip()
+    if p.startswith("s3://"):                    # accept full s3://bucket/key
+        p = p.split("/", 3)[3] if p.count("/") >= 3 else ""
+    p = p.strip("/")
+    report = CleanupReport(scope=f"prefix:{p}")
+    if not (p.startswith("jobs/") or p.startswith("mezz/") or p in ("jobs", "mezz")):
+        report.actions.append(ResourceAction(
+            kind="s3_prefix", id=prefix, job_id=None, action="skipped",
+            detail="refused: only jobs/ or mezz/ prefixes may be deleted"))
+        return report
+    bucket = _s3_bucket_from_env()
+    if bucket:
+        _delete_s3_prefix(bucket, p + "/", report, job_id=None)
+    return report
+
+
 def _main() -> int:
     import argparse
     p = argparse.ArgumentParser(prog="encoder.cloud.cleanup")
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--job-id", help="tear down one job's resources")
+    group.add_argument("--delete-prefix", metavar="PREFIX",
+                       help="delete every object under one S3 prefix "
+                            "(jobs/ or mezz/ only) — e.g. a single mezz-cache entry")
     group.add_argument("--sweep-all", action="store_true",
                        help="tear down every Application=encoder-app resource")
     group.add_argument("--backfill-tags", action="store_true",
@@ -491,7 +515,9 @@ def _main() -> int:
                    help="print machine-readable JSON instead of a summary")
     args = p.parse_args()
 
-    if args.sweep_all:
+    if args.delete_prefix:
+        report = delete_prefix(args.delete_prefix)
+    elif args.sweep_all:
         report = sweep_all()
     elif args.backfill_tags:
         report = backfill_tags()
