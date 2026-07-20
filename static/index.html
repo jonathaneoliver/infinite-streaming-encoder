@@ -111,9 +111,6 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    chunked row is solid green at the same height as a completed whole row. */
 .chunk-grid { display: flex; flex-wrap: nowrap; gap: 2px; align-items: center; width: 100%; }
 .chunk-cell { flex: 1 1 0; min-width: 3px; height: 6px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
-/* queued = submitted to Batch but waiting for a slot: tint the empty track
-   amber so it's distinct from a not-yet-submitted (dark) chunk. */
-.chunk-cell.chunk-queued { background: #4a3a1a; }
 /* display:block so width/height apply — it's a <span> inside the cell, and
    inline elements ignore both (unlike the whole-variant fill, which is a div). */
 .chunk-cell-fill { display: block; height: 100%; width: 0; background: #4361ee; transition: width 0.3s ease; }
@@ -1674,9 +1671,6 @@ function updateStagesTable(row, stages) {
             const pct = (st === 'done' || st === 'skipped') ? 100
                 : (st === 'pending' || st === 'queued') ? 0 : c.s.percent;
             sumPct += pct;
-            // Track tint marks only the queued (waiting-for-slot) state; the
-            // fill shows the chunk's own progress like a whole-variant bar.
-            cell.className = 'chunk-cell' + (st === 'queued' ? ' chunk-queued' : '');
             const fill = cell.querySelector('.chunk-cell-fill');
             if (fill) {
                 fill.style.width = pct.toFixed(1) + '%';
