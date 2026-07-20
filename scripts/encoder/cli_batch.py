@@ -272,18 +272,15 @@ def _report_reclaims(exit_ev: dict, label: str) -> None:
                  f"(resumed the chunk, not the whole variant)")
 
 
-def _forward_container_timing(exit_ev: dict) -> None:
-    """On task exit, pull two end-of-container lines from CloudWatch:
+def _forward_container_timing(stream: str | None) -> None:
+    """Pull two end-of-container lines from the worker's CloudWatch stream:
     the [timing] breakdown (fetch/encode/upload) for the job log, and the
     [[ENCODER-SPEED ...]] marker that feeds the control plane's learned
     dynamic-chunk model. Both are emitted after the last live progress poll,
-    so this on-exit drain is the reliable place to forward them — the live
-    _tail_progress usually misses them."""
-    try:
-        out = exit_ev.get("stateExitedEventDetails", {}).get("output", "")
-        stream = json.loads(out).get("Container", {}).get("LogStreamName")
-    except (ValueError, TypeError):
-        stream = None
+    so this drain is the reliable place to forward them — _tail_progress misses
+    them. Driven off the TaskSucceeded event (which carries the Batch result's
+    LogStreamName); the TaskStateExited output can't be used because the encode
+    tasks set ResultPath:null, which strips the Container block."""
     if not stream:
         return
     try:
@@ -493,7 +490,6 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
                     _emit_stage(f"encode:{c}:{t}:chunk{ci}", "done", 100.0)
                     _narrate(f"✓ encode {c} {t} chunk{ci} done")
                     _report_reclaims(ev, f"encode {c} {t} chunk{ci}")
-                    _forward_container_timing(ev)
             elif name == "EncodeWhole":
                 idn = _enter_of(ev, whole_enter)
                 if idn:
@@ -501,7 +497,20 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
                     _emit_stage(f"encode:{c}:{t}", "done", 100.0)
                     _narrate(f"✓ encode {c} {t} done")
                     _report_reclaims(ev, f"encode {c} {t}")
-                    _forward_container_timing(ev)
+
+        elif etype == "TaskSucceeded":
+            # The Batch result (carrying Container.LogStreamName) lives on this
+            # event, NOT on TaskStateExited — the encode tasks set
+            # ResultPath:null, which strips the Container block from the exited
+            # output. Only variant/chunk jobs (JobName "var-*") emit an
+            # [[ENCODER-SPEED]] sample + [timing] line worth draining.
+            d = ev.get("taskSucceededEventDetails", {})
+            try:
+                out = json.loads(d.get("output", "") or "{}")
+            except (ValueError, TypeError):
+                out = {}
+            if str(out.get("JobName", "")).startswith("var-"):
+                _forward_container_timing(out.get("Container", {}).get("LogStreamName"))
 
         elif etype == "TaskFailed":
             _report_task_failure(ev.get("taskFailedEventDetails", {}))
