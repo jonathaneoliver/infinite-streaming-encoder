@@ -249,27 +249,43 @@ def _narrate(msg: str) -> None:
     print(msg, flush=True)
 
 
-def _report_reclaims(exit_ev: dict, label: str) -> None:
-    """Surface spot interruptions in the job log. A reclaim fails a Batch job
-    attempt with a 'Host EC2 instance was terminated' reason and the retry
-    strategy re-runs it on fresh capacity — all transparent under
-    submitJob.sync, so this is the ONLY place a reclaim becomes visible. The
-    completed job's Attempts[] (carried in the exit event output) records each
-    interrupted attempt."""
-    try:
-        out = exit_ev.get("stateExitedEventDetails", {}).get("output", "")
-        attempts = json.loads(out).get("Attempts", [])
-    except (ValueError, TypeError):
-        return
+def _count_reclaims(attempts) -> int:
+    """How many Batch attempts died to a spot reclaim ('Host EC2 instance was
+    terminated'). The retry strategy re-runs each on fresh capacity, so this is
+    the only place a reclaim becomes visible under submitJob.sync."""
     n = 0
-    for a in attempts:
+    for a in attempts or []:
         reason = str(a.get("StatusReason", "") or
                      a.get("Container", {}).get("Reason", ""))
         if reason.startswith("Host EC2") or "was terminated" in reason.lower():
             n += 1
-    if n:
-        _narrate(f"⚠ {label}: spot-reclaimed {n}x, retried on fresh capacity "
-                 f"(resumed the chunk, not the whole variant)")
+    return n
+
+
+def _var_label(job_name: str) -> str:
+    """'var-h264-360p-c3-<exec>' -> 'encode h264 360p chunk3' (whole -> no
+    chunk). Falls back to the raw name if it doesn't parse."""
+    m = re.match(r"var-(\w+?)-(\w+?)-(whole|c(\d+))-", job_name)
+    if not m:
+        return job_name
+    tail = f" chunk{m.group(4)}" if m.group(4) else ""
+    return f"encode {m.group(1)} {m.group(2)}{tail}"
+
+
+def _report_reclaims(exit_ev: dict, label: str) -> None:
+    """Reclaims for tasks whose exit output KEEPS the Batch result (mezzanine,
+    audio, package). The encode tasks set ResultPath:null — their Attempts[] is
+    stripped from the exit output — so they're handled off the TaskSucceeded
+    event instead (see _translate_events)."""
+    try:
+        attempts = json.loads(
+            exit_ev.get("stateExitedEventDetails", {}).get("output", "")
+        ).get("Attempts", [])
+    except (ValueError, TypeError):
+        return
+    if _count_reclaims(attempts):
+        _narrate(f"⚠ {label}: spot-reclaimed {_count_reclaims(attempts)}x, "
+                 f"retried on fresh capacity")
 
 
 def _forward_container_timing(stream: str | None) -> None:
@@ -489,14 +505,13 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
                     c, t, ci = idn
                     _emit_stage(f"encode:{c}:{t}:chunk{ci}", "done", 100.0)
                     _narrate(f"✓ encode {c} {t} chunk{ci} done")
-                    _report_reclaims(ev, f"encode {c} {t} chunk{ci}")
+                    # reclaims handled off TaskSucceeded (ResultPath:null here)
             elif name == "EncodeWhole":
                 idn = _enter_of(ev, whole_enter)
                 if idn:
                     c, t = idn
                     _emit_stage(f"encode:{c}:{t}", "done", 100.0)
                     _narrate(f"✓ encode {c} {t} done")
-                    _report_reclaims(ev, f"encode {c} {t}")
 
         elif etype == "TaskSucceeded":
             # The Batch result (carrying Container.LogStreamName) lives on this
@@ -509,8 +524,15 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
                 out = json.loads(d.get("output", "") or "{}")
             except (ValueError, TypeError):
                 out = {}
-            if str(out.get("JobName", "")).startswith("var-"):
+            jn = str(out.get("JobName", ""))
+            if jn.startswith("var-"):
                 _forward_container_timing(out.get("Container", {}).get("LogStreamName"))
+                # Attempts[] lives on this event (not the ResultPath:null exit),
+                # so spot reclaims of a variant/chunk are only visible here.
+                if _count_reclaims(out.get("Attempts")):
+                    _narrate(f"⚠ {_var_label(jn)}: spot-reclaimed "
+                             f"{_count_reclaims(out.get('Attempts'))}x, "
+                             f"retried on fresh capacity")
 
         elif etype == "TaskFailed":
             _report_task_failure(ev.get("taskFailedEventDetails", {}))
