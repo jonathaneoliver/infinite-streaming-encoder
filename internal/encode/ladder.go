@@ -67,13 +67,14 @@ var maxResHeight = map[string]int{
 // even 4K HEVC peaked at ~2.2 GiB and h264 1080p at ~0.9 GiB (measured via
 // ru_maxrss), so 3 GiB is generous and never the binding constraint.
 func variantResourcesFor(codec string, height int) (vcpu, memory string) {
-	// h264: give every encode a whole .2xlarge (8 vCPU) so no two h264 jobs
-	// co-locate. x264 scales to ~7 cores, and co-location was throttling the
-	// heavy tiers — 1080p+1044p shared one box and each took ~700s (0.48x)
-	// vs a lone 360p at 2.82x. Whole-box isolation measures uncontended speed;
-	// packing density can be revisited once the learned model has clean numbers.
+	// h264: 4 vCPU so two encodes pack per 8-vCPU .2xlarge. On Graviton3/4 a
+	// single x264 encode only drives ~4-5 cores (a dedicated 8-vCPU box idles at
+	// 50-60%), so isolating one per box wastes half the machine. Packing two
+	// fills it with only mild contention — each encode wanted ~4 cores anyway.
+	// (An earlier 8-vCPU/whole-box setting was to measure uncontended speed and
+	// dodge c6g's much worse contention; c6g is now dropped from the fleet.)
 	if codec == "h264" {
-		return "8", "3072"
+		return "4", "3072"
 	}
 	if height <= 540 {
 		return "2", "3072" // small res is cheap for any codec
