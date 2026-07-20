@@ -116,10 +116,6 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .chunk-cell-fill { display: block; height: 100%; width: 0; background: #4361ee; transition: width 0.3s ease; }
 .chunk-cell-fill.chunk-done { background: #06d6a0; }
 .chunk-cell-fill.chunk-failed { background: #ef476f; }
-.chunk-concat { flex: 0 0 auto; margin-left: 7px; color: #667; font-size: 0.85rem; line-height: 1; }
-.chunk-concat.concat-running { color: #4361ee; }
-.chunk-concat.concat-done { color: #06d6a0; }
-.chunk-concat.concat-failed { color: #ef476f; }
 
 /* --- AWS tab --- */
 .tab-aws { color: #ffa94d; }
@@ -1631,11 +1627,12 @@ function updateStagesTable(row, stages) {
             }
             const cells = r.cells.map(c =>
                 `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" title="chunk ${c.index}"><span class="chunk-cell-fill"></span></span>`).join('');
-            const concat = r.concat
-                ? `<span class="chunk-concat" data-stage-key="${escapeHtml(r.concat.key)}" title="concat / join">&#8904;</span>` : '';
+            // The join is implicit in the solid bar (concat is folded into
+            // package-all), so no separate join glyph is drawn. Any concat stage
+            // is still absorbed into this group (below) so it doesn't spawn a row.
             return `<tr data-chunk-group="${escapeHtml(r.codec + ':' + r.tier)}">
                 <td class="stage-label">encode ${escapeHtml(r.codec)} ${escapeHtml(r.tier)}</td>
-                <td class="stage-bar"><div class="chunk-grid">${cells}${concat}</div></td>
+                <td class="stage-bar"><div class="chunk-grid">${cells}</div></td>
                 <td class="stage-pct chunk-count"></td></tr>`;
         }).join('');
         tbody.dataset.sig = sig;
