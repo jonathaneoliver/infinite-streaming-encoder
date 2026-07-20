@@ -461,6 +461,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
         <h2>Fleet</h2>
         <div id="jobs-fleet-full" title="Live cloud fleet — per-instance packing, utilization, and lifecycle (from the AWS inventory)"></div>
     </div>
+    <div class="panel" id="jobs-aws-metrics-panel">
+        <div class="aws-summary" id="jobs-aws-metrics"></div>
+    </div>
     <div class="panel">
         <h2>Jobs</h2>
         <div id="jobs-list">
@@ -2062,6 +2065,7 @@ function renderAws(data) {
     renderMaxVcpuRadio(s.max_vcpus || 0);
     document.getElementById('aws-region').textContent = data.region || '—';
 
+    renderJobsMetrics(s);
     renderFleet(data.fleet || {}, data.instances || []);
 
     const execs = s.running_executions || 0;
@@ -2491,6 +2495,44 @@ function renderAwsS3(prefixes) {
 // Max-vCPUs radio: current (1x) vs 2x. Base is the configured 48-vCPU default;
 // the live ceiling (from the fleet summary) picks which option is selected.
 const _MAXVCPU_BASE = 48;
+// Mirror the AWS-tab summary tiles at the top of the Jobs page (under Fleet),
+// so the at-a-glance cloud status is visible without switching tabs. Fed from
+// the same inventory summary `s` that renderAws already fetched — full innerHTML
+// re-render each 10s tick is fine (radios re-check from live state, no text
+// input to lose focus on).
+function renderJobsMetrics(s) {
+    const el = document.getElementById('jobs-aws-metrics');
+    if (!el) return;
+    const execs = s.running_executions || 0;
+    const bjobs = s.active_batch_jobs || 0;
+    const running = s.running_instances || 0;
+    const orphans = s.orphan_volumes || 0;
+    const hourly = s.estimated_hourly_usd || 0;
+    const rpct = s.reclaim_24h_pct || 0;
+    const live = s.max_vcpus || 0;
+    const cls = (v, warnAbove) => 'aws-metric-value' + (v > (warnAbove || 0) ? ' warn' : ' ok');
+    const tile = (label, valueHtml, title) =>
+        `<div class="aws-metric"><div class="aws-metric-label"${title ? ` title="${title}"` : ''}>${label}</div>${valueHtml}</div>`;
+    let vcpuHtml = '<div class="aws-metric-value" style="font-size:0.9rem">—</div>';
+    if (live) {
+        const opts = [_MAXVCPU_BASE, _MAXVCPU_BASE * 2];
+        vcpuHtml = '<div class="aws-metric-value" style="font-size:0.9rem">' + opts.map(v =>
+            `<label style="margin-right:10px;cursor:pointer;white-space:nowrap"><input type="radio" name="maxvcpu-jobs" value="${v}" ${v === live ? 'checked' : ''} onchange="setMaxVcpus(${v})" style="width:auto;min-width:0;vertical-align:middle"> ${v} ${v === _MAXVCPU_BASE ? '(1×)' : '(2×)'}</label>`).join('') + '</div>';
+    }
+    el.innerHTML = [
+        tile('Running executions', `<div class="${cls(execs)}">${execs}</div>`),
+        tile('Active batch jobs', `<div class="${cls(bjobs)}">${bjobs}</div>`),
+        tile('Running instances', `<div class="${cls(running)}">${running}</div>`),
+        tile('Orphan volumes', `<div class="${cls(orphans)}">${orphans}</div>`),
+        tile('S3 staged', `<div class="aws-metric-value">${formatBytes(s.total_s3_bytes || 0)}</div>`),
+        tile('Est. hourly spend', `<div class="${cls(hourly)}">$${hourly.toFixed(2)}</div>`),
+        tile('Spent (last 24h)', `<div class="aws-metric-value">$${(s.spend_24h_usd || 0).toFixed(2)}</div>`, 'Self-tracked: burn rate integrated over the trailing 24h'),
+        tile('Saved by spot (total)', `<div class="aws-metric-value ok">$${(s.saved_total_usd || 0).toFixed(2)}</div>`, 'Accumulated (on-demand − spot) cost across all finished cloud-batch jobs'),
+        tile('Reclaim waste (24h)', `<div class="aws-metric-value${rpct >= 10 ? ' warn' : rpct > 0 ? '' : ' ok'}">${rpct.toFixed(1)}%</div>`, (s.reclaim_24h_lost_min || 0).toFixed(1) + ' min of encoding lost to reclaims in the last 24h'),
+        tile('Max vCPUs', vcpuHtml, 'Batch compute-env max vCPUs. 2× runs ~twice as many machines → roughly half the wall-clock for ~the same total cost.'),
+    ].join('');
+}
+
 function renderMaxVcpuRadio(live) {
     const el = document.getElementById('aws-maxvcpu');
     if (!el) return;
