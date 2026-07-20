@@ -64,6 +64,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--set-min-vcpus", type=int, help="new minvCpus floor")
     p.add_argument("--set-max-vcpus", type=int, help="new maxvCpus ceiling")
     p.add_argument("--get", action="store_true", help="print current min/max/desired")
+    # Output is always JSON; accept --json as a no-op so the Go server's
+    # runPythonCloud helper (which always appends it) works unchanged.
+    p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
     try:
         if args.set_max_vcpus is not None:
