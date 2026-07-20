@@ -102,20 +102,21 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .stage-bar-fill.stage-fill-skipped { background: repeating-linear-gradient(45deg, #555 0 6px, #444 6px 12px); }
 .stage-skipped { opacity: 0.7; }
 .stage-skipped .stage-label::after { content: ' (reused)'; color: #888; font-size: 0.75rem; font-style: italic; }
-/* Chunk grid: one cell per encode chunk of a variant, so the parallel
-   fan-out is visible at a glance. Colours match the stage-bar palette. */
+/* Chunk grid: one cell per encode chunk of a variant. Each cell is a mini
+   stage-bar — same 6px height as a whole-variant bar — so a chunked row reads
+   just like a whole one, only broken into per-chunk segments (the gap shows how
+   the variant was chunked). Cells stretch to fill the row, so each segment's
+   width tracks its chunk duration. Each segment fills to its own chunk's live
+   %, so a running chunk shows real progress instead of a pulse; a completed
+   chunked row is solid green at the same height as a completed whole row. */
 .chunk-grid { display: flex; flex-wrap: nowrap; gap: 2px; align-items: center; width: 100%; }
-/* Cells stretch to fill the row, so every variant's grid spans the same total
-   content length and each cell's width tracks its chunk duration: a 60s-chunk
-   variant (fewer cells) shows cells ~2x wider than a 30s-chunk one. */
-.chunk-cell { flex: 1 1 0; min-width: 3px; height: 11px; border-radius: 2px; background: #1a2a4a; }
-/* queued = submitted to Batch but waiting for a slot (amber, no pulse) —
-   distinct from running = actually encoding (blue, pulsing). */
-.chunk-cell.chunk-queued { background: #ffa94d; }
-.chunk-cell.chunk-running { background: #4361ee; animation: chunkpulse 1s ease-in-out infinite; }
-.chunk-cell.chunk-done { background: #06d6a0; }
-.chunk-cell.chunk-failed { background: #ef476f; }
-@keyframes chunkpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.chunk-cell { flex: 1 1 0; min-width: 3px; height: 6px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
+/* queued = submitted to Batch but waiting for a slot: tint the empty track
+   amber so it's distinct from a not-yet-submitted (dark) chunk. */
+.chunk-cell.chunk-queued { background: #4a3a1a; }
+.chunk-cell-fill { height: 100%; width: 0; background: #4361ee; transition: width 0.3s ease; }
+.chunk-cell-fill.chunk-done { background: #06d6a0; }
+.chunk-cell-fill.chunk-failed { background: #ef476f; }
 .chunk-concat { flex: 0 0 auto; margin-left: 7px; color: #667; font-size: 0.85rem; line-height: 1; }
 .chunk-concat.concat-running { color: #4361ee; }
 .chunk-concat.concat-done { color: #06d6a0; }
@@ -1619,13 +1620,18 @@ function updateStagesTable(row, stages) {
     if (tbody.dataset.sig !== sig) {
         tbody.innerHTML = rows.map(r => {
             if (r.kind === 'stage') {
+                // Normalize a raw whole-variant encode key ("encode:h264:720p")
+                // to the friendly form ("encode h264 720p") so whole rows read
+                // the same as the chunked rows below.
+                const label = (r.s.label && r.s.label.startsWith('encode:'))
+                    ? r.s.label.replace(/:/g, ' ') : r.s.label;
                 return `<tr data-stage-key="${escapeHtml(r.s.key)}">
-                    <td class="stage-label">${escapeHtml(r.s.label)}</td>
+                    <td class="stage-label">${escapeHtml(label)}</td>
                     <td class="stage-bar"><div class="stage-bar-track"><div class="stage-bar-fill"></div></div></td>
                     <td class="stage-pct"></td></tr>`;
             }
             const cells = r.cells.map(c =>
-                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" title="chunk ${c.index}"></span>`).join('');
+                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" title="chunk ${c.index}"><span class="chunk-cell-fill"></span></span>`).join('');
             const concat = r.concat
                 ? `<span class="chunk-concat" data-stage-key="${escapeHtml(r.concat.key)}" title="concat / join">&#8904;</span>` : '';
             return `<tr data-chunk-group="${escapeHtml(r.codec + ':' + r.tier)}">
@@ -1662,8 +1668,20 @@ function updateStagesTable(row, stages) {
         for (const c of r.cells) {
             const cell = tr.querySelector(`.chunk-cell[data-chunk-key="${c.key}"]`);
             if (!cell) continue;
-            cell.className = 'chunk-cell' + (c.s.status === 'pending' ? '' : ' chunk-' + c.s.status);
-            if (c.s.status === 'done' || c.s.status === 'skipped') done++;
+            const st = c.s.status;
+            // Track tint marks only the queued (waiting-for-slot) state; the
+            // fill shows the chunk's own progress like a whole-variant bar.
+            cell.className = 'chunk-cell' + (st === 'queued' ? ' chunk-queued' : '');
+            const fill = cell.querySelector('.chunk-cell-fill');
+            if (fill) {
+                const pct = (st === 'done' || st === 'skipped') ? 100
+                    : (st === 'pending' || st === 'queued') ? 0 : c.s.percent;
+                fill.style.width = pct.toFixed(1) + '%';
+                fill.className = 'chunk-cell-fill'
+                    + ((st === 'done' || st === 'skipped') ? ' chunk-done'
+                        : st === 'failed' ? ' chunk-failed' : '');
+            }
+            if (st === 'done' || st === 'skipped') done++;
         }
         if (r.concat) {
             const el = tr.querySelector('.chunk-concat');
