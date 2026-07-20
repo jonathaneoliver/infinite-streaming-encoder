@@ -1743,19 +1743,25 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	if bufMult <= 0 {
 		bufMult = 0.25
 	}
-	codecs := []string{"h264", "hevc"}
+	var codecs []string
 	switch codecSel {
 	case "h264":
 		codecs = []string{"h264"}
 	case "hevc":
 		codecs = []string{"hevc"}
+	case "av1":
+		codecs = []string{"av1"}
+	case "all":
+		codecs = []string{"h264", "hevc", "av1"}
+	default: // "both" or empty
+		codecs = []string{"h264", "hevc"}
 	}
 	// Build the per-codec rung list from the ladder store. resolveLadderRungs
 	// caps each codec at the source width (no upscale) and --max-res, and
 	// assigns ordinal labels for repeated resolutions — identical to
 	// ladder.select_rungs, so cloud and local agree on {codec}_{label}.
 	var variants []sfnVariant
-	doH264, doHevc := false, false
+	doH264, doHevc, doAV1 := false, false, false
 	for _, c := range codecs {
 		rungs := store.resolveRungs(ladderName, c, maxRes, sourceWidth)
 		if len(rungs) == 0 {
@@ -1766,6 +1772,8 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			doH264 = true
 		case "hevc":
 			doHevc = true
+		case "av1":
+			doAV1 = true
 		}
 		for _, r := range rungs {
 			vcpu, mem := variantResourcesFor(c, r.Height)
@@ -1823,6 +1831,7 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		"variants":  variants,
 		"do_h264":   doH264,
 		"do_hevc":   doHevc,
+		"do_av1":    doAV1,
 		// Ladder-level VBV shaping, applied to every variant's encode (the
 		// worker reads these as MAXRATE_PERCENT / BUFSIZE_MULT env). Threaded
 		// so a custom ladder's VBV is honored in the cloud, not just locally.

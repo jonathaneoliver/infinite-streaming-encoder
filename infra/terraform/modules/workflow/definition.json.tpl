@@ -289,6 +289,40 @@
               "End": true
             }
           }
+        },
+
+        {
+          "StartAt": "Av1Selected",
+          "States": {
+            "Av1Selected": {
+              "Comment": "Only package av1 if it was actually encoded (do_av1 from buildSFNInput). A single-codec job would otherwise fail here with 'no av1 variants found'.",
+              "Type": "Choice",
+              "Choices": [
+                { "Variable": "$.do_av1", "BooleanEquals": true, "Next": "PackageAllAv1" }
+              ],
+              "Default": "SkipAv1"
+            },
+            "SkipAv1": { "Type": "Succeed" },
+            "PackageAllAv1": {
+              "Comment": "Combined package + byteranges + fMP4 HLS in one job (downloads the ladder once).",
+              "Type": "Task",
+              "Resource": "arn:aws:states:::batch:submitJob.sync",
+              "Parameters": {
+                "JobName.$": "States.Format('pkgall-av1-{}', $$.Execution.Name)",
+                "JobQueue": "${job_queue_arn}",
+                "JobDefinition": "${package_all_def}",
+                "ShareIdentifier": "encode",
+                "SchedulingPriorityOverride": 45,
+                "Parameters": {
+                  "codec": "av1",
+                  "s3_variants.$": "$.s3_prefix",
+                  "s3_audio.$": "$.s3_prefix",
+                  "s3_out.$": "$.s3_prefix"
+                }
+              },
+              "End": true
+            }
+          }
         }
 
       ],
