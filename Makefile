@@ -190,8 +190,15 @@ ecr-login:
 	  docker login --username AWS --password-stdin $(ECR_REGISTRY)
 
 ecr-push: ecr-login   ## build arm64 (Graviton) + push the worker image to ECR
+	# Registry-backed layer cache: buildx's container builder doesn't durably
+	# reuse the local Docker cache, so without this a script-only change can
+	# rebuild the heavy ffmpeg/Shaka layers from scratch (minutes). Pull/push a
+	# :buildcache image so those layers are reused across builds and machines.
+	# image-manifest + oci-mediatypes make the cache manifest ECR-compatible.
 	docker buildx build --platform linux/arm64 \
 		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(IMAGE_TAG) \
+		--cache-from type=registry,ref=$(ECR_REPO):buildcache \
+		--cache-to type=registry,ref=$(ECR_REPO):buildcache,mode=max,image-manifest=true,oci-mediatypes=true \
 		--tag $(ECR_REPO):latest --tag $(ECR_REPO):$(IMAGE_TAG) --push .
 	@echo "Pushed $(ECR_REPO):latest :$(IMAGE_TAG) (linux/arm64)"
 
@@ -246,11 +253,19 @@ infra-setup:          ## one-shot stand-up: init + apply + ecr-push + bake-ami +
 # Deploy stops at the plan on purpose — review it, then run `make infra-apply`.
 # (Keeping preview and apply as separate, deliberate steps for live IaC.)
 deploy:               ## push image + restart + plan + APPLY infra (one shot)
-	$(MAKE) ecr-push
-	$(MAKE) restart
-	$(MAKE) infra-plan
-	$(MAKE) infra-apply
-	@echo ">>> deploy complete: image pushed, server restarted, infra applied"
+	@start=$$(date +%s); \
+	echo ">>> deploy started $$(date '+%H:%M:%S')  worker=$(IMAGE_TAG)"; \
+	if $(MAKE) ecr-push && $(MAKE) restart && $(MAKE) infra-plan && $(MAKE) infra-apply; then \
+		el=$$(( $$(date +%s) - start )); \
+		printf '\a\n\033[1;32m==================================================\n'; \
+		printf '  DEPLOY COMPLETE  %dm %02ds   worker=%s\n' $$((el/60)) $$((el%60)) "$(IMAGE_TAG)"; \
+		printf '  image pushed - server restarted - infra applied\n'; \
+		printf '==================================================\033[0m\n'; \
+	else \
+		el=$$(( $$(date +%s) - start )); \
+		printf '\a\n\033[1;31m!!! DEPLOY FAILED after %dm %02ds - see output above\033[0m\n' $$((el/60)) $$((el%60)); \
+		exit 1; \
+	fi
 
 deploy-review:        ## like deploy but stop at the plan (review before infra-apply)
 	$(MAKE) ecr-push
