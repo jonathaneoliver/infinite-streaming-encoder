@@ -163,11 +163,11 @@ def _tail_progress(stream: str, label: str, log_state: dict) -> None:
     for e in events:
         log_state[stream] = max(log_state.get(stream, 0), e.get("timestamp", 0))
         msg = e.get("message", "").rstrip()
-        if (msg.startswith("[[ENCODER-BOOT ") or msg.startswith("[[ENCODER-STAGE ")
-                or msg.startswith("[[ENCODER-SPEED ")):
+        if msg.startswith("[[ENCODER-BOOT ") or msg.startswith("[[ENCODER-STAGE "):
             # Verbatim so the Go scanner parses it — ENCODER-STAGE carries the
-            # live ffmpeg % for this chunk/variant, driving the progress bars;
-            # ENCODER-SPEED feeds the control plane's learned dynamic-chunk model.
+            # live ffmpeg % for this chunk/variant, driving the progress bars.
+            # (ENCODER-SPEED is forwarded on exit by _forward_container_timing —
+            # it's emitted after the last live poll, so tailing misses it.)
             print(msg, flush=True)
         elif _PROGRESS_RE.search(msg):
             _narrate(f"{label}: {msg}")
@@ -273,9 +273,12 @@ def _report_reclaims(exit_ev: dict, label: str) -> None:
 
 
 def _forward_container_timing(exit_ev: dict) -> None:
-    """Pull the container's [timing] line (fetch/encode/upload) from CloudWatch
-    for a just-completed chunk and add it to the job log, so the per-chunk
-    breakdown shows up live as chunks finish."""
+    """On task exit, pull two end-of-container lines from CloudWatch:
+    the [timing] breakdown (fetch/encode/upload) for the job log, and the
+    [[ENCODER-SPEED ...]] marker that feeds the control plane's learned
+    dynamic-chunk model. Both are emitted after the last live progress poll,
+    so this on-exit drain is the reliable place to forward them — the live
+    _tail_progress usually misses them."""
     try:
         out = exit_ev.get("stateExitedEventDetails", {}).get("output", "")
         stream = json.loads(out).get("Container", {}).get("LogStreamName")
@@ -290,11 +293,21 @@ def _forward_container_timing(exit_ev: dict) -> None:
         ).get("events", [])
     except ClientError:
         return
+    speed_line = timing_line = None
     for e in reversed(events):
-        msg = e.get("message", "")
-        if msg.lstrip().startswith("[timing]"):
-            _narrate("    " + msg.strip())
-            return
+        s = e.get("message", "").lstrip()
+        if speed_line is None and s.startswith("[[ENCODER-SPEED "):
+            speed_line = s.rstrip()
+        elif timing_line is None and s.startswith("[timing]"):
+            timing_line = s.rstrip()
+        if speed_line and timing_line:
+            break
+    # Verbatim (own line, no prefix) so the Go scanner's speedMarkerRe matches
+    # and Manager.learnSpeed folds it into encode_speeds.json exactly once.
+    if speed_line:
+        print(speed_line, flush=True)
+    if timing_line:
+        _narrate("    " + timing_line)
 
 
 # ---------------------------------------------------------------------------
