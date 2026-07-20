@@ -106,6 +106,12 @@ var (
 	// so the control plane can learn each (codec, height, pass)'s speed for the
 	// dynamic chunk selector. Consumed by Manager.learnSpeed (not per-job).
 	speedMarkerRe = regexp.MustCompile(`^\[\[ENCODER-SPEED codec=(\S+) height=(\d+) two_pass=([01]) content_s=([0-9.]+) encode_s=([0-9.]+)\]\]$`)
+	// ENCODER-RECLAIM reports one encode chunk's spot-reclaim accounting:
+	// count (# reclaimed attempts), lost_s (encode wall-time thrown away), and
+	// total_s (all attempts' wall-time = the "total encoded" denominator).
+	// Emitted per chunk (even zero-reclaim) so the job's %-wasted ratio is
+	// exact. Per-stage values are cumulative; the Job max-merges them.
+	reclaimMarkerRe = regexp.MustCompile(`^\[\[ENCODER-RECLAIM key=(\S+) count=(\d+) lost_s=([0-9.]+) total_s=([0-9.]+)\]\]$`)
 )
 
 // learnSpeed folds an ENCODER-SPEED marker into the learned-speed model. Returns
@@ -310,6 +316,13 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Unlock()
 		return true
 	}
+	if m := reclaimMarkerRe.FindStringSubmatch(line); m != nil {
+		count, _ := strconv.ParseFloat(m[2], 64)
+		lost, _ := strconv.ParseFloat(m[3], 64)
+		total, _ := strconv.ParseFloat(m[4], 64)
+		j.recordReclaim(m[1], count, lost, total)
+		return true
+	}
 	// Non-consuming matches: capture sideband info but still let the
 	// line flow into the raw log buffer (return false).
 	if m := cloudJobIDRe.FindStringSubmatch(line); m != nil {
@@ -323,6 +336,36 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Unlock()
 	}
 	return false
+}
+
+// recordReclaim folds one chunk's ENCODER-RECLAIM accounting into the job.
+// Per-stage [count, lost_s, total_s] is cumulative and can arrive twice (the
+// live poll while running + the final on completion), so max-merge per stage,
+// then re-sum the job totals. WastePct = ReclaimLostS/EncodeTotalS.
+func (j *Job) recordReclaim(key string, count, lost, total float64) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.reclaimByStage == nil {
+		j.reclaimByStage = map[string][3]float64{}
+	}
+	cur := j.reclaimByStage[key]
+	if count > cur[0] {
+		cur[0] = count
+	}
+	if lost > cur[1] {
+		cur[1] = lost
+	}
+	if total > cur[2] {
+		cur[2] = total
+	}
+	j.reclaimByStage[key] = cur
+	var c, l, t float64
+	for _, v := range j.reclaimByStage {
+		c += v[0]
+		l += v[1]
+		t += v[2]
+	}
+	j.ReclaimCount, j.ReclaimLostS, j.EncodeTotalS = int(c), l, t
 }
 
 // startFile archives the current Stages (so end-of-job timing can still
@@ -469,6 +512,16 @@ type Job struct {
 	// and the ECR pull was skipped. Drives the "pre-baked AMI" UI badge.
 	BootAMI     string `json:"boot_ami,omitempty"`
 	PrebakedAMI bool   `json:"prebaked_ami,omitempty"`
+
+	// Spot-reclaim accounting for this file's encode (from ENCODER-RECLAIM).
+	// ReclaimCount = chunks reclaimed; ReclaimLostS = encode wall-seconds thrown
+	// away; EncodeTotalS = all encode wall-seconds. The UI shows the waste ratio
+	// ReclaimLostS/EncodeTotalS — how much of the encoding a spot reclaim cost.
+	ReclaimCount int     `json:"reclaim_count,omitempty"`
+	ReclaimLostS float64 `json:"reclaim_lost_s,omitempty"`
+	EncodeTotalS float64 `json:"encode_total_s,omitempty"`
+	// per-stage cumulative [count, lost_s, total_s], max-merged; not serialized.
+	reclaimByStage map[string][3]float64
 
 	// Stages is populated from [[ENCODER-PLAN]] + [[ENCODER-STAGE]]
 	// markers the Python orchestrator emits. Empty when the job hasn't

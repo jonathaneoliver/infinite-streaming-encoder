@@ -249,17 +249,43 @@ def _narrate(msg: str) -> None:
     print(msg, flush=True)
 
 
-def _count_reclaims(attempts) -> int:
-    """How many Batch attempts died to a spot reclaim ('Host EC2 instance was
-    terminated'). The retry strategy re-runs each on fresh capacity, so this is
-    the only place a reclaim becomes visible under submitJob.sync."""
-    n = 0
+def _reclaim_stats(attempts) -> "tuple[int, float]":
+    """(count, wasted_seconds) of spot reclaims across a Batch job's attempts.
+    A reclaimed attempt failed with 'Host EC2 instance was terminated'; the wall
+    time it ran before dying (StartedAt->StoppedAt) is encode work thrown away —
+    the number that says how much the reclaim actually cost. The retry re-runs
+    each on fresh capacity, so this is the only place a reclaim becomes visible
+    under submitJob.sync."""
+    n, lost = 0, 0.0
     for a in attempts or []:
         reason = str(a.get("StatusReason", "") or
                      a.get("Container", {}).get("Reason", ""))
         if reason.startswith("Host EC2") or "was terminated" in reason.lower():
             n += 1
-    return n
+            st, sp = a.get("StartedAt"), a.get("StoppedAt")
+            if isinstance(st, (int, float)) and isinstance(sp, (int, float)) and sp > st:
+                lost += (sp - st) / 1000.0
+    return n, lost
+
+
+def _count_reclaims(attempts) -> int:
+    return _reclaim_stats(attempts)[0]
+
+
+def _encode_total_s(attempts, now_ms=None) -> float:
+    """Total wall-seconds across ALL of a job's attempts (successful + wasted) —
+    the denominator of the reclaim-waste ratio. A still-running attempt (no
+    StoppedAt) is counted up to now_ms so the live ratio isn't stuck at 100%."""
+    t = 0.0
+    for a in attempts or []:
+        st = a.get("StartedAt")
+        if not isinstance(st, (int, float)):
+            continue
+        sp = a.get("StoppedAt")
+        end = sp if isinstance(sp, (int, float)) and sp > st else now_ms
+        if isinstance(end, (int, float)) and end > st:
+            t += (end - st) / 1000.0
+    return t
 
 
 def _var_label(job_name: str) -> str:
@@ -270,6 +296,57 @@ def _var_label(job_name: str) -> str:
         return job_name
     tail = f" chunk{m.group(4)}" if m.group(4) else ""
     return f"encode {m.group(1)} {m.group(2)}{tail}"
+
+
+def _stage_from_jobname(job_name: str) -> "str | None":
+    """'var-h264-360p-c3-<exec>' -> stage key 'encode:h264:360p:chunk3'
+    ('...-whole-...' -> 'encode:h264:360p'). None if it doesn't parse."""
+    m = re.match(r"var-(\w+?)-(\w+?)-(whole|c(\d+))-", job_name)
+    if not m:
+        return None
+    return f"encode:{m.group(1)}:{m.group(2)}" + (
+        f":chunk{m.group(4)}" if m.group(4) else "")
+
+
+def _report_live_reclaims(exec_name: str, seen: dict) -> None:
+    """Poll this execution's non-terminal encode jobs' attempts[] for spot
+    reclaims. Emit ENCODER-RECLAIM (per-stage cumulative count + wasted seconds)
+    on change, and flag the stage 'reclaimed' (red) while it's waiting to
+    restart (RUNNABLE/STARTING after a failed attempt). Best-effort/cosmetic."""
+    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    batch = _batch()
+    status_by_id, name_by_id, ids = {}, {}, []
+    for status in ("RUNNABLE", "STARTING", "RUNNING"):
+        try:
+            for j in batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", []):
+                jn = j.get("jobName", "")
+                if exec_name in jn and jn.startswith("var-"):
+                    ids.append(j["jobId"])
+                    status_by_id[j["jobId"]] = status
+                    name_by_id[j["jobId"]] = jn
+        except ClientError:
+            return
+    for i in range(0, len(ids), 100):
+        try:
+            jobs = batch.describe_jobs(jobs=ids[i:i + 100]).get("jobs", [])
+        except ClientError:
+            continue
+        now_ms = time.time() * 1000.0
+        for job in jobs:
+            jid = job["jobId"]
+            n, lost = _reclaim_stats(job.get("attempts"))
+            if n == 0:
+                continue
+            stage = _stage_from_jobname(name_by_id.get(jid, ""))
+            if not stage:
+                continue
+            total = _encode_total_s(job.get("attempts"), now_ms)
+            if seen.get(jid) != (n, round(lost), round(total)):
+                seen[jid] = (n, round(lost), round(total))
+                print(f"[[ENCODER-RECLAIM key={stage} count={n} "
+                      f"lost_s={lost:.1f} total_s={total:.1f}]]", flush=True)
+            if status_by_id.get(jid) in ("RUNNABLE", "STARTING"):
+                _emit_stage(stage, "reclaimed", 0.0)  # red until the retry runs
 
 
 def _report_reclaims(exit_ev: dict, label: str) -> None:
@@ -527,12 +604,20 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
             jn = str(out.get("JobName", ""))
             if jn.startswith("var-"):
                 _forward_container_timing(out.get("Container", {}).get("LogStreamName"))
-                # Attempts[] lives on this event (not the ResultPath:null exit),
-                # so spot reclaims of a variant/chunk are only visible here.
-                if _count_reclaims(out.get("Attempts")):
-                    _narrate(f"⚠ {_var_label(jn)}: spot-reclaimed "
-                             f"{_count_reclaims(out.get('Attempts'))}x, "
-                             f"retried on fresh capacity")
+                # Attempts[] lives on this event (not the ResultPath:null exit).
+                # Emit the reclaim accounting for EVERY finished chunk — even
+                # zero-reclaim ones — so the job's total_s denominator (all
+                # encode time) is complete for the %-wasted ratio.
+                atts = out.get("Attempts")
+                n, lost = _reclaim_stats(atts)
+                total = _encode_total_s(atts)
+                stage = _stage_from_jobname(jn)
+                if stage:
+                    print(f"[[ENCODER-RECLAIM key={stage} count={n} "
+                          f"lost_s={lost:.1f} total_s={total:.1f}]]", flush=True)
+                if n:
+                    _narrate(f"⚠ {_var_label(jn)}: spot-reclaimed {n}x, "
+                             f"{lost / 60:.1f} min of encoding lost, retried")
 
         elif etype == "TaskFailed":
             _report_task_failure(ev.get("taskFailedEventDetails", {}))
@@ -594,6 +679,7 @@ def cmd_poll(args: argparse.Namespace) -> int:
 
     seen: set[int] = set()
     log_state: dict[str, int] = {}  # stream -> last-forwarded timestamp
+    reclaim_seen: dict = {}         # jobId -> last-emitted (count, lost, total)
     exec_name = args.execution_arn.rsplit(":", 1)[-1]
     interval_s = int(os.environ.get("BATCH_POLL_INTERVAL_S", "5"))
     timeout_s = int(os.environ.get("BATCH_POLL_TIMEOUT_S", "14400"))  # 4h ceiling
@@ -625,6 +711,11 @@ def cmd_poll(args: argparse.Namespace) -> int:
         try:
             _reflect_batch_status(exec_name)
         except Exception:  # noqa: BLE001 — status reflection is cosmetic
+            pass
+        # Detect spot reclaims of in-flight encode jobs (red bar + waste stats).
+        try:
+            _report_live_reclaims(exec_name, reclaim_seen)
+        except Exception:  # noqa: BLE001 — reclaim reporting is best-effort
             pass
         # Forward live [progress]/[phase] lines from running containers so
         # long phases show activity, not a dark gap. Best-effort.
