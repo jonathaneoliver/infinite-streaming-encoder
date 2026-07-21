@@ -678,15 +678,32 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
             _report_task_failure(ev.get("taskFailedEventDetails", {}))
 
 
-def _download_outputs(s3_prefix: str, local_dir: Path) -> int:
-    """Mirror s3://.../<prefix>/output_*/ into local_dir. The state
-    machine writes each codec's packaged dir as output_<codec>/."""
+def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "") -> int:
+    """Mirror s3://.../<prefix>/output_<codec>/ into local_dir.
+
+    The state machine writes each codec's packaged dir as output_<codec>/. When
+    output_stem is given, each is downloaded to a per-codec top-level directory
+    named <output_stem>_<codec>/ (e.g. myclip_p200_hevc/master.m3u8) — matching
+    the local pipeline's naming contract (OutputStem + codec suffix). That lets
+    moveTmpToOutput move each codec independently, so codecs of the same clip
+    COEXIST in OUTPUT_DIR instead of one replacing the other's <stem> wrapper.
+    Without output_stem (legacy), the raw output_<codec>/ layout is preserved."""
     if not s3_prefix.startswith("s3://"):
         return 0
     rest = s3_prefix[len("s3://"):].rstrip("/")
     bucket, _, base_key = rest.partition("/")
     s3 = _s3()
     local_dir.mkdir(parents=True, exist_ok=True)
+
+    def _dst_for(rel: str):
+        # rel = "output_<codec>/<path...>"; remap to "<stem>_<codec>/<path...>".
+        if not output_stem:
+            return local_dir / rel
+        head, _, tail = rel.partition("/")
+        if not tail or not head.startswith("output_"):
+            return None  # dir marker or unexpected key — skip
+        codec = head[len("output_"):]
+        return local_dir / f"{output_stem}_{codec}" / tail
 
     # List everything first so the sync-back can drive a real progress bar
     # (weighted by bytes — segment counts vary wildly in size). This runs in the
@@ -705,7 +722,10 @@ def _download_outputs(s3_prefix: str, local_dir: Path) -> int:
         _emit_stage("download:outputs", "running", 0.0)
     for key, size in objs:
         rel = key[len(base_key) + 1:]
-        dst = local_dir / rel
+        dst = _dst_for(rel)
+        if dst is None:
+            done_bytes += size
+            continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         s3.download_file(bucket, key, str(dst))
         done_bytes += size
@@ -895,7 +915,8 @@ def cmd_poll(args: argparse.Namespace) -> int:
                         for k in ("package", "fragments", "hls"):
                             _emit_stage(f"{k}:{codec}", "done", 100.0)
                 print(f"    downloading outputs from {args.s3_prefix}", flush=True)
-                n = _download_outputs(args.s3_prefix, Path(args.local_dir))
+                n = _download_outputs(args.s3_prefix, Path(args.local_dir),
+                                      getattr(args, "output_stem", ""))
                 print(f"    downloaded {n} files", flush=True)
                 try:
                     _emit_cost_summary(exec_name)  # spot-vs-on-demand savings
@@ -930,6 +951,9 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--execution-arn", required=True, dest="execution_arn")
     pp.add_argument("--s3-prefix", required=True, dest="s3_prefix")
     pp.add_argument("--local-dir", required=True, dest="local_dir")
+    # Base output name (OutputStem, no codec). When set, each codec's outputs
+    # land in <output-stem>_<codec>/ so codecs coexist in OUTPUT_DIR.
+    pp.add_argument("--output-stem", dest="output_stem", default="")
     pp.set_defaults(fn=cmd_poll)
 
     args = p.parse_args(argv)

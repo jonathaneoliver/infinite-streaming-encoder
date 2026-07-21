@@ -1825,10 +1825,16 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	}
 
 	// Poll + stream progress back into the job log.
+	// Download into the job tmp with the stem passed separately: the downloader
+	// lays each codec down as its own top-level <stem>_<codec>/ dir (not a shared
+	// <stem>/output_<codec>/ wrapper), so moveTmpToOutput moves each codec
+	// independently and codecs of the same clip COEXIST in OUTPUT_DIR — matching
+	// the local pipeline + the OutputStem/resolveCodec/watcher naming contract.
 	poll := exec.Command("python3", "-m", "encoder.cli_batch", "poll",
 		"--execution-arn", execArn,
 		"--s3-prefix", s3Prefix,
-		"--local-dir", filepath.Join(tmpDir, job.Config.OutputStem(filename)))
+		"--local-dir", tmpDir,
+		"--output-stem", job.Config.OutputStem(filename))
 	poll.Env = os.Environ()
 	stdout, err := poll.StdoutPipe()
 	if err != nil {
