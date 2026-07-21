@@ -99,7 +99,10 @@ func (m *Manager) Promote(name string) ([]PromoteResult, error) {
 		target := strings.TrimRight(dest, "/") + "/" + name + "/"
 		args := []string{"-a", "--partial"}
 		if isRemoteDest(dest) {
-			args = append(args, "-e", "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes")
+			// IgnoreUnknown=UseKeychain so the mounted macOS ~/.ssh/config parses
+			// under Linux ssh; auth uses the forwarded host ssh-agent (the key's
+			// passphrase lives in the macOS keychain, unreachable in-container).
+			args = append(args, "-e", "ssh -o IgnoreUnknown=UseKeychain -o StrictHostKeyChecking=accept-new -o BatchMode=yes")
 		}
 		args = append(args, src+"/", target)
 		cmd := exec.Command("rsync", args...)

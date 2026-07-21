@@ -23,6 +23,9 @@ GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 PROMOTE_MOUNT := $(if $(PROMOTE_LOCAL_DIR),-v $(PROMOTE_LOCAL_DIR):/media/promote-local,)
 PROMOTE_SSH_IP := $(if $(PROMOTE_SSH_HOST),$(shell dscacheutil -q host -a name $(PROMOTE_SSH_HOST) 2>/dev/null | awk '/^ip_address:/{print $$2; exit}'),)
 PROMOTE_ADDHOST := $(if $(PROMOTE_SSH_IP),--add-host $(PROMOTE_SSH_HOST):$(PROMOTE_SSH_IP),)
+# Forward the host ssh-agent (Docker Desktop magic socket) so a passphrase-
+# protected key whose passphrase is in the macOS keychain works in-container.
+PROMOTE_SSH_AGENT := $(if $(PROMOTE_SSH_HOST),-v /run/host-services/ssh-auth.sock:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent,)
 
 # GHCR publishing
 GHCR_IMAGE ?= ghcr.io/jonathaneoliver/encoder
@@ -57,7 +60,8 @@ run: require-paths build
 		-v $(HOME)/.ssh:/root/.ssh:ro \
 		$(PROMOTE_MOUNT) \
 		$(PROMOTE_ADDHOST) \
-		-e PROMOTE_DESTS=$(PROMOTE_DESTS) \
+		$(PROMOTE_SSH_AGENT) \
+		-e 'PROMOTE_DESTS=$(PROMOTE_DESTS)' \
 		-e SOURCE_DIR=/media/originals \
 		-e OUTPUT_DIR=/media/dynamic_content \
 		-e TMP_DIR=/media/tmp \
