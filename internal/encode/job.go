@@ -2019,6 +2019,37 @@ func s3ObjectExists(uri string) bool {
 	return cmd.Run() == nil
 }
 
+// parseCodecSel turns the codec selector into the ordered codec list. It accepts
+// a comma-separated subset ("h264", "hevc,av1", "h264,hevc,av1") — the form the
+// UI's codec checkboxes emit — plus the legacy named values ("all", "both", and
+// "" → h264+hevc). Unknown tokens are ignored; an empty result falls back to
+// h264+hevc. Output is always in canonical order (h264, hevc, av1).
+func parseCodecSel(sel string) []string {
+	switch sel {
+	case "", "both":
+		return []string{"h264", "hevc"}
+	case "all":
+		return []string{"h264", "hevc", "av1"}
+	}
+	want := map[string]bool{}
+	for _, t := range strings.Split(sel, ",") {
+		switch strings.TrimSpace(t) {
+		case "h264", "hevc", "av1":
+			want[strings.TrimSpace(t)] = true
+		}
+	}
+	var out []string
+	for _, c := range []string{"h264", "hevc", "av1"} {
+		if want[c] {
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"h264", "hevc"}
+	}
+	return out
+}
+
 func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached bool, sourceWidth int, clipDurationS float64, chunkCfg string, logf func(string)) string {
 	if ladderName == "" {
 		ladderName = "apple-uniq-live"
@@ -2033,19 +2064,7 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	if bufMult <= 0 {
 		bufMult = 0.25
 	}
-	var codecs []string
-	switch codecSel {
-	case "h264":
-		codecs = []string{"h264"}
-	case "hevc":
-		codecs = []string{"hevc"}
-	case "av1":
-		codecs = []string{"av1"}
-	case "all":
-		codecs = []string{"h264", "hevc", "av1"}
-	default: // "both" or empty
-		codecs = []string{"h264", "hevc"}
-	}
+	codecs := parseCodecSel(codecSel)
 	// Build the per-codec rung list from the ladder store. resolveLadderRungs
 	// caps each codec at the source width (no upscale) and --max-res, and
 	// assigns ordinal labels for repeated resolutions — identical to
@@ -2146,62 +2165,33 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 // resolveCodec checks which codecs are already encoded in OutputDir and returns
 // the codec flag that covers only the missing ones. Returns "" if all exist.
 func (m *Manager) resolveCodec(cfg JobConfig, filename string) string {
-	if cfg.Codec == "" {
-		cfg.Codec = "both"
-	}
 	stem := cfg.OutputStem(filename)
-
-	wantH264 := cfg.Codec == "h264" || cfg.Codec == "both" || cfg.Codec == "all"
-	wantHEVC := cfg.Codec == "hevc" || cfg.Codec == "both" || cfg.Codec == "all"
-	wantAV1 := cfg.Codec == "av1" || cfg.Codec == "all"
-
-	hasH264 := dirExistsWithFiles(filepath.Join(m.OutputDir, stem+"_h264"))
-	hasHEVC := dirExistsWithFiles(filepath.Join(m.OutputDir, stem+"_hevc"))
-	hasAV1 := dirExistsWithFiles(filepath.Join(m.OutputDir, stem+"_av1"))
-
-	needH264 := wantH264 && !hasH264
-	needHEVC := wantHEVC && !hasHEVC
-	needAV1 := wantAV1 && !hasAV1
-
-	if !needH264 && !needHEVC && !needAV1 {
-		return ""
+	want := map[string]bool{}
+	for _, c := range parseCodecSel(cfg.Codec) { // handles "", both, all, comma-list, single
+		want[c] = true
 	}
-	if cfg.Codec == "all" {
-		missing := []string{}
-		if needH264 {
-			missing = append(missing, "h264")
+	// The still-missing codecs, in canonical order.
+	var missing []string
+	for _, c := range []string{"h264", "hevc", "av1"} {
+		if want[c] && !dirExistsWithFiles(filepath.Join(m.OutputDir, stem+"_"+c)) {
+			missing = append(missing, c)
 		}
-		if needHEVC {
-			missing = append(missing, "hevc")
-		}
-		if needAV1 {
-			missing = append(missing, "av1")
-		}
-		if len(missing) == 3 {
-			return "all"
-		}
-		if len(missing) == 2 && needH264 && needHEVC {
-			return "both"
-		}
-		if len(missing) == 1 {
-			return missing[0]
-		}
-		// 2 of 3 but not h264+hevc — encode individually
-		return strings.Join(missing, ",")
 	}
-	if cfg.Codec == "both" {
-		if needH264 && needHEVC {
-			return "both"
-		}
-		if needH264 {
-			return "h264"
-		}
-		if needHEVC {
-			return "hevc"
-		}
-		return ""
+	if len(missing) == 0 {
+		return "" // everything wanted is already encoded → skip the file
 	}
-	return cfg.Codec
+	// Re-encode only the missing ones. Keep the friendly "all"/"both" names when
+	// they match exactly (nicer logs/UI); otherwise a comma-list (or single).
+	if len(missing) == 3 {
+		return "all"
+	}
+	if len(missing) == 2 && missing[0] == "h264" && missing[1] == "hevc" {
+		return "both"
+	}
+	if len(missing) == 1 {
+		return missing[0]
+	}
+	return strings.Join(missing, ",")
 }
 
 func dirExistsWithFiles(path string) bool {

@@ -113,6 +113,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    chunked row is solid green at the same height as a completed whole row. */
 .chunk-grid { display: flex; flex-wrap: nowrap; gap: 2px; align-items: center; width: 100%; }
 .chunk-cell { position: relative; flex: 1 1 0; min-width: 3px; height: 10px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
+/* Codec multi-select checkboxes (any subset of h264/hevc/av1). */
+.codec-checks { display: flex; gap: 16px; align-items: center; padding: 6px 0; }
+.codec-checks label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; font-weight: 400; }
+.codec-checks input { width: auto; min-width: 0; margin: 0; vertical-align: middle; }
 /* End-of-run efficiency stats, shown under the stages once ENCODER-STATS lands. */
 .job-stats { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; padding: 9px 12px; background: #141b2b; border-radius: 6px; font-size: 12px; }
 .job-stat { color: #8a9bb5; white-space: nowrap; }
@@ -350,13 +354,11 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             </div>
             <div class="control-group">
                 <label>Codec</label>
-                <select id="codec">
-                    <option value="both">Both (H.264 + HEVC)</option>
-                    <option value="h264">H.264 only</option>
-                    <option value="hevc">HEVC only</option>
-                    <option value="av1">AV1 only</option>
-                    <option value="all">All (H.264 + HEVC + AV1)</option>
-                </select>
+                <div id="codec" class="codec-checks">
+                    <label><input type="checkbox" class="codec-cb" value="h264" checked> H.264</label>
+                    <label><input type="checkbox" class="codec-cb" value="hevc" checked> HEVC</label>
+                    <label><input type="checkbox" class="codec-cb" value="av1"> AV1</label>
+                </div>
             </div>
             <div class="control-group">
                 <label title="Bitrate ladder (resolutions + target bitrates). Manage ladders in the Ladders tab.">Ladder</label>
@@ -1292,7 +1294,7 @@ async function startEncode(force = false) {
     const body = {
         files: selected,
         target: target,
-        codec: document.getElementById('codec').value,
+        codec: codecValue(),
         max_res: document.getElementById('max-res').value,
         time: document.getElementById('time-limit').value,
         segment_duration: document.getElementById('segment-duration').value,
@@ -1559,6 +1561,19 @@ function renderJobStats(el, j) {
     el.title = 'efficiency = avg vCPUs busy ÷ max vCPUs (how full the fleet ran). '
         + 'slowest chunk = the makespan floor — nothing finishes faster than this one chunk.';
     el.style.display = '';
+}
+
+// Read the codec checkboxes into the backend's codec selector: friendly
+// "both"/"all" for the common combos, a comma-list for any other subset (both
+// buildSFNInput and cli_local accept all of these). Never empty — falls back to
+// h264 so a submit always encodes something.
+function codecValue() {
+    const on = ['h264', 'hevc', 'av1'].filter(c =>
+        document.querySelector(`.codec-cb[value="${c}"]`)?.checked);
+    if (on.length === 0) return 'h264';
+    if (on.length === 3) return 'all';
+    if (on.length === 2 && on[0] === 'h264' && on[1] === 'hevc') return 'both';
+    return on.join(',');
 }
 
 function jobRowHtml(j) {
@@ -2877,7 +2892,7 @@ async function forceReencode(fileName) {
     const body = {
         files: [fileName],
         target: document.getElementById('target').value,
-        codec: document.getElementById('codec').value,
+        codec: codecValue(),
         max_res: document.getElementById('max-res').value,
         time: document.getElementById('time-limit').value,
         segment_duration: document.getElementById('segment-duration').value,

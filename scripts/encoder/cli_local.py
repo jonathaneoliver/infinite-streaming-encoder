@@ -69,8 +69,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="base name for output dirs (stem + partial/pad suffixes)")
     p.add_argument("--output-dir", type=Path, required=True, dest="output_dir")
 
-    p.add_argument("--codec", default="both",
-                   choices=("h264", "hevc", "av1", "both", "all"))
+    # A single codec, a comma-separated subset (the UI's codec checkboxes,
+    # e.g. "hevc,av1"), or the legacy "both"/"all". Parsed by _codec_list; not
+    # an argparse `choices` set so arbitrary subsets are accepted.
+    p.add_argument("--codec", default="both")
     # Ladder by name (legacy | apple | apple-uniq | any custom ladder). Not
     # restricted to `choices` so user-defined ladders work; validated via
     # get_ladder at run time.
@@ -148,11 +150,14 @@ def _ts_package_dir(output_dir: Path, stem: str, codec: str) -> Path:
 
 
 def _codec_list(selection: str) -> list[str]:
-    if selection == "both":
+    if selection in ("", "both"):
         return ["hevc", "h264"]
     if selection == "all":
         return ["hevc", "h264", "av1"]
-    return [selection]
+    # A comma-separated subset (the UI's codec checkboxes) or a single codec.
+    want = {c.strip() for c in selection.split(",")}
+    out = [c for c in ("hevc", "h264", "av1") if c in want]
+    return out or ["hevc", "h264"]
 
 
 def _emit_plan(
