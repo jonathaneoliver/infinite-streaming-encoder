@@ -806,9 +806,18 @@ type Manager struct {
 	// so an earlier job floods the queue with its higher-priority chunks before a
 	// later job's execution starts. Batch never preempts, so a later job that
 	// fanned out first would keep the vCPUs it grabbed regardless of priority.
-	launchGate  chan struct{}
-	subscribers []chan *Job
-	subMu       sync.Mutex
+	launchGate    chan struct{}
+	warmReconcile func()
+	subscribers   []chan *Job
+	subMu         sync.Mutex
+}
+
+// triggerWarm nudges the awswatch keep-warm loop to re-evaluate now (job start /
+// finalize), so the floor doesn't lag a poll interval behind the queue.
+func (m *Manager) triggerWarm() {
+	if m.warmReconcile != nil {
+		m.warmReconcile()
+	}
 }
 
 type ManagerConfig struct {
@@ -824,6 +833,10 @@ type ManagerConfig struct {
 	EncoderImage    string
 	StateMachineArn string
 	MaxConcurrent   int
+	// WarmReconcile, if set, is called on a job START and FINALIZE so the
+	// awswatch keep-warm floor reacts immediately (raise on start, drop when the
+	// queue empties) instead of waiting for its next poll. Non-blocking.
+	WarmReconcile func()
 }
 
 func NewManager(cfg ManagerConfig) *Manager {
@@ -850,6 +863,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		StateMachineArn: cfg.StateMachineArn,
 		sem:             make(chan struct{}, cfg.MaxConcurrent),
 		launchGate:      make(chan struct{}, 1),
+		warmReconcile:   cfg.WarmReconcile,
 	}
 }
 
@@ -986,6 +1000,9 @@ func (m *Manager) run(job *Job, startIdx int) {
 	m.notify(job)
 	m.sem <- struct{}{}
 	defer func() { <-m.sem }()
+	// Job reached terminal state (any return path below) → nudge keep-warm to
+	// re-evaluate now, so the floor drops the moment the queue empties.
+	defer m.triggerWarm()
 
 	// If cancel fired while this job was queued, skip straight to cleanup.
 	if job.IsCancelled() {
@@ -994,6 +1011,7 @@ func (m *Manager) run(job *Job, startIdx int) {
 	}
 
 	job.Status = StatusRunning
+	m.triggerWarm() // run starting → warm a box promptly, don't wait for the poll
 	if startIdx == 0 {
 		job.Progress = "starting"
 	} else {
