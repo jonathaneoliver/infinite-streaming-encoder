@@ -125,6 +125,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .encode-hint { margin-top: 10px; font-size: 12px; color: #8a9bb5; line-height: 1.5; }
 .encode-hint b { color: #cdd6e6; font-weight: 600; }
 .encode-hint kbd { display: inline-block; padding: 1px 5px; font-size: 11px; font-family: inherit; color: #dfe6f2; background: #232b3d; border: 1px solid #3a4560; border-radius: 4px; }
+/* Drag-and-drop source upload. */
+#sources-panel { transition: background 0.12s, outline 0.12s; }
+#sources-panel.dropzone-active { outline: 2px dashed #4cc9f0; outline-offset: -6px; background: rgba(76,201,240,0.07); }
+#upload-progress { margin: 8px 0; padding: 8px 12px; background: #14233a; border-radius: 6px; font-size: 12px; color: #cdd6e6; }
 /* Codec multi-select checkboxes (any subset of h264/hevc/av1). */
 .codec-checks { display: flex; gap: 16px; align-items: center; padding: 6px 0; }
 .codec-checks label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; font-weight: 400; }
@@ -306,13 +310,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
 <!-- ENCODE TAB -->
 <div id="tab-originals" class="tab-content active">
-    <div class="panel">
-        <h2>Source Files</h2>
+    <div class="panel" id="sources-panel">
+        <h2>Source Files <span style="font-size:0.7rem;color:#5d6b82;font-weight:400">— or drag &amp; drop videos here to upload</span></h2>
         <div class="select-actions">
             <button class="btn-select" onclick="selectAll()">Select All</button>
             <button class="btn-select" onclick="selectNone()">Select None</button>
             <span id="selected-count" style="color:#888;font-size:0.85rem;line-height:2;margin-left:8px"></span>
         </div>
+        <div id="upload-progress" style="display:none"></div>
         <div id="file-list" class="file-list">
             <div class="no-files">Loading...</div>
         </div>
@@ -1195,10 +1200,76 @@ async function loadSources() {
     }
 }
 
+// Names to auto-check on the next render (freshly uploaded files).
+let _preselectSources = new Set();
+
+// --- Drag-and-drop upload into SOURCE_DIR ---
+
+const _VIDEO_EXT = /\.(mp4|mkv|mov|avi|webm|ts)$/i;
+
+function initDropUpload() {
+    const panel = document.getElementById('sources-panel');
+    if (!panel) return;
+    let depth = 0; // enter/leave fire per child; count to avoid flicker
+    panel.addEventListener('dragenter', e => { e.preventDefault(); if (++depth === 1) panel.classList.add('dropzone-active'); });
+    panel.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+    panel.addEventListener('dragleave', e => { if (--depth <= 0) { depth = 0; panel.classList.remove('dropzone-active'); } });
+    panel.addEventListener('drop', e => {
+        e.preventDefault();
+        depth = 0; panel.classList.remove('dropzone-active');
+        uploadSources(Array.from(e.dataTransfer.files || []));
+    });
+}
+
+async function uploadSources(fileObjs) {
+    const vids = fileObjs.filter(f => _VIDEO_EXT.test(f.name));
+    if (!vids.length) { showToast('Drop a video file (mp4/mkv/mov/avi/webm/ts)', 'error'); return; }
+    const prog = document.getElementById('upload-progress');
+    const uploaded = [];
+    for (let i = 0; i < vids.length; i++) {
+        const f = vids[i];
+        prog.style.display = 'block';
+        prog.textContent = `Uploading ${f.name} (${i + 1}/${vids.length})…`;
+        try {
+            await uploadOneSource(f, pct => {
+                prog.textContent = `Uploading ${f.name} (${i + 1}/${vids.length}) — ${pct}% of ${formatSize(f.size)}`;
+            });
+            uploaded.push(f.name);
+        } catch (err) {
+            showToast(`Upload failed: ${f.name} — ${err}`, 'error');
+        }
+    }
+    prog.style.display = 'none';
+    if (uploaded.length) {
+        _preselectSources = new Set(uploaded); // check them on reload
+        await loadSources();
+        showToast(`Uploaded ${uploaded.length} file${uploaded.length === 1 ? '' : 's'} — selected, ready to encode`, 'success');
+    }
+}
+
+function uploadOneSource(file, onProgress) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/sources/upload');
+        xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(Math.round(e.loaded / e.total * 100)); };
+        xhr.onload = () => (xhr.status >= 200 && xhr.status < 300) ? resolve() : reject(xhr.responseText || ('HTTP ' + xhr.status));
+        xhr.onerror = () => reject('network error');
+        const fd = new FormData();
+        fd.append('file', file, file.name);
+        xhr.send(fd);
+    });
+}
+
 function renderSources() {
     const list = document.getElementById('file-list');
+    // Preserve the current selection across re-renders (the 60s poll rebuilds this
+    // list) and add any freshly-uploaded files, so a drop → encode flow keeps them
+    // checked. _preselectSources is one-shot.
+    const checked = new Set([...document.querySelectorAll('#file-list input:checked')].map(cb => cb.value));
+    _preselectSources.forEach(n => checked.add(n));
+    _preselectSources.clear();
     if (!files || files.length === 0) {
-        list.innerHTML = '<div class="no-files">No video files found in source directory</div>';
+        list.innerHTML = '<div class="no-files">No video files — drag &amp; drop a video here to upload one</div>';
         return;
     }
     const sorted = sortBy(files, sourceSort.key, sourceSort.asc);
@@ -1210,7 +1281,7 @@ function renderSources() {
         </div>
     ` + sorted.map(f => `
         <div class="file-item" oncontextmenu="showSourceContextMenu(event, '${escapeAttr(f.name)}')">
-            <input type="checkbox" value="${f.name}" onclick="event.stopPropagation(); updateSelectedCount()">
+            <input type="checkbox" value="${f.name}" ${checked.has(f.name) ? 'checked' : ''} onclick="event.stopPropagation(); updateSelectedCount()">
             <span class="file-name" onclick="this.parentElement.querySelector('input').click()">${f.name}</span>
             <span class="file-size">${formatSize(f.size)}</span>
             <span class="file-date">${formatDate(f.mod_time)}</span>
@@ -3196,6 +3267,7 @@ function closePlayer(modal) {
 }
 
 loadSources();
+initDropUpload();
 connectSSE();
 setInterval(loadSources, 60000);
 startAwsAutoRefresh();

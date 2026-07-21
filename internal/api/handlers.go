@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -41,6 +42,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/settings", s.getSettings)
 	s.Mux.HandleFunc("POST /api/settings", s.putSettings)
 	s.Mux.HandleFunc("GET /api/sources", s.listSources)
+	s.Mux.HandleFunc("POST /api/sources/upload", s.uploadSource)
 	s.Mux.HandleFunc("GET /api/ladders", s.getLadders)
 	s.Mux.HandleFunc("POST /api/ladders", s.putLadder)
 	s.Mux.HandleFunc("DELETE /api/ladders/{name}", s.deleteLadder)
@@ -112,6 +114,65 @@ type sourceFile struct {
 	Name    string `json:"name"`
 	Size    int64  `json:"size"`
 	ModTime int64  `json:"mod_time"`
+}
+
+// uploadSource streams dropped video file(s) straight to SOURCE_DIR. Uses the
+// streaming MultipartReader (never ParseMultipartForm — sources are multi-GB and
+// must not buffer in memory), writes to <name>.uploading, then renames on
+// completion so the watcher never picks up a partial file. Rejects non-video and
+// path-traversal names.
+func (s *Server) uploadSource(w http.ResponseWriter, r *http.Request) {
+	mr, err := r.MultipartReader()
+	if err != nil {
+		http.Error(w, "expected a multipart upload: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	var saved []string
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			http.Error(w, "read part: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if part.FormName() != "file" {
+			part.Close()
+			continue
+		}
+		name := filepath.Base(part.FileName()) // strip any client path components
+		if name == "" || name == "." || strings.ContainsAny(name, `/\`) {
+			http.Error(w, "invalid filename", http.StatusBadRequest)
+			return
+		}
+		if !isVideo(strings.ToLower(filepath.Ext(name))) {
+			http.Error(w, "not a video file: "+name, http.StatusBadRequest)
+			return
+		}
+		dst := filepath.Join(s.Manager.SourceDir, name)
+		tmp := dst + ".uploading"
+		f, cerr := os.Create(tmp)
+		if cerr != nil {
+			http.Error(w, "create: "+cerr.Error(), http.StatusInternalServerError)
+			return
+		}
+		_, werr := io.Copy(f, part)
+		f.Close()
+		part.Close()
+		if werr != nil {
+			os.Remove(tmp)
+			http.Error(w, "write: "+werr.Error(), http.StatusInternalServerError)
+			return
+		}
+		if rerr := os.Rename(tmp, dst); rerr != nil {
+			os.Remove(tmp)
+			http.Error(w, "finalize: "+rerr.Error(), http.StatusInternalServerError)
+			return
+		}
+		saved = append(saved, name)
+	}
+	writeJSON(w, map[string]any{"saved": saved})
 }
 
 func (s *Server) listSources(w http.ResponseWriter, r *http.Request) {
