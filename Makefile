@@ -52,7 +52,7 @@ run: require-paths build
 	docker run --rm -d \
 		--name $(CONTAINER_NAME) \
 		-p $(PORT):8080 \
-		-v $(SOURCE_DIR):/media/originals:ro \
+		-v $(SOURCE_DIR):/media/originals \
 		-v $(OUTPUT_DIR):/media/dynamic_content \
 		-v $(TMP_DIR):/media/tmp \
 		-v /var/run/docker.sock:/var/run/docker.sock \
