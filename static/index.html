@@ -99,6 +99,12 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .stages-table td.stage-bar { width: 55%; }
 .stages-table td.stage-pct { color: #888; white-space: nowrap; text-align: right; font-variant-numeric: tabular-nums; width: 10%; }
 .stages-table tr.stage-pending { opacity: 0.45; }
+/* The wide gap between the short label and the far-right bar makes it hard to
+   track which row is which. Zebra striping aids static scanning; a full-row
+   hover highlight ties label ↔ bar ↔ % together on the row you're pointing at. */
+.stages-table tbody tr:nth-child(even) { background: rgba(255,255,255,0.028); }
+.stages-table tbody tr:hover { background: rgba(67,97,238,0.16); }
+.stages-table tbody tr:hover td.stage-label { color: #dfe6f2; }
 .stage-bar-track { height: 6px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
 .stage-bar-fill { height: 100%; background: #4361ee; transition: width 0.3s ease; }
 .stage-bar-fill.stage-fill-done { background: #06d6a0; }
