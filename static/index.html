@@ -409,17 +409,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="pink">Pink</option>
                 </select>
             </div>
-            <div class="control-group" style="align-self:center;padding-top:16px">
-                <label><input type="checkbox" id="keep-mezzanine" style="width:auto;min-width:auto"> Keep mezzanine</label>
-            </div>
             <div class="control-group">
                 <label title="Two-pass is applied automatically per codec: HEVC (libx265) needs it for an accurate average/peak bitrate, H264 (libx264) does not, AV1 never. This only affects HEVC — pick 1-pass to run a faster, less-accurate HEVC encode for comparison.">HEVC pass</label>
                 <select id="hevc-pass">
-                    <option value="2">2-pass (accurate, default)</option>
+                    <option value="2" selected>2-pass (accurate, default)</option>
                     <option value="1">1-pass (faster, for comparison)</option>
                 </select>
             </div>
-            <button class="btn btn-primary" id="encode-btn" onclick="startEncode(event.altKey)" oncontextmenu="event.preventDefault(); startEncode(true); return false;" title="Click: encode checked files (skips any already fully encoded). Alt/Option+click OR right-click: force re-encode all checked files (archives existing outputs)." disabled>Start Encode</button>
+            <button class="btn btn-primary" id="encode-btn" onclick="startEncode(event.altKey)" oncontextmenu="event.preventDefault(); startEncode(true); return false;" title="Click: encode checked files (skips any already fully encoded). Alt/Option+click OR right-click: force re-encode all checked files (existing outputs are kept, renamed with their last-modified date)." disabled>Start Encode</button>
             </div>
         </fieldset>
     </div>
@@ -1302,7 +1299,6 @@ async function startEncode(force = false) {
         gop_duration: document.getElementById('gop-duration').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
-        keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         hevc_single_pass: document.getElementById('hevc-pass').value === '1',
         ladder: document.getElementById('ladder').value,
         cpu_arch: document.getElementById('cpu-arch').value,
@@ -2900,7 +2896,6 @@ async function forceReencode(fileName) {
         gop_duration: document.getElementById('gop-duration').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
-        keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         hevc_single_pass: document.getElementById('hevc-pass').value === '1',
         ladder: document.getElementById('ladder').value,
         cpu_arch: document.getElementById('cpu-arch').value,
