@@ -119,6 +119,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "two-pass (faster, less accurate average — for "
                         "comparison; H264/AV1 are single-pass regardless)")
 
+    # Local parallelism: fill a multi-core box by running encodes concurrently
+    # (a single x265 encode only ~half-fills a machine). With a chunk duration,
+    # each variant is split into chunks encoded in parallel then concatenated —
+    # so even one HEVC variant saturates the cores (the same unit the cloud
+    # fans out to Batch). Threads-per-encode pins each concurrent ffmpeg to its
+    # slice (locally there's no cgroup to size them).
+    p.add_argument("--encode-concurrency", type=int, default=0,
+                   help="max concurrent variant/chunk encodes (0 = cores/threads)")
+    p.add_argument("--encode-threads", type=int, default=0,
+                   help="ffmpeg threads per concurrent encode (0 = auto, ~2)")
+    p.add_argument("--local-chunk-duration", type=float, default=0.0,
+                   dest="local_chunk_duration",
+                   help="split each variant into ~N-second chunks encoded in "
+                        "parallel then concatenated (0 = whole variant)")
+
     p.add_argument("--vmaf-lookup-csv", default=None, dest="vmaf_lookup_csv",
                    help="unused for now; reserved for burn-in VMAF labels")
     p.add_argument("--vmaf-lookup-mode", default="auto",
@@ -342,7 +357,13 @@ def run_full(args: argparse.Namespace) -> int:
         print(f"[phase 3] encoding variants: codec={args.codec} "
               f"ladder={args.ladder}", flush=True)
         t0 = time.monotonic()
-        encode_all(encode_ctx, rungs_by_codec)
+        encode_all(
+            encode_ctx, rungs_by_codec,
+            concurrency=args.encode_concurrency or None,
+            threads_per_encode=args.encode_threads or None,
+            chunk_duration_s=args.local_chunk_duration,
+            segment_duration_s=args.segment_duration_s,
+        )
         print(f"[phase 3] done in {time.monotonic() - t0:.1f}s", flush=True)
 
         if info.has_audio:

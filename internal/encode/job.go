@@ -556,7 +556,9 @@ type JobConfig struct {
 	// = size each variant's chunks by learned encode speed (slow → 30s floor,
 	// cheap → whole clip, so all variants finish ~together); "whole" = one job
 	// per variant (max efficiency, no joins); or a fixed seconds value
-	// (multiple of the 6s segment duration). Only affects the cloud-batch target.
+	// (multiple of the 6s segment duration). On cloud-batch it sizes the Batch
+	// fan-out; on local it sizes cli_local's parallel chunk pool (see
+	// localChunkSeconds) — "dynamic"/"" default to 2×segment there.
 	ChunkDuration string `json:"chunk_duration,omitempty"`
 	GopDuration   string `json:"gop_duration"`
 	HlsFormat     string `json:"hls_format"`
@@ -1565,6 +1567,36 @@ func (cfg *JobConfig) OutputStem(filename string) string {
 	return stem
 }
 
+// localChunkSeconds resolves the fixed chunk size for a LOCAL encode, driving
+// cli_local's --local-chunk-duration. Unlike the cloud (per-variant, complexity
+// aware), cli_local applies ONE chunk duration to every variant, so the cloud's
+// "dynamic"/"per-variant" modes collapse here to a fixed default of 2×segment
+// (12s by default): small enough that any real-length clip yields plenty of
+// chunks to fill the cores — a lone x265 encode only ~half-fills a box, so
+// chunking is what lets a single HEVC variant saturate the machine — yet large
+// enough to amortize 2-pass startup. "whole" disables chunking (0). A numeric
+// value is used verbatim. The result must stay a whole multiple of the segment
+// duration (plan_chunks enforces this; 2×segment always is).
+func (cfg *JobConfig) localChunkSeconds() float64 {
+	seg := 6.0
+	if cfg.SegmentDuration != "" {
+		if v, err := strconv.ParseFloat(cfg.SegmentDuration, 64); err == nil && v > 0 {
+			seg = v
+		}
+	}
+	switch cfg.ChunkDuration {
+	case "whole":
+		return 0
+	case "dynamic", "":
+		return 2 * seg
+	default:
+		if v, err := strconv.ParseFloat(cfg.ChunkDuration, 64); err == nil && v > 0 {
+			return v
+		}
+		return 2 * seg
+	}
+}
+
 func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) []string {
 	args := []string{
 		"--input", sourceDir + "/" + filename,
@@ -1608,6 +1640,16 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	}
 	if cfg.HevcSinglePass {
 		args = append(args, "--hevc-single-pass")
+	}
+	// Local: chunk each variant so concurrent encodes fill the cores (the
+	// cloud gets this from Batch fan-out; locally cli_local runs a bounded
+	// pool over the chunks). Concurrency/threads are left to cli_local's
+	// core-aware auto-sizing so it adapts to whatever host runs the worker.
+	if cfg.Target == TargetLocal {
+		if chunk := cfg.localChunkSeconds(); chunk > 0 {
+			args = append(args, "--local-chunk-duration",
+				strconv.FormatFloat(chunk, 'f', -1, 64))
+		}
 	}
 	// CPU arch only makes sense for cloud encodes (local runs on the
 	// host's own architecture), and cli_local.py doesn't accept the
