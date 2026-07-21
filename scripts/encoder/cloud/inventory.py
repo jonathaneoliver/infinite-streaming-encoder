@@ -635,14 +635,15 @@ def _record_fleet_samples(hourly_usd: float, fleet: dict) -> dict:
     return {"spend_24h_usd": round(spend, 4), "history": history}
 
 
-def _current_max_vcpus():
-    """The encoder compute env's current maxvCpus, for the AWS panel's max-vCPUs
-    radio (current vs 2x). None if it can't be read (don't break inventory)."""
+def _current_vcpus():
+    """The encoder compute env's current min/max vCPUs. Empty dict if unreadable
+    (never break inventory). max feeds the AWS panel's max-vCPUs radio; min is the
+    live keep-warm floor (0 idle, WARM_MIN_VCPUS while a run is active)."""
     try:
         from encoder.cloud.compute_env import get_vcpus
-        return get_vcpus().get("max_vcpus")
+        return get_vcpus()
     except Exception:  # noqa: BLE001 — best-effort
-        return None
+        return {}
 
 
 def _spot_and_reclaim_stats() -> dict:
@@ -715,6 +716,7 @@ def collect() -> dict[str, Any]:
         if cluster:
             fleet["cw"] = _fleet_cw_series(cluster)
 
+    _ce_vcpus = _current_vcpus()
     return {
         "fleet": fleet,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -737,7 +739,8 @@ def collect() -> dict[str, Any]:
             "saved_24h_usd": fleet.get("saved_24h_usd", 0),
             "reclaim_24h_pct": fleet.get("reclaim_24h_pct", 0),
             "reclaim_24h_lost_min": fleet.get("reclaim_24h_lost_min", 0),
-            "max_vcpus": _current_max_vcpus(),
+            "max_vcpus": _ce_vcpus.get("max_vcpus"),
+            "min_vcpus": _ce_vcpus.get("min_vcpus"),
             "running_executions": len(running_executions),
             "active_batch_jobs": len(active_batch_jobs),
         },
