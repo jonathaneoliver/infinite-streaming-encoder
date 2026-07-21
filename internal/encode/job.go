@@ -563,6 +563,10 @@ type JobConfig struct {
 	Padding       string `json:"padding"`
 	KeepMezzanine bool   `json:"keep_mezzanine"`
 	ForceReencode bool   `json:"force_reencode"`
+	// PromoteAfter rsyncs each produced output to the configured PROMOTE_DESTS
+	// (local + remote live libraries) once the encode succeeds and moves to
+	// OUTPUT_DIR — the automatic version of the per-output Promote button.
+	PromoteAfter bool `json:"promote,omitempty"`
 	// HevcSinglePass forces HEVC to encode single-pass. Two-pass is a codec
 	// property, applied automatically: HEVC (libx265) is two-pass by default
 	// (the accurate-average path — its single-pass VBR drifts below target),
@@ -954,13 +958,17 @@ func (m *Manager) run(job *Job, startIdx int) {
 	} else {
 		job.Progress = "moving to output"
 		m.notify(job)
-		if mvErr := m.moveTmpToOutput(jobTmpDir); mvErr != nil {
+		moved, mvErr := m.moveTmpToOutput(jobTmpDir)
+		if mvErr != nil {
 			job.Status = StatusFailed
 			job.Error = "encode succeeded but move failed: " + mvErr.Error()
 			job.Progress = "failed"
 		} else {
 			job.Status = StatusDone
 			job.Progress = "complete"
+			if job.Config.PromoteAfter {
+				m.autoPromote(job, moved)
+			}
 		}
 	}
 	// On failure, preserve the job's tmp dir — it holds diagnostic
@@ -1342,11 +1350,15 @@ func IsDatedBackup(name string) bool {
 	return datedBackupRe.MatchString(name)
 }
 
-func (m *Manager) moveTmpToOutput(tmpDir string) error {
+// moveTmpToOutput moves each top-level dir from tmpDir into OUTPUT_DIR and
+// returns the names moved (so the caller can promote them). See the collision
+// note on the in-place dated-backup behaviour.
+func (m *Manager) moveTmpToOutput(tmpDir string) ([]string, error) {
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var moved []string
 	for _, e := range entries {
 		src := filepath.Join(tmpDir, e.Name())
 		dst := filepath.Join(m.OutputDir, e.Name())
@@ -1367,12 +1379,13 @@ func (m *Manager) moveTmpToOutput(tmpDir string) error {
 
 		if err := os.Rename(src, dst); err != nil {
 			if cpErr := copyDir(src, dst); cpErr != nil {
-				return fmt.Errorf("move %s: %w", e.Name(), cpErr)
+				return moved, fmt.Errorf("move %s: %w", e.Name(), cpErr)
 			}
 			os.RemoveAll(src)
 		}
+		moved = append(moved, e.Name())
 	}
-	return nil
+	return moved, nil
 }
 
 func copyDir(src, dst string) error {

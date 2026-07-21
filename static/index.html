@@ -24,6 +24,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .file-name { flex: 1; font-family: 'SF Mono', Menlo, monospace; font-size: 0.9rem; cursor: pointer; }
 .btn-play { color: #4361ee; cursor: pointer; font-size: 0.9rem; padding: 4px 8px; border-radius: 4px; margin-left: 8px; }
 .btn-play:hover { background: #1a2a4a; color: #4cc9f0; }
+.btn-promote { color: #2a9d8f; cursor: pointer; font-size: 0.95rem; padding: 4px 7px; border-radius: 4px; margin-left: 2px; }
+.btn-promote:hover { background: #14332c; color: #4ecdc4; }
 .file-size { color: #888; font-size: 0.85rem; margin-left: 12px; }
 .file-count { color: #666; font-size: 0.8rem; margin-left: 12px; }
 
@@ -419,6 +421,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="2" selected>2-pass (accurate, default)</option>
                     <option value="1">1-pass (faster, for comparison)</option>
                 </select>
+            </div>
+            <div class="control-group" id="promote-group" style="display:none;align-self:center;padding-top:16px">
+                <label id="promote-after-label"><input type="checkbox" id="promote-after" style="width:auto;min-width:auto"> Promote after encode</label>
             </div>
             <button class="btn btn-primary" id="encode-btn" onclick="startEncode(event.altKey)" oncontextmenu="event.preventDefault(); startEncode(true); return false;" title="Click: encode checked files (skips any already fully encoded). Alt/Option+click OR right-click: force re-encode all checked files (existing outputs are kept, renamed with their last-modified date)." disabled>Start Encode</button>
             </div>
@@ -1310,7 +1315,8 @@ async function startEncode(force = false) {
         chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
         simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
-        force_reencode: force
+        force_reencode: force,
+        promote: document.getElementById('promote-after').checked
     };
 
     try {
@@ -1348,6 +1354,47 @@ async function loadOutputs() {
         renderOutputs();
     } catch (e) {
         document.getElementById('outputs-list').innerHTML = '<div class="no-files">Failed to load outputs</div>';
+    }
+}
+
+// Promote destinations (from /api/promote). Empty => promote not configured, so
+// the "promote after encode" checkbox and the per-output Promote buttons hide.
+let _promoteDests = [];
+async function loadPromoteConfig() {
+    try {
+        const res = await fetch('/api/promote');
+        if (!res.ok) return;
+        _promoteDests = (await res.json()).dests || [];
+    } catch (e) { _promoteDests = []; }
+    if (_promoteDests.length) {
+        const g = document.getElementById('promote-group');
+        if (g) g.style.display = '';
+        const lbl = document.getElementById('promote-after-label');
+        if (lbl) lbl.title = 'rsync each output to:\n' + _promoteDests.join('\n');
+    }
+    if (typeof outputDirs !== 'undefined' && outputDirs) renderOutputs();
+}
+
+// Promote one staged output to the live locations. Streams button feedback;
+// alerts a summary if any destination failed.
+async function promoteOutput(name, el) {
+    const orig = el ? el.textContent : '';
+    if (el) { el.textContent = '…'; el.style.pointerEvents = 'none'; }
+    try {
+        const res = await fetch(`/api/outputs/${encodeURIComponent(name)}/promote`, { method: 'POST' });
+        if (!res.ok) throw new Error(await res.text());
+        const results = await res.json();
+        const failed = results.filter(r => !r.ok);
+        if (el) el.textContent = failed.length ? '✗' : '✓';
+        if (failed.length) {
+            alert(`Promote ${name}: ${failed.length}/${results.length} destination(s) failed:\n\n`
+                + failed.map(r => `${r.dest}\n  ${r.error}`).join('\n\n'));
+        }
+    } catch (e) {
+        if (el) el.textContent = '✗';
+        alert('Promote failed: ' + e.message);
+    } finally {
+        if (el) setTimeout(() => { el.textContent = orig; el.style.pointerEvents = ''; }, 2500);
     }
 }
 
@@ -1404,7 +1451,10 @@ function renderOutputs() {
             <span>${renderFormatBadge(d)}</span>
             <span class="output-dir-stats">${formatSize(d.size)}</span>
             <span class="file-date">${formatDate(d.mod_time)}</span>
-            <span class="btn-play" onclick="event.stopPropagation(); playOutputMaster('${escapeAttr(d.name)}')" title="Play">&#9654;</span>
+            <span>
+                <span class="btn-play" onclick="event.stopPropagation(); playOutputMaster('${escapeAttr(d.name)}')" title="Play">&#9654;</span>
+                ${_promoteDests.length ? `<span class="btn-promote" onclick="event.stopPropagation(); promoteOutput('${escapeAttr(d.name)}', this)" title="Promote to ${_promoteDests.length} live location(s)">&#8681;</span>` : ''}
+            </span>
         </div>
     `).join('');
 }
@@ -2907,7 +2957,8 @@ async function forceReencode(fileName) {
         chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
         simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
-        force_reencode: true
+        force_reencode: true,
+        promote: document.getElementById('promote-after').checked
     };
 
     const result = await showDialog(
@@ -3134,6 +3185,7 @@ startAwsAutoRefresh();
 loadVersion();
 loadLadders();
 loadSettings();
+loadPromoteConfig();
 
 function _renderWatcher(enabled) {
     const cb = document.getElementById('watcher-enabled');

@@ -15,6 +15,15 @@ PORT ?= 8080
 VERSION := $(shell cat VERSION 2>/dev/null || echo dev)
 GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
+# Promote (staging -> live rsync). All optional; no-ops when unset.
+#  - PROMOTE_LOCAL_DIR: host dir mounted at /media/promote-local (a local dest;
+#    reference /media/promote-local in PROMOTE_DESTS).
+#  - PROMOTE_SSH_HOST: a *.local remote resolved here via mDNS and --add-host'd
+#    into the container, since Docker can't resolve .local names itself.
+PROMOTE_MOUNT := $(if $(PROMOTE_LOCAL_DIR),-v $(PROMOTE_LOCAL_DIR):/media/promote-local,)
+PROMOTE_SSH_IP := $(if $(PROMOTE_SSH_HOST),$(shell dscacheutil -q host -a name $(PROMOTE_SSH_HOST) 2>/dev/null | awk '/^ip_address:/{print $$2; exit}'),)
+PROMOTE_ADDHOST := $(if $(PROMOTE_SSH_IP),--add-host $(PROMOTE_SSH_HOST):$(PROMOTE_SSH_IP),)
+
 # GHCR publishing
 GHCR_IMAGE ?= ghcr.io/jonathaneoliver/encoder
 GHCR_USERNAME ?= jonathaneoliver
@@ -45,6 +54,10 @@ run: require-paths build
 		-v $(TMP_DIR):/media/tmp \
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		-v $(HOME)/.aws:/root/.aws:ro \
+		-v $(HOME)/.ssh:/root/.ssh:ro \
+		$(PROMOTE_MOUNT) \
+		$(PROMOTE_ADDHOST) \
+		-e PROMOTE_DESTS=$(PROMOTE_DESTS) \
 		-e SOURCE_DIR=/media/originals \
 		-e OUTPUT_DIR=/media/dynamic_content \
 		-e TMP_DIR=/media/tmp \

@@ -49,6 +49,8 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/outputs/{name}/playlists", s.listPlaylists)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/ladder", s.ladder)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/logs", s.outputLogs)
+	s.Mux.HandleFunc("POST /api/outputs/{name}/promote", s.promoteOutput)
+	s.Mux.HandleFunc("GET /api/promote", s.getPromote)
 	s.Mux.HandleFunc("POST /api/encode", s.startEncode)
 	s.Mux.HandleFunc("GET /api/jobs", s.listJobs)
 	s.Mux.HandleFunc("GET /api/jobs/{id}/logs", s.jobLogs)
@@ -456,6 +458,24 @@ func (s *Server) deleteLadder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, s.Manager.Ladders.List())
+}
+
+// getPromote reports the configured promote destinations so the UI can show/hide
+// the Promote button + "promote after encode" checkbox and label them.
+func (s *Server) getPromote(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{"dests": encode.PromoteDests()})
+}
+
+// promoteOutput rsyncs one staged output to every configured destination and
+// returns the per-destination results (200 with a mix of ok/failed dests; 400
+// only when nothing could run — bad name or no PROMOTE_DESTS).
+func (s *Server) promoteOutput(w http.ResponseWriter, r *http.Request) {
+	results, err := s.Manager.Promote(r.PathValue("name"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, results)
 }
 
 func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {

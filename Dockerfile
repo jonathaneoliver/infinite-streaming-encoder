@@ -28,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         fonts-dejavu-core \
         unzip \
+        rsync openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # AWS CLI v2 (multi-arch; official installer).
