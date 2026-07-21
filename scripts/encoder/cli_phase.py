@@ -45,6 +45,7 @@ from encoder.ffprobe import probe
 from encoder.hls import (
     TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls,
 )
+from encoder.manifests import write_fragmented_mpd
 from encoder.ladder import (
     BUFSIZE_MULTIPLIER, DEFAULT_MAXRATE_PERCENT, Rung, burnin_for_height,
     label_res_name,
@@ -667,6 +668,8 @@ def phase_byteranges(args: argparse.Namespace) -> int:
 
     emit_stage(f"fragments:{args.codec}", "running", 0.0)
     generate_byteranges_sidecars(pkg_dir)
+    # Self-contained DASH: expand fragment byte-ranges into manifest_fragmented.mpd
+    write_fragmented_mpd(pkg_dir)
     emit_stage(f"fragments:{args.codec}", "done", 100.0)
 
     _upload_dir(pkg_dir, args.s3_out.rstrip("/") + f"/{stem}")
@@ -792,6 +795,8 @@ def phase_package_all(args: argparse.Namespace) -> int:
     # Byteranges BEFORE HLS — the playlists embed the fragment byte ranges.
     emit_stage(f"fragments:{args.codec}", "running", 0.0)
     generate_byteranges_sidecars(pkg_dir)
+    # Self-contained DASH: expand fragment byte-ranges into manifest_fragmented.mpd
+    write_fragmented_mpd(pkg_dir)
     emit_stage(f"fragments:{args.codec}", "done", 100.0)
 
     emit_stage(f"hls:{args.codec}", "running", 0.0)

@@ -34,6 +34,7 @@ from encoder.ffprobe import ProbeError, probe
 from encoder.hls import (
     TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls, generate_ts_hls,
 )
+from encoder.manifests import write_fragmented_mpd
 from encoder.ladder import (
     Rung, get_ladder, label_height, ladder_bufsize_multiplier,
     ladder_maxrate_percent, parse_bitrate_override, select_rungs,
@@ -382,6 +383,7 @@ def run_full(args: argparse.Namespace) -> int:
                 print(f"[phase 6] fragment sidecars for {codec}...", flush=True)
                 emit_stage(f"fragments:{codec}", "running", 0.0)
                 count = generate_byteranges_sidecars(pkg_dir)
+                write_fragmented_mpd(pkg_dir)
                 emit_stage(f"fragments:{codec}", "done", 100.0)
                 print(f"[phase 6] wrote {count} byteranges sidecars", flush=True)
 
@@ -543,6 +545,8 @@ def run_resume(args: argparse.Namespace) -> int:
 
         if want_fmp4:
             generate_byteranges_sidecars(pkg_dir)
+            # Self-contained DASH: expand fragment byte-ranges into manifest_fragmented.mpd
+            write_fragmented_mpd(pkg_dir)
             generate_fmp4_hls(pkg_dir)
 
         if want_ts:
