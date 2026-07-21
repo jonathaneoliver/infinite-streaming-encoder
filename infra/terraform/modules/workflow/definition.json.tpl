@@ -20,7 +20,7 @@
         "JobQueue": "${job_queue_arn}",
         "JobDefinition": "${mezzanine_def}",
         "ShareIdentifier": "encode",
-        "SchedulingPriorityOverride": 99,
+        "SchedulingPriorityOverride.$": "$.prio_mezz",
         "Parameters": {
           "s3_in.$": "$.s3_input",
           "s3_out.$": "$.s3_mezz"
@@ -67,7 +67,7 @@
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${audio_def}",
                 "ShareIdentifier": "encode",
-                "SchedulingPriorityOverride": 55,
+                "SchedulingPriorityOverride.$": "$.prio_audio",
                 "Parameters": {
                   "s3_mezz.$": "$.s3_mezz",
                   "s3_out.$": "$.s3_prefix"
@@ -255,7 +255,7 @@
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${package_all_def}",
                 "ShareIdentifier": "encode",
-                "SchedulingPriorityOverride": 45,
+                "SchedulingPriorityOverride.$": "$.prio_pkg",
                 "Parameters": {
                   "codec": "h264",
                   "s3_variants.$": "$.s3_prefix",
@@ -289,7 +289,7 @@
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${package_all_def}",
                 "ShareIdentifier": "encode",
-                "SchedulingPriorityOverride": 45,
+                "SchedulingPriorityOverride.$": "$.prio_pkg",
                 "Parameters": {
                   "codec": "hevc",
                   "s3_variants.$": "$.s3_prefix",
@@ -323,7 +323,7 @@
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${package_all_def}",
                 "ShareIdentifier": "encode",
-                "SchedulingPriorityOverride": 45,
+                "SchedulingPriorityOverride.$": "$.prio_pkg",
                 "Parameters": {
                   "codec": "av1",
                   "s3_variants.$": "$.s3_prefix",

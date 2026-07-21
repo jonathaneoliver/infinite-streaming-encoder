@@ -898,6 +898,33 @@ func (m *Manager) ActiveCloudJobs() int {
 	return n
 }
 
+// jobPriorityBase returns the SchedulingPriority band for a cloud job so EARLIER
+// jobs in the queue outrank LATER ones on the shared Batch fleet: the oldest
+// active job's phases all sit above the next job's, so a later job only gets
+// capacity the earlier one can't use (its tail — or spare capacity on a big
+// fleet). Bands are 1000 apart (oldest active job: 9000, next: 8000, …), with
+// the within-job variant/phase priority (0-999) riding inside. Job IDs are
+// ascending timestamps, so a smaller ID is older.
+func (m *Manager) jobPriorityBase(job *Job) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	older := 0
+	for _, j := range m.jobs {
+		if j == job {
+			continue
+		}
+		if (j.Status == StatusQueued || j.Status == StatusRunning) &&
+			(j.Config.Target == TargetCloud || j.Config.Target == TargetCloudBatch) &&
+			j.ID < job.ID {
+			older++
+		}
+	}
+	if older > 8 {
+		older = 8
+	}
+	return 9000 - older*1000
+}
+
 func (m *Manager) GetJob(id string) *Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1847,7 +1874,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		if srcWidth > 0 {
 			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
 		}
-		inputJSON := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, srcWidth, durationS, job.Config.ChunkDuration, job.AppendLog)
+		inputJSON := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, srcWidth, durationS, job.Config.ChunkDuration, m.jobPriorityBase(job), job.AppendLog)
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 			return fmt.Errorf("write input json: %w", err)
@@ -2095,9 +2122,23 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached bool, sourceWidth int, clipDurationS float64, chunkCfg string, logf func(string)) string {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached bool, sourceWidth int, clipDurationS float64, chunkCfg string, priorityBase int, logf func(string)) string {
 	if ladderName == "" {
 		ladderName = "apple-uniq-live"
+	}
+	// Every Batch SchedulingPriorityOverride for this job rides inside a 1000-wide
+	// band (priorityBase): an EARLIER queued job gets a higher band, so ALL its
+	// phases (mezzanine/audio/chunks/package) outrank a later job's — the later
+	// job only gets fleet capacity the earlier one can't use (its tail, or spare
+	// capacity on a big fleet). Within-job priority (0-999) rides inside the band.
+	clampPrio := func(v int) int {
+		if v < 1 {
+			return 1
+		}
+		if v > 9999 {
+			return 9999
+		}
+		return v
 	}
 	// Ladder-level VBV, defaulted to match ladder.py (124% / 0.25×).
 	ladderDef, _ := store.Get(ladderName)
@@ -2142,6 +2183,12 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			// all fold into the speed model, so 1080p sorts ahead of 1044p and
 			// 4K HEVC 2-pass far ahead of any H.264, self-correcting as learned.
 			prio := predictedPriority(speeds, c, r.Height, twoPass, clipDurationS)
+			// Compress the within-job priority to 0-999 (order preserved; very slow
+			// variants tie at the top) and lift it into this job's band.
+			if prio > 999 {
+				prio = 999
+			}
+			prio = clampPrio(priorityBase + prio)
 			// Per-variant chunking: size this variant's chunks (dynamic by
 			// complexity, or the job's fixed/whole config), then enumerate them.
 			cs := variantChunkSeconds(chunkCfg, clipDurationS, speeds, c, r.Height, twoPass)
@@ -2200,6 +2247,12 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		// so a custom ladder's VBV is honored in the cloud, not just locally.
 		"maxrate_percent":    strconv.Itoa(maxratePct),
 		"bufsize_multiplier": strconv.FormatFloat(bufMult, 'f', -1, 64),
+		// Banded priorities for the fixed phases (chunks carry their own banded
+		// priority per variant). Keeps a job's whole pipeline in one band so an
+		// earlier job's package isn't starved by a later job's chunks.
+		"prio_mezz":  clampPrio(priorityBase + 99),
+		"prio_audio": clampPrio(priorityBase + 55),
+		"prio_pkg":   clampPrio(priorityBase + 45),
 		// NOTE: two_pass + chunk_* are per-variant now (see the variant struct),
 		// not top-level — variants differ in codec/pass AND chunk length.
 	}
