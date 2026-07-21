@@ -154,8 +154,18 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 	if cfg.Codec == "" {
 		cfg.Codec = "both"
 	}
-	job := s.Manager.Submit(cfg)
-	writeJSON(w, job)
+	// One job per file: each selected file becomes its own independent job, so
+	// they run concurrently (up to MAX_CONCURRENT), each with its own log,
+	// history, cancel and retry — instead of a single batched job that processes
+	// the files strictly sequentially. Returns the list of created jobs (the UI
+	// tracks them via the SSE stream, so it doesn't depend on this body).
+	jobs := make([]*encode.Job, 0, len(cfg.Files))
+	for _, f := range cfg.Files {
+		c := cfg
+		c.Files = []string{f}
+		jobs = append(jobs, s.Manager.Submit(c))
+	}
+	writeJSON(w, jobs)
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
