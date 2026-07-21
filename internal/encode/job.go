@@ -3,6 +3,8 @@ package encode
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -27,22 +29,6 @@ const defaultChunkDurationSeconds = 30.0
 // to a single chunk, and it still passes chunking.py's "multiple of segment"
 // validation. 86400 = 24h = 14400 x 6.
 const wholeVariantChunkSeconds = 86400.0
-
-// chunkDurationSeconds resolves the configured chunk size. Empty => default
-// 30s; "whole"/"0" => one chunk per variant; otherwise the parsed seconds.
-func (c JobConfig) chunkDurationSeconds() float64 {
-	switch c.ChunkDuration {
-	case "":
-		return defaultChunkDurationSeconds
-	case "whole", "0":
-		return wholeVariantChunkSeconds
-	default:
-		if v, err := strconv.ParseFloat(c.ChunkDuration, 64); err == nil && v > 0 {
-			return v
-		}
-		return defaultChunkDurationSeconds
-	}
-}
 
 // chunkCountForDuration mirrors chunking.chunk_count: ceil(dur/chunk), min 1.
 func chunkCountForDuration(durationS, chunkS float64) int {
@@ -99,6 +85,10 @@ func stripANSI(s string) string {
 var (
 	planMarkerRe  = regexp.MustCompile(`^\[\[ENCODER-PLAN (.+)\]\]$`)
 	stageMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=([0-9.]+)\]\]$`)
+	// ENCODER-HOST reports the machine (EC2 instance-id, or a stable ARN slug)
+	// a stage's Batch job landed on — used to colour the chunk plot by instance
+	// so co-located heavy chunks are visible. Emitted once per (stage, instance).
+	hostMarkerRe = regexp.MustCompile(`^\[\[ENCODER-HOST key=(\S+) instance=(\S+)\]\]$`)
 	// Cloud cli_cloud.py prints its computed S3 job id in the plan
 	// header (`  job_id:         20260420T203910Z-1`). That's the prefix
 	// under `s3://.../jobs/` — we capture it so the retry endpoint can
@@ -116,7 +106,42 @@ var (
 	// AMI) to flag whether the image was already resident — a definitive
 	// "AMI cache hit" signal for the UI, independent of timing.
 	bootMarkerRe = regexp.MustCompile(`^\[\[ENCODER-BOOT ami=(\S+)\]\]$`)
+	// ENCODER-SPEED reports a completed encode's content-seconds vs wall-seconds
+	// so the control plane can learn each (codec, height, pass)'s speed for the
+	// dynamic chunk selector. Consumed by Manager.learnSpeed (not per-job).
+	speedMarkerRe = regexp.MustCompile(`^\[\[ENCODER-SPEED codec=(\S+) height=(\d+) two_pass=([01]) content_s=([0-9.]+) encode_s=([0-9.]+)\]\]$`)
+	// ENCODER-RECLAIM reports one encode chunk's spot-reclaim accounting:
+	// count (# reclaimed attempts), lost_s (encode wall-time thrown away), and
+	// total_s (all attempts' wall-time = the "total encoded" denominator).
+	// Emitted per chunk (even zero-reclaim) so the job's %-wasted ratio is
+	// exact. Per-stage values are cumulative; the Job max-merges them.
+	reclaimMarkerRe = regexp.MustCompile(`^\[\[ENCODER-RECLAIM key=(\S+) count=(\d+) lost_s=([0-9.]+) total_s=([0-9.]+)\]\]$`)
+	// ENCODER-COST reports one execution's spot-vs-on-demand cost + savings at
+	// job end. Keyed by exec so a reattach that re-emits is idempotent (the Job
+	// sums per-exec, last value wins). Drives "saved by using spot".
+	costMarkerRe = regexp.MustCompile(`^\[\[ENCODER-COST exec=(\S+) spot_usd=([0-9.]+) ondemand_usd=([0-9.]+) saved_usd=([0-9.]+) vcpu_hours=([0-9.]+)\]\]$`)
+	// ENCODER-STATS reports one execution's run-efficiency stats at job end
+	// (encode wall span, total vCPU-hours, the slowest single chunk = makespan
+	// floor, job count, and the compute-env max vCPUs). The Job derives avg
+	// concurrency + efficiency from these. Keyed by exec for idempotent reattach.
+	statsMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STATS exec=(\S+) wall_s=([0-9.]+) vcpu_h=([0-9.]+) longest_s=([0-9.]+) slowest=(\S+) jobs=(\d+) max_vcpus=(\d+)\]\]$`)
 )
+
+// learnSpeed folds an ENCODER-SPEED marker into the learned-speed model. Returns
+// true when the line was such a marker (so the caller skips logging it).
+func (m *Manager) learnSpeed(line string) bool {
+	sm := speedMarkerRe.FindStringSubmatch(line)
+	if sm == nil {
+		return false
+	}
+	height, _ := strconv.Atoi(sm[2])
+	contentS, _ := strconv.ParseFloat(sm[4], 64)
+	encodeS, _ := strconv.ParseFloat(sm[5], 64)
+	if m.Speeds != nil {
+		m.Speeds.Update(sm[1], height, sm[3] == "1", contentS, encodeS)
+	}
+	return true
+}
 
 // upsertStage sets (or creates) a stage by key with the given label, status and
 // percent, stamping StartedAt/EndedAt on transitions. For Go-side stages (the
@@ -288,6 +313,18 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Unlock()
 		return true
 	}
+	if m := hostMarkerRe.FindStringSubmatch(line); m != nil {
+		key, inst := m[1], m[2]
+		j.mu.Lock()
+		for i := range j.Stages {
+			if j.Stages[i].Key == key {
+				j.Stages[i].Instance = inst
+				break
+			}
+		}
+		j.mu.Unlock()
+		return true
+	}
 	if m := fileMarkerRe.FindStringSubmatch(line); m != nil {
 		idx, _ := strconv.Atoi(m[1])
 		total, _ := strconv.Atoi(m[2])
@@ -304,6 +341,37 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Unlock()
 		return true
 	}
+	if m := reclaimMarkerRe.FindStringSubmatch(line); m != nil {
+		count, _ := strconv.ParseFloat(m[2], 64)
+		lost, _ := strconv.ParseFloat(m[3], 64)
+		total, _ := strconv.ParseFloat(m[4], 64)
+		j.recordReclaim(m[1], count, lost, total)
+		return true
+	}
+	if m := costMarkerRe.FindStringSubmatch(line); m != nil {
+		spot, _ := strconv.ParseFloat(m[2], 64)
+		ondemand, _ := strconv.ParseFloat(m[3], 64)
+		saved, _ := strconv.ParseFloat(m[4], 64)
+		vh, _ := strconv.ParseFloat(m[5], 64)
+		j.recordCost(m[1], spot, ondemand, saved, vh)
+		return true
+	}
+	if m := statsMarkerRe.FindStringSubmatch(line); m != nil {
+		wall, _ := strconv.ParseFloat(m[2], 64)
+		vcpuH, _ := strconv.ParseFloat(m[3], 64)
+		longest, _ := strconv.ParseFloat(m[4], 64)
+		jobs, _ := strconv.Atoi(m[6])
+		maxV, _ := strconv.Atoi(m[7])
+		slowest := m[5]
+		if slowest == "-" { // driver's "no slowest" sentinel
+			slowest = ""
+		}
+		j.recordRunStats(m[1], runStat{
+			wallS: wall, vcpuH: vcpuH, slowestS: longest,
+			slowest: slowest, jobs: jobs, maxVcpus: maxV,
+		})
+		return true
+	}
 	// Non-consuming matches: capture sideband info but still let the
 	// line flow into the raw log buffer (return false).
 	if m := cloudJobIDRe.FindStringSubmatch(line); m != nil {
@@ -317,6 +385,97 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Unlock()
 	}
 	return false
+}
+
+// recordReclaim folds one chunk's ENCODER-RECLAIM accounting into the job.
+// Per-stage [count, lost_s, total_s] is cumulative and can arrive twice (the
+// live poll while running + the final on completion), so max-merge per stage,
+// then re-sum the job totals. WastePct = ReclaimLostS/EncodeTotalS.
+func (j *Job) recordReclaim(key string, count, lost, total float64) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.reclaimByStage == nil {
+		j.reclaimByStage = map[string][3]float64{}
+	}
+	cur := j.reclaimByStage[key]
+	if count > cur[0] {
+		cur[0] = count
+	}
+	if lost > cur[1] {
+		cur[1] = lost
+	}
+	if total > cur[2] {
+		cur[2] = total
+	}
+	j.reclaimByStage[key] = cur
+	var c, l, t float64
+	for _, v := range j.reclaimByStage {
+		c += v[0]
+		l += v[1]
+		t += v[2]
+	}
+	j.ReclaimCount, j.ReclaimLostS, j.EncodeTotalS = int(c), l, t
+}
+
+// recordCost folds one execution's ENCODER-COST into the job. Keyed by exec so
+// a reattach re-emitting is idempotent; job totals sum across files/executions.
+// runStat is one execution's efficiency stats from ENCODER-STATS.
+type runStat struct {
+	wallS, vcpuH, slowestS float64
+	slowest                string
+	jobs, maxVcpus         int
+}
+
+// recordRunStats folds one execution's ENCODER-STATS into the job. Multi-file
+// jobs run one execution per file (sequentially), so wall/vCPU-hours/jobs SUM,
+// the slowest chunk is the MAX across files, and max-vCPUs is the last seen;
+// concurrency + efficiency are recomputed from the summed totals. Keyed by exec
+// so a reattach that re-emits the marker overwrites rather than double-counts.
+func (j *Job) recordRunStats(exec string, s runStat) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.statsByExec == nil {
+		j.statsByExec = map[string]runStat{}
+	}
+	j.statsByExec[exec] = s
+	var wall, vcpuH, slowestS float64
+	var jobs, maxV int
+	var slowest string
+	for _, v := range j.statsByExec {
+		wall += v.wallS
+		vcpuH += v.vcpuH
+		jobs += v.jobs
+		if v.maxVcpus > 0 {
+			maxV = v.maxVcpus
+		}
+		if v.slowestS > slowestS {
+			slowestS, slowest = v.slowestS, v.slowest
+		}
+	}
+	j.EncodeWallS, j.CPUVcpuH, j.JobCount, j.MaxVcpus = wall, vcpuH, jobs, maxV
+	j.SlowestJob, j.SlowestJobS = slowest, slowestS
+	if wall > 0 {
+		j.AvgConcurrency = vcpuH * 3600.0 / wall
+		if maxV > 0 {
+			j.EfficiencyPct = j.AvgConcurrency / float64(maxV) * 100.0
+		}
+	}
+}
+
+func (j *Job) recordCost(exec string, spot, ondemand, saved, vcpuH float64) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.costByExec == nil {
+		j.costByExec = map[string][4]float64{}
+	}
+	j.costByExec[exec] = [4]float64{spot, ondemand, saved, vcpuH}
+	var s, o, sv float64
+	for _, v := range j.costByExec {
+		s += v[0]
+		o += v[1]
+		sv += v[2]
+	}
+	j.SpotUSD, j.OnDemandUSD, j.SavedUSD = s, o, sv
 }
 
 // startFile archives the current Stages (so end-of-job timing can still
@@ -393,16 +552,21 @@ type JobConfig struct {
 	Time            string `json:"time"`
 	SegmentDuration string `json:"segment_duration"`
 	PartialDuration string `json:"partial_duration"`
-	// ChunkDuration tunes the cloud-batch encode granularity: "" = 30s
-	// chunks (max parallelism), "whole" = one job per variant (max
-	// efficiency, less fleet overhead), or a seconds value (multiple of the
-	// 6s segment duration). Only affects the cloud-batch target.
+	// ChunkDuration tunes the cloud-batch encode granularity: "" or "dynamic"
+	// = size each variant's chunks by learned encode speed (slow → 30s floor,
+	// cheap → whole clip, so all variants finish ~together); "whole" = one job
+	// per variant (max efficiency, no joins); or a fixed seconds value
+	// (multiple of the 6s segment duration). Only affects the cloud-batch target.
 	ChunkDuration string `json:"chunk_duration,omitempty"`
 	GopDuration   string `json:"gop_duration"`
 	HlsFormat     string `json:"hls_format"`
 	Padding       string `json:"padding"`
 	KeepMezzanine bool   `json:"keep_mezzanine"`
 	ForceReencode bool   `json:"force_reencode"`
+	// PromoteAfter rsyncs each produced output to the configured PROMOTE_DESTS
+	// (local + remote live libraries) once the encode succeeds and moves to
+	// OUTPUT_DIR — the automatic version of the per-output Promote button.
+	PromoteAfter bool `json:"promote,omitempty"`
 	// HevcSinglePass forces HEVC to encode single-pass. Two-pass is a codec
 	// property, applied automatically: HEVC (libx265) is two-pass by default
 	// (the accurate-average path — its single-pass VBR drifts below target),
@@ -439,6 +603,10 @@ type StageProgress struct {
 	Label   string  `json:"label"`
 	Status  string  `json:"status"` // pending | running | done | failed
 	Percent float64 `json:"percent"`
+	// Instance is the machine (EC2 instance-id, or a stable ARN slug) this
+	// stage's Batch job ran on — set from ENCODER-HOST, used by the UI to
+	// colour the chunk plot by instance. Empty until the job is placed.
+	Instance string `json:"instance,omitempty"`
 	// Timestamps of state transitions. StartedAt is set the first time
 	// the stage sees `status=running`; EndedAt is set when it reaches
 	// a terminal state (done|failed). Used to build the end-of-job
@@ -453,8 +621,13 @@ type Job struct {
 	Status    JobStatus  `json:"status"`
 	StartedAt time.Time  `json:"started_at"`
 	EndedAt   *time.Time `json:"ended_at,omitempty"`
-	Progress  string     `json:"progress"`
-	Error     string     `json:"error,omitempty"`
+	// FanOutAt is stamped when the cloud-batch execution first submits its encode
+	// jobs (fan-out) — i.e. when actual encoding starts, after upload + mezzanine.
+	// Lets timing anchor on encode start rather than submit (which includes the
+	// upload + queue wait).
+	FanOutAt *time.Time `json:"fan_out_at,omitempty"`
+	Progress string     `json:"progress"`
+	Error    string     `json:"error,omitempty"`
 
 	// BootAMI is the AMI a cloud worker's instance actually booted from
 	// (from the [[ENCODER-BOOT]] marker); PrebakedAMI is true when that
@@ -462,6 +635,42 @@ type Job struct {
 	// and the ECR pull was skipped. Drives the "pre-baked AMI" UI badge.
 	BootAMI     string `json:"boot_ami,omitempty"`
 	PrebakedAMI bool   `json:"prebaked_ami,omitempty"`
+
+	// Spot-reclaim accounting for this file's encode (from ENCODER-RECLAIM).
+	// ReclaimCount = chunks reclaimed; ReclaimLostS = encode wall-seconds thrown
+	// away; EncodeTotalS = all encode wall-seconds. The UI shows the waste ratio
+	// ReclaimLostS/EncodeTotalS — how much of the encoding a spot reclaim cost.
+	ReclaimCount int     `json:"reclaim_count,omitempty"`
+	ReclaimLostS float64 `json:"reclaim_lost_s,omitempty"`
+	EncodeTotalS float64 `json:"encode_total_s,omitempty"`
+	// per-stage cumulative [count, lost_s, total_s], max-merged; not serialized.
+	reclaimByStage map[string][3]float64
+
+	// Spot-vs-on-demand cost (from ENCODER-COST). SpotUSD is what this job cost
+	// on the spot fleet; SavedUSD = OnDemandUSD - SpotUSD (what spot avoided).
+	SpotUSD     float64 `json:"spot_usd,omitempty"`
+	OnDemandUSD float64 `json:"ondemand_usd,omitempty"`
+	SavedUSD    float64 `json:"saved_usd,omitempty"`
+	// per-execution [spot, ondemand, saved, vcpu_h], summed across files; not serialized.
+	costByExec map[string][4]float64
+
+	// Run efficiency stats (from ENCODER-STATS, computed by the driver from Batch
+	// at job end). EncodeWallS = the Batch encode span (denominator for
+	// concurrency, distinct from the end-to-end job wall which includes upload +
+	// sync); CPUVcpuH = total vCPU-hours of compute; AvgConcurrency = vCPU-hours ÷
+	// encode-wall-hours (avg vCPUs kept busy); EfficiencyPct = AvgConcurrency ÷
+	// max vCPUs (how well the fleet ceiling was used); SlowestJob/SlowestJobS =
+	// the single longest chunk (the makespan floor); JobCount = Batch jobs.
+	EncodeWallS    float64 `json:"encode_wall_s,omitempty"`
+	CPUVcpuH       float64 `json:"cpu_vcpu_h,omitempty"`
+	AvgConcurrency float64 `json:"avg_concurrency,omitempty"`
+	EfficiencyPct  float64 `json:"efficiency_pct,omitempty"`
+	SlowestJob     string  `json:"slowest_job,omitempty"`
+	SlowestJobS    float64 `json:"slowest_job_s,omitempty"`
+	JobCount       int     `json:"job_count,omitempty"`
+	MaxVcpus       int     `json:"max_vcpus,omitempty"`
+	// per-execution stats, summed/maxed across files; not serialized.
+	statsByExec map[string]runStat
 
 	// Stages is populated from [[ENCODER-PLAN]] + [[ENCODER-STAGE]]
 	// markers the Python orchestrator emits. Empty when the job hasn't
@@ -582,12 +791,22 @@ type Manager struct {
 	// $TmpDir/ladders.json; resolves the concrete rungs for the cloud path.
 	Ladders *LadderStore
 
+	// Speeds learns per-variant encode speed (content/wall) from completed
+	// encodes ($TmpDir/encode_speeds.json); the dynamic chunk selector uses it.
+	Speeds *EncodeSpeedStore
+
 	// Persisted global settings (e.g. watcher on/off) owned at
 	// $TmpDir/settings.json. Survives restarts so a UI toggle sticks.
 	settingsMu sync.Mutex
 	settings   Settings
 
-	sem         chan struct{}
+	sem chan struct{}
+	// launchGate (size 1) serializes the cloud-batch launch → fan-out phase across
+	// jobs: a job holds it from start-execution until its encodes are submitted,
+	// so an earlier job floods the queue with its higher-priority chunks before a
+	// later job's execution starts. Batch never preempts, so a later job that
+	// fanned out first would keep the vCPUs it grabbed regardless of priority.
+	launchGate  chan struct{}
 	subscribers []chan *Job
 	subMu       sync.Mutex
 }
@@ -617,6 +836,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 	os.MkdirAll(cfg.TmpDir, 0755)
 	return &Manager{
 		Ladders:         LoadLadderStore(filepath.Join(cfg.TmpDir, "ladders.json")),
+		Speeds:          LoadEncodeSpeedStore(filepath.Join(cfg.TmpDir, "encode_speeds.json")),
 		SourceDir:       cfg.SourceDir,
 		OutputDir:       cfg.OutputDir,
 		TmpDir:          cfg.TmpDir,
@@ -629,6 +849,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		EncoderImage:    cfg.EncoderImage,
 		StateMachineArn: cfg.StateMachineArn,
 		sem:             make(chan struct{}, cfg.MaxConcurrent),
+		launchGate:      make(chan struct{}, 1),
 	}
 }
 
@@ -669,6 +890,62 @@ func (m *Manager) Jobs() []*Job {
 	out := make([]*Job, len(m.jobs))
 	copy(out, m.jobs)
 	return out
+}
+
+// ActiveCloudJobs counts submitted cloud jobs still queued or running — the
+// app's own job queue. The awswatch keep-warm loop uses this so a box is held
+// across the gap BETWEEN sequential jobs (one finishing before the next's AWS
+// resources appear), not only while a single job's Batch work is live — so the
+// next job in the queue doesn't cold-start.
+func (m *Manager) ActiveCloudJobs() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, j := range m.jobs {
+		if (j.Status == StatusQueued || j.Status == StatusRunning) &&
+			(j.Config.Target == TargetCloud || j.Config.Target == TargetCloudBatch) {
+			n++
+		}
+	}
+	return n
+}
+
+// jobPriorityBase returns the SchedulingPriority band for a cloud job so EARLIER
+// jobs in the queue outrank LATER ones on the shared Batch fleet: the oldest
+// active job's phases all sit above the next job's, so a later job only gets
+// capacity the earlier one can't use (its tail — or spare capacity on a big
+// fleet). Bands are 1000 apart (oldest active job: 9000, next: 8000, …), with
+// the within-job variant/phase priority (0-999) riding inside. Job IDs are
+// ascending timestamps, so a smaller ID is older.
+// markFanOut stamps FanOutAt once, the first time this job's execution submits
+// encode jobs. Idempotent across reattaches / multiple detections.
+func (j *Job) markFanOut() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.FanOutAt == nil {
+		now := time.Now()
+		j.FanOutAt = &now
+	}
+}
+
+func (m *Manager) jobPriorityBase(job *Job) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	older := 0
+	for _, j := range m.jobs {
+		if j == job {
+			continue
+		}
+		if (j.Status == StatusQueued || j.Status == StatusRunning) &&
+			(j.Config.Target == TargetCloud || j.Config.Target == TargetCloudBatch) &&
+			j.ID < job.ID {
+			older++
+		}
+	}
+	if older > 8 {
+		older = 8
+	}
+	return 9000 - older*1000
 }
 
 func (m *Manager) GetJob(id string) *Job {
@@ -749,13 +1026,17 @@ func (m *Manager) run(job *Job, startIdx int) {
 	} else {
 		job.Progress = "moving to output"
 		m.notify(job)
-		if mvErr := m.moveTmpToOutput(jobTmpDir, job.Config.ForceReencode); mvErr != nil {
+		moved, mvErr := m.moveTmpToOutput(jobTmpDir)
+		if mvErr != nil {
 			job.Status = StatusFailed
 			job.Error = "encode succeeded but move failed: " + mvErr.Error()
 			job.Progress = "failed"
 		} else {
 			job.Status = StatusDone
 			job.Progress = "complete"
+			if job.Config.PromoteAfter {
+				m.autoPromote(job, moved)
+			}
 		}
 	}
 	// On failure, preserve the job's tmp dir — it holds diagnostic
@@ -770,8 +1051,45 @@ func (m *Manager) run(job *Job, startIdx int) {
 		os.RemoveAll(jobTmpDir)
 	}
 	m.removePersistedState(job.ID)
+	m.persistSpotSample(job)
 	m.writeHistory(job)
 	m.notify(job)
+}
+
+// persistSpotSample appends this finished cloud-batch job's spot-vs-on-demand
+// cost and reclaim-waste to a rolling log in TmpDir (host-mounted, survives
+// restarts) so the AWS view can show the accumulated "saved by spot" and the
+// trailing-24h reclaim-waste %. No-op for jobs without cost/reclaim data.
+func (m *Manager) persistSpotSample(job *Job) {
+	if job.EncodeTotalS <= 0 && job.SavedUSD <= 0 {
+		return
+	}
+	type sample struct {
+		Ts          int64   `json:"ts"`
+		LostS       float64 `json:"lost_s"`
+		TotalS      float64 `json:"total_s"`
+		SpotUSD     float64 `json:"spot_usd"`
+		OnDemandUSD float64 `json:"ondemand_usd"`
+		SavedUSD    float64 `json:"saved_usd"`
+	}
+	path := filepath.Join(m.TmpDir, "spot_samples.json")
+	var samples []sample
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &samples)
+	}
+	samples = append(samples, sample{
+		Ts: time.Now().Unix(), LostS: job.ReclaimLostS, TotalS: job.EncodeTotalS,
+		SpotUSD: job.SpotUSD, OnDemandUSD: job.OnDemandUSD, SavedUSD: job.SavedUSD,
+	})
+	if len(samples) > 5000 {
+		samples = samples[len(samples)-5000:]
+	}
+	if data, err := json.MarshalIndent(samples, "", " "); err == nil {
+		tmp := path + ".tmp"
+		if os.WriteFile(tmp, data, 0644) == nil {
+			_ = os.Rename(tmp, path)
+		}
+	}
 }
 
 // preserveTmpForFailure moves jobTmpDir to $TMP_DIR/failed/<job_id>/ so the
@@ -1088,35 +1406,54 @@ func defaultVal(v, d string) string {
 	return v
 }
 
-func (m *Manager) moveTmpToOutput(tmpDir string, archive bool) error {
+// datedBackupRe matches an output dir a re-encode preserved: <name>_<YYYYMMDD>
+// or <name>_<YYYYMMDD>_<HHMMSS>. Real outputs always end in _<codec>, so this
+// never matches a live output.
+var datedBackupRe = regexp.MustCompile(`_\d{8}(_\d{6})?$`)
+
+// IsDatedBackup reports whether an output dir name is a datestamped backup left
+// behind when a re-encode replaced a prior output. The Outputs list and the
+// watcher skip these so a preserved old copy isn't treated as a live output.
+func IsDatedBackup(name string) bool {
+	return datedBackupRe.MatchString(name)
+}
+
+// moveTmpToOutput moves each top-level dir from tmpDir into OUTPUT_DIR and
+// returns the names moved (so the caller can promote them). See the collision
+// note on the in-place dated-backup behaviour.
+func (m *Manager) moveTmpToOutput(tmpDir string) ([]string, error) {
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var moved []string
 	for _, e := range entries {
 		src := filepath.Join(tmpDir, e.Name())
 		dst := filepath.Join(m.OutputDir, e.Name())
 
-		if _, statErr := os.Stat(dst); statErr == nil {
-			if archive {
-				archiveDir := filepath.Join(m.OutputDir, ".archive")
-				os.MkdirAll(archiveDir, 0755)
-				ts := time.Now().Format("20060102_150405")
-				archiveDst := filepath.Join(archiveDir, e.Name()+"_"+ts)
-				os.Rename(dst, archiveDst)
-			} else {
-				os.RemoveAll(dst)
+		if fi, statErr := os.Stat(dst); statErr == nil {
+			// Preserve the existing copy: rename it in place with the date it was
+			// last modified appended (<name>_<YYYYMMDD>), so a re-encode never
+			// destroys the prior output. A same-day re-encode disambiguates with a
+			// time suffix. These dated backups are skipped by the Outputs list and
+			// the watcher (IsDatedBackup).
+			ts := fi.ModTime().Format("20060102")
+			backup := filepath.Join(m.OutputDir, e.Name()+"_"+ts)
+			if _, err := os.Stat(backup); err == nil {
+				backup = filepath.Join(m.OutputDir, e.Name()+"_"+ts+"_"+fi.ModTime().Format("150405"))
 			}
+			os.Rename(dst, backup)
 		}
 
 		if err := os.Rename(src, dst); err != nil {
 			if cpErr := copyDir(src, dst); cpErr != nil {
-				return fmt.Errorf("move %s: %w", e.Name(), cpErr)
+				return moved, fmt.Errorf("move %s: %w", e.Name(), cpErr)
 			}
 			os.RemoveAll(src)
 		}
+		moved = append(moved, e.Name())
 	}
-	return nil
+	return moved, nil
 }
 
 func copyDir(src, dst string) error {
@@ -1460,80 +1797,114 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	// of re-uploading + re-submitting (which would orphan the old execution and
 	// duplicate the work). Only if the persisted ARN is still RUNNING/SUCCEEDED.
 	execArn := job.CloudExecArn()
+	// Serialize the launch → fan-out phase across cloud jobs (see launchGate).
+	// Held from start-execution until this job's encodes are submitted; released
+	// on the first encode stage marker in the poll loop, or on return (fallback).
+	launchHeld := false
+	releaseLaunch := func() {
+		if launchHeld {
+			launchHeld = false
+			<-m.launchGate
+		}
+	}
+	defer releaseLaunch()
+	// Encode jobs this fan-out will submit + the distinct encode stage keys seen
+	// so far; the gate releases only once every job has been submitted (fully
+	// fanned out), not on the first one. 0 on reattach (gate not held).
+	expectedEncodes := 0
+	seenEncodes := map[string]bool{}
 	if execArn != "" && m.cloudExecutionResumable(execArn) {
 		job.AppendLog("[cloud-batch] reattaching to execution " + execArn)
 		m.notify(job)
 	} else {
 
-		// Upload the clip (skip if already present via aws CLI's size check).
-		// Stream the aws-cli progress into an `upload:inputs` stage so the UI shows
-		// a live bar for the local->S3 copy — the mirror of the download:outputs
-		// bar on the sync-back. Set before the worker's PLAN arrives so it renders
-		// as the leading stage.
-		job.AppendLog(fmt.Sprintf("[cloud-batch] uploading %s → %s", filename, s3Input))
-		job.upsertStage("upload:inputs", "upload inputs", "running", 0)
-		m.notify(job)
+		// Source-keyed mezzanine: if a prior job of the SAME source already
+		// produced the mezzanine (mezz/<key>/), skip BOTH the raw upload and the
+		// mezzanine job — variants read it straight from there (one copy, no
+		// duplicate storage). This applies even under ForceReencode: the mezzanine
+		// is a stream-copy of the source, a pure function of the source file
+		// (the cache key is sha1(name|size|mtime)), independent of codec/ladder —
+		// so reusing it is always correct. ForceReencode redoes the variant
+		// OUTPUTS, not the source mezzanine. To force the mezzanine to regenerate,
+		// clear the mezz cache (source changes bump the key automatically).
 		localSrc := filepath.Join(m.SourceDir, filename)
-		upload := exec.Command("aws", "s3", "cp", localSrc, s3Input) // no --only-show-errors: we want the progress lines
-		upload.Env = os.Environ()
-		stderr, pipeErr := upload.StderrPipe()
-		if pipeErr != nil {
-			return fmt.Errorf("aws s3 cp stderr pipe: %w", pipeErr)
+		s3Mezz := s3Prefix // fallback: mezzanine stays in the job prefix
+		cacheHit := false
+		if key, ok := sourceMezzKey(localSrc); ok {
+			s3Mezz = fmt.Sprintf("s3://%s/mezz/%s", bucket, key)
+			if s3ObjectExists(s3Mezz+"/mezzanine.mp4") &&
+				s3ObjectExists(s3Mezz+"/mezzanine.mp4.done") {
+				cacheHit = true
+			}
 		}
-		if err := upload.Start(); err != nil {
-			job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
+		if cacheHit {
+			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: mezzanine cache hit — reusing %s, skipping upload + mezzanine", filename, s3Mezz))
+			job.upsertStage("upload:inputs", "upload inputs", "skipped", 100)
 			m.notify(job)
-			return fmt.Errorf("aws s3 cp start: %w", err)
 		}
-		// aws s3 cp updates its progress in place with '\r'; split on both \r and \n
-		// so intermediate updates are seen, not just the final \n-terminated line.
-		upScanner := bufio.NewScanner(stderr)
-		upScanner.Buffer(make([]byte, 64*1024), 1<<20)
-		upScanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
-			if atEOF && len(data) == 0 {
-				return 0, nil, nil
+		if !cacheHit {
+			// Upload the clip. Stream the aws-cli progress into an `upload:inputs`
+			// stage so the UI shows a live bar for the local->S3 copy — the mirror
+			// of the download:outputs bar on the sync-back.
+			job.AppendLog(fmt.Sprintf("[cloud-batch] uploading %s → %s", filename, s3Input))
+			job.upsertStage("upload:inputs", "upload inputs", "running", 0)
+			m.notify(job)
+			upload := exec.Command("aws", "s3", "cp", localSrc, s3Input) // no --only-show-errors: we want the progress lines
+			upload.Env = os.Environ()
+			stderr, pipeErr := upload.StderrPipe()
+			if pipeErr != nil {
+				return fmt.Errorf("aws s3 cp stderr pipe: %w", pipeErr)
 			}
-			if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
-				return i + 1, data[:i], nil
-			}
-			if atEOF {
-				return len(data), data, nil
-			}
-			return 0, nil, nil
-		})
-		var lastErr string
-		for upScanner.Scan() {
-			line := strings.TrimSpace(upScanner.Text())
-			if pct, ok := parseAwsCpProgress(line); ok {
-				job.upsertStage("upload:inputs", "upload inputs", "running", pct)
+			if err := upload.Start(); err != nil {
+				job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
 				m.notify(job)
-			} else if line != "" && !strings.HasPrefix(line, "Completed") {
-				lastErr = line // keep the tail of any non-progress (error) output
+				return fmt.Errorf("aws s3 cp start: %w", err)
 			}
-		}
-		if err := upload.Wait(); err != nil {
-			job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
+			// aws s3 cp updates its progress in place with '\r'; split on both \r and \n
+			// so intermediate updates are seen, not just the final \n-terminated line.
+			upScanner := bufio.NewScanner(stderr)
+			upScanner.Buffer(make([]byte, 64*1024), 1<<20)
+			upScanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+				if atEOF && len(data) == 0 {
+					return 0, nil, nil
+				}
+				if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+					return i + 1, data[:i], nil
+				}
+				if atEOF {
+					return len(data), data, nil
+				}
+				return 0, nil, nil
+			})
+			var lastErr string
+			for upScanner.Scan() {
+				line := strings.TrimSpace(upScanner.Text())
+				if pct, ok := parseAwsCpProgress(line); ok {
+					job.upsertStage("upload:inputs", "upload inputs", "running", pct)
+					m.notify(job)
+				} else if line != "" && !strings.HasPrefix(line, "Completed") {
+					lastErr = line // keep the tail of any non-progress (error) output
+				}
+			}
+			if err := upload.Wait(); err != nil {
+				job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
+				m.notify(job)
+				return fmt.Errorf("aws s3 cp: %w: %s", err, lastErr)
+			}
+			job.upsertStage("upload:inputs", "upload inputs", "done", 100)
 			m.notify(job)
-			return fmt.Errorf("aws s3 cp: %w: %s", err, lastErr)
-		}
-		job.upsertStage("upload:inputs", "upload inputs", "done", 100)
-		m.notify(job)
+		} // end if !cacheHit (upload)
 
 		// Build the state-machine input document.
-		// Probe the source duration to plan chunks. ffprobe runs in the worker
-		// image; if it's unavailable (e.g. local dev), fall back to a single
-		// whole-clip chunk so the pipeline still works.
-		chunkS := job.Config.chunkDurationSeconds()
-		nChunks := 1
-		if durationS, err := probeDurationSeconds(localSrc); err != nil {
-			job.AppendLog(fmt.Sprintf("[cloud-batch] ffprobe failed (%v); encoding %s as one chunk", err, filename))
+		// Probe the source duration so each variant can size its own chunks
+		// (buildSFNInput does the per-variant planning). ffprobe runs in the
+		// worker image; if unavailable, 0 duration collapses to whole variants.
+		durationS := 0.0
+		if d, err := probeDurationSeconds(localSrc); err != nil {
+			job.AppendLog(fmt.Sprintf("[cloud-batch] ffprobe failed (%v); encoding %s as whole variants", err, filename))
 		} else {
-			nChunks = chunkCountForDuration(durationS, chunkS)
-			grain := fmt.Sprintf("%.0fs chunks", chunkS)
-			if chunkS >= wholeVariantChunkSeconds {
-				grain = "whole variant"
-			}
-			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: %.1fs → %d chunk(s) (%s)", filename, durationS, nChunks, grain))
+			durationS = d
+			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: %.1fs — chunking mode %q (per-variant by complexity)", filename, durationS, chunkModeLabel(job.Config.ChunkDuration)))
 		}
 
 		// Probe the source width so the ladder is capped at native resolution
@@ -1542,11 +1913,19 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		if srcWidth > 0 {
 			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
 		}
-		inputJSON := buildSFNInput(m.Ladders, s3Input, s3Prefix, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, nChunks, srcWidth, chunkS)
+		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, srcWidth, durationS, job.Config.ChunkDuration, m.jobPriorityBase(job), job.AppendLog)
+		expectedEncodes = expEnc
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 			return fmt.Errorf("write input json: %w", err)
 		}
+
+		// Hold the launch gate so an earlier queued job fully fans out (floods the
+		// fleet with its higher-priority chunks) before this execution starts —
+		// Batch never preempts, so a later job that grabbed vCPUs early keeps them.
+		job.AppendLog("[cloud-batch] waiting for launch gate (earlier jobs fan out first)…")
+		m.launchGate <- struct{}{}
+		launchHeld = true
 
 		// Submit.
 		submit := exec.Command("python3", "-m", "encoder.cli_batch", "submit",
@@ -1565,10 +1944,16 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	}
 
 	// Poll + stream progress back into the job log.
+	// Download into the job tmp with the stem passed separately: the downloader
+	// lays each codec down as its own top-level <stem>_<codec>/ dir (not a shared
+	// <stem>/output_<codec>/ wrapper), so moveTmpToOutput moves each codec
+	// independently and codecs of the same clip COEXIST in OUTPUT_DIR — matching
+	// the local pipeline + the OutputStem/resolveCodec/watcher naming contract.
 	poll := exec.Command("python3", "-m", "encoder.cli_batch", "poll",
 		"--execution-arn", execArn,
 		"--s3-prefix", s3Prefix,
-		"--local-dir", filepath.Join(tmpDir, job.Config.OutputStem(filename)))
+		"--local-dir", tmpDir,
+		"--output-stem", job.Config.OutputStem(filename))
 	poll.Env = os.Environ()
 	stdout, err := poll.StdoutPipe()
 	if err != nil {
@@ -1596,10 +1981,14 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 				return
 			case <-ticker.C:
 				if job.IsCancelled() {
-					job.AppendLog("[cloud-batch] cancel requested — aborting execution")
+					job.AppendLog("[cloud-batch] cancel requested — aborting execution + terminating its Batch jobs")
 					m.notify(job)
+					// --terminate-jobs: stopping the execution alone leaves its
+					// in-flight submitJob.sync jobs running (orphaned) until they
+					// finish; terminate them so in-progress chunks stop now and
+					// the fleet frees up promptly.
 					stop := exec.Command("python3", "-m", "encoder.cloud.batch_admin",
-						"stop-execution", "--arn", execArn)
+						"stop-execution", "--arn", execArn, "--terminate-jobs")
 					stop.Env = os.Environ()
 					if o, e := stop.CombinedOutput(); e != nil {
 						job.AppendLog(fmt.Sprintf("[cloud-batch] stop-execution failed: %v: %s",
@@ -1618,6 +2007,24 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := stripANSI(scanner.Text())
+		// Track encode-job submission for the launch gate: release only once ALL
+		// expected encode jobs have been submitted (fully fanned out), so the next
+		// job's execution can't start while this one still has higher-priority
+		// jobs to submit. Batch never preempts, so a partial release would let the
+		// later job grab vCPUs this job's remaining jobs should have had.
+		if launchHeld {
+			if m := stageMarkerRe.FindStringSubmatch(line); m != nil && strings.HasPrefix(m[1], "encode:") {
+				job.markFanOut() // encode start (first job); idempotent
+				seenEncodes[m[1]] = true
+				if len(seenEncodes) >= expectedEncodes {
+					releaseLaunch()
+					job.AppendLog(fmt.Sprintf("[cloud-batch] fully fanned out (%d encode jobs) — releasing launch gate", expectedEncodes))
+				}
+			}
+		}
+		if m.learnSpeed(line) {
+			continue // telemetry for the dynamic chunk selector, not a log line
+		}
 		if !job.parseMarker(line) {
 			job.AppendLog(line)
 		}
@@ -1635,9 +2042,165 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 // buildSFNInput renders the JSON doc the state machine expects. Picks
 // which (codec, tier) combinations to fan out over based on the
 // JobConfig's Codec + MaxRes.
-func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, maxRes string, hevcSinglePass bool, nChunks, sourceWidth int, chunkS float64) string {
+// variantChunkSeconds resolves one variant's chunk length from the job's
+// ChunkDuration config: "dynamic" (also the default when unset) sizes it by
+// learned encode speed (slow → 12s floor, cheap → whole clip); "whole" → one
+// chunk; a number → that fixed size. clipS==0 (duration unknown) collapses to
+// whole downstream.
+func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, codec string, height int, twoPass bool) float64 {
+	switch cfg {
+	case "dynamic", "":
+		return dynamicChunkSeconds(speeds, codec, height, twoPass, clipS)
+	case "whole":
+		if clipS > 0 {
+			return clipS
+		}
+		return wholeVariantChunkSeconds
+	default:
+		if v, err := strconv.ParseFloat(cfg, 64); err == nil && v > 0 {
+			return v
+		}
+		return defaultChunkDurationSeconds
+	}
+}
+
+// predictedPriority ranks a variant by its predicted encode WALL time
+// (content ÷ learned-or-seeded speed) so the slowest variant gets the highest
+// Batch SchedulingPriorityOverride and enters the fleet first. Reuses the same
+// speed model as the dynamic chunk selector, so ordering sharpens as speeds are
+// learned. Clamped to Batch's [1, 9999] priority range. When the clip duration
+// is unknown (0), content falls back to 1 so variants still rank by 1/speed.
+func predictedPriority(speeds *EncodeSpeedStore, codec string, height int, twoPass bool, clipS float64) int {
+	content := clipS
+	if content <= 0 {
+		content = 1
+	}
+	p := int(math.Round(content / speeds.Speed(codec, height, twoPass)))
+	if p < 1 {
+		p = 1
+	}
+	if p > 9999 {
+		p = 9999
+	}
+	return p
+}
+
+// chunkPlanLine explains one variant's chunk-size decision for the job log:
+// how many chunks, the per-chunk length, and — for the dynamic selector — the
+// speed (learned or seeded) and target that produced it. This is what makes a
+// "why is h264 1080p one whole chunk?" question answerable from the log alone.
+func chunkPlanLine(cfg, codec, label string, height int, twoPass bool, speeds *EncodeSpeedStore, chunkS float64, count int, clipS float64) string {
+	pass := "1-pass"
+	if twoPass {
+		pass = "2-pass"
+	}
+	mode := fmt.Sprintf("%d chunks", count)
+	if count == 1 {
+		mode = "1 chunk (whole)"
+	}
+	head := fmt.Sprintf("[cloud-batch] chunk plan %s %s %s: %s — %.0fs/chunk",
+		codec, label, pass, mode, chunkS)
+	switch cfg {
+	case "dynamic", "":
+		sp, n := speeds.SpeedDetail(codec, height, twoPass)
+		src := fmt.Sprintf("seeded %.3gx", sp)
+		if n > 0 {
+			src = fmt.Sprintf("learned %.3gx (%d samples)", sp, n)
+		}
+		return fmt.Sprintf("%s [dynamic: %s realtime × %.0fs target → %.0fs, clip %.0fs, min %.0fs]",
+			head, src, dynamicTargetWallSeconds, math.Round(dynamicTargetWallSeconds*sp), clipS, dynamicMinChunkSeconds)
+	case "whole":
+		return head + " [whole]"
+	default:
+		return head + " [fixed " + cfg + "s]"
+	}
+}
+
+// chunkModeLabel is a human-readable name for a ChunkDuration config value.
+func chunkModeLabel(cfg string) string {
+	switch cfg {
+	case "dynamic", "":
+		return "dynamic"
+	case "whole":
+		return "whole"
+	default:
+		return cfg + "s"
+	}
+}
+
+// sourceMezzKey derives a stable source-identity key for the mezzanine cache
+// from the file's name + size + mtime — cheap (a stat, no reading the file).
+// Any change to those re-mezzanines. Returns false if the file can't be stat'd.
+func sourceMezzKey(path string) (string, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	sum := sha1.Sum([]byte(fmt.Sprintf("%s|%d|%d",
+		filepath.Base(path), fi.Size(), fi.ModTime().UnixNano())))
+	return hex.EncodeToString(sum[:])[:16], true
+}
+
+// s3ObjectExists reports whether an s3://bucket/key object exists (aws-cli
+// head-object; exit 0 == present). Best-effort — any error reads as absent.
+func s3ObjectExists(uri string) bool {
+	bucket, key, ok := strings.Cut(strings.TrimPrefix(uri, "s3://"), "/")
+	if !ok || bucket == "" || key == "" {
+		return false
+	}
+	cmd := exec.Command("aws", "s3api", "head-object", "--bucket", bucket, "--key", key)
+	cmd.Env = os.Environ()
+	return cmd.Run() == nil
+}
+
+// parseCodecSel turns the codec selector into the ordered codec list. It accepts
+// a comma-separated subset ("h264", "hevc,av1", "h264,hevc,av1") — the form the
+// UI's codec checkboxes emit — plus the legacy named values ("all", "both", and
+// "" → h264+hevc). Unknown tokens are ignored; an empty result falls back to
+// h264+hevc. Output is always in canonical order (h264, hevc, av1).
+func parseCodecSel(sel string) []string {
+	switch sel {
+	case "", "both":
+		return []string{"h264", "hevc"}
+	case "all":
+		return []string{"h264", "hevc", "av1"}
+	}
+	want := map[string]bool{}
+	for _, t := range strings.Split(sel, ",") {
+		switch strings.TrimSpace(t) {
+		case "h264", "hevc", "av1":
+			want[strings.TrimSpace(t)] = true
+		}
+	}
+	var out []string
+	for _, c := range []string{"h264", "hevc", "av1"} {
+		if want[c] {
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"h264", "hevc"}
+	}
+	return out
+}
+
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached bool, sourceWidth int, clipDurationS float64, chunkCfg string, priorityBase int, logf func(string)) (string, int) {
 	if ladderName == "" {
 		ladderName = "apple-uniq-live"
+	}
+	// Every Batch SchedulingPriorityOverride for this job rides inside a 1000-wide
+	// band (priorityBase): an EARLIER queued job gets a higher band, so ALL its
+	// phases (mezzanine/audio/chunks/package) outrank a later job's — the later
+	// job only gets fleet capacity the earlier one can't use (its tail, or spare
+	// capacity on a big fleet). Within-job priority (0-999) rides inside the band.
+	clampPrio := func(v int) int {
+		if v < 1 {
+			return 1
+		}
+		if v > 9999 {
+			return 9999
+		}
+		return v
 	}
 	// Ladder-level VBV, defaulted to match ladder.py (124% / 0.25×).
 	ladderDef, _ := store.Get(ladderName)
@@ -1649,19 +2212,13 @@ func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, 
 	if bufMult <= 0 {
 		bufMult = 0.25
 	}
-	codecs := []string{"h264", "hevc"}
-	switch codecSel {
-	case "h264":
-		codecs = []string{"h264"}
-	case "hevc":
-		codecs = []string{"hevc"}
-	}
+	codecs := parseCodecSel(codecSel)
 	// Build the per-codec rung list from the ladder store. resolveLadderRungs
 	// caps each codec at the source width (no upscale) and --max-res, and
 	// assigns ordinal labels for repeated resolutions — identical to
 	// ladder.select_rungs, so cloud and local agree on {codec}_{label}.
 	var variants []sfnVariant
-	doH264, doHevc := false, false
+	doH264, doHevc, doAV1 := false, false, false
 	for _, c := range codecs {
 		rungs := store.resolveRungs(ladderName, c, maxRes, sourceWidth)
 		if len(rungs) == 0 {
@@ -1672,31 +2229,53 @@ func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, 
 			doH264 = true
 		case "hevc":
 			doHevc = true
+		case "av1":
+			doAV1 = true
 		}
 		for _, r := range rungs {
 			vcpu, mem := variantResourcesFor(c, r.Height)
-			rank := resHeightRank(r.Height)
-			prio := rank * 10
 			// Two-pass is HEVC-only and automatic: H264's single-pass VBV
 			// already hits target average, so it never two-passes; HEVC
 			// two-passes by default unless the user asked for a single-pass
 			// comparison run (hevcSinglePass).
 			twoPass := c == "hevc" && !hevcSinglePass
-			if c == "hevc" {
-				prio++ // HEVC just ahead of H.264 within a resolution (slower)
+			// Priority = predicted encode WALL time (content ÷ learned speed):
+			// the slowest variant enters the fleet first. Subsumes the old
+			// resolution-tier + HEVC-bump heuristic — pixels, codec, and pass
+			// all fold into the speed model, so 1080p sorts ahead of 1044p and
+			// 4K HEVC 2-pass far ahead of any H.264, self-correcting as learned.
+			prio := predictedPriority(speeds, c, r.Height, twoPass, clipDurationS)
+			// Compress the within-job priority to 0-999 (order preserved; very slow
+			// variants tie at the top) and lift it into this job's band.
+			if prio > 999 {
+				prio = 999
+			}
+			prio = clampPrio(priorityBase + prio)
+			// Per-variant chunking: size this variant's chunks (dynamic by
+			// complexity, or the job's fixed/whole config), then enumerate them.
+			cs := variantChunkSeconds(chunkCfg, clipDurationS, speeds, c, r.Height, twoPass)
+			nc := chunkCountForDuration(clipDurationS, cs)
+			idx := make([]int, nc)
+			for k := range idx {
+				idx[k] = k
+			}
+			if logf != nil {
+				logf(chunkPlanLine(chunkCfg, c, r.Label, r.Height, twoPass, speeds, cs, nc, clipDurationS))
 			}
 			variants = append(variants, sfnVariant{
-				Codec:      c,
-				Label:      r.Label,
-				Width:      strconv.Itoa(r.Width),
-				Height:     strconv.Itoa(r.Height),
-				Bitrate:    strconv.Itoa(r.Bitrate),
-				Preset:     r.Preset,
-				VCPU:       vcpu,
-				Memory:     mem,
-				Priority:   prio,
-				TwoPass:    strconv.FormatBool(twoPass),
-				heightRank: rank,
+				Codec:         c,
+				Label:         r.Label,
+				Width:         strconv.Itoa(r.Width),
+				Height:        strconv.Itoa(r.Height),
+				Bitrate:       strconv.Itoa(r.Bitrate),
+				Preset:        r.Preset,
+				VCPU:          vcpu,
+				Memory:        mem,
+				Priority:      prio,
+				TwoPass:       strconv.FormatBool(twoPass),
+				ChunkIndices:  idx,
+				ChunkDuration: strconv.FormatFloat(cs, 'f', -1, 64),
+				Chunked:       strconv.FormatBool(nc > 1),
 			})
 		}
 	}
@@ -1704,104 +2283,86 @@ func buildSFNInput(store *LadderStore, s3Input, s3Prefix, ladderName, codecSel, 
 	// long poles enter the queue early; schedulingPriority enforces it, but a
 	// good submission order helps too.
 	sortRungsSlowestFirst(variants)
-	// chunk_indices drives the state machine's inner Map: each variant fans
-	// out one encode job per chunk index, then a concat-variant job joins
-	// them. A single-chunk clip (nChunks == 1) still flows through this path —
-	// chunk 0 covers the whole clip and concat is a passthrough — so there's
-	// no special case. Same for all variants (they share the clip duration).
-	if nChunks < 1 {
-		nChunks = 1
-	}
-	chunkIndices := make([]int, nChunks)
-	for i := range chunkIndices {
-		chunkIndices[i] = i
-	}
+	// chunk_indices / chunk_duration / chunked are PER-VARIANT now (on each
+	// sfnVariant above): each variant sizes its own chunks by complexity, so the
+	// SFN Map reads them off the item, not a shared top-level value. A variant
+	// that resolves to a single chunk flows through the whole-variant path
+	// (chunk_index=-1, no concat) via its own "chunked":"false".
 	doc := map[string]any{
-		"s3_input":      s3Input,
-		"s3_prefix":     s3Prefix,
-		"variants":      variants,
-		"chunk_indices": chunkIndices,
-		"do_h264":       doH264,
-		"do_hevc":       doHevc,
-		// Chunk size (seconds) the encode + concat workers plan against, so
-		// they agree with chunk_indices above. String for a container env var.
-		"chunk_duration": strconv.FormatFloat(chunkS, 'f', -1, 64),
-		// True when the clip splits into >1 chunk. Single-chunk (whole-variant)
-		// runs skip the chunk fan-out + concat entirely: the SFN encodes the
-		// whole variant in one job (chunk_index=-1) writing the un-suffixed
-		// {codec}_{label}.mp4 directly. String for the SFN Choice comparison.
-		"chunked": strconv.FormatBool(nChunks > 1),
+		"s3_input":  s3Input,
+		"s3_prefix": s3Prefix,
+		// Source-keyed mezzanine home (mezz/<key>/), reused across jobs so the
+		// same source skips the upload + mezzanine job. Falls back to s3_prefix
+		// when the key can't be computed. Read by mezzanine (out), variants +
+		// audio (in); variant/output writes still go to s3_prefix.
+		"s3_mezz": s3Mezz,
+		// Cache hit: the mezzanine already exists at s3_mezz, so the SFN skips
+		// the Mezzanine job entirely (Choice → FanOut) and variants/audio read
+		// it straight from the cache.
+		"mezz_cached": mezzCached,
+		"variants":    variants,
+		"do_h264":     doH264,
+		"do_hevc":     doHevc,
+		"do_av1":      doAV1,
 		// Ladder-level VBV shaping, applied to every variant's encode (the
 		// worker reads these as MAXRATE_PERCENT / BUFSIZE_MULT env). Threaded
 		// so a custom ladder's VBV is honored in the cloud, not just locally.
 		"maxrate_percent":    strconv.Itoa(maxratePct),
 		"bufsize_multiplier": strconv.FormatFloat(bufMult, 'f', -1, 64),
-		// NOTE: two_pass is per-variant now (see the variant struct above),
-		// not a top-level field — HEVC two-passes, H264 doesn't, in one run.
+		// Banded priorities for the fixed phases (chunks carry their own banded
+		// priority per variant). Keeps a job's whole pipeline in one band so an
+		// earlier job's package isn't starved by a later job's chunks.
+		"prio_mezz":  clampPrio(priorityBase + 99),
+		"prio_audio": clampPrio(priorityBase + 55),
+		"prio_pkg":   clampPrio(priorityBase + 45),
+		// NOTE: two_pass + chunk_* are per-variant now (see the variant struct),
+		// not top-level — variants differ in codec/pass AND chunk length.
 	}
 	b, _ := json.Marshal(doc)
-	return string(b)
+	// Expected number of encode Batch jobs this fan-out will submit (one per
+	// chunk; a whole variant is one). The launch gate releases once it has seen
+	// all of them submitted — i.e. the job has fully fanned out.
+	expected := 0
+	for _, v := range variants {
+		if len(v.ChunkIndices) > 0 {
+			expected += len(v.ChunkIndices)
+		} else {
+			expected++
+		}
+	}
+	return string(b), expected
 }
 
 // resolveCodec checks which codecs are already encoded in OutputDir and returns
 // the codec flag that covers only the missing ones. Returns "" if all exist.
 func (m *Manager) resolveCodec(cfg JobConfig, filename string) string {
-	if cfg.Codec == "" {
-		cfg.Codec = "both"
-	}
 	stem := cfg.OutputStem(filename)
-
-	wantH264 := cfg.Codec == "h264" || cfg.Codec == "both" || cfg.Codec == "all"
-	wantHEVC := cfg.Codec == "hevc" || cfg.Codec == "both" || cfg.Codec == "all"
-	wantAV1 := cfg.Codec == "av1" || cfg.Codec == "all"
-
-	hasH264 := dirExistsWithFiles(filepath.Join(m.OutputDir, stem+"_h264"))
-	hasHEVC := dirExistsWithFiles(filepath.Join(m.OutputDir, stem+"_hevc"))
-	hasAV1 := dirExistsWithFiles(filepath.Join(m.OutputDir, stem+"_av1"))
-
-	needH264 := wantH264 && !hasH264
-	needHEVC := wantHEVC && !hasHEVC
-	needAV1 := wantAV1 && !hasAV1
-
-	if !needH264 && !needHEVC && !needAV1 {
-		return ""
+	want := map[string]bool{}
+	for _, c := range parseCodecSel(cfg.Codec) { // handles "", both, all, comma-list, single
+		want[c] = true
 	}
-	if cfg.Codec == "all" {
-		missing := []string{}
-		if needH264 {
-			missing = append(missing, "h264")
+	// The still-missing codecs, in canonical order.
+	var missing []string
+	for _, c := range []string{"h264", "hevc", "av1"} {
+		if want[c] && !dirExistsWithFiles(filepath.Join(m.OutputDir, stem+"_"+c)) {
+			missing = append(missing, c)
 		}
-		if needHEVC {
-			missing = append(missing, "hevc")
-		}
-		if needAV1 {
-			missing = append(missing, "av1")
-		}
-		if len(missing) == 3 {
-			return "all"
-		}
-		if len(missing) == 2 && needH264 && needHEVC {
-			return "both"
-		}
-		if len(missing) == 1 {
-			return missing[0]
-		}
-		// 2 of 3 but not h264+hevc — encode individually
-		return strings.Join(missing, ",")
 	}
-	if cfg.Codec == "both" {
-		if needH264 && needHEVC {
-			return "both"
-		}
-		if needH264 {
-			return "h264"
-		}
-		if needHEVC {
-			return "hevc"
-		}
-		return ""
+	if len(missing) == 0 {
+		return "" // everything wanted is already encoded → skip the file
 	}
-	return cfg.Codec
+	// Re-encode only the missing ones. Keep the friendly "all"/"both" names when
+	// they match exactly (nicer logs/UI); otherwise a comma-list (or single).
+	if len(missing) == 3 {
+		return "all"
+	}
+	if len(missing) == 2 && missing[0] == "h264" && missing[1] == "hevc" {
+		return "both"
+	}
+	if len(missing) == 1 {
+		return missing[0]
+	}
+	return strings.Join(missing, ",")
 }
 
 func dirExistsWithFiles(path string) bool {
@@ -1937,6 +2498,9 @@ func (m *Manager) attachAndWait(job *Job, name string) error {
 		line := scanner.Text()
 		if line == "" {
 			continue
+		}
+		if m.learnSpeed(line) {
+			continue // dynamic-chunk-selector telemetry, not a log line
 		}
 		// Structured progress markers update Job.Stages and are suppressed
 		// from the log buffer so the viewer stays readable. Anything else

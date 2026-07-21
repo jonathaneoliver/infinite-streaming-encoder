@@ -205,28 +205,32 @@ def _spot_view(req: dict) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _s3_prefix_inventory(bucket: str | None) -> list[dict[str, Any]]:
-    """Per-job S3 prefix sizes under s3://<bucket>/jobs/."""
+    """Per-prefix S3 sizes under s3://<bucket>/jobs/ (per-job staging) AND
+    s3://<bucket>/mezz/ (the source-keyed mezzanine cache) — so the cached
+    mezzanines are visible in the S3 Staging view and can be deleted there."""
     if not bucket:
         return []
     s3 = s3_client()
     paginator = s3.get_paginator("list_objects_v2")
 
     by_prefix: dict[str, dict[str, int]] = {}
-    try:
-        for page in paginator.paginate(Bucket=bucket, Prefix="jobs/"):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                # keys look like jobs/<job_id>/input/clip.mp4 etc.
-                parts = key.split("/", 2)
-                if len(parts) < 2:
-                    continue
-                prefix = f"{parts[0]}/{parts[1]}/"
-                bucket_stats = by_prefix.setdefault(prefix,
-                                                   {"count": 0, "bytes": 0})
-                bucket_stats["count"] += 1
-                bucket_stats["bytes"] += obj.get("Size", 0)
-    except ClientError as e:
-        return [{"prefix": f"s3://{bucket}/jobs/", "error": str(e)}]
+    for root in ("jobs/", "mezz/"):
+        try:
+            for page in paginator.paginate(Bucket=bucket, Prefix=root):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    # keys look like jobs/<job_id>/input/clip.mp4 or
+                    # mezz/<source_key>/mezzanine.mp4 — group by the first two.
+                    parts = key.split("/", 2)
+                    if len(parts) < 2:
+                        continue
+                    prefix = f"{parts[0]}/{parts[1]}/"
+                    bucket_stats = by_prefix.setdefault(prefix,
+                                                       {"count": 0, "bytes": 0})
+                    bucket_stats["count"] += 1
+                    bucket_stats["bytes"] += obj.get("Size", 0)
+        except ClientError:
+            continue  # one root failing shouldn't hide the other
 
     out: list[dict[str, Any]] = []
     for prefix, stats in sorted(by_prefix.items()):
@@ -237,6 +241,7 @@ def _s3_prefix_inventory(bucket: str | None) -> list[dict[str, Any]]:
             "object_count": stats["count"],
             "size_bytes": stats["bytes"],
             "job_id": job_id,
+            "kind": parts[0],  # "jobs" | "mezz" — UI labels the cache distinctly
         })
     return out
 
@@ -579,8 +584,13 @@ def _record_fleet_samples(hourly_usd: float, fleet: dict) -> dict:
     Sample record: [ts, hourly_usd, used_vcpus, total_vcpus, queued, running].
     Old 2-field [ts, hourly] records are tolerated for backward compat.
     """
+    # Persist to the app's host-mounted TMP_DIR (survives server restarts) —
+    # NOT the container's ephemeral /tmp, which every restart/deploy wipes,
+    # resetting the trailing-24h integral to "since last restart". TMPDIR is the
+    # standard-lib fallback (usually unset here); /tmp is the last resort.
     path = os.environ.get("COST_LOG") or os.path.join(
-        os.environ.get("TMPDIR") or "/tmp", "cost_samples.json")
+        os.environ.get("TMP_DIR") or os.environ.get("TMPDIR") or "/tmp",
+        "cost_samples.json")
     now = datetime.now(timezone.utc).timestamp()
     cutoff = now - 24 * 3600
     samples: list[list] = []
@@ -625,6 +635,43 @@ def _record_fleet_samples(hourly_usd: float, fleet: dict) -> dict:
     return {"spend_24h_usd": round(spend, 4), "history": history}
 
 
+def _current_vcpus():
+    """The encoder compute env's current min/max vCPUs. Empty dict if unreadable
+    (never break inventory). max feeds the AWS panel's max-vCPUs radio; min is the
+    live keep-warm floor (0 idle, WARM_MIN_VCPUS while a run is active)."""
+    try:
+        from encoder.cloud.compute_env import get_vcpus
+        return get_vcpus()
+    except Exception:  # noqa: BLE001 — best-effort
+        return {}
+
+
+def _spot_and_reclaim_stats() -> dict:
+    """Accumulated 'saved by using spot' + trailing-24h reclaim-waste %, read
+    from the Go server's spot_samples.json (one entry per finished cloud-batch
+    job: ts, lost_s, total_s, spot_usd, ondemand_usd, saved_usd)."""
+    path = os.environ.get("SPOT_LOG") or os.path.join(
+        os.environ.get("TMP_DIR") or os.environ.get("TMPDIR") or "/tmp",
+        "spot_samples.json")
+    try:
+        with open(path) as f:
+            samples = json.load(f)
+    except (OSError, ValueError):
+        samples = []
+    now = datetime.now(timezone.utc).timestamp()
+    cut = now - 24 * 3600
+    def _sum(field, since=None):
+        return sum(s.get(field, 0) for s in samples
+                   if (since is None or s.get("ts", 0) >= since))
+    lost_24h, total_24h = _sum("lost_s", cut), _sum("total_s", cut)
+    return {
+        "saved_total_usd": round(_sum("saved_usd"), 2),
+        "saved_24h_usd": round(_sum("saved_usd", cut), 2),
+        "reclaim_24h_lost_min": round(lost_24h / 60.0, 1),
+        "reclaim_24h_pct": round(lost_24h / total_24h * 100.0, 1) if total_24h > 0 else 0.0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Public entry
 # ---------------------------------------------------------------------------
@@ -660,6 +707,7 @@ def collect() -> dict[str, Any]:
     _sampled = _record_fleet_samples(hourly_total, fleet)
     fleet["spend_24h_usd"] = _sampled["spend_24h_usd"]
     fleet["history"] = _sampled["history"]
+    fleet.update(_spot_and_reclaim_stats())  # saved_total_usd, reclaim_24h_pct, …
     # Actual CPU (cores) + memory (GiB) from CloudWatch Container Insights, for
     # the "real usage vs allocated" sparklines. Only when a box is up (else the
     # cluster metrics are empty and it's a wasted call).
@@ -668,6 +716,7 @@ def collect() -> dict[str, Any]:
         if cluster:
             fleet["cw"] = _fleet_cw_series(cluster)
 
+    _ce_vcpus = _current_vcpus()
     return {
         "fleet": fleet,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -686,6 +735,12 @@ def collect() -> dict[str, Any]:
             "total_s3_bytes": total_s3_bytes,
             "estimated_hourly_usd": round(hourly_total, 4),
             "spend_24h_usd": fleet["spend_24h_usd"],
+            "saved_total_usd": fleet.get("saved_total_usd", 0),
+            "saved_24h_usd": fleet.get("saved_24h_usd", 0),
+            "reclaim_24h_pct": fleet.get("reclaim_24h_pct", 0),
+            "reclaim_24h_lost_min": fleet.get("reclaim_24h_lost_min", 0),
+            "max_vcpus": _ce_vcpus.get("max_vcpus"),
+            "min_vcpus": _ce_vcpus.get("min_vcpus"),
             "running_executions": len(running_executions),
             "active_batch_jobs": len(active_batch_jobs),
         },

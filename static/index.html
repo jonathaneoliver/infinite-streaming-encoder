@@ -24,6 +24,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .file-name { flex: 1; font-family: 'SF Mono', Menlo, monospace; font-size: 0.9rem; cursor: pointer; }
 .btn-play { color: #4361ee; cursor: pointer; font-size: 0.9rem; padding: 4px 8px; border-radius: 4px; margin-left: 8px; }
 .btn-play:hover { background: #1a2a4a; color: #4cc9f0; }
+.btn-promote { color: #2a9d8f; cursor: pointer; font-size: 0.95rem; padding: 4px 7px; border-radius: 4px; margin-left: 2px; }
+.btn-promote:hover { background: #14332c; color: #4ecdc4; }
 .file-size { color: #888; font-size: 0.85rem; margin-left: 12px; }
 .file-count { color: #666; font-size: 0.8rem; margin-left: 12px; }
 
@@ -34,6 +36,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .job-cloud-badge { display: inline-block; color: #ffa94d; background: rgba(255, 169, 77, 0.15); border: 1px solid #ffa94d; border-radius: 3px; padding: 0 6px; margin-left: 8px; font-size: 0.7rem; cursor: pointer; vertical-align: middle; }
 .job-cloud-badge:hover { background: rgba(255, 169, 77, 0.3); }
 .job-ami-badge { display: inline-block; color: #06d6a0; background: rgba(6, 214, 160, 0.15); border: 1px solid #06d6a0; border-radius: 3px; padding: 0 6px; margin-left: 8px; font-size: 0.7rem; vertical-align: middle; }
+.job-reclaim-badge { display: inline-block; color: #ef476f; background: rgba(239, 71, 111, 0.15); border: 1px solid #ef476f; border-radius: 3px; padding: 0 6px; margin-left: 8px; font-size: 0.7rem; vertical-align: middle; }
+.job-saved-badge { display: inline-block; color: #06d6a0; background: rgba(6, 214, 160, 0.15); border: 1px solid #06d6a0; border-radius: 3px; padding: 0 6px; margin-left: 8px; font-size: 0.7rem; vertical-align: middle; }
 .encode-options > legend { padding: 0 8px; color: #888; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; }
 .encode-options > .controls { margin-top: 0; }
 .control-group { display: flex; flex-direction: column; gap: 4px; }
@@ -102,21 +106,39 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .stage-bar-fill.stage-fill-skipped { background: repeating-linear-gradient(45deg, #555 0 6px, #444 6px 12px); }
 .stage-skipped { opacity: 0.7; }
 .stage-skipped .stage-label::after { content: ' (reused)'; color: #888; font-size: 0.75rem; font-style: italic; }
-/* Chunk grid: one cell per encode chunk of a variant, so the parallel
-   fan-out is visible at a glance. Colours match the stage-bar palette. */
-.chunk-grid { display: flex; flex-wrap: wrap; gap: 2px; align-items: center; }
-.chunk-cell { width: 11px; height: 11px; border-radius: 2px; background: #1a2a4a; }
-/* queued = submitted to Batch but waiting for a slot (amber, no pulse) —
-   distinct from running = actually encoding (blue, pulsing). */
-.chunk-cell.chunk-queued { background: #ffa94d; }
-.chunk-cell.chunk-running { background: #4361ee; animation: chunkpulse 1s ease-in-out infinite; }
-.chunk-cell.chunk-done { background: #06d6a0; }
-.chunk-cell.chunk-failed { background: #ef476f; }
-@keyframes chunkpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-.chunk-concat { margin-left: 7px; color: #667; font-size: 0.85rem; line-height: 1; }
-.chunk-concat.concat-running { color: #4361ee; }
-.chunk-concat.concat-done { color: #06d6a0; }
-.chunk-concat.concat-failed { color: #ef476f; }
+/* Chunk grid: one cell per encode chunk of a variant. Each cell is a mini
+   stage-bar — same 6px height as a whole-variant bar — so a chunked row reads
+   just like a whole one, only broken into per-chunk segments (the gap shows how
+   the variant was chunked). Cells stretch to fill the row, so each segment's
+   width tracks its chunk duration. Each segment fills to its own chunk's live
+   %, so a running chunk shows real progress instead of a pulse; a completed
+   chunked row is solid green at the same height as a completed whole row. */
+.chunk-grid { display: flex; flex-wrap: nowrap; gap: 2px; align-items: center; width: 100%; }
+.chunk-cell { position: relative; flex: 1 1 0; min-width: 3px; height: 10px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
+/* On-screen hint under Start Encode explaining the force-reencode gesture. */
+.encode-hint { margin-top: 10px; font-size: 12px; color: #8a9bb5; line-height: 1.5; }
+.encode-hint b { color: #cdd6e6; font-weight: 600; }
+.encode-hint kbd { display: inline-block; padding: 1px 5px; font-size: 11px; font-family: inherit; color: #dfe6f2; background: #232b3d; border: 1px solid #3a4560; border-radius: 4px; }
+/* Codec multi-select checkboxes (any subset of h264/hevc/av1). */
+.codec-checks { display: flex; gap: 16px; align-items: center; padding: 6px 0; }
+.codec-checks label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; font-weight: 400; }
+.codec-checks input { width: auto; min-width: 0; margin: 0; vertical-align: middle; }
+/* End-of-run efficiency stats, shown under the stages once ENCODER-STATS lands. */
+.job-stats { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; padding: 9px 12px; background: #141b2b; border-radius: 6px; font-size: 12px; }
+.job-stat { color: #8a9bb5; white-space: nowrap; }
+.job-stat b { color: #e2e9f5; font-weight: 600; }
+.job-stat .u { color: #5d6b82; font-weight: 400; }
+/* display:block so width/height apply — it's a <span> inside the cell, and
+   inline elements ignore both (unlike the whole-variant fill, which is a div).
+   The fill's COLOUR is the machine the chunk ran on (set inline in JS) so
+   co-located chunks are unmistakable; width is progress; red states win. */
+.chunk-cell-fill { display: block; height: 100%; width: 0; background: #4361ee; transition: width 0.3s ease; }
+.chunk-cell-fill.chunk-failed { background: #ef476f; }
+/* reclaimed = AWS took the spot instance; red + pulse (encoding thrown away,
+   waiting to restart on fresh capacity) until the retry begins encoding. */
+.chunk-cell-fill.chunk-reclaimed { background: #ef476f; animation: reclaimpulse 1s ease-in-out infinite; }
+.stage-bar-fill.stage-fill-reclaimed { background: #ef476f; animation: reclaimpulse 1s ease-in-out infinite; }
+@keyframes reclaimpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 /* --- AWS tab --- */
 .tab-aws { color: #ffa94d; }
@@ -319,9 +341,11 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 </select>
             </div>
             <div class="control-group" id="chunk-dur-group" style="display:none">
-                <label title="How the cloud-batch target splits each variant. Smaller chunks = more parallel jobs (faster wall-clock, but more fleet overhead / lower efficiency). Whole variant = one job per tier (most efficient, least parallel).">Chunking (cloud)</label>
+                <label title="How the cloud-batch target splits each variant. Dynamic sizes each variant's chunks by its learned encode speed — ~4 min of encode work per chunk (min 30s), so slow 4K HEVC splits into many chunks while cheap H264 runs whole and pays no join cost. Fixed sizes: smaller chunks = more parallel jobs (faster wall-clock, more fleet overhead); whole variant = one job per tier (most efficient, least parallel).">Chunking (cloud)</label>
                 <select id="chunk-duration">
-                    <option value="30" selected>30s chunks (max parallelism)</option>
+                    <option value="dynamic" selected>Dynamic (per-variant, learned)</option>
+                    <option value="12">12s chunks (max parallelism)</option>
+                    <option value="30">30s chunks</option>
                     <option value="60">60s chunks</option>
                     <option value="300">5m chunks</option>
                     <option value="whole">Whole variant (max efficiency)</option>
@@ -336,13 +360,11 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             </div>
             <div class="control-group">
                 <label>Codec</label>
-                <select id="codec">
-                    <option value="both">Both (H.264 + HEVC)</option>
-                    <option value="h264">H.264 only</option>
-                    <option value="hevc">HEVC only</option>
-                    <option value="av1">AV1 only</option>
-                    <option value="all">All (H.264 + HEVC + AV1)</option>
-                </select>
+                <div id="codec" class="codec-checks">
+                    <label><input type="checkbox" class="codec-cb" value="h264" checked> H.264</label>
+                    <label><input type="checkbox" class="codec-cb" value="hevc" checked> HEVC</label>
+                    <label><input type="checkbox" class="codec-cb" value="av1"> AV1</label>
+                </div>
             </div>
             <div class="control-group">
                 <label title="Bitrate ladder (resolutions + target bitrates). Manage ladders in the Ladders tab.">Ladder</label>
@@ -393,18 +415,19 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="pink">Pink</option>
                 </select>
             </div>
-            <div class="control-group" style="align-self:center;padding-top:16px">
-                <label><input type="checkbox" id="keep-mezzanine" style="width:auto;min-width:auto"> Keep mezzanine</label>
-            </div>
             <div class="control-group">
                 <label title="Two-pass is applied automatically per codec: HEVC (libx265) needs it for an accurate average/peak bitrate, H264 (libx264) does not, AV1 never. This only affects HEVC — pick 1-pass to run a faster, less-accurate HEVC encode for comparison.">HEVC pass</label>
                 <select id="hevc-pass">
-                    <option value="2">2-pass (accurate, default)</option>
+                    <option value="2" selected>2-pass (accurate, default)</option>
                     <option value="1">1-pass (faster, for comparison)</option>
                 </select>
             </div>
-            <button class="btn btn-primary" id="encode-btn" onclick="startEncode(event.altKey)" oncontextmenu="event.preventDefault(); startEncode(true); return false;" title="Click: encode checked files (skips any already fully encoded). Alt/Option+click OR right-click: force re-encode all checked files (archives existing outputs)." disabled>Start Encode</button>
+            <div class="control-group" id="promote-group" style="display:none;align-self:center;padding-top:16px">
+                <label id="promote-after-label"><input type="checkbox" id="promote-after" style="width:auto;min-width:auto"> Promote after encode</label>
             </div>
+            <button class="btn btn-primary" id="encode-btn" onclick="startEncode(event.altKey)" oncontextmenu="event.preventDefault(); startEncode(true); return false;" title="Click: encode checked files (skips any already fully encoded). Alt/Option+click OR right-click: force re-encode all checked files (existing outputs are kept, renamed with their last-modified date)." disabled>Start Encode</button>
+            </div>
+            <div class="encode-hint">Skips files already fully encoded. To <b>force a re-encode</b>, <kbd>Alt</kbd>/<kbd>Option</kbd>+click (or right-click) Start Encode — existing outputs are kept, renamed with their last-modified date.</div>
         </fieldset>
     </div>
 </div>
@@ -450,8 +473,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
 <!-- JOBS TAB -->
 <div id="tab-jobs" class="tab-content">
-    <div class="panel" id="jobs-fleet-panel" style="display:none">
+    <div class="panel" id="jobs-fleet-panel">
         <h2>Fleet</h2>
+        <div class="aws-summary" id="jobs-aws-metrics"></div>
         <div id="jobs-fleet-full" title="Live cloud fleet — per-instance packing, utilization, and lifecycle (from the AWS inventory)"></div>
     </div>
     <div class="panel">
@@ -520,6 +544,22 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="aws-metric">
                 <div class="aws-metric-label" title="Self-tracked: burn rate integrated over the trailing 24h">Spent (last 24h)</div>
                 <div class="aws-metric-value" id="aws-spend-24h">—</div>
+            </div>
+            <div class="aws-metric">
+                <div class="aws-metric-label" title="Accumulated (on-demand − spot) cost across all finished cloud-batch jobs — what running on spot has saved you">Saved by spot (total)</div>
+                <div class="aws-metric-value ok" id="aws-saved">—</div>
+            </div>
+            <div class="aws-metric">
+                <div class="aws-metric-label" title="Trailing 24h: encode-minutes thrown away by spot reclaims ÷ total encode-minutes. High = reclaims are eating your spot savings.">Reclaim waste (24h)</div>
+                <div class="aws-metric-value" id="aws-reclaim-pct">—</div>
+            </div>
+            <div class="aws-metric">
+                <div class="aws-metric-label" title="Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box instead of cold-starting. 0 when idle; WARM_MIN_VCPUS (a whole box) during a run.">Keep warm</div>
+                <div class="aws-metric-value" id="aws-warm">—</div>
+            </div>
+            <div class="aws-metric">
+                <div class="aws-metric-label" title="Batch compute-env max vCPUs. 2x runs ~twice as many machines → roughly half the wall-clock for ~the same total cost (down to the slowest single chunk).">Max vCPUs</div>
+                <div class="aws-metric-value" id="aws-maxvcpu" style="font-size:0.9rem">—</div>
             </div>
             <div class="aws-metric">
                 <div class="aws-metric-label">Region</div>
@@ -1265,7 +1305,7 @@ async function startEncode(force = false) {
     const body = {
         files: selected,
         target: target,
-        codec: document.getElementById('codec').value,
+        codec: codecValue(),
         max_res: document.getElementById('max-res').value,
         time: document.getElementById('time-limit').value,
         segment_duration: document.getElementById('segment-duration').value,
@@ -1273,14 +1313,14 @@ async function startEncode(force = false) {
         gop_duration: document.getElementById('gop-duration').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
-        keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         hevc_single_pass: document.getElementById('hevc-pass').value === '1',
         ladder: document.getElementById('ladder').value,
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
         simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
-        force_reencode: force
+        force_reencode: force,
+        promote: document.getElementById('promote-after').checked
     };
 
     try {
@@ -1318,6 +1358,47 @@ async function loadOutputs() {
         renderOutputs();
     } catch (e) {
         document.getElementById('outputs-list').innerHTML = '<div class="no-files">Failed to load outputs</div>';
+    }
+}
+
+// Promote destinations (from /api/promote). Empty => promote not configured, so
+// the "promote after encode" checkbox and the per-output Promote buttons hide.
+let _promoteDests = [];
+async function loadPromoteConfig() {
+    try {
+        const res = await fetch('/api/promote');
+        if (!res.ok) return;
+        _promoteDests = (await res.json()).dests || [];
+    } catch (e) { _promoteDests = []; }
+    if (_promoteDests.length) {
+        const g = document.getElementById('promote-group');
+        if (g) g.style.display = '';
+        const lbl = document.getElementById('promote-after-label');
+        if (lbl) lbl.title = 'rsync each output to:\n' + _promoteDests.join('\n');
+    }
+    if (typeof outputDirs !== 'undefined' && outputDirs) renderOutputs();
+}
+
+// Promote one staged output to the live locations. Streams button feedback;
+// alerts a summary if any destination failed.
+async function promoteOutput(name, el) {
+    const orig = el ? el.textContent : '';
+    if (el) { el.textContent = '…'; el.style.pointerEvents = 'none'; }
+    try {
+        const res = await fetch(`/api/outputs/${encodeURIComponent(name)}/promote`, { method: 'POST' });
+        if (!res.ok) throw new Error(await res.text());
+        const results = await res.json();
+        const failed = results.filter(r => !r.ok);
+        if (el) el.textContent = failed.length ? '✗' : '✓';
+        if (failed.length) {
+            alert(`Promote ${name}: ${failed.length}/${results.length} destination(s) failed:\n\n`
+                + failed.map(r => `${r.dest}\n  ${r.error}`).join('\n\n'));
+        }
+    } catch (e) {
+        if (el) el.textContent = '✗';
+        alert('Promote failed: ' + e.message);
+    } finally {
+        if (el) setTimeout(() => { el.textContent = orig; el.style.pointerEvents = ''; }, 2500);
     }
 }
 
@@ -1374,7 +1455,10 @@ function renderOutputs() {
             <span>${renderFormatBadge(d)}</span>
             <span class="output-dir-stats">${formatSize(d.size)}</span>
             <span class="file-date">${formatDate(d.mod_time)}</span>
-            <span class="btn-play" onclick="event.stopPropagation(); playOutputMaster('${escapeAttr(d.name)}')" title="Play">&#9654;</span>
+            <span>
+                <span class="btn-play" onclick="event.stopPropagation(); playOutputMaster('${escapeAttr(d.name)}')" title="Play">&#9654;</span>
+                ${_promoteDests.length ? `<span class="btn-promote" onclick="event.stopPropagation(); promoteOutput('${escapeAttr(d.name)}', this)" title="Promote to ${_promoteDests.length} live location(s)">&#8681;</span>` : ''}
+            </span>
         </div>
     `).join('');
 }
@@ -1500,12 +1584,51 @@ function _jobConfigHtml(c) {
     ];
     if (c.max_res) chips.push(chip('max-res', c.max_res));
     if (c.hevc_single_pass) chips.push(chip('hevc', '1-pass'));
-    if (c.chunk_duration) chips.push(chip('chunk', c.chunk_duration + 's'));
+    if (c.chunk_duration) chips.push(chip('chunk', /^\d+$/.test(c.chunk_duration) ? c.chunk_duration + 's' : c.chunk_duration));
     if (c.cpu_arch && (c.target === 'cloud' || c.target === 'cloud-batch')) chips.push(chip('cpu', c.cpu_arch));
     if (c.padding) chips.push(chip('padding', c.padding));
     if (c.time) chips.push(chip('time', c.time));
     if (c.force_reencode) chips.push(chip('force', 're-encode', '#d0883a'));
     return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px">${chips.join('')}</div>`;
+}
+
+// End-of-run efficiency stats block, fed by ENCODER-STATS (+ the job's own
+// timing). Total = end-to-end wall (upload → done); encode wall = the Batch
+// span; CPU = vCPU-hours of compute; avg busy = vCPU-hours ÷ encode-wall-hours;
+// efficiency = avg busy ÷ max vCPUs; slowest chunk = the makespan floor.
+function renderJobStats(el, j) {
+    if (!el) return;
+    if (!(j.cpu_vcpu_h > 0)) { el.style.display = 'none'; return; }
+    const totalS = (j.started_at && j.ended_at)
+        ? (new Date(j.ended_at).getTime() - new Date(j.started_at).getTime()) / 1000
+        : (j.started_at ? (Date.now() - new Date(j.started_at).getTime()) / 1000 : 0);
+    const stat = (label, val) => `<span class="job-stat">${label} <b>${val}</b></span>`;
+    const slowest = (j.slowest_job || '').replace(/:/g, ' ').replace(/^encode /, '');
+    el.innerHTML =
+          stat('total', formatDuration(totalS))
+        + (j.encode_wall_s ? stat('encode wall', formatDuration(j.encode_wall_s)) : '')
+        + stat('CPU', j.cpu_vcpu_h.toFixed(1) + ' <span class="u">vCPU-hr</span>')
+        + (j.job_count ? stat('jobs', j.job_count) : '')
+        + stat('avg busy', (j.avg_concurrency || 0).toFixed(0) + ' <span class="u">of ' + (j.max_vcpus || '?') + ' vCPU</span>')
+        + stat('efficiency', (j.efficiency_pct || 0).toFixed(0) + '%')
+        + (j.slowest_job ? stat('slowest chunk', escapeHtml(slowest) + ' <span class="u">' + formatDuration(j.slowest_job_s || 0) + '</span>') : '')
+        + (j.saved_usd > 0 ? stat('cost', '$' + (j.spot_usd || 0).toFixed(2) + ' <span class="u">spot · saved $' + j.saved_usd.toFixed(2) + '</span>') : '');
+    el.title = 'efficiency = avg vCPUs busy ÷ max vCPUs (how full the fleet ran). '
+        + 'slowest chunk = the makespan floor — nothing finishes faster than this one chunk.';
+    el.style.display = '';
+}
+
+// Read the codec checkboxes into the backend's codec selector: friendly
+// "both"/"all" for the common combos, a comma-list for any other subset (both
+// buildSFNInput and cli_local accept all of these). Never empty — falls back to
+// h264 so a submit always encodes something.
+function codecValue() {
+    const on = ['h264', 'hevc', 'av1'].filter(c =>
+        document.querySelector(`.codec-cb[value="${c}"]`)?.checked);
+    if (on.length === 0) return 'h264';
+    if (on.length === 3) return 'all';
+    if (on.length === 2 && on[0] === 'h264' && on[1] === 'hevc') return 'both';
+    return on.join(',');
 }
 
 function jobRowHtml(j) {
@@ -1520,6 +1643,8 @@ function jobRowHtml(j) {
                     <span class="job-meta"> — ${j.config.target} / ${j.config.codec} / ${j.config.ladder || 'apple-uniq-live'}${j.config.max_res ? ' / ' + j.config.max_res : ''}</span>
                     ${cloudBadge}
                     <span class="job-ami-badge" style="display:none"></span>
+                    <span class="job-reclaim-badge" style="display:none"></span>
+                    <span class="job-saved-badge" style="display:none"></span>
                 </div>
                 <span class="job-status status-${j.status}">${j.status.toUpperCase()}</span>
             </div>
@@ -1528,12 +1653,58 @@ function jobRowHtml(j) {
             <div class="job-error" style="color:#ef476f;font-size:0.8rem;margin-top:4px;display:none"></div>
             <div class="current-file" style="display:none;font-size:0.85rem;color:#8cf;margin-top:8px;font-weight:600"></div>
             <table class="stages-table" style="display:none"><tbody></tbody></table>
+            <div class="job-stats" style="display:none"></div>
             <div class="job-actions">
                 <span class="log-toggle" onclick="toggleLog('${j.id}')">Show log</span>
             </div>
             <div class="log-viewer" id="log-${j.id}" style="display:none"></div>
         </div>
     `;
+}
+
+// Stable colour per instance for the chunk plot. Chunks sharing a colour ran
+// on the same machine, so a row — or the whole plot — in one colour reveals
+// heavy chunks co-located on a single box. Assigned in first-seen order; the
+// palette deliberately avoids the status fills (blue/green/red) so the stripe
+// reads as "which machine", not "what state".
+const _INSTANCE_PALETTE = ['#4cc9f0', '#f4a261', '#b5179e', '#e9c46a', '#7209b7',
+    '#2a9d8f', '#ff8fab', '#90be6d', '#c77dff', '#f28482', '#48cae4', '#bc6c25'];
+const _instanceColors = {};
+let _instanceColorNext = 0;
+function instanceColor(inst) {
+    if (!inst) return null;
+    if (!(inst in _instanceColors)) {
+        _instanceColors[inst] = _INSTANCE_PALETTE[_instanceColorNext % _INSTANCE_PALETTE.length];
+        _instanceColorNext++;
+    }
+    return _instanceColors[inst];
+}
+
+// Elapsed wall time for a stage/chunk from its transition timestamps: "took 4m"
+// once ended, "running 90s" while live, "" before it starts.
+function stageElapsed(s) {
+    if (!s || !s.started_at) return '';
+    const start = new Date(s.started_at).getTime();
+    if (isNaN(start)) return '';
+    const end = s.ended_at ? new Date(s.ended_at).getTime() : Date.now();
+    const sec = Math.max(0, (end - start) / 1000);
+    return (s.ended_at ? 'took ' : 'running ') + formatDuration(sec);
+}
+
+// Rich hover text for a progress/chunk bar: what it is, its state, %, the
+// machine it ran on, and how long it's taken. Shown as a native title tooltip.
+function stageTooltip(s, indexLabel) {
+    const parts = [];
+    if (indexLabel) parts.push(indexLabel);
+    if (s.label && s.label !== indexLabel) parts.push(s.label.replace(/:/g, ' '));
+    parts.push('status: ' + (s.status || 'pending'));
+    if (s.status !== 'pending' && s.status !== 'skipped' && typeof s.percent === 'number')
+        parts.push(s.percent.toFixed(0) + '%');
+    if (s.status === 'skipped') parts.push('reused from cache');
+    if (s.instance) parts.push('machine: ' + s.instance);
+    const el = stageElapsed(s);
+    if (el) parts.push(el);
+    return parts.join(' · ');
 }
 
 // Match a per-chunk encode stage key: encode:<codec>:<tier>:chunk<N>.
@@ -1615,18 +1786,24 @@ function updateStagesTable(row, stages) {
     if (tbody.dataset.sig !== sig) {
         tbody.innerHTML = rows.map(r => {
             if (r.kind === 'stage') {
+                // Normalize a raw whole-variant encode key ("encode:h264:720p")
+                // to the friendly form ("encode h264 720p") so whole rows read
+                // the same as the chunked rows below.
+                const label = (r.s.label && r.s.label.startsWith('encode:'))
+                    ? r.s.label.replace(/:/g, ' ') : r.s.label;
                 return `<tr data-stage-key="${escapeHtml(r.s.key)}">
-                    <td class="stage-label">${escapeHtml(r.s.label)}</td>
+                    <td class="stage-label">${escapeHtml(label)}</td>
                     <td class="stage-bar"><div class="stage-bar-track"><div class="stage-bar-fill"></div></div></td>
                     <td class="stage-pct"></td></tr>`;
             }
             const cells = r.cells.map(c =>
-                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" title="chunk ${c.index}"></span>`).join('');
-            const concat = r.concat
-                ? `<span class="chunk-concat" data-stage-key="${escapeHtml(r.concat.key)}" title="concat / join">&#8904;</span>` : '';
+                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" title="chunk ${c.index}"><span class="chunk-cell-fill"></span></span>`).join('');
+            // The join is implicit in the solid bar (concat is folded into
+            // package-all), so no separate join glyph is drawn. Any concat stage
+            // is still absorbed into this group (below) so it doesn't spawn a row.
             return `<tr data-chunk-group="${escapeHtml(r.codec + ':' + r.tier)}">
                 <td class="stage-label">encode ${escapeHtml(r.codec)} ${escapeHtml(r.tier)}</td>
-                <td class="stage-bar"><div class="chunk-grid">${cells}${concat}</div></td>
+                <td class="stage-bar"><div class="chunk-grid">${cells}</div></td>
                 <td class="stage-pct chunk-count"></td></tr>`;
         }).join('');
         tbody.dataset.sig = sig;
@@ -1639,35 +1816,64 @@ function updateStagesTable(row, stages) {
             const tr = tbody.querySelector(`tr[data-stage-key="${s.key}"]`);
             if (!tr) continue;
             tr.className = 'stage-' + s.status;
+            const reclaimed = s.status === 'reclaimed';
             const fill = tr.querySelector('.stage-bar-fill');
-            fill.style.width = s.percent.toFixed(1) + '%';
+            // reclaimed → fill the bar red (spot taken, waiting to restart);
+            // when the retry resumes, the normal running % takes over.
+            fill.style.width = (reclaimed ? 100 : s.percent).toFixed(1) + '%';
             fill.className = 'stage-bar-fill';
-            if (s.status === 'done')    fill.classList.add('stage-fill-done');
-            if (s.status === 'failed')  fill.classList.add('stage-fill-failed');
-            if (s.status === 'skipped') fill.classList.add('stage-fill-skipped');
+            fill.style.background = '';
+            // Encode rows (whole variants) colour the bar by the MACHINE it ran
+            // on — identical look to the chunk-grid rows, so a variant reads the
+            // same whether it encoded in one piece or many. EVERY phase that ran
+            // on a machine (mezzanine/audio/encode/package/fragments/hls) fills
+            // with that machine's colour once placed; red states always win, and
+            // phases without a host (or pre-placement) keep the status colours.
+            if (s.status === 'failed')       fill.classList.add('stage-fill-failed');
+            else if (reclaimed)              fill.classList.add('stage-fill-reclaimed');
+            else if (s.status === 'skipped') fill.classList.add('stage-fill-skipped');
+            else if (s.instance)             fill.style.background = instanceColor(s.instance);
+            else if (s.status === 'done')    fill.classList.add('stage-fill-done');
             tr.querySelector('.stage-pct').textContent =
                 s.status === 'pending' ? '—'
                 : s.status === 'skipped' ? 'reused'
+                : reclaimed ? '⚠ reclaimed'
                 : s.percent.toFixed(0) + '%';
+            const bar = tr.querySelector('.stage-bar');
+            if (bar) bar.title = stageTooltip(s);
             continue;
         }
         // Chunk group: colour each cell by its chunk's status.
         const tr = tbody.querySelector(`tr[data-chunk-group="${r.codec + ':' + r.tier}"]`);
         if (!tr) continue;
-        let done = 0;
+        let sumPct = 0;
         for (const c of r.cells) {
             const cell = tr.querySelector(`.chunk-cell[data-chunk-key="${c.key}"]`);
             if (!cell) continue;
-            cell.className = 'chunk-cell' + (c.s.status === 'pending' ? '' : ' chunk-' + c.s.status);
-            if (c.s.status === 'done' || c.s.status === 'skipped') done++;
+            const st = c.s.status;
+            const prog = (st === 'done' || st === 'skipped') ? 100
+                : (st === 'pending' || st === 'queued' || st === 'reclaimed') ? 0
+                : c.s.percent;
+            sumPct += prog;
+            const fill = cell.querySelector('.chunk-cell-fill');
+            if (fill) {
+                const isRed = (st === 'failed' || st === 'reclaimed');
+                // reclaimed → fill red (waiting to restart); else show progress.
+                fill.style.width = (st === 'reclaimed' ? 100 : prog).toFixed(1) + '%';
+                fill.className = 'chunk-cell-fill'
+                    + (st === 'failed' ? ' chunk-failed'
+                        : st === 'reclaimed' ? ' chunk-reclaimed' : '');
+                // The fill COLOUR is the machine this chunk ran on — bold and
+                // unmissable so co-located chunks pop; red states keep their
+                // class colour (clear the inline so the class wins).
+                fill.style.background = isRed ? '' : (instanceColor(c.s.instance) || '#4361ee');
+            }
+            cell.title = stageTooltip(c.s, 'chunk ' + c.index);
         }
-        if (r.concat) {
-            const el = tr.querySelector('.chunk-concat');
-            if (el) el.className = 'chunk-concat' + (r.concat.status === 'pending' ? '' : ' concat-' + r.concat.status);
-        }
-        const joined = r.concat && (r.concat.status === 'done');
+        // Aggregate % across chunks so a chunked row reads like a whole row
+        // ("100%") instead of a chunk count — the join is implicit, not shown.
         tr.querySelector('.chunk-count').textContent =
-            joined ? 'joined' : `${done}/${r.cells.length}`;
+            (r.cells.length ? sumPct / r.cells.length : 0).toFixed(0) + '%';
     }
 }
 
@@ -1698,6 +1904,38 @@ function updateJobRow(row, j) {
             amiEl.style.display = 'none';
         }
     }
+
+    // Spot-reclaim waste: how much encoding a reclaim threw away, live.
+    const rc = row.querySelector('.job-reclaim-badge');
+    if (rc) {
+        const n = j.reclaim_count || 0;
+        if (n > 0) {
+            const lost = j.reclaim_lost_s || 0, total = j.encode_total_s || 0;
+            const pct = total > 0 ? (lost / total * 100) : 0;
+            rc.textContent = `⚠ ${n} reclaimed · ${(lost / 60).toFixed(1)}m lost · ${pct.toFixed(0)}% wasted`;
+            rc.title = `Spot reclaims threw away ${(lost / 60).toFixed(1)} min of encoding out of `
+                + `${(total / 60).toFixed(1)} min total (${pct.toFixed(1)}% wasted) — each reclaim `
+                + `restarts a chunk from 0% on fresh capacity.`;
+            rc.style.display = '';
+        } else {
+            rc.style.display = 'none';
+        }
+    }
+
+    // Saved by using spot (on-demand − spot cost) for this job.
+    const sv = row.querySelector('.job-saved-badge');
+    if (sv) {
+        if (j.saved_usd > 0) {
+            sv.textContent = `💰 saved $${j.saved_usd.toFixed(2)} on spot`;
+            sv.title = `This job cost $${(j.spot_usd || 0).toFixed(2)} on spot vs `
+                + `$${(j.ondemand_usd || 0).toFixed(2)} on-demand — spot saved $${j.saved_usd.toFixed(2)}.`;
+            sv.style.display = '';
+        } else {
+            sv.style.display = 'none';
+        }
+    }
+
+    renderJobStats(row.querySelector('.job-stats'), j);
 
     const err = row.querySelector('.job-error');
     if (j.error) {
@@ -1982,8 +2220,20 @@ function renderAws(data) {
     hourlyEl.textContent = '$' + hourly.toFixed(2);
     hourlyEl.className = 'aws-metric-value' + (hourly > 0 ? ' warn' : ' ok');
     document.getElementById('aws-spend-24h').textContent = '$' + (s.spend_24h_usd || 0).toFixed(2);
+    document.getElementById('aws-saved').textContent = '$' + (s.saved_total_usd || 0).toFixed(2);
+    const rpct = s.reclaim_24h_pct || 0;
+    const rEl = document.getElementById('aws-reclaim-pct');
+    rEl.textContent = rpct.toFixed(1) + '%';
+    rEl.className = 'aws-metric-value' + (rpct >= 10 ? ' warn' : rpct > 0 ? '' : ' ok');
+    rEl.title = (s.reclaim_24h_lost_min || 0).toFixed(1) + ' min of encoding lost to reclaims in the last 24h';
+    const warm = s.min_vcpus || 0;
+    const warmEl = document.getElementById('aws-warm');
+    warmEl.textContent = warm + ' vCPU';
+    warmEl.className = 'aws-metric-value' + (warm > 0 ? ' ok' : '');
+    renderMaxVcpuRadio(s.max_vcpus || 0);
     document.getElementById('aws-region').textContent = data.region || '—';
 
+    renderJobsMetrics(s);
     renderFleet(data.fleet || {}, data.instances || []);
 
     const execs = s.running_executions || 0;
@@ -2179,9 +2429,16 @@ function _fleetInstanceRow(i, maxV) {
             ? _sparkline(cpuVals, '#e0555a', { min: 0, max: 100, w: 54, h: 13 }) + ' ' : '';
         cpuSpark = `<span title="this box's CPU% (CloudWatch)">CPU ${spark}<span style="color:#ccc">${cpuVals[cpuVals.length - 1]}%</span></span> · `;
     }
+    // Swatch keyed by the SAME instanceColor() the chunk plot uses, so a box
+    // here and its chunks below share one colour — the machine a chunk ran on is
+    // traceable to this fleet row at a glance.
+    const hostColor = i.id ? instanceColor(i.id) : null;
+    const swatch = hostColor
+        ? `<span title="machine ${escapeHtml(i.id)} — matches its chunk colour in the plot" style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${hostColor};vertical-align:middle;margin-right:6px"></span>`
+        : '';
     return `<div>
       <div style="display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-bottom:2px">
-        <span>${escapeHtml(i.type || '')} <span style="color:#666">${escapeHtml((i.id || '').slice(-6))}</span>${badge}</span>
+        <span>${swatch}${escapeHtml(i.type || '')} <span style="color:#666">${escapeHtml((i.id || '').slice(-6))}</span>${badge}</span>
         <span>${cpuSpark}${rightLabel} · ${formatDuration(i.age_seconds || 0)}</span>
       </div>
       <div style="height:16px;width:${barW}%;background:#20252f;border-radius:4px;overflow:hidden;display:flex" title="${cap} vCPU">${parts}</div>
@@ -2277,14 +2534,12 @@ function renderFleet(fleet, instances) {
     const el = document.getElementById('aws-fleet');
     if (el) el.innerHTML = panelHtml;
 
-    // Jobs page: show the same full panel above the jobs list; hide it entirely
-    // when there's no fleet so the page isn't cluttered while idle.
-    const jp = document.getElementById('jobs-fleet-panel');
+    // Jobs page: the Fleet panel stays visible so its metrics row (rendered by
+    // renderJobsMetrics, right under the title) is always an at-a-glance status.
+    // The per-instance display below carries its own "No active fleet" empty
+    // state while idle, so the panel isn't blank.
     const jff = document.getElementById('jobs-fleet-full');
-    if (jp && jff) {
-        if (running.length || total) { jff.innerHTML = panelHtml; jp.style.display = ''; }
-        else { jp.style.display = 'none'; }
-    }
+    if (jff) jff.innerHTML = panelHtml;
 }
 
 function renderAwsInstances(instances) {
@@ -2379,17 +2634,27 @@ function renderAwsS3(prefixes) {
         el.innerHTML = '<div class="aws-empty">No S3 staging.</div>';
         return;
     }
-    const rows = prefixes.map(p => `
+    const rows = prefixes.map(p => {
+        const isMezz = p.kind === 'mezz';
+        // mezz-cache entries delete by prefix (no job to terminate); job
+        // staging deletes via the job cleanup path.
+        const jobCell = isMezz
+            ? '<span style="color:#e0883a" title="Source-keyed mezzanine cache — safe to delete; auto-expires on its TTL">mezz-cache</span>'
+            : escapeHtml(p.job_id || '—');
+        const del = isMezz
+            ? `<span class="aws-row-action" onclick="deleteS3Prefix('${escapeAttr(p.prefix)}')">delete</span>`
+            : (p.job_id
+                ? `<span class="aws-row-action" onclick="cleanupJob('${escapeAttr(p.job_id)}','')">delete</span>`
+                : '—');
+        return `
         <tr>
             <td>${escapeHtml(p.prefix)}</td>
             <td>${formatBytes(p.size_bytes || 0)}</td>
             <td>${p.object_count || 0}</td>
-            <td>${escapeHtml(p.job_id || '—')}</td>
-            <td>${p.job_id
-                ? `<span class="aws-row-action" onclick="cleanupJob('${escapeAttr(p.job_id)}','')">delete</span>`
-                : '—'}</td>
-        </tr>
-    `).join('');
+            <td>${jobCell}</td>
+            <td>${del}</td>
+        </tr>`;
+    }).join('');
     el.innerHTML = `
         <table class="aws-table">
             <thead><tr>
@@ -2398,6 +2663,87 @@ function renderAwsS3(prefixes) {
             <tbody>${rows}</tbody>
         </table>
     `;
+}
+
+// Max-vCPUs radio: current (1x) vs 2x. Base is the configured 48-vCPU default;
+// the live ceiling (from the fleet summary) picks which option is selected.
+const _MAXVCPU_BASE = 48;
+// Mirror the AWS-tab summary tiles at the top of the Jobs page (under Fleet),
+// so the at-a-glance cloud status is visible without switching tabs. Fed from
+// the same inventory summary `s` that renderAws already fetched — full innerHTML
+// re-render each 10s tick is fine (radios re-check from live state, no text
+// input to lose focus on).
+function renderJobsMetrics(s) {
+    const el = document.getElementById('jobs-aws-metrics');
+    if (!el) return;
+    const execs = s.running_executions || 0;
+    const bjobs = s.active_batch_jobs || 0;
+    const running = s.running_instances || 0;
+    const orphans = s.orphan_volumes || 0;
+    const hourly = s.estimated_hourly_usd || 0;
+    const rpct = s.reclaim_24h_pct || 0;
+    const live = s.max_vcpus || 0;
+    const cls = (v, warnAbove) => 'aws-metric-value' + (v > (warnAbove || 0) ? ' warn' : ' ok');
+    const tile = (label, valueHtml, title) =>
+        `<div class="aws-metric"><div class="aws-metric-label"${title ? ` title="${title}"` : ''}>${label}</div>${valueHtml}</div>`;
+    let vcpuHtml = '<div class="aws-metric-value" style="font-size:0.9rem">—</div>';
+    if (live) {
+        const opts = [_MAXVCPU_BASE, _MAXVCPU_BASE * 2];
+        vcpuHtml = '<div class="aws-metric-value" style="font-size:0.9rem">' + opts.map(v =>
+            `<label style="margin-right:10px;cursor:pointer;white-space:nowrap"><input type="radio" name="maxvcpu-jobs" value="${v}" ${v === live ? 'checked' : ''} onchange="setMaxVcpus(${v})" style="width:auto;min-width:0;vertical-align:middle"> ${v} ${v === _MAXVCPU_BASE ? '(1×)' : '(2×)'}</label>`).join('') + '</div>';
+    }
+    el.innerHTML = [
+        tile('Running executions', `<div class="${cls(execs)}">${execs}</div>`),
+        tile('Active batch jobs', `<div class="${cls(bjobs)}">${bjobs}</div>`),
+        tile('Running instances', `<div class="${cls(running)}">${running}</div>`),
+        tile('Orphan volumes', `<div class="${cls(orphans)}">${orphans}</div>`),
+        tile('S3 staged', `<div class="aws-metric-value">${formatBytes(s.total_s3_bytes || 0)}</div>`),
+        tile('Est. hourly spend', `<div class="${cls(hourly)}">$${hourly.toFixed(2)}</div>`),
+        tile('Spent (last 24h)', `<div class="aws-metric-value">$${(s.spend_24h_usd || 0).toFixed(2)}</div>`, 'Self-tracked: burn rate integrated over the trailing 24h'),
+        tile('Saved by spot (total)', `<div class="aws-metric-value ok">$${(s.saved_total_usd || 0).toFixed(2)}</div>`, 'Accumulated (on-demand − spot) cost across all finished cloud-batch jobs'),
+        tile('Reclaim waste (24h)', `<div class="aws-metric-value${rpct >= 10 ? ' warn' : rpct > 0 ? '' : ' ok'}">${rpct.toFixed(1)}%</div>`, (s.reclaim_24h_lost_min || 0).toFixed(1) + ' min of encoding lost to reclaims in the last 24h'),
+        tile('Keep warm', `<div class="aws-metric-value${(s.min_vcpus || 0) > 0 ? ' ok' : ''}">${s.min_vcpus || 0} vCPU</div>`, 'Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box (0 when idle).'),
+        tile('Max vCPUs', vcpuHtml, 'Batch compute-env max vCPUs. 2× runs ~twice as many machines → roughly half the wall-clock for ~the same total cost.'),
+    ].join('');
+}
+
+function renderMaxVcpuRadio(live) {
+    const el = document.getElementById('aws-maxvcpu');
+    if (!el) return;
+    if (!live) { el.textContent = '—'; return; }
+    const opts = [_MAXVCPU_BASE, _MAXVCPU_BASE * 2];
+    el.innerHTML = opts.map(v =>
+        `<label style="margin-right:10px;cursor:pointer;white-space:nowrap">
+           <input type="radio" name="maxvcpu" value="${v}" ${v === live ? 'checked' : ''}
+             onchange="setMaxVcpus(${v})" style="width:auto;min-width:0;vertical-align:middle"> ${v} ${v === _MAXVCPU_BASE ? '(1×)' : '(2×)'}
+         </label>`).join('');
+}
+
+async function setMaxVcpus(v) {
+    try {
+        const res = await fetch('/api/aws/max-vcpus', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ max_vcpus: v }),
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
+        await refreshAws();
+    } catch (e) {
+        alert('Set max vCPUs failed: ' + e.message);
+    }
+}
+
+async function deleteS3Prefix(prefix) {
+    if (!confirm('Delete all objects under ' + prefix + '?')) return;
+    try {
+        const res = await fetch('/api/aws/s3/delete-prefix', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prefix }),
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
+        await refreshAws();
+    } catch (e) {
+        alert('Delete failed: ' + e.message);
+    }
 }
 
 async function cleanupJob(jobId, instanceHint) {
@@ -2608,7 +2954,7 @@ async function forceReencode(fileName) {
     const body = {
         files: [fileName],
         target: document.getElementById('target').value,
-        codec: document.getElementById('codec').value,
+        codec: codecValue(),
         max_res: document.getElementById('max-res').value,
         time: document.getElementById('time-limit').value,
         segment_duration: document.getElementById('segment-duration').value,
@@ -2616,14 +2962,14 @@ async function forceReencode(fileName) {
         gop_duration: document.getElementById('gop-duration').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
-        keep_mezzanine: document.getElementById('keep-mezzanine').checked,
         hevc_single_pass: document.getElementById('hevc-pass').value === '1',
         ladder: document.getElementById('ladder').value,
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
         simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
-        force_reencode: true
+        force_reencode: true,
+        promote: document.getElementById('promote-after').checked
     };
 
     const result = await showDialog(
@@ -2850,6 +3196,7 @@ startAwsAutoRefresh();
 loadVersion();
 loadLadders();
 loadSettings();
+loadPromoteConfig();
 
 function _renderWatcher(enabled) {
     const cb = document.getElementById('watcher-enabled');

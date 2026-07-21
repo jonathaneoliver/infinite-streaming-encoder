@@ -15,6 +15,18 @@ PORT ?= 8080
 VERSION := $(shell cat VERSION 2>/dev/null || echo dev)
 GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
+# Promote (staging -> live rsync). All optional; no-ops when unset.
+#  - PROMOTE_LOCAL_DIR: host dir mounted at /media/promote-local (a local dest;
+#    reference /media/promote-local in PROMOTE_DESTS).
+#  - PROMOTE_SSH_HOST: a *.local remote resolved here via mDNS and --add-host'd
+#    into the container, since Docker can't resolve .local names itself.
+PROMOTE_MOUNT := $(if $(PROMOTE_LOCAL_DIR),-v $(PROMOTE_LOCAL_DIR):/media/promote-local,)
+PROMOTE_SSH_IP := $(if $(PROMOTE_SSH_HOST),$(shell dscacheutil -q host -a name $(PROMOTE_SSH_HOST) 2>/dev/null | awk '/^ip_address:/{print $$2; exit}'),)
+PROMOTE_ADDHOST := $(if $(PROMOTE_SSH_IP),--add-host $(PROMOTE_SSH_HOST):$(PROMOTE_SSH_IP),)
+# Forward the host ssh-agent (Docker Desktop magic socket) so a passphrase-
+# protected key whose passphrase is in the macOS keychain works in-container.
+PROMOTE_SSH_AGENT := $(if $(PROMOTE_SSH_HOST),-v /run/host-services/ssh-auth.sock:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent,)
+
 # GHCR publishing
 GHCR_IMAGE ?= ghcr.io/jonathaneoliver/encoder
 GHCR_USERNAME ?= jonathaneoliver
@@ -45,6 +57,11 @@ run: require-paths build
 		-v $(TMP_DIR):/media/tmp \
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		-v $(HOME)/.aws:/root/.aws:ro \
+		-v $(HOME)/.ssh:/root/.ssh:ro \
+		$(PROMOTE_MOUNT) \
+		$(PROMOTE_ADDHOST) \
+		$(PROMOTE_SSH_AGENT) \
+		-e 'PROMOTE_DESTS=$(PROMOTE_DESTS)' \
 		-e SOURCE_DIR=/media/originals \
 		-e OUTPUT_DIR=/media/dynamic_content \
 		-e TMP_DIR=/media/tmp \
@@ -59,6 +76,7 @@ run: require-paths build
 		-e DEFAULT_CODEC=$(DEFAULT_CODEC) \
 		-e DEFAULT_MAX_RES=$(DEFAULT_MAX_RES) \
 		-e MAX_CONCURRENT=$(MAX_CONCURRENT) \
+		-e WARM_MIN_VCPUS=$(WARM_MIN_VCPUS) \
 		-e DOCKER_IMAGE=$(DOCKER_IMAGE) \
 		-e WORKER_AMI_ID=$(WORKER_AMI) \
 		-e AWS_REGION=$(AWS_REGION) \
@@ -190,6 +208,11 @@ ecr-login:
 	  docker login --username AWS --password-stdin $(ECR_REGISTRY)
 
 ecr-push: ecr-login   ## build arm64 (Graviton) + push the worker image to ECR
+	# The default buildx "docker" driver already caches layers in the local
+	# daemon across builds, so an incremental (script-only) build reuses the
+	# heavy ffmpeg/Shaka layers. External registry cache (--cache-to) needs a
+	# docker-container buildx builder; not worth it on one host, adopt only if
+	# builds move to multiple machines/CI.
 	docker buildx build --platform linux/arm64 \
 		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(IMAGE_TAG) \
 		--tag $(ECR_REPO):latest --tag $(ECR_REPO):$(IMAGE_TAG) --push .
@@ -246,11 +269,19 @@ infra-setup:          ## one-shot stand-up: init + apply + ecr-push + bake-ami +
 # Deploy stops at the plan on purpose — review it, then run `make infra-apply`.
 # (Keeping preview and apply as separate, deliberate steps for live IaC.)
 deploy:               ## push image + restart + plan + APPLY infra (one shot)
-	$(MAKE) ecr-push
-	$(MAKE) restart
-	$(MAKE) infra-plan
-	$(MAKE) infra-apply
-	@echo ">>> deploy complete: image pushed, server restarted, infra applied"
+	@start=$$(date +%s); \
+	echo ">>> deploy started $$(date '+%H:%M:%S')  worker=$(IMAGE_TAG)"; \
+	if $(MAKE) ecr-push && $(MAKE) restart && $(MAKE) infra-plan && $(MAKE) infra-apply; then \
+		el=$$(( $$(date +%s) - start )); \
+		printf '\a\n\033[1;32m==================================================\n'; \
+		printf '  DEPLOY COMPLETE  %dm %02ds   worker=%s\n' $$((el/60)) $$((el%60)) "$(IMAGE_TAG)"; \
+		printf '  image pushed - server restarted - infra applied\n'; \
+		printf '==================================================\033[0m\n'; \
+	else \
+		el=$$(( $$(date +%s) - start )); \
+		printf '\a\n\033[1;31m!!! DEPLOY FAILED after %dm %02ds - see output above\033[0m\n' $$((el/60)) $$((el%60)); \
+		exit 1; \
+	fi
 
 deploy-review:        ## like deploy but stop at the plan (review before infra-apply)
 	$(MAKE) ecr-push

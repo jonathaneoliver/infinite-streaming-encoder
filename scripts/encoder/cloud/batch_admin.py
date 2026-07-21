@@ -1,10 +1,12 @@
 """Release controls for the cloud-batch target, surfaced by the AWS tab.
 
-Stopping a Step Functions execution aborts the Batch jobs it manages;
-terminating jobs lets the Batch compute environment scale its spot instances
-back to zero. The Go server shells out to these commands:
+Stopping a Step Functions execution does NOT stop its in-flight
+batch:submitJob.sync jobs — they run to completion, orphaned — so cancel passes
+--terminate-jobs to also terminate the execution's Batch jobs (in-progress
+chunks stop now, and the compute environment can scale spot instances back to
+zero). The Go server shells out to these commands:
 
-    python3 -m encoder.cloud.batch_admin stop-execution --arn <arn>
+    python3 -m encoder.cloud.batch_admin stop-execution --arn <arn> [--terminate-jobs]
     python3 -m encoder.cloud.batch_admin terminate-job --id <jobId>
     python3 -m encoder.cloud.batch_admin stop-all
 
@@ -25,9 +27,36 @@ _ACTIVE_BATCH_STATUSES = ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNI
 _REASON = "released from encoder AWS tab"
 
 
-def _stop_execution(arn: str) -> dict:
+def _stop_execution(arn: str, terminate_jobs: bool = False) -> dict:
+    """Stop the execution. With terminate_jobs, ALSO terminate the Batch jobs it
+    launched — stopping a Standard-workflow execution does NOT stop its in-flight
+    batch:submitJob.sync jobs (they run to completion, orphaned), so a plain
+    stop leaves in-progress chunk encodes running and the fleet busy. The jobs
+    are matched by JobName, which carries the execution name (var-*-<execName>,
+    mezz-<execName>, etc.)."""
     sfn_client().stop_execution(executionArn=arn, cause=_REASON)
-    return {"stopped_execution": arn}
+    report: dict = {"stopped_execution": arn}
+    if terminate_jobs:
+        name = arn.rsplit(":", 1)[-1]
+        queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+        batch = batch_client()
+        terminated, errors = [], []
+        for status in _ACTIVE_BATCH_STATUSES:
+            try:
+                for j in batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", []):
+                    if name not in j.get("jobName", ""):
+                        continue
+                    try:
+                        batch.terminate_job(jobId=j["jobId"], reason=_REASON)
+                        terminated.append(j["jobId"])
+                    except ClientError as e:
+                        errors.append(f"terminate {j['jobId']}: {e}")
+            except ClientError as e:
+                errors.append(f"list {status}: {e}")
+        report["terminated_jobs"] = terminated
+        if errors:
+            report["errors"] = errors
+    return report
 
 
 def _execution_status(arn: str) -> dict:
@@ -86,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd", required=True)
     se = sub.add_parser("stop-execution"); se.add_argument("--arn", required=True)
+    se.add_argument("--terminate-jobs", action="store_true", dest="terminate_jobs")
     est = sub.add_parser("execution-status"); est.add_argument("--arn", required=True)
     tj = sub.add_parser("terminate-job"); tj.add_argument("--id", required=True, dest="job_id")
     sub.add_parser("stop-all")
@@ -93,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.cmd == "stop-execution":
-            report = _stop_execution(args.arn)
+            report = _stop_execution(args.arn, terminate_jobs=args.terminate_jobs)
         elif args.cmd == "execution-status":
             report = _execution_status(args.arn)
         elif args.cmd == "terminate-job":

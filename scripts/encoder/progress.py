@@ -105,6 +105,9 @@ def run_ffmpeg_with_progress(
     cmd: list[str],
     duration_s: float,
     stage_key: str,
+    pct_lo: float = 0.0,
+    pct_hi: float = 100.0,
+    terminal: bool = True,
 ) -> None:
     """Run ffmpeg with `-progress pipe:1` appended and emit live STAGE updates.
 
@@ -126,7 +129,14 @@ def run_ffmpeg_with_progress(
     """
     full_cmd = [*cmd, "-progress", "pipe:1", "-stats_period", _FFMPEG_STATS_PERIOD]
 
-    emit_stage(stage_key, "running", 0.0)
+    # Map ffmpeg's own 0-100% onto the caller's [pct_lo, pct_hi] band, so a
+    # phase whose ffmpeg step is only the middle of the stage (mezzanine/audio:
+    # download → copy → upload) fills one continuous bar instead of jumping.
+    # Defaults (0..100, terminal) leave variant encodes unchanged.
+    def _scale(p: float) -> float:
+        return pct_lo + max(0.0, min(100.0, p)) / 100.0 * (pct_hi - pct_lo)
+
+    emit_stage(stage_key, "running", pct_lo)
 
     proc = subprocess.Popen(
         full_cmd,
@@ -151,7 +161,7 @@ def run_ffmpeg_with_progress(
                 percent = (out_us / (duration_s * 1_000_000.0)) * 100.0
                 now = time.monotonic()
                 if now - last_emit >= _MIN_EMIT_INTERVAL_S:
-                    emit_stage(stage_key, "running", percent)
+                    emit_stage(stage_key, "running", _scale(percent))
                     last_emit = now
             elif key == "progress" and value == "end":
                 break
@@ -159,7 +169,10 @@ def run_ffmpeg_with_progress(
         rc = proc.wait()
 
     if rc != 0:
-        emit_stage(stage_key, "failed", 0.0)
+        emit_stage(stage_key, "failed", pct_lo)
         raise subprocess.CalledProcessError(rc, full_cmd)
 
-    emit_stage(stage_key, "done", 100.0)
+    # terminal → the stage is complete (done at pct_hi, normally 100); otherwise
+    # this ffmpeg step is a mid-stage segment, so just advance to pct_hi and let
+    # the caller emit the final "done" after its remaining work (e.g. upload).
+    emit_stage(stage_key, "done" if terminal else "running", pct_hi)

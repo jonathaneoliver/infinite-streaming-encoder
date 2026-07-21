@@ -47,6 +47,26 @@ resource "aws_s3_bucket_lifecycle_configuration" "staging" {
       days_after_initiation = 3
     }
   }
+
+  # Source-keyed mezzanine cache (mezz/<key>/mezzanine.mp4): reused across jobs
+  # to skip the re-upload + mezzanine job for a source encoded again. Bounded to
+  # recent files by its own TTL so it never accumulates cost.
+  rule {
+    id     = "expire-mezz-cache"
+    status = "Enabled"
+
+    filter {
+      prefix = "mezz/"
+    }
+
+    expiration {
+      days = var.mezz_cache_retention_days
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 3
+    }
+  }
 }
 
 module "network" {
@@ -64,7 +84,7 @@ module "iam" {
 }
 
 module "compute" {
-  source            = "./modules/compute"
+  source               = "./modules/compute"
   vpc_id               = module.network.vpc_id
   subnet_ids           = module.network.subnet_ids
   security_group_id    = module.network.batch_sg_id
@@ -74,18 +94,18 @@ module "compute" {
 }
 
 module "jobs" {
-  source            = "./modules/jobs"
-  ecr_repo_url      = module.ecr.repo_url
-  image_tag         = var.image_tag
-  task_role_arn     = module.iam.task_role_arn
+  source             = "./modules/jobs"
+  ecr_repo_url       = module.ecr.repo_url
+  image_tag          = var.image_tag
+  task_role_arn      = module.iam.task_role_arn
   execution_role_arn = module.iam.execution_role_arn
-  s3_bucket         = var.s3_bucket
-  region            = local.region
+  s3_bucket          = var.s3_bucket
+  region             = local.region
 }
 
 module "workflow" {
-  source              = "./modules/workflow"
-  job_queue_arn       = module.compute.job_queue_arn
-  job_def_arns        = module.jobs.job_def_arns
-  workflow_role_arn   = module.iam.workflow_role_arn
+  source            = "./modules/workflow"
+  job_queue_arn     = module.compute.job_queue_arn
+  job_def_arns      = module.jobs.job_def_arns
+  workflow_role_arn = module.iam.workflow_role_arn
 }

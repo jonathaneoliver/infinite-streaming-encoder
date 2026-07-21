@@ -39,21 +39,25 @@ type Config struct {
 	// staging accumulate indefinitely. Zero disables.
 	FailedStagingMaxAge time.Duration
 	// WarmMinVCPUs keeps the Batch compute environment's minvCpus at this
-	// value while a cloud-batch run is active (a RUNNING execution or active
-	// Batch job), then resets it to 0 when idle — so the packaging tail lands
-	// on a hot instance instead of cold-starting. Zero disables the feature
-	// (min_vcpus is left at whatever Terraform set).
+	// value while a cloud-batch run is active, then resets it to 0 when idle —
+	// so the packaging tail lands on a hot instance instead of cold-starting.
+	// Zero disables the feature (min_vcpus is left at whatever Terraform set).
 	WarmMinVCPUs int
+	// ActiveJobs returns the count of the app's own queued/running cloud jobs.
+	// The warm floor is held while this is > 0 (not just while AWS resources are
+	// live), so it stays warm across the gap between sequential jobs and only
+	// drops when the whole app job queue is empty. Nil disables this signal.
+	ActiveJobs func() int
 }
 
 type inventoryDoc struct {
 	Instances []struct {
-		ID          string  `json:"id"`
-		State       string  `json:"state"`
-		Type        string  `json:"type"`
-		JobID       string  `json:"job_id"`
-		AgeSeconds  float64 `json:"age_seconds"`
-		HourlyUSD   float64 `json:"estimated_hourly_usd"`
+		ID         string  `json:"id"`
+		State      string  `json:"state"`
+		Type       string  `json:"type"`
+		JobID      string  `json:"job_id"`
+		AgeSeconds float64 `json:"age_seconds"`
+		HourlyUSD  float64 `json:"estimated_hourly_usd"`
 	} `json:"instances"`
 	Summary struct {
 		RunningInstances   int     `json:"running_instances"`
@@ -163,7 +167,11 @@ func reconcileWarmCapacity(cfg Config, inv *inventoryDoc) {
 	if cfg.WarmMinVCPUs <= 0 {
 		return // feature disabled
 	}
-	active := inv.Summary.RunningExecutions > 0 || inv.Summary.ActiveBatchJobs > 0
+	// Hold the warm floor while the app's own job queue has work (covers the gap
+	// between sequential jobs) OR AWS still shows a live run. Drops to 0 only when
+	// the app queue is empty AND no execution/Batch job is active.
+	appQueued := cfg.ActiveJobs != nil && cfg.ActiveJobs() > 0
+	active := appQueued || inv.Summary.RunningExecutions > 0 || inv.Summary.ActiveBatchJobs > 0
 	desired := 0
 	if active {
 		desired = cfg.WarmMinVCPUs

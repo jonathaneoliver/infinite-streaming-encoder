@@ -257,11 +257,16 @@ def build_ffmpeg_cmd(
     ]
     cmd += _codec_specific_args(codec, target_kbps, k, rung.preset,
                                 pass_num=pass_num, stats_path=stats_path)
-    cmd += [
-        "-b:v", f"{target_kbps}k",
-        "-maxrate", f"{maxrate_k}k",
-        "-bufsize", f"{bufsize_k}k",
-    ]
+    # VBV-capped ABR: target average + peak cap + buffer. SVT-AV1 is the
+    # exception — its ffmpeg wrapper rejects -maxrate outside CRF mode
+    # ("Max Bitrate only supported with CRF mode"), so av1 runs plain VBR to the
+    # target average with no peak cap. (x264/x265 take the full triple.)
+    cmd += ["-b:v", f"{target_kbps}k"]
+    if codec != "av1":
+        cmd += [
+            "-maxrate", f"{maxrate_k}k",
+            "-bufsize", f"{bufsize_k}k",
+        ]
     if pass_num == 1:
         # Analysis pass: discard the muxed output, keep only the stats.
         cmd += ["-an", "-f", "null", "-"]
@@ -316,15 +321,22 @@ def encode_variant(
             # discarded); pass 2 reads it to hit the target average.
             # Both passes reuse the same filter + rate control. With a
             # chunk, this runs per chunk against its own stats file.
+            #
+            # Show the two passes as ONE continuous bar — pass 1 fills 0-50%,
+            # pass 2 fills 50-100% — so it doesn't reset to 0 mid-encode (which
+            # reads as lost work). Pass 1's stats ARE used by pass 2; nothing is
+            # discarded except the pass-1 muxed output.
             run_ffmpeg_with_progress(
                 build_ffmpeg_cmd(ctx, codec, rung, pass_num=1, chunk=chunk),
                 duration_s=total_duration_s,
                 stage_key=stage_key,
+                pct_lo=0.0, pct_hi=50.0, terminal=False,
             )
             run_ffmpeg_with_progress(
                 build_ffmpeg_cmd(ctx, codec, rung, pass_num=2, chunk=chunk),
                 duration_s=total_duration_s,
                 stage_key=stage_key,
+                pct_lo=50.0, pct_hi=100.0,
             )
         else:
             run_ffmpeg_with_progress(

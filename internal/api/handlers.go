@@ -49,6 +49,8 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/outputs/{name}/playlists", s.listPlaylists)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/ladder", s.ladder)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/logs", s.outputLogs)
+	s.Mux.HandleFunc("POST /api/outputs/{name}/promote", s.promoteOutput)
+	s.Mux.HandleFunc("GET /api/promote", s.getPromote)
 	s.Mux.HandleFunc("POST /api/encode", s.startEncode)
 	s.Mux.HandleFunc("GET /api/jobs", s.listJobs)
 	s.Mux.HandleFunc("GET /api/jobs/{id}/logs", s.jobLogs)
@@ -61,6 +63,8 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/aws/inventory", s.awsInventory)
 	s.Mux.HandleFunc("POST /api/aws/clear", s.awsClearAll)
 	s.Mux.HandleFunc("POST /api/aws/jobs/{id}/cleanup", s.awsCleanupJob)
+	s.Mux.HandleFunc("POST /api/aws/s3/delete-prefix", s.awsDeleteS3Prefix)
+	s.Mux.HandleFunc("POST /api/aws/max-vcpus", s.awsSetMaxVCPUs)
 	// Cloud-batch release controls (Step Functions executions + Batch jobs).
 	s.Mux.HandleFunc("POST /api/aws/executions/stop", s.awsStopExecution)
 	s.Mux.HandleFunc("POST /api/aws/batch-jobs/terminate", s.awsTerminateBatchJob)
@@ -150,8 +154,18 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 	if cfg.Codec == "" {
 		cfg.Codec = "both"
 	}
-	job := s.Manager.Submit(cfg)
-	writeJSON(w, job)
+	// One job per file: each selected file becomes its own independent job, so
+	// they run concurrently (up to MAX_CONCURRENT), each with its own log,
+	// history, cancel and retry — instead of a single batched job that processes
+	// the files strictly sequentially. Returns the list of created jobs (the UI
+	// tracks them via the SSE stream, so it doesn't depend on this body).
+	jobs := make([]*encode.Job, 0, len(cfg.Files))
+	for _, f := range cfg.Files {
+		c := cfg
+		c.Files = []string{f}
+		jobs = append(jobs, s.Manager.Submit(c))
+	}
+	writeJSON(w, jobs)
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
@@ -456,6 +470,24 @@ func (s *Server) deleteLadder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.Manager.Ladders.List())
 }
 
+// getPromote reports the configured promote destinations so the UI can show/hide
+// the Promote button + "promote after encode" checkbox and label them.
+func (s *Server) getPromote(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{"dests": encode.PromoteDests()})
+}
+
+// promoteOutput rsyncs one staged output to every configured destination and
+// returns the per-destination results (200 with a mix of ok/failed dests; 400
+// only when nothing could run — bad name or no PROMOTE_DESTS).
+func (s *Server) promoteOutput(w http.ResponseWriter, r *http.Request) {
+	results, err := s.Manager.Promote(r.PathValue("name"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, results)
+}
+
 func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {
 	entries, err := os.ReadDir(s.Manager.OutputDir)
 	if err != nil {
@@ -468,7 +500,7 @@ func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		name := e.Name()
-		if strings.HasPrefix(name, ".") || strings.HasSuffix(name, "_tmp") {
+		if strings.HasPrefix(name, ".") || strings.HasSuffix(name, "_tmp") || encode.IsDatedBackup(name) {
 			continue
 		}
 		info, _ := e.Info()
@@ -870,6 +902,45 @@ func (s *Server) awsCleanupJob(w http.ResponseWriter, r *http.Request) {
 }
 
 // awsStopExecution stops one Step Functions execution (aborts its Batch jobs).
+// awsDeleteS3Prefix deletes every object under one S3 staging prefix — a job's
+// staging or a single mezz-cache entry. cleanup.py restricts it to jobs/ or
+// mezz/, so a bad prefix can't reach arbitrary keys.
+func (s *Server) awsDeleteS3Prefix(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Prefix string `json:"prefix"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Prefix == "" {
+		http.Error(w, `bad request: {"prefix": "..."} required`, 400)
+		return
+	}
+	out, err := runPythonCloud("cleanup", "--delete-prefix", body.Prefix)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+// awsSetMaxVCPUs changes the Batch compute env's maxvCpus ceiling live (the AWS
+// panel's current-vs-2x toggle). Terraform ignores max_vcpus so it isn't reset.
+func (s *Server) awsSetMaxVCPUs(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		MaxVCPUs int `json:"max_vcpus"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.MaxVCPUs <= 0 {
+		http.Error(w, `bad request: {"max_vcpus": N} required`, 400)
+		return
+	}
+	out, err := runPythonCloud("compute_env", "--set-max-vcpus", strconv.Itoa(body.MaxVCPUs))
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
 func (s *Server) awsStopExecution(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Arn string `json:"arn"`

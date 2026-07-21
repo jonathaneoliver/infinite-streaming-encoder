@@ -1,7 +1,16 @@
 {
   "Comment": "Encoder pipeline: mezzanine -> fan-out variants + audio -> per-codec package/HLS/byteranges.",
-  "StartAt": "Mezzanine",
+  "StartAt": "MezzCheck",
   "States": {
+
+    "MezzCheck": {
+      "Comment": "Skip the mezzanine job entirely when a prior job of the same source already produced it (mezz_cached from buildSFNInput) — variants + audio read it straight from the source-keyed cache (s3_mezz).",
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.mezz_cached", "BooleanEquals": true, "Next": "FanOut" }
+      ],
+      "Default": "Mezzanine"
+    },
 
     "Mezzanine": {
       "Type": "Task",
@@ -11,10 +20,10 @@
         "JobQueue": "${job_queue_arn}",
         "JobDefinition": "${mezzanine_def}",
         "ShareIdentifier": "encode",
-        "SchedulingPriorityOverride": 99,
+        "SchedulingPriorityOverride.$": "$.prio_mezz",
         "Parameters": {
           "s3_in.$": "$.s3_input",
-          "s3_out.$": "$.s3_prefix"
+          "s3_out.$": "$.s3_mezz"
         },
         "ContainerOverrides": {
           "Environment": [
@@ -58,9 +67,9 @@
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${audio_def}",
                 "ShareIdentifier": "encode",
-                "SchedulingPriorityOverride": 55,
+                "SchedulingPriorityOverride.$": "$.prio_audio",
                 "Parameters": {
-                  "s3_mezz.$": "$.s3_prefix",
+                  "s3_mezz.$": "$.s3_mezz",
                   "s3_out.$": "$.s3_prefix"
                 }
               },
@@ -73,10 +82,10 @@
           "StartAt": "Variants",
           "States": {
             "Variants": {
-              "Comment": "Fan out across (codec, tier); each variant fans out again across chunks. The chunks are joined inline by the package-all phase (no separate concat job). Batch queue depth + compute-env max_vcpus cap real parallelism; 12 lets a full 48-vCPU fleet (6x 8-vCPU boxes) stay busy in whole-variant mode.",
+              "Comment": "Fan out across (codec, tier); each variant fans out again across chunks. The chunks are joined inline by the package-all phase (no separate concat job). MaxConcurrency 40 covers any ladder (3 codecs x ~12 rungs) so ALL variants of a file submit at once — real parallelism is still capped by compute-env max_vcpus (the rest sit RUNNABLE, ordered by schedulingPriority). Atomic fan-out is what makes the app-side launch gate correct: an earlier job has submitted every one of its jobs before the next job's execution starts.",
               "Type": "Map",
               "ItemsPath": "$.variants",
-              "MaxConcurrency": 12,
+              "MaxConcurrency": 40,
               "ItemSelector": {
                 "codec.$": "$$.Map.Item.Value.codec",
                 "label.$": "$$.Map.Item.Value.label",
@@ -88,12 +97,13 @@
                 "memory.$": "$$.Map.Item.Value.memory",
                 "priority.$": "$$.Map.Item.Value.priority",
                 "s3_prefix.$": "$.s3_prefix",
+                "s3_mezz.$": "$.s3_mezz",
                 "two_pass.$": "$$.Map.Item.Value.two_pass",
-                "chunk_indices.$": "$.chunk_indices",
-                "chunk_duration.$": "$.chunk_duration",
+                "chunk_indices.$": "$$.Map.Item.Value.chunk_indices",
+                "chunk_duration.$": "$$.Map.Item.Value.chunk_duration",
                 "maxrate_percent.$": "$.maxrate_percent",
                 "bufsize_multiplier.$": "$.bufsize_multiplier",
-                "chunked.$": "$.chunked"
+                "chunked.$": "$$.Map.Item.Value.chunked"
               },
               "ItemProcessor": {
                 "StartAt": "Chunked",
@@ -123,7 +133,7 @@
                         "bitrate.$": "$.bitrate",
                         "preset.$": "$.preset",
                         "chunk_index": "-1",
-                        "s3_mezz.$": "$.s3_prefix",
+                        "s3_mezz.$": "$.s3_mezz",
                         "s3_out.$": "$.s3_prefix"
                       },
                       "ContainerOverrides": {
@@ -157,6 +167,7 @@
                       "memory.$": "$.memory",
                       "priority.$": "$.priority",
                       "s3_prefix.$": "$.s3_prefix",
+                      "s3_mezz.$": "$.s3_mezz",
                       "two_pass.$": "$.two_pass",
                       "chunk_index.$": "$$.Map.Item.Value",
                       "chunk_duration.$": "$.chunk_duration",
@@ -183,7 +194,7 @@
                               "bitrate.$": "$.bitrate",
                               "preset.$": "$.preset",
                               "chunk_index.$": "States.Format('{}', $.chunk_index)",
-                              "s3_mezz.$": "$.s3_prefix",
+                              "s3_mezz.$": "$.s3_mezz",
                               "s3_out.$": "$.s3_prefix"
                             },
                             "ContainerOverrides": {
@@ -244,7 +255,7 @@
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${package_all_def}",
                 "ShareIdentifier": "encode",
-                "SchedulingPriorityOverride": 45,
+                "SchedulingPriorityOverride.$": "$.prio_pkg",
                 "Parameters": {
                   "codec": "h264",
                   "s3_variants.$": "$.s3_prefix",
@@ -278,9 +289,43 @@
                 "JobQueue": "${job_queue_arn}",
                 "JobDefinition": "${package_all_def}",
                 "ShareIdentifier": "encode",
-                "SchedulingPriorityOverride": 45,
+                "SchedulingPriorityOverride.$": "$.prio_pkg",
                 "Parameters": {
                   "codec": "hevc",
+                  "s3_variants.$": "$.s3_prefix",
+                  "s3_audio.$": "$.s3_prefix",
+                  "s3_out.$": "$.s3_prefix"
+                }
+              },
+              "End": true
+            }
+          }
+        },
+
+        {
+          "StartAt": "Av1Selected",
+          "States": {
+            "Av1Selected": {
+              "Comment": "Only package av1 if it was actually encoded (do_av1 from buildSFNInput). A single-codec job would otherwise fail here with 'no av1 variants found'.",
+              "Type": "Choice",
+              "Choices": [
+                { "Variable": "$.do_av1", "BooleanEquals": true, "Next": "PackageAllAv1" }
+              ],
+              "Default": "SkipAv1"
+            },
+            "SkipAv1": { "Type": "Succeed" },
+            "PackageAllAv1": {
+              "Comment": "Combined package + byteranges + fMP4 HLS in one job (downloads the ladder once).",
+              "Type": "Task",
+              "Resource": "arn:aws:states:::batch:submitJob.sync",
+              "Parameters": {
+                "JobName.$": "States.Format('pkgall-av1-{}', $$.Execution.Name)",
+                "JobQueue": "${job_queue_arn}",
+                "JobDefinition": "${package_all_def}",
+                "ShareIdentifier": "encode",
+                "SchedulingPriorityOverride.$": "$.prio_pkg",
+                "Parameters": {
+                  "codec": "av1",
                   "s3_variants.$": "$.s3_prefix",
                   "s3_audio.$": "$.s3_prefix",
                   "s3_out.$": "$.s3_prefix"

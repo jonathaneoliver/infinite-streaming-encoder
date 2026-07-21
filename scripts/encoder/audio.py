@@ -98,8 +98,15 @@ def build_ffmpeg_cmd(spec: AudioSpec) -> list[str]:
 
 
 def create_audio(spec: AudioSpec, stage_key: str = "audio",
-                 duration_s: float = 0.0) -> Path:
-    """Run the audio extraction/transcode. Returns the output path."""
+                 duration_s: float = 0.0,
+                 pct_lo: float = 0.0, pct_hi: float = 100.0,
+                 terminal: bool = True) -> Path:
+    """Run the audio extraction/transcode. Returns the output path.
+
+    `pct_lo`/`pct_hi`/`terminal` place the transcode's progress in a sub-band of
+    the stage (the phase brackets it with the mezzanine download before and the
+    audio upload after), so the bar fills continuously instead of jumping.
+    """
     spec.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Probe only to validate an audio stream exists and to log the source
@@ -111,7 +118,9 @@ def create_audio(spec: AudioSpec, stage_key: str = "audio",
     cmd = build_ffmpeg_cmd(spec)
     try:
         if duration_s > 0:
-            run_ffmpeg_with_progress(cmd, duration_s, stage_key)
+            run_ffmpeg_with_progress(cmd, duration_s, stage_key,
+                                     pct_lo=pct_lo, pct_hi=pct_hi,
+                                     terminal=terminal)
         else:
             subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:

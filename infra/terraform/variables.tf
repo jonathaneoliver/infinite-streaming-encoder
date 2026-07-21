@@ -16,8 +16,8 @@ Encoder image tag the Batch job definitions pull from ECR. Defaults
 to `latest`, but pin to a short-sha in production for reproducible
 runs.
 EOT
-  type    = string
-  default = "latest"
+  type        = string
+  default     = "latest"
 }
 
 variable "worker_ami_id" {
@@ -29,8 +29,8 @@ AMI tagged with the current image SHA, so it's opt-in and self-correcting:
 bake before an encode session, `make unbake-ami` after to drop the standing
 EBS-snapshot cost back to $0. A missing/stale AMI just falls back to pull-on-boot.
 EOT
-  type    = string
-  default = ""
+  type        = string
+  default     = ""
 }
 
 variable "compute_max_vcpus" {
@@ -42,8 +42,8 @@ once (less queue-wait). With per-tier right-sizing (small tiers = 2 vCPU), 48
 runs ~24 small chunks or ~6 4K chunks concurrently — and caps peak spend at
 roughly half of what 96 would (~6 packed instances instead of ~12).
 EOT
-  type    = number
-  default = 48
+  type        = number
+  default     = 48
 }
 
 variable "staging_retention_days" {
@@ -55,6 +55,18 @@ so S3 is staging only. This lifecycle rule is the safety net that bounds S3
 cost even if a job crashes mid-run and orphans chunk files. Give failed jobs
 enough runway to debug / resume before cleanup.
 EOT
-  type    = number
-  default = 7
+  type        = number
+  default     = 7
+}
+
+variable "mezz_cache_retention_days" {
+  description = <<EOT
+Days before a cached mezzanine under s3://<s3_bucket>/mezz/ is auto-expired.
+The mezzanine is source-keyed (name+size+mtime) and reused across jobs so a
+re-encode of the same source skips the upload + mezzanine job. Keep it long
+enough to cover an iterate-on-one-clip session; the TTL bounds the "recent
+files only" cache so storage never accumulates.
+EOT
+  type        = number
+  default     = 7
 }

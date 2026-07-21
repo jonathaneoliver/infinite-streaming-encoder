@@ -62,7 +62,7 @@ type ladderDoc struct {
 }
 
 var (
-	bandwidthRe = regexp.MustCompile(`BANDWIDTH=(\d+)`)
+	bandwidthRe  = regexp.MustCompile(`BANDWIDTH=(\d+)`)
 	resolutionRe = regexp.MustCompile(`RESOLUTION=(\d+)x(\d+)`)
 )
 

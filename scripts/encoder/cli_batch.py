@@ -60,6 +60,43 @@ def _batch():
     return boto3.client("batch", region_name=_region())
 
 
+def _ecs():
+    return boto3.client("ecs", region_name=_region())
+
+
+# containerInstanceArn -> EC2 instance-id, resolved once per instance. The ARN
+# is stable per machine, so a cache hit avoids re-describing; on missing ecs perm
+# we fall back to a short slug of the ARN (still a stable per-machine key, which
+# is all the chunk-plot colouring needs).
+_HOST_CACHE: dict = {}
+
+
+def _ec2_for_container_instance(ci_arn: str) -> str:
+    """Map an ECS container-instance ARN to its EC2 instance-id (cached).
+    Falls back to the last 8 chars of the ARN if ecs:DescribeContainerInstances
+    isn't granted — a per-machine key is all the caller needs for colouring."""
+    if not ci_arn:
+        return ""
+    if ci_arn in _HOST_CACHE:
+        return _HOST_CACHE[ci_arn]
+    # arn:aws:ecs:region:acct:container-instance/<cluster>/<id>
+    slug = ci_arn.rsplit("/", 1)[-1][:8]
+    resolved = slug
+    try:
+        parts = ci_arn.split(":container-instance/", 1)[-1].split("/")
+        cluster = parts[0] if len(parts) == 2 else None
+        if cluster:
+            r = _ecs().describe_container_instances(
+                cluster=cluster, containerInstances=[ci_arn])
+            cis = r.get("containerInstances", [])
+            if cis and cis[0].get("ec2InstanceId"):
+                resolved = cis[0]["ec2InstanceId"]
+    except (ClientError, KeyError, IndexError):
+        pass
+    _HOST_CACHE[ci_arn] = resolved
+    return resolved
+
+
 # var-<codec>-<tier>-c<N>-<execName> — the chunk job name from the SFN template.
 _CHUNK_JOBNAME_RE = re.compile(r"^var-([^-]+)-([^-]+)-c(\d+)-")
 # var-<codec>-<tier>-whole-<execName> — the whole-variant (single-chunk) job.
@@ -144,9 +181,23 @@ def _forward_running_logs(exec_name: str, log_state: dict) -> None:
         except ClientError:
             continue
         for j in jobs:
-            stream = j.get("container", {}).get("logStreamName")
+            container = j.get("container", {})
+            stream = container.get("logStreamName")
             if stream:
                 _tail_progress(stream, _short_label(j.get("jobName", "")), log_state)
+            # Report which machine each running job landed on, once per stage
+            # key, so the UI can colour EVERY row (encode chunks + mezzanine /
+            # audio / package / fragments / hls) by instance. Best-effort.
+            keys = _host_stage_keys(j.get("jobName", ""))
+            ci_arn = container.get("containerInstanceArn")
+            if keys and ci_arn:
+                inst = _ec2_for_container_instance(ci_arn)
+                if inst:
+                    for key in keys:
+                        seen_key = "_host:" + key
+                        if log_state.get(seen_key) != inst:
+                            log_state[seen_key] = inst
+                            _emit_host(key, inst)
 
 
 def _tail_progress(stream: str, label: str, log_state: dict) -> None:
@@ -166,6 +217,8 @@ def _tail_progress(stream: str, label: str, log_state: dict) -> None:
         if msg.startswith("[[ENCODER-BOOT ") or msg.startswith("[[ENCODER-STAGE "):
             # Verbatim so the Go scanner parses it — ENCODER-STAGE carries the
             # live ffmpeg % for this chunk/variant, driving the progress bars.
+            # (ENCODER-SPEED is forwarded on exit by _forward_container_timing —
+            # it's emitted after the last live poll, so tailing misses it.)
             print(msg, flush=True)
         elif _PROGRESS_RE.search(msg):
             _narrate(f"{label}: {msg}")
@@ -241,44 +294,163 @@ def _emit_stage(key: str, status: str, percent: float = 0.0) -> None:
           flush=True)
 
 
+def _emit_host(key: str, instance: str) -> None:
+    """Report the machine a stage's Batch job landed on, for the chunk plot's
+    per-instance colouring. Emitted once per (key, instance) by the log poller."""
+    print(f"[[ENCODER-HOST key={key} instance={instance}]]", flush=True)
+
+
 def _narrate(msg: str) -> None:
     """A plain (non-marker) line for the job log — the Go server appends these
     verbatim, so they narrate the pipeline in the app's 'Show log'."""
     print(msg, flush=True)
 
 
-def _report_reclaims(exit_ev: dict, label: str) -> None:
-    """Surface spot interruptions in the job log. A reclaim fails a Batch job
-    attempt with a 'Host EC2 instance was terminated' reason and the retry
-    strategy re-runs it on fresh capacity — all transparent under
-    submitJob.sync, so this is the ONLY place a reclaim becomes visible. The
-    completed job's Attempts[] (carried in the exit event output) records each
-    interrupted attempt."""
-    try:
-        out = exit_ev.get("stateExitedEventDetails", {}).get("output", "")
-        attempts = json.loads(out).get("Attempts", [])
-    except (ValueError, TypeError):
-        return
-    n = 0
-    for a in attempts:
+def _reclaim_stats(attempts) -> "tuple[int, float]":
+    """(count, wasted_seconds) of spot reclaims across a Batch job's attempts.
+    A reclaimed attempt failed with 'Host EC2 instance was terminated'; the wall
+    time it ran before dying (StartedAt->StoppedAt) is encode work thrown away —
+    the number that says how much the reclaim actually cost. The retry re-runs
+    each on fresh capacity, so this is the only place a reclaim becomes visible
+    under submitJob.sync."""
+    n, lost = 0, 0.0
+    for a in attempts or []:
         reason = str(a.get("StatusReason", "") or
                      a.get("Container", {}).get("Reason", ""))
         if reason.startswith("Host EC2") or "was terminated" in reason.lower():
             n += 1
-    if n:
-        _narrate(f"⚠ {label}: spot-reclaimed {n}x, retried on fresh capacity "
-                 f"(resumed the chunk, not the whole variant)")
+            st, sp = a.get("StartedAt"), a.get("StoppedAt")
+            if isinstance(st, (int, float)) and isinstance(sp, (int, float)) and sp > st:
+                lost += (sp - st) / 1000.0
+    return n, lost
 
 
-def _forward_container_timing(exit_ev: dict) -> None:
-    """Pull the container's [timing] line (fetch/encode/upload) from CloudWatch
-    for a just-completed chunk and add it to the job log, so the per-chunk
-    breakdown shows up live as chunks finish."""
+def _count_reclaims(attempts) -> int:
+    return _reclaim_stats(attempts)[0]
+
+
+def _encode_total_s(attempts, now_ms=None) -> float:
+    """Total wall-seconds across ALL of a job's attempts (successful + wasted) —
+    the denominator of the reclaim-waste ratio. A still-running attempt (no
+    StoppedAt) is counted up to now_ms so the live ratio isn't stuck at 100%."""
+    t = 0.0
+    for a in attempts or []:
+        st = a.get("StartedAt")
+        if not isinstance(st, (int, float)):
+            continue
+        sp = a.get("StoppedAt")
+        end = sp if isinstance(sp, (int, float)) and sp > st else now_ms
+        if isinstance(end, (int, float)) and end > st:
+            t += (end - st) / 1000.0
+    return t
+
+
+def _var_label(job_name: str) -> str:
+    """'var-h264-360p-c3-<exec>' -> 'encode h264 360p chunk3' (whole -> no
+    chunk). Falls back to the raw name if it doesn't parse."""
+    m = re.match(r"var-(\w+?)-(\w+?)-(whole|c(\d+))-", job_name)
+    if not m:
+        return job_name
+    tail = f" chunk{m.group(4)}" if m.group(4) else ""
+    return f"encode {m.group(1)} {m.group(2)}{tail}"
+
+
+def _stage_from_jobname(job_name: str) -> "str | None":
+    """'var-h264-360p-c3-<exec>' -> stage key 'encode:h264:360p:chunk3'
+    ('...-whole-...' -> 'encode:h264:360p'). None if it doesn't parse."""
+    m = re.match(r"var-(\w+?)-(\w+?)-(whole|c(\d+))-", job_name)
+    if not m:
+        return None
+    return f"encode:{m.group(1)}:{m.group(2)}" + (
+        f":chunk{m.group(4)}" if m.group(4) else "")
+
+
+_PKGALL_JOBNAME_RE = re.compile(r"^pkgall-(\w+?)-")
+
+
+def _host_stage_keys(job_name: str) -> list:
+    """Stage keys a running Batch job maps to, for ENCODER-HOST colouring. A
+    pkgall-<codec> job drives three per-codec rows (package/fragments/hls), all
+    on the same box; mezz/audio one each; var-* the encode chunk/whole key."""
+    m = _PKGALL_JOBNAME_RE.match(job_name)
+    if m:
+        c = m.group(1)
+        return [f"package:{c}", f"fragments:{c}", f"hls:{c}"]
+    head = job_name.split("-", 1)[0]
+    if head == "mezz":
+        return ["mezzanine"]
+    if head == "audio":
+        return ["audio"]
+    k = _stage_from_jobname(job_name)
+    return [k] if k else []
+
+
+def _report_live_reclaims(exec_name: str, seen: dict) -> None:
+    """Poll this execution's non-terminal encode jobs' attempts[] for spot
+    reclaims. Emit ENCODER-RECLAIM (per-stage cumulative count + wasted seconds)
+    on change, and flag the stage 'reclaimed' (red) while it's waiting to
+    restart (RUNNABLE/STARTING after a failed attempt). Best-effort/cosmetic."""
+    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    batch = _batch()
+    status_by_id, name_by_id, ids = {}, {}, []
+    for status in ("RUNNABLE", "STARTING", "RUNNING"):
+        try:
+            for j in batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", []):
+                jn = j.get("jobName", "")
+                if exec_name in jn and jn.startswith("var-"):
+                    ids.append(j["jobId"])
+                    status_by_id[j["jobId"]] = status
+                    name_by_id[j["jobId"]] = jn
+        except ClientError:
+            return
+    for i in range(0, len(ids), 100):
+        try:
+            jobs = batch.describe_jobs(jobs=ids[i:i + 100]).get("jobs", [])
+        except ClientError:
+            continue
+        now_ms = time.time() * 1000.0
+        for job in jobs:
+            jid = job["jobId"]
+            n, lost = _reclaim_stats(job.get("attempts"))
+            if n == 0:
+                continue
+            stage = _stage_from_jobname(name_by_id.get(jid, ""))
+            if not stage:
+                continue
+            total = _encode_total_s(job.get("attempts"), now_ms)
+            if seen.get(jid) != (n, round(lost), round(total)):
+                seen[jid] = (n, round(lost), round(total))
+                print(f"[[ENCODER-RECLAIM key={stage} count={n} "
+                      f"lost_s={lost:.1f} total_s={total:.1f}]]", flush=True)
+            if status_by_id.get(jid) in ("RUNNABLE", "STARTING"):
+                _emit_stage(stage, "reclaimed", 0.0)  # red until the retry runs
+
+
+def _report_reclaims(exit_ev: dict, label: str) -> None:
+    """Reclaims for tasks whose exit output KEEPS the Batch result (mezzanine,
+    audio, package). The encode tasks set ResultPath:null — their Attempts[] is
+    stripped from the exit output — so they're handled off the TaskSucceeded
+    event instead (see _translate_events)."""
     try:
-        out = exit_ev.get("stateExitedEventDetails", {}).get("output", "")
-        stream = json.loads(out).get("Container", {}).get("LogStreamName")
+        attempts = json.loads(
+            exit_ev.get("stateExitedEventDetails", {}).get("output", "")
+        ).get("Attempts", [])
     except (ValueError, TypeError):
-        stream = None
+        return
+    if _count_reclaims(attempts):
+        _narrate(f"⚠ {label}: spot-reclaimed {_count_reclaims(attempts)}x, "
+                 f"retried on fresh capacity")
+
+
+def _forward_container_timing(stream: str | None) -> None:
+    """Pull two end-of-container lines from the worker's CloudWatch stream:
+    the [timing] breakdown (fetch/encode/upload) for the job log, and the
+    [[ENCODER-SPEED ...]] marker that feeds the control plane's learned
+    dynamic-chunk model. Both are emitted after the last live progress poll,
+    so this drain is the reliable place to forward them — _tail_progress misses
+    them. Driven off the TaskSucceeded event (which carries the Batch result's
+    LogStreamName); the TaskStateExited output can't be used because the encode
+    tasks set ResultPath:null, which strips the Container block."""
     if not stream:
         return
     try:
@@ -288,11 +460,21 @@ def _forward_container_timing(exit_ev: dict) -> None:
         ).get("events", [])
     except ClientError:
         return
+    speed_line = timing_line = None
     for e in reversed(events):
-        msg = e.get("message", "")
-        if msg.lstrip().startswith("[timing]"):
-            _narrate("    " + msg.strip())
-            return
+        s = e.get("message", "").lstrip()
+        if speed_line is None and s.startswith("[[ENCODER-SPEED "):
+            speed_line = s.rstrip()
+        elif timing_line is None and s.startswith("[timing]"):
+            timing_line = s.rstrip()
+        if speed_line and timing_line:
+            break
+    # Verbatim (own line, no prefix) so the Go scanner's speedMarkerRe matches
+    # and Manager.learnSpeed folds it into encode_speeds.json exactly once.
+    if speed_line:
+        print(speed_line, flush=True)
+    if timing_line:
+        _narrate("    " + timing_line)
 
 
 # ---------------------------------------------------------------------------
@@ -477,30 +659,73 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
                     c, t, ci = idn
                     _emit_stage(f"encode:{c}:{t}:chunk{ci}", "done", 100.0)
                     _narrate(f"✓ encode {c} {t} chunk{ci} done")
-                    _report_reclaims(ev, f"encode {c} {t} chunk{ci}")
-                    _forward_container_timing(ev)
+                    # reclaims handled off TaskSucceeded (ResultPath:null here)
             elif name == "EncodeWhole":
                 idn = _enter_of(ev, whole_enter)
                 if idn:
                     c, t = idn
                     _emit_stage(f"encode:{c}:{t}", "done", 100.0)
                     _narrate(f"✓ encode {c} {t} done")
-                    _report_reclaims(ev, f"encode {c} {t}")
-                    _forward_container_timing(ev)
+
+        elif etype == "TaskSucceeded":
+            # The Batch result (carrying Container.LogStreamName) lives on this
+            # event, NOT on TaskStateExited — the encode tasks set
+            # ResultPath:null, which strips the Container block from the exited
+            # output. Only variant/chunk jobs (JobName "var-*") emit an
+            # [[ENCODER-SPEED]] sample + [timing] line worth draining.
+            d = ev.get("taskSucceededEventDetails", {})
+            try:
+                out = json.loads(d.get("output", "") or "{}")
+            except (ValueError, TypeError):
+                out = {}
+            jn = str(out.get("JobName", ""))
+            if jn.startswith("var-"):
+                _forward_container_timing(out.get("Container", {}).get("LogStreamName"))
+                # Attempts[] lives on this event (not the ResultPath:null exit).
+                # Emit the reclaim accounting for EVERY finished chunk — even
+                # zero-reclaim ones — so the job's total_s denominator (all
+                # encode time) is complete for the %-wasted ratio.
+                atts = out.get("Attempts")
+                n, lost = _reclaim_stats(atts)
+                total = _encode_total_s(atts)
+                stage = _stage_from_jobname(jn)
+                if stage:
+                    print(f"[[ENCODER-RECLAIM key={stage} count={n} "
+                          f"lost_s={lost:.1f} total_s={total:.1f}]]", flush=True)
+                if n:
+                    _narrate(f"⚠ {_var_label(jn)}: spot-reclaimed {n}x, "
+                             f"{lost / 60:.1f} min of encoding lost, retried")
 
         elif etype == "TaskFailed":
             _report_task_failure(ev.get("taskFailedEventDetails", {}))
 
 
-def _download_outputs(s3_prefix: str, local_dir: Path) -> int:
-    """Mirror s3://.../<prefix>/output_*/ into local_dir. The state
-    machine writes each codec's packaged dir as output_<codec>/."""
+def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "") -> int:
+    """Mirror s3://.../<prefix>/output_<codec>/ into local_dir.
+
+    The state machine writes each codec's packaged dir as output_<codec>/. When
+    output_stem is given, each is downloaded to a per-codec top-level directory
+    named <output_stem>_<codec>/ (e.g. myclip_p200_hevc/master.m3u8) — matching
+    the local pipeline's naming contract (OutputStem + codec suffix). That lets
+    moveTmpToOutput move each codec independently, so codecs of the same clip
+    COEXIST in OUTPUT_DIR instead of one replacing the other's <stem> wrapper.
+    Without output_stem (legacy), the raw output_<codec>/ layout is preserved."""
     if not s3_prefix.startswith("s3://"):
         return 0
     rest = s3_prefix[len("s3://"):].rstrip("/")
     bucket, _, base_key = rest.partition("/")
     s3 = _s3()
     local_dir.mkdir(parents=True, exist_ok=True)
+
+    def _dst_for(rel: str):
+        # rel = "output_<codec>/<path...>"; remap to "<stem>_<codec>/<path...>".
+        if not output_stem:
+            return local_dir / rel
+        head, _, tail = rel.partition("/")
+        if not tail or not head.startswith("output_"):
+            return None  # dir marker or unexpected key — skip
+        codec = head[len("output_"):]
+        return local_dir / f"{output_stem}_{codec}" / tail
 
     # List everything first so the sync-back can drive a real progress bar
     # (weighted by bytes — segment counts vary wildly in size). This runs in the
@@ -519,7 +744,10 @@ def _download_outputs(s3_prefix: str, local_dir: Path) -> int:
         _emit_stage("download:outputs", "running", 0.0)
     for key, size in objs:
         rel = key[len(base_key) + 1:]
-        dst = local_dir / rel
+        dst = _dst_for(rel)
+        if dst is None:
+            done_bytes += size
+            continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         s3.download_file(bucket, key, str(dst))
         done_bytes += size
@@ -530,6 +758,109 @@ def _download_outputs(s3_prefix: str, local_dir: Path) -> int:
     if objs:
         _emit_stage("download:outputs", "done", 100.0)
     return len(objs)
+
+
+# Blended Graviton per-vCPU-hour rates, us-west-2 (c7g/c8g .2xlarge/.4xlarge).
+# cloud-batch always runs on the SPOT compute env, so every run's savings = the
+# on-demand price it avoided. Estimates — good enough for "saved by spot".
+_SPOT_VCPU_HR = 0.011
+_ONDEMAND_VCPU_HR = 0.037
+
+
+def _job_vcpu(job: dict) -> float:
+    for rr in job.get("container", {}).get("resourceRequirements", []):
+        if rr.get("type") == "VCPU":
+            try:
+                return float(rr["value"])
+            except (KeyError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def _collect_exec_jobs(exec_name: str) -> list:
+    """All terminal Batch jobs of one execution, fully described. Paginates
+    list_jobs (a single page caps at 100 — the old cost summary silently
+    dropped everything past the first page and, worse, read 0 when the terminal
+    states hadn't propagated yet). Retries a few times so a just-finished run's
+    jobs have settled before we sum them."""
+    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    batch = _batch()
+    for attempt in range(6):
+        ids = []
+        for status in ("SUCCEEDED", "FAILED"):
+            tok = None
+            while True:
+                try:
+                    kw = dict(jobQueue=queue, jobStatus=status, maxResults=100)
+                    if tok:
+                        kw["nextToken"] = tok
+                    r = batch.list_jobs(**kw)
+                except ClientError:
+                    break
+                ids += [j["jobId"] for j in r.get("jobSummaryList", [])
+                        if exec_name in j.get("jobName", "")]
+                tok = r.get("nextToken")
+                if not tok:
+                    break
+        jobs = []
+        for i in range(0, len(ids), 100):
+            try:
+                jobs += batch.describe_jobs(jobs=ids[i:i + 100]).get("jobs", [])
+            except ClientError:
+                continue
+        # Any job with a real runtime means the states have propagated.
+        if any(isinstance(j.get("startedAt"), (int, float)) and
+               isinstance(j.get("stoppedAt"), (int, float)) for j in jobs):
+            return jobs
+        time.sleep(2)
+    return jobs
+
+
+def _emit_cost_summary(exec_name: str) -> None:
+    """At job end, sum the execution's Batch compute and emit two markers the
+    control plane consumes: ENCODER-COST (spot-vs-on-demand savings, accumulated
+    into 'saved by using spot') and ENCODER-STATS (run efficiency: encode wall,
+    vCPU-hours, the slowest single chunk = makespan floor, job count, max vCPUs).
+    exec= keeps both idempotent across a reattach."""
+    jobs = _collect_exec_jobs(exec_name)
+    vcpu_s = 0.0
+    mn = mx = None
+    longest_s = 0.0
+    slowest = ""
+    n = 0
+    for job in jobs:
+        v = _job_vcpu(job)
+        st, sp = job.get("startedAt"), job.get("stoppedAt")
+        if v and isinstance(st, (int, float)) and isinstance(sp, (int, float)) and sp > st:
+            dur = (sp - st) / 1000.0
+            vcpu_s += v * dur
+            n += 1
+            mn = st if mn is None else min(mn, st)
+            mx = sp if mx is None else max(mx, sp)
+            if dur > longest_s:
+                longest_s = dur
+                slowest = _stage_from_jobname(job.get("jobName", "")) or job.get("jobName", "")
+    vh = vcpu_s / 3600.0
+    wall_s = (mx - mn) / 1000.0 if mn is not None else 0.0
+    spot, ondemand = vh * _SPOT_VCPU_HR, vh * _ONDEMAND_VCPU_HR
+    saved = ondemand - spot
+    try:
+        from encoder.cloud.compute_env import get_vcpus
+        max_vcpus = int(get_vcpus().get("max_vcpus") or 0)
+    except Exception:  # noqa: BLE001 — best-effort
+        max_vcpus = 0
+    print(f"[[ENCODER-COST exec={exec_name} spot_usd={spot:.4f} "
+          f"ondemand_usd={ondemand:.4f} saved_usd={saved:.4f} vcpu_hours={vh:.2f}]]",
+          flush=True)
+    print(f"[[ENCODER-STATS exec={exec_name} wall_s={wall_s:.1f} vcpu_h={vh:.3f} "
+          f"longest_s={longest_s:.1f} slowest={slowest or '-'} jobs={n} "
+          f"max_vcpus={max_vcpus}]]", flush=True)
+    conc = (vcpu_s / wall_s) if wall_s else 0.0
+    eff = (conc / max_vcpus * 100.0) if max_vcpus else 0.0
+    _narrate(f"💰 saved ${saved:.2f} using spot — {vh:.1f} vCPU-hr "
+             f"(${spot:.2f} spot vs ${ondemand:.2f} on-demand)")
+    _narrate(f"📊 {n} jobs · {vh:.1f} vCPU-hr · avg {conc:.0f} vCPUs busy "
+             f"({eff:.0f}% of {max_vcpus}) · slowest chunk {longest_s / 60:.1f} min")
 
 
 def cmd_poll(args: argparse.Namespace) -> int:
@@ -548,6 +879,7 @@ def cmd_poll(args: argparse.Namespace) -> int:
 
     seen: set[int] = set()
     log_state: dict[str, int] = {}  # stream -> last-forwarded timestamp
+    reclaim_seen: dict = {}         # jobId -> last-emitted (count, lost, total)
     exec_name = args.execution_arn.rsplit(":", 1)[-1]
     interval_s = int(os.environ.get("BATCH_POLL_INTERVAL_S", "5"))
     timeout_s = int(os.environ.get("BATCH_POLL_TIMEOUT_S", "14400"))  # 4h ceiling
@@ -580,6 +912,11 @@ def cmd_poll(args: argparse.Namespace) -> int:
             _reflect_batch_status(exec_name)
         except Exception:  # noqa: BLE001 — status reflection is cosmetic
             pass
+        # Detect spot reclaims of in-flight encode jobs (red bar + waste stats).
+        try:
+            _report_live_reclaims(exec_name, reclaim_seen)
+        except Exception:  # noqa: BLE001 — reclaim reporting is best-effort
+            pass
         # Forward live [progress]/[phase] lines from running containers so
         # long phases show activity, not a dark gap. Best-effort.
         try:
@@ -600,8 +937,13 @@ def cmd_poll(args: argparse.Namespace) -> int:
                         for k in ("package", "fragments", "hls"):
                             _emit_stage(f"{k}:{codec}", "done", 100.0)
                 print(f"    downloading outputs from {args.s3_prefix}", flush=True)
-                n = _download_outputs(args.s3_prefix, Path(args.local_dir))
+                n = _download_outputs(args.s3_prefix, Path(args.local_dir),
+                                      getattr(args, "output_stem", ""))
                 print(f"    downloaded {n} files", flush=True)
+                try:
+                    _emit_cost_summary(exec_name)  # spot-vs-on-demand savings
+                except Exception:  # noqa: BLE001 — cost summary is best-effort
+                    pass
                 return 0
             print(f"!!! execution ended with status {status}: "
                   f"{desc.get('cause', '')}", file=sys.stderr)
@@ -631,6 +973,9 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--execution-arn", required=True, dest="execution_arn")
     pp.add_argument("--s3-prefix", required=True, dest="s3_prefix")
     pp.add_argument("--local-dir", required=True, dest="local_dir")
+    # Base output name (OutputStem, no codec). When set, each codec's outputs
+    # land in <output-stem>_<codec>/ so codecs coexist in OUTPUT_DIR.
+    pp.add_argument("--output-stem", dest="output_stem", default="")
     pp.set_defaults(fn=cmd_poll)
 
     args = p.parse_args(argv)
