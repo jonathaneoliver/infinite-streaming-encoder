@@ -880,6 +880,24 @@ func (m *Manager) Jobs() []*Job {
 	return out
 }
 
+// ActiveCloudJobs counts submitted cloud jobs still queued or running — the
+// app's own job queue. The awswatch keep-warm loop uses this so a box is held
+// across the gap BETWEEN sequential jobs (one finishing before the next's AWS
+// resources appear), not only while a single job's Batch work is live — so the
+// next job in the queue doesn't cold-start.
+func (m *Manager) ActiveCloudJobs() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, j := range m.jobs {
+		if (j.Status == StatusQueued || j.Status == StatusRunning) &&
+			(j.Config.Target == TargetCloud || j.Config.Target == TargetCloudBatch) {
+			n++
+		}
+	}
+	return n
+}
+
 func (m *Manager) GetJob(id string) *Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()

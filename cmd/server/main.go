@@ -116,9 +116,12 @@ func main() {
 		MaxLifetime:         *awsMaxLifetime,
 		AutoTerminateStale:  *awsAutoTerminate,
 		FailedStagingMaxAge: 1 * time.Hour,
-		// Keep one small box warm during active cloud-batch runs so the
-		// packaging tail doesn't cold-start; 0 disables (min_vcpus stays 0).
+		// Keep one box warm while cloud work is active so the packaging tail
+		// (and the next queued job) doesn't cold-start; 0 disables.
 		WarmMinVCPUs: intEnv("WARM_MIN_VCPUS", 2),
+		// Hold the warm floor across the whole app job queue, not just while one
+		// job's AWS resources are live — so it drops only when the queue is empty.
+		ActiveJobs: mgr.ActiveCloudJobs,
 	})
 
 	srv := api.NewServer(mgr)
