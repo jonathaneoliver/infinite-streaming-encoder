@@ -68,5 +68,5 @@ enough to cover an iterate-on-one-clip session; the TTL bounds the "recent
 files only" cache so storage never accumulates.
 EOT
   type        = number
-  default     = 14
+  default     = 7
 }

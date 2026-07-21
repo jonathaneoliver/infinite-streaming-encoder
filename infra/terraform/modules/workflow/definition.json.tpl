@@ -82,10 +82,10 @@
           "StartAt": "Variants",
           "States": {
             "Variants": {
-              "Comment": "Fan out across (codec, tier); each variant fans out again across chunks. The chunks are joined inline by the package-all phase (no separate concat job). Batch queue depth + compute-env max_vcpus cap real parallelism; 12 lets a full 48-vCPU fleet (6x 8-vCPU boxes) stay busy in whole-variant mode.",
+              "Comment": "Fan out across (codec, tier); each variant fans out again across chunks. The chunks are joined inline by the package-all phase (no separate concat job). MaxConcurrency 40 covers any ladder (3 codecs x ~12 rungs) so ALL variants of a file submit at once — real parallelism is still capped by compute-env max_vcpus (the rest sit RUNNABLE, ordered by schedulingPriority). Atomic fan-out is what makes the app-side launch gate correct: an earlier job has submitted every one of its jobs before the next job's execution starts.",
               "Type": "Map",
               "ItemsPath": "$.variants",
-              "MaxConcurrency": 12,
+              "MaxConcurrency": 40,
               "ItemSelector": {
                 "codec.$": "$$.Map.Item.Value.codec",
                 "label.$": "$$.Map.Item.Value.label",

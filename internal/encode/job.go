@@ -1808,6 +1808,11 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		}
 	}
 	defer releaseLaunch()
+	// Encode jobs this fan-out will submit + the distinct encode stage keys seen
+	// so far; the gate releases only once every job has been submitted (fully
+	// fanned out), not on the first one. 0 on reattach (gate not held).
+	expectedEncodes := 0
+	seenEncodes := map[string]bool{}
 	if execArn != "" && m.cloudExecutionResumable(execArn) {
 		job.AppendLog("[cloud-batch] reattaching to execution " + execArn)
 		m.notify(job)
@@ -1908,7 +1913,8 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		if srcWidth > 0 {
 			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
 		}
-		inputJSON := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, srcWidth, durationS, job.Config.ChunkDuration, m.jobPriorityBase(job), job.AppendLog)
+		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, srcWidth, durationS, job.Config.ChunkDuration, m.jobPriorityBase(job), job.AppendLog)
+		expectedEncodes = expEnc
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 			return fmt.Errorf("write input json: %w", err)
@@ -2001,11 +2007,20 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := stripANSI(scanner.Text())
-		// First encode stage marker = fan-out: this job has submitted its encodes,
-		// so stamp the fan-out time and release the launch gate for the next job.
-		if launchHeld && strings.Contains(line, "key=encode:") {
-			job.markFanOut()
-			releaseLaunch()
+		// Track encode-job submission for the launch gate: release only once ALL
+		// expected encode jobs have been submitted (fully fanned out), so the next
+		// job's execution can't start while this one still has higher-priority
+		// jobs to submit. Batch never preempts, so a partial release would let the
+		// later job grab vCPUs this job's remaining jobs should have had.
+		if launchHeld {
+			if m := stageMarkerRe.FindStringSubmatch(line); m != nil && strings.HasPrefix(m[1], "encode:") {
+				job.markFanOut() // encode start (first job); idempotent
+				seenEncodes[m[1]] = true
+				if len(seenEncodes) >= expectedEncodes {
+					releaseLaunch()
+					job.AppendLog(fmt.Sprintf("[cloud-batch] fully fanned out (%d encode jobs) — releasing launch gate", expectedEncodes))
+				}
+			}
 		}
 		if m.learnSpeed(line) {
 			continue // telemetry for the dynamic chunk selector, not a log line
@@ -2169,7 +2184,7 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached bool, sourceWidth int, clipDurationS float64, chunkCfg string, priorityBase int, logf func(string)) string {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached bool, sourceWidth int, clipDurationS float64, chunkCfg string, priorityBase int, logf func(string)) (string, int) {
 	if ladderName == "" {
 		ladderName = "apple-uniq-live"
 	}
@@ -2304,7 +2319,18 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		// not top-level — variants differ in codec/pass AND chunk length.
 	}
 	b, _ := json.Marshal(doc)
-	return string(b)
+	// Expected number of encode Batch jobs this fan-out will submit (one per
+	// chunk; a whole variant is one). The launch gate releases once it has seen
+	// all of them submitted — i.e. the job has fully fanned out.
+	expected := 0
+	for _, v := range variants {
+		if len(v.ChunkIndices) > 0 {
+			expected += len(v.ChunkIndices)
+		} else {
+			expected++
+		}
+	}
+	return string(b), expected
 }
 
 // resolveCodec checks which codecs are already encoded in OutputDir and returns
