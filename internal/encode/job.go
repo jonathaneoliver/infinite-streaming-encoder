@@ -621,8 +621,13 @@ type Job struct {
 	Status    JobStatus  `json:"status"`
 	StartedAt time.Time  `json:"started_at"`
 	EndedAt   *time.Time `json:"ended_at,omitempty"`
-	Progress  string     `json:"progress"`
-	Error     string     `json:"error,omitempty"`
+	// FanOutAt is stamped when the cloud-batch execution first submits its encode
+	// jobs (fan-out) — i.e. when actual encoding starts, after upload + mezzanine.
+	// Lets timing anchor on encode start rather than submit (which includes the
+	// upload + queue wait).
+	FanOutAt *time.Time `json:"fan_out_at,omitempty"`
+	Progress string     `json:"progress"`
+	Error    string     `json:"error,omitempty"`
 
 	// BootAMI is the AMI a cloud worker's instance actually booted from
 	// (from the [[ENCODER-BOOT]] marker); PrebakedAMI is true when that
@@ -795,7 +800,13 @@ type Manager struct {
 	settingsMu sync.Mutex
 	settings   Settings
 
-	sem         chan struct{}
+	sem chan struct{}
+	// launchGate (size 1) serializes the cloud-batch launch → fan-out phase across
+	// jobs: a job holds it from start-execution until its encodes are submitted,
+	// so an earlier job floods the queue with its higher-priority chunks before a
+	// later job's execution starts. Batch never preempts, so a later job that
+	// fanned out first would keep the vCPUs it grabbed regardless of priority.
+	launchGate  chan struct{}
 	subscribers []chan *Job
 	subMu       sync.Mutex
 }
@@ -838,6 +849,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		EncoderImage:    cfg.EncoderImage,
 		StateMachineArn: cfg.StateMachineArn,
 		sem:             make(chan struct{}, cfg.MaxConcurrent),
+		launchGate:      make(chan struct{}, 1),
 	}
 }
 
@@ -905,6 +917,17 @@ func (m *Manager) ActiveCloudJobs() int {
 // fleet). Bands are 1000 apart (oldest active job: 9000, next: 8000, …), with
 // the within-job variant/phase priority (0-999) riding inside. Job IDs are
 // ascending timestamps, so a smaller ID is older.
+// markFanOut stamps FanOutAt once, the first time this job's execution submits
+// encode jobs. Idempotent across reattaches / multiple detections.
+func (j *Job) markFanOut() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.FanOutAt == nil {
+		now := time.Now()
+		j.FanOutAt = &now
+	}
+}
+
 func (m *Manager) jobPriorityBase(job *Job) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1774,6 +1797,17 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	// of re-uploading + re-submitting (which would orphan the old execution and
 	// duplicate the work). Only if the persisted ARN is still RUNNING/SUCCEEDED.
 	execArn := job.CloudExecArn()
+	// Serialize the launch → fan-out phase across cloud jobs (see launchGate).
+	// Held from start-execution until this job's encodes are submitted; released
+	// on the first encode stage marker in the poll loop, or on return (fallback).
+	launchHeld := false
+	releaseLaunch := func() {
+		if launchHeld {
+			launchHeld = false
+			<-m.launchGate
+		}
+	}
+	defer releaseLaunch()
 	if execArn != "" && m.cloudExecutionResumable(execArn) {
 		job.AppendLog("[cloud-batch] reattaching to execution " + execArn)
 		m.notify(job)
@@ -1880,6 +1914,13 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 			return fmt.Errorf("write input json: %w", err)
 		}
 
+		// Hold the launch gate so an earlier queued job fully fans out (floods the
+		// fleet with its higher-priority chunks) before this execution starts —
+		// Batch never preempts, so a later job that grabbed vCPUs early keeps them.
+		job.AppendLog("[cloud-batch] waiting for launch gate (earlier jobs fan out first)…")
+		m.launchGate <- struct{}{}
+		launchHeld = true
+
 		// Submit.
 		submit := exec.Command("python3", "-m", "encoder.cli_batch", "submit",
 			"--state-machine-arn", m.StateMachineArn,
@@ -1960,6 +2001,12 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := stripANSI(scanner.Text())
+		// First encode stage marker = fan-out: this job has submitted its encodes,
+		// so stamp the fan-out time and release the launch gate for the next job.
+		if launchHeld && strings.Contains(line, "key=encode:") {
+			job.markFanOut()
+			releaseLaunch()
+		}
 		if m.learnSpeed(line) {
 			continue // telemetry for the dynamic chunk selector, not a log line
 		}
