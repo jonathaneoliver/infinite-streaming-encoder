@@ -1831,6 +1831,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	// fanned out), not on the first one. 0 on reattach (gate not held).
 	expectedEncodes := 0
 	seenEncodes := map[string]bool{}
+	var gateAcquiredAt time.Time
 	if execArn != "" && m.cloudExecutionResumable(execArn) {
 		job.AppendLog("[cloud-batch] reattaching to execution " + execArn)
 		m.notify(job)
@@ -1944,6 +1945,15 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		job.AppendLog("[cloud-batch] waiting for launch gate (earlier jobs fan out first)…")
 		m.launchGate <- struct{}{}
 		launchHeld = true
+		gateAcquiredAt = time.Now()
+		// A cancel can fire while we were parked on the gate (which can be minutes
+		// if an earlier job is still uploading/mezzanine). Bail before submitting so
+		// we don't spin up a Step Functions execution + Batch jobs for a job the
+		// user already cancelled — run() finalizes it as cancelled; the deferred
+		// releaseLaunch frees the gate.
+		if job.IsCancelled() {
+			return nil
+		}
 
 		// Submit.
 		submit := exec.Command("python3", "-m", "encoder.cli_batch", "submit",
@@ -2034,10 +2044,16 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 			if m := stageMarkerRe.FindStringSubmatch(line); m != nil && strings.HasPrefix(m[1], "encode:") {
 				job.markFanOut() // encode start (first job); idempotent
 				seenEncodes[m[1]] = true
-				if len(seenEncodes) >= expectedEncodes {
-					releaseLaunch()
-					job.AppendLog(fmt.Sprintf("[cloud-batch] fully fanned out (%d encode jobs) — releasing launch gate", expectedEncodes))
-				}
+			}
+			// Release once ALL expected encode jobs are submitted. Checked on every
+			// line (not just encode markers) so: expectedEncodes==0 (source below
+			// the smallest rung → no encodes) releases at once, and a Go/Python
+			// count divergence can't hold the gate for the whole job — a safety
+			// timeout frees it (10min is well past any mezzanine + atomic fan-out,
+			// which take seconds–minutes) rather than serializing every cloud launch.
+			if len(seenEncodes) >= expectedEncodes || time.Since(gateAcquiredAt) > 10*time.Minute {
+				releaseLaunch()
+				job.AppendLog(fmt.Sprintf("[cloud-batch] fanned out (%d/%d encode jobs) — releasing launch gate", len(seenEncodes), expectedEncodes))
 			}
 		}
 		if m.learnSpeed(line) {
