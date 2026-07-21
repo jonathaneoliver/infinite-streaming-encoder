@@ -123,7 +123,7 @@ func (w *Watcher) alreadyEncoded(name string) bool {
 		return false
 	}
 	for _, e := range entries {
-		if e.IsDir() && strings.HasPrefix(e.Name(), stem+"_") {
+		if e.IsDir() && strings.HasPrefix(e.Name(), stem+"_") && !encode.IsDatedBackup(e.Name()) {
 			return true
 		}
 	}

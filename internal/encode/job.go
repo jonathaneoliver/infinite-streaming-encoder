@@ -954,7 +954,7 @@ func (m *Manager) run(job *Job, startIdx int) {
 	} else {
 		job.Progress = "moving to output"
 		m.notify(job)
-		if mvErr := m.moveTmpToOutput(jobTmpDir, job.Config.ForceReencode); mvErr != nil {
+		if mvErr := m.moveTmpToOutput(jobTmpDir); mvErr != nil {
 			job.Status = StatusFailed
 			job.Error = "encode succeeded but move failed: " + mvErr.Error()
 			job.Progress = "failed"
@@ -1330,7 +1330,19 @@ func defaultVal(v, d string) string {
 	return v
 }
 
-func (m *Manager) moveTmpToOutput(tmpDir string, archive bool) error {
+// datedBackupRe matches an output dir a re-encode preserved: <name>_<YYYYMMDD>
+// or <name>_<YYYYMMDD>_<HHMMSS>. Real outputs always end in _<codec>, so this
+// never matches a live output.
+var datedBackupRe = regexp.MustCompile(`_\d{8}(_\d{6})?$`)
+
+// IsDatedBackup reports whether an output dir name is a datestamped backup left
+// behind when a re-encode replaced a prior output. The Outputs list and the
+// watcher skip these so a preserved old copy isn't treated as a live output.
+func IsDatedBackup(name string) bool {
+	return datedBackupRe.MatchString(name)
+}
+
+func (m *Manager) moveTmpToOutput(tmpDir string) error {
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
 		return err
@@ -1339,16 +1351,18 @@ func (m *Manager) moveTmpToOutput(tmpDir string, archive bool) error {
 		src := filepath.Join(tmpDir, e.Name())
 		dst := filepath.Join(m.OutputDir, e.Name())
 
-		if _, statErr := os.Stat(dst); statErr == nil {
-			if archive {
-				archiveDir := filepath.Join(m.OutputDir, ".archive")
-				os.MkdirAll(archiveDir, 0755)
-				ts := time.Now().Format("20060102_150405")
-				archiveDst := filepath.Join(archiveDir, e.Name()+"_"+ts)
-				os.Rename(dst, archiveDst)
-			} else {
-				os.RemoveAll(dst)
+		if fi, statErr := os.Stat(dst); statErr == nil {
+			// Preserve the existing copy: rename it in place with the date it was
+			// last modified appended (<name>_<YYYYMMDD>), so a re-encode never
+			// destroys the prior output. A same-day re-encode disambiguates with a
+			// time suffix. These dated backups are skipped by the Outputs list and
+			// the watcher (IsDatedBackup).
+			ts := fi.ModTime().Format("20060102")
+			backup := filepath.Join(m.OutputDir, e.Name()+"_"+ts)
+			if _, err := os.Stat(backup); err == nil {
+				backup = filepath.Join(m.OutputDir, e.Name()+"_"+ts+"_"+fi.ModTime().Format("150405"))
 			}
+			os.Rename(dst, backup)
 		}
 
 		if err := os.Rename(src, dst); err != nil {

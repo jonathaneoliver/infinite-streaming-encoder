@@ -470,7 +470,7 @@ func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		name := e.Name()
-		if strings.HasPrefix(name, ".") || strings.HasSuffix(name, "_tmp") {
+		if strings.HasPrefix(name, ".") || strings.HasSuffix(name, "_tmp") || encode.IsDatedBackup(name) {
 			continue
 		}
 		info, _ := e.Info()
