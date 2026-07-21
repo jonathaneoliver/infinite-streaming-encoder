@@ -672,6 +672,11 @@ type Job struct {
 	// per-execution stats, summed/maxed across files; not serialized.
 	statsByExec map[string]runStat
 
+	// launchComplete is set once this cloud job has submitted ALL its encode jobs
+	// (fully fanned out); the age-ordered launch gate lets the next-oldest job
+	// proceed only after this is true (or the job goes terminal). Not serialized.
+	launchComplete bool
+
 	// Stages is populated from [[ENCODER-PLAN]] + [[ENCODER-STAGE]]
 	// markers the Python orchestrator emits. Empty when the job hasn't
 	// reached the Python side yet (still queued, pre-run) or for old
@@ -801,15 +806,52 @@ type Manager struct {
 	settings   Settings
 
 	sem chan struct{}
-	// launchGate (size 1) serializes the cloud-batch launch → fan-out phase across
-	// jobs: a job holds it from start-execution until its encodes are submitted,
-	// so an earlier job floods the queue with its higher-priority chunks before a
-	// later job's execution starts. Batch never preempts, so a later job that
-	// fanned out first would keep the vCPUs it grabbed regardless of priority.
-	launchGate    chan struct{}
+	// launchMu/launchCond order the cloud-batch launch → fan-out phase by QUEUE
+	// AGE: a job waits until every OLDER active cloud job has fully fanned out
+	// (submitted all its jobs) before submitting its own execution. Age-ordered,
+	// not first-come — so an earlier job floods the fleet with its higher-priority
+	// jobs first regardless of upload timing (Batch never preempts).
+	launchMu      sync.Mutex
+	launchCond    *sync.Cond
 	warmReconcile func()
 	subscribers   []chan *Job
 	subMu         sync.Mutex
+}
+
+// signalLaunch wakes any jobs waiting for their launch turn to re-check (called
+// when a job fully fans out or finalizes, so the next-oldest can proceed).
+func (m *Manager) signalLaunch() {
+	m.launchMu.Lock()
+	m.launchCond.Broadcast()
+	m.launchMu.Unlock()
+}
+
+// waitForLaunchTurn blocks the caller until no OLDER active cloud job is still
+// launching (queued/running without having fully fanned out). Guarantees cloud
+// executions start in queue order.
+func (m *Manager) waitForLaunchTurn(job *Job) {
+	m.launchMu.Lock()
+	defer m.launchMu.Unlock()
+	for m.olderStillLaunching(job) {
+		m.launchCond.Wait()
+	}
+}
+
+func (m *Manager) olderStillLaunching(job *Job) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, j := range m.jobs {
+		if j == job || j.ID >= job.ID { // IDs are ascending timestamps → older = smaller
+			continue
+		}
+		if j.Config.Target != TargetCloud && j.Config.Target != TargetCloudBatch {
+			continue
+		}
+		if (j.Status == StatusQueued || j.Status == StatusRunning) && !j.isLaunchComplete() {
+			return true
+		}
+	}
+	return false
 }
 
 // triggerWarm nudges the awswatch keep-warm loop to re-evaluate now (job start /
@@ -847,7 +889,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		cfg.EncoderImage = "encoder:latest"
 	}
 	os.MkdirAll(cfg.TmpDir, 0755)
-	return &Manager{
+	m := &Manager{
 		Ladders:         LoadLadderStore(filepath.Join(cfg.TmpDir, "ladders.json")),
 		Speeds:          LoadEncodeSpeedStore(filepath.Join(cfg.TmpDir, "encode_speeds.json")),
 		SourceDir:       cfg.SourceDir,
@@ -862,9 +904,10 @@ func NewManager(cfg ManagerConfig) *Manager {
 		EncoderImage:    cfg.EncoderImage,
 		StateMachineArn: cfg.StateMachineArn,
 		sem:             make(chan struct{}, cfg.MaxConcurrent),
-		launchGate:      make(chan struct{}, 1),
 		warmReconcile:   cfg.WarmReconcile,
 	}
+	m.launchCond = sync.NewCond(&m.launchMu)
+	return m
 }
 
 func (m *Manager) Subscribe() chan *Job {
@@ -940,6 +983,20 @@ func (j *Job) markFanOut() {
 		now := time.Now()
 		j.FanOutAt = &now
 	}
+}
+
+// markLaunchComplete records that this job has submitted ALL its encode jobs
+// (fully fanned out) — the signal that lets the next-oldest cloud job launch.
+func (j *Job) markLaunchComplete() {
+	j.mu.Lock()
+	j.launchComplete = true
+	j.mu.Unlock()
+}
+
+func (j *Job) isLaunchComplete() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.launchComplete
 }
 
 func (m *Manager) jobPriorityBase(job *Job) int {
@@ -1815,23 +1872,24 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	// of re-uploading + re-submitting (which would orphan the old execution and
 	// duplicate the work). Only if the persisted ARN is still RUNNING/SUCCEEDED.
 	execArn := job.CloudExecArn()
-	// Serialize the launch → fan-out phase across cloud jobs (see launchGate).
-	// Held from start-execution until this job's encodes are submitted; released
-	// on the first encode stage marker in the poll loop, or on return (fallback).
-	launchHeld := false
-	releaseLaunch := func() {
-		if launchHeld {
-			launchHeld = false
-			<-m.launchGate
-		}
-	}
-	defer releaseLaunch()
-	// Encode jobs this fan-out will submit + the distinct encode stage keys seen
-	// so far; the gate releases only once every job has been submitted (fully
-	// fanned out), not on the first one. 0 on reattach (gate not held).
+	// Age-ordered launch: this job waits (below, before submit) until every older
+	// cloud job has fully fanned out, then marks itself launch-complete once it has
+	// submitted all its own encode jobs — releasing the next-oldest job. Counting
+	// distinct encode stage keys vs the expected total detects "fully fanned out";
+	// markLaunched is idempotent and always runs on return (so a job that fails
+	// before fan-out still unblocks the queue).
 	expectedEncodes := 0
 	seenEncodes := map[string]bool{}
-	var gateAcquiredAt time.Time
+	var launchStart time.Time
+	launchDone := false
+	markLaunched := func() {
+		if !launchDone {
+			launchDone = true
+			job.markLaunchComplete()
+			m.signalLaunch()
+		}
+	}
+	defer markLaunched()
 	if execArn != "" && m.cloudExecutionResumable(execArn) {
 		job.AppendLog("[cloud-batch] reattaching to execution " + execArn)
 		m.notify(job)
@@ -1939,18 +1997,17 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 			return fmt.Errorf("write input json: %w", err)
 		}
 
-		// Hold the launch gate so an earlier queued job fully fans out (floods the
-		// fleet with its higher-priority chunks) before this execution starts —
-		// Batch never preempts, so a later job that grabbed vCPUs early keeps them.
-		job.AppendLog("[cloud-batch] waiting for launch gate (earlier jobs fan out first)…")
-		m.launchGate <- struct{}{}
-		launchHeld = true
-		gateAcquiredAt = time.Now()
-		// A cancel can fire while we were parked on the gate (which can be minutes
-		// if an earlier job is still uploading/mezzanine). Bail before submitting so
-		// we don't spin up a Step Functions execution + Batch jobs for a job the
-		// user already cancelled — run() finalizes it as cancelled; the deferred
-		// releaseLaunch frees the gate.
+		// Wait our turn: block until every OLDER queued/running cloud job has fully
+		// fanned out, so an earlier job floods the fleet with its higher-priority
+		// jobs before this execution starts (Batch never preempts, so a later job
+		// that fanned out first would keep the vCPUs it grabbed).
+		job.AppendLog("[cloud-batch] waiting for launch turn (older jobs fan out first)…")
+		m.waitForLaunchTurn(job)
+		launchStart = time.Now()
+		// A cancel can fire while we were waiting our turn (minutes, if an earlier
+		// job is still uploading/mezzanine). Bail before submitting so we don't spin
+		// up an execution + Batch jobs for a cancelled job — run() finalizes it as
+		// cancelled; the deferred markLaunched unblocks the queue.
 		if job.IsCancelled() {
 			return nil
 		}
@@ -2040,20 +2097,20 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// job's execution can't start while this one still has higher-priority
 		// jobs to submit. Batch never preempts, so a partial release would let the
 		// later job grab vCPUs this job's remaining jobs should have had.
-		if launchHeld {
+		if !launchDone {
 			if m := stageMarkerRe.FindStringSubmatch(line); m != nil && strings.HasPrefix(m[1], "encode:") {
 				job.markFanOut() // encode start (first job); idempotent
 				seenEncodes[m[1]] = true
 			}
-			// Release once ALL expected encode jobs are submitted. Checked on every
-			// line (not just encode markers) so: expectedEncodes==0 (source below
-			// the smallest rung → no encodes) releases at once, and a Go/Python
-			// count divergence can't hold the gate for the whole job — a safety
-			// timeout frees it (10min is well past any mezzanine + atomic fan-out,
-			// which take seconds–minutes) rather than serializing every cloud launch.
-			if len(seenEncodes) >= expectedEncodes || time.Since(gateAcquiredAt) > 10*time.Minute {
-				releaseLaunch()
-				job.AppendLog(fmt.Sprintf("[cloud-batch] fanned out (%d/%d encode jobs) — releasing launch gate", len(seenEncodes), expectedEncodes))
+			// Mark launch-complete once ALL expected encode jobs are submitted —
+			// this releases the next-oldest job. Checked on every line so:
+			// expectedEncodes==0 (source below the smallest rung → no encodes)
+			// completes at once, and a Go/Python count divergence can't stall the
+			// queue for the whole job — a safety timeout (10min, well past any
+			// mezzanine + atomic fan-out) releases it.
+			if len(seenEncodes) >= expectedEncodes || (!launchStart.IsZero() && time.Since(launchStart) > 10*time.Minute) {
+				markLaunched()
+				job.AppendLog(fmt.Sprintf("[cloud-batch] fully fanned out (%d/%d encode jobs) — next job may launch", len(seenEncodes), expectedEncodes))
 			}
 		}
 		if m.learnSpeed(line) {
