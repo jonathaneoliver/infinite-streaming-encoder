@@ -113,6 +113,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    chunked row is solid green at the same height as a completed whole row. */
 .chunk-grid { display: flex; flex-wrap: nowrap; gap: 2px; align-items: center; width: 100%; }
 .chunk-cell { position: relative; flex: 1 1 0; min-width: 3px; height: 10px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
+/* On-screen hint under Start Encode explaining the force-reencode gesture. */
+.encode-hint { margin-top: 10px; font-size: 12px; color: #8a9bb5; line-height: 1.5; }
+.encode-hint b { color: #cdd6e6; font-weight: 600; }
+.encode-hint kbd { display: inline-block; padding: 1px 5px; font-size: 11px; font-family: inherit; color: #dfe6f2; background: #232b3d; border: 1px solid #3a4560; border-radius: 4px; }
 /* Codec multi-select checkboxes (any subset of h264/hevc/av1). */
 .codec-checks { display: flex; gap: 16px; align-items: center; padding: 6px 0; }
 .codec-checks label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; font-weight: 400; }
@@ -418,6 +422,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             </div>
             <button class="btn btn-primary" id="encode-btn" onclick="startEncode(event.altKey)" oncontextmenu="event.preventDefault(); startEncode(true); return false;" title="Click: encode checked files (skips any already fully encoded). Alt/Option+click OR right-click: force re-encode all checked files (existing outputs are kept, renamed with their last-modified date)." disabled>Start Encode</button>
             </div>
+            <div class="encode-hint">Skips files already fully encoded. To <b>force a re-encode</b>, <kbd>Alt</kbd>/<kbd>Option</kbd>+click (or right-click) Start Encode — existing outputs are kept, renamed with their last-modified date.</div>
         </fieldset>
     </div>
 </div>
