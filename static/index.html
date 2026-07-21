@@ -113,10 +113,6 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    chunked row is solid green at the same height as a completed whole row. */
 .chunk-grid { display: flex; flex-wrap: nowrap; gap: 2px; align-items: center; width: 100%; }
 .chunk-cell { position: relative; flex: 1 1 0; min-width: 3px; height: 10px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
-/* Whole-variant encode rows have no chunk grid, so the instance shows as a dot
-   before the label — same palette as the chunk fills, so a whole encode and a
-   chunk sharing a colour ran on the same box. */
-.host-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: transparent; }
 /* End-of-run efficiency stats, shown under the stages once ENCODER-STATS lands. */
 .job-stats { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; padding: 9px 12px; background: #141b2b; border-radius: 6px; font-size: 12px; }
 .job-stat { color: #8a9bb5; white-space: nowrap; }
@@ -1725,11 +1721,8 @@ function updateStagesTable(row, stages) {
                 // the same as the chunked rows below.
                 const label = (r.s.label && r.s.label.startsWith('encode:'))
                     ? r.s.label.replace(/:/g, ' ') : r.s.label;
-                // Encode rows (whole variants) carry an instance → prefix a dot
-                // placeholder; other phases (mezz/audio/pkg) have no host, no dot.
-                const dot = r.s.key.startsWith('encode:') ? '<span class="host-dot"></span>' : '';
                 return `<tr data-stage-key="${escapeHtml(r.s.key)}">
-                    <td class="stage-label">${dot}${escapeHtml(label)}</td>
+                    <td class="stage-label">${escapeHtml(label)}</td>
                     <td class="stage-bar"><div class="stage-bar-track"><div class="stage-bar-fill"></div></div></td>
                     <td class="stage-pct"></td></tr>`;
             }
@@ -1753,23 +1746,22 @@ function updateStagesTable(row, stages) {
             const tr = tbody.querySelector(`tr[data-stage-key="${s.key}"]`);
             if (!tr) continue;
             tr.className = 'stage-' + s.status;
-            // Colour the instance dot on encode rows once the job is placed.
-            const dot = tr.querySelector('.host-dot');
-            if (dot) {
-                const color = instanceColor(s.instance);
-                dot.style.background = color || 'transparent';
-                dot.title = s.instance || '';
-            }
             const reclaimed = s.status === 'reclaimed';
             const fill = tr.querySelector('.stage-bar-fill');
             // reclaimed → fill the bar red (spot taken, waiting to restart);
             // when the retry resumes, the normal running % takes over.
             fill.style.width = (reclaimed ? 100 : s.percent).toFixed(1) + '%';
             fill.className = 'stage-bar-fill';
-            if (s.status === 'done')    fill.classList.add('stage-fill-done');
-            if (s.status === 'failed')  fill.classList.add('stage-fill-failed');
-            if (s.status === 'skipped') fill.classList.add('stage-fill-skipped');
-            if (reclaimed)              fill.classList.add('stage-fill-reclaimed');
+            fill.style.background = '';
+            // Encode rows (whole variants) colour the bar by the MACHINE it ran
+            // on — identical look to the chunk-grid rows, so a variant reads the
+            // same whether it encoded in one piece or many. Non-encode phases
+            // (mezz/audio/pkg/hls) keep the status colours; red states always win.
+            if (s.status === 'failed')            fill.classList.add('stage-fill-failed');
+            else if (reclaimed)                   fill.classList.add('stage-fill-reclaimed');
+            else if (s.status === 'skipped')      fill.classList.add('stage-fill-skipped');
+            else if (s.key.startsWith('encode:')) fill.style.background = instanceColor(s.instance) || '#4361ee';
+            else if (s.status === 'done')         fill.classList.add('stage-fill-done');
             tr.querySelector('.stage-pct').textContent =
                 s.status === 'pending' ? '—'
                 : s.status === 'skipped' ? 'reused'
