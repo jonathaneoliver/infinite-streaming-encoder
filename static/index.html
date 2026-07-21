@@ -1825,13 +1825,15 @@ function updateStagesTable(row, stages) {
             fill.style.background = '';
             // Encode rows (whole variants) colour the bar by the MACHINE it ran
             // on — identical look to the chunk-grid rows, so a variant reads the
-            // same whether it encoded in one piece or many. Non-encode phases
-            // (mezz/audio/pkg/hls) keep the status colours; red states always win.
-            if (s.status === 'failed')            fill.classList.add('stage-fill-failed');
-            else if (reclaimed)                   fill.classList.add('stage-fill-reclaimed');
-            else if (s.status === 'skipped')      fill.classList.add('stage-fill-skipped');
-            else if (s.key.startsWith('encode:')) fill.style.background = instanceColor(s.instance) || '#4361ee';
-            else if (s.status === 'done')         fill.classList.add('stage-fill-done');
+            // same whether it encoded in one piece or many. EVERY phase that ran
+            // on a machine (mezzanine/audio/encode/package/fragments/hls) fills
+            // with that machine's colour once placed; red states always win, and
+            // phases without a host (or pre-placement) keep the status colours.
+            if (s.status === 'failed')       fill.classList.add('stage-fill-failed');
+            else if (reclaimed)              fill.classList.add('stage-fill-reclaimed');
+            else if (s.status === 'skipped') fill.classList.add('stage-fill-skipped');
+            else if (s.instance)             fill.style.background = instanceColor(s.instance);
+            else if (s.status === 'done')    fill.classList.add('stage-fill-done');
             tr.querySelector('.stage-pct').textContent =
                 s.status === 'pending' ? '—'
                 : s.status === 'skipped' ? 'reused'

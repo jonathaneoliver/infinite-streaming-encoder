@@ -185,17 +185,19 @@ def _forward_running_logs(exec_name: str, log_state: dict) -> None:
             stream = container.get("logStreamName")
             if stream:
                 _tail_progress(stream, _short_label(j.get("jobName", "")), log_state)
-            # Report which machine this chunk/variant landed on, once per stage
-            # key, so the UI can colour the chunk plot by instance (and reveal
-            # heavy chunks co-located on one box). Best-effort/cosmetic.
-            key = _stage_from_jobname(j.get("jobName", ""))
+            # Report which machine each running job landed on, once per stage
+            # key, so the UI can colour EVERY row (encode chunks + mezzanine /
+            # audio / package / fragments / hls) by instance. Best-effort.
+            keys = _host_stage_keys(j.get("jobName", ""))
             ci_arn = container.get("containerInstanceArn")
-            if key and ci_arn:
-                seen_key = "_host:" + key
+            if keys and ci_arn:
                 inst = _ec2_for_container_instance(ci_arn)
-                if inst and log_state.get(seen_key) != inst:
-                    log_state[seen_key] = inst
-                    _emit_host(key, inst)
+                if inst:
+                    for key in keys:
+                        seen_key = "_host:" + key
+                        if log_state.get(seen_key) != inst:
+                            log_state[seen_key] = inst
+                            _emit_host(key, inst)
 
 
 def _tail_progress(stream: str, label: str, log_state: dict) -> None:
@@ -361,6 +363,26 @@ def _stage_from_jobname(job_name: str) -> "str | None":
         return None
     return f"encode:{m.group(1)}:{m.group(2)}" + (
         f":chunk{m.group(4)}" if m.group(4) else "")
+
+
+_PKGALL_JOBNAME_RE = re.compile(r"^pkgall-(\w+?)-")
+
+
+def _host_stage_keys(job_name: str) -> list:
+    """Stage keys a running Batch job maps to, for ENCODER-HOST colouring. A
+    pkgall-<codec> job drives three per-codec rows (package/fragments/hls), all
+    on the same box; mezz/audio one each; var-* the encode chunk/whole key."""
+    m = _PKGALL_JOBNAME_RE.match(job_name)
+    if m:
+        c = m.group(1)
+        return [f"package:{c}", f"fragments:{c}", f"hls:{c}"]
+    head = job_name.split("-", 1)[0]
+    if head == "mezz":
+        return ["mezzanine"]
+    if head == "audio":
+        return ["audio"]
+    k = _stage_from_jobname(job_name)
+    return [k] if k else []
 
 
 def _report_live_reclaims(exec_name: str, seen: dict) -> None:
