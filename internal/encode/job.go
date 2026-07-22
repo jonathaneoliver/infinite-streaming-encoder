@@ -1650,6 +1650,13 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 			args = append(args, "--local-chunk-duration",
 				strconv.FormatFloat(chunk, 'f', -1, 64))
 		}
+		// The per-clip work dir is keyed by filename and persists across jobs,
+		// so a force re-encode must tell cli_local to drop the prior run's
+		// complete variants (else encode_all reuses them). resolveCodec is
+		// already bypassed for force upstream; this closes the worker-side reuse.
+		if cfg.ForceReencode {
+			args = append(args, "--force-reencode")
+		}
 	}
 	// CPU arch only makes sense for cloud encodes (local runs on the
 	// host's own architecture), and cli_local.py doesn't accept the

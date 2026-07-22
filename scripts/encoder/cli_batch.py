@@ -273,19 +273,39 @@ _STEP_TO_STAGE: dict[str, str] = {
 }
 
 
-def _emit_plan(do_h264: bool = True, do_hevc: bool = True) -> None:
+def _emit_plan(variants: "list | None" = None,
+               do_h264: bool = True, do_hevc: bool = True) -> None:
     """Announce the pipeline stages for THIS run. Only the codecs actually being
     encoded are listed, so a h264-only run doesn't render empty hevc rows.
     Package order is package -> fragments -> hls (the LL-HLS playlists embed the
     fragment byteranges, so hls must run last). The trailing download:outputs
     stage is the driver's own S3 -> local sync-back of the finished package.
-    Variant encode stages are emitted dynamically as Map iterations start."""
+
+    The full per-variant/per-chunk encode grid is declared up front from the SFN
+    input's `variants` (each carries codec, label, chunk_indices, chunked), so a
+    28-chunk 2160p variant shows all 28 cells from the start instead of the bar
+    growing as Map iterations trickle in. Chunk stage keys match the running
+    jobs: chunked -> encode:<codec>:<label>:chunk<i>, whole -> encode:<codec>:<label>."""
     keys = ["mezzanine", "audio"]
+    for v in variants or []:
+        codec, label = v.get("codec"), v.get("label")
+        if not codec or not label:
+            continue
+        if str(v.get("chunked", "")).lower() == "true":
+            for i in v.get("chunk_indices") or [0]:
+                keys.append(f"encode:{codec}:{label}:chunk{i}")
+        else:
+            keys.append(f"encode:{codec}:{label}")
     for codec, on in (("h264", do_h264), ("hevc", do_hevc)):
         if on:
             keys += [f"package:{codec}", f"fragments:{codec}", f"hls:{codec}"]
     keys.append("download:outputs")
-    stages = [{"key": k, "label": k.replace(":", " ")} for k in keys]
+    seen: set = set()
+    stages = []
+    for k in keys:  # de-dupe, preserve order
+        if k not in seen:
+            seen.add(k)
+            stages.append({"key": k, "label": k.replace(":", " ")})
     print(f"[[ENCODER-PLAN {json.dumps(stages)}]]", flush=True)
 
 
@@ -868,14 +888,16 @@ def cmd_poll(args: argparse.Namespace) -> int:
     # Read the execution input up front so the plan lists only the codecs we're
     # actually encoding (do_h264 / do_hevc from buildSFNInput).
     do_h264 = do_hevc = True
+    variants: list = []
     try:
         inp = json.loads(sfn.describe_execution(
             executionArn=args.execution_arn).get("input") or "{}")
         do_h264 = bool(inp.get("do_h264", True))
         do_hevc = bool(inp.get("do_hevc", True))
+        variants = inp.get("variants") or []
     except (ClientError, ValueError, TypeError):
         pass
-    _emit_plan(do_h264, do_hevc)
+    _emit_plan(variants, do_h264, do_hevc)
 
     seen: set[int] = set()
     log_state: dict[str, int] = {}  # stream -> last-forwarded timestamp
