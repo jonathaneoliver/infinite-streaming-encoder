@@ -5,6 +5,8 @@ export
 IMAGE_NAME ?= encoder
 CONTAINER_NAME ?= encoder
 PORT ?= 8080
+# Temporal UI address the server queries for available distributed-local workers.
+TEMPORAL_UI_ADDR ?= http://host.docker.internal:8233
 
 # Single source of truth: ./VERSION. Embedded into the Go binary via
 # -ldflags and stamped on every image tag we publish to GHCR. The
@@ -87,6 +89,7 @@ run: require-paths build
 		-e INSTANCE_TYPE=$(INSTANCE_TYPE) \
 		-e GHCR_PAT=$(GHCR_PAT) \
 		-e STATE_MACHINE_ARN=$(STATE_MACHINE_ARN) \
+		-e TEMPORAL_UI_ADDR=$(TEMPORAL_UI_ADDR) \
 		$(IMAGE_NAME)
 	@echo "Encoder running at http://localhost:$(PORT)"
 

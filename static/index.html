@@ -565,6 +565,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <div class="aws-metric-value" id="aws-reclaim-pct">—</div>
             </div>
             <div class="aws-metric">
+                <div class="aws-metric-label" title="Distributed-local encoder machines currently available (workers polling Temporal). One encode's chunks spread across these boxes; hover the value for names.">Local machines</div>
+                <div class="aws-metric-value" id="aws-dist-machines">—</div>
+            </div>
+            <div class="aws-metric">
                 <div class="aws-metric-label" title="Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box instead of cold-starting. 0 when idle; WARM_MIN_VCPUS (a whole box) during a run.">Keep warm</div>
                 <div class="aws-metric-value" id="aws-warm">—</div>
             </div>
@@ -2750,6 +2754,26 @@ const _MAXVCPU_BASE = 48;
 // the same inventory summary `s` that renderAws already fetched — full innerHTML
 // re-render each 10s tick is fine (radios re-check from live state, no text
 // input to lose focus on).
+// Distributed-local encoder machines available — the workers polling the
+// Temporal task queue, from /api/dist/workers (distinct poller identities).
+// Feeds the "Local machines" tile; best-effort, shows 0 if the cluster's down.
+let _distMachines = { count: 0, machines: [] };
+async function pollDistWorkers() {
+    try {
+        const r = await fetch('/api/dist/workers');
+        if (!r.ok) return;
+        _distMachines = await r.json();
+        const el = document.getElementById('aws-dist-machines');
+        if (el) {
+            el.textContent = _distMachines.count;
+            el.classList.toggle('ok', _distMachines.count > 0);
+            el.title = _distMachines.machines.join(', ') || 'none available';
+        }
+    } catch (e) { /* cluster not up — leave at 0 */ }
+}
+setInterval(pollDistWorkers, 10000);
+pollDistWorkers();
+
 function renderJobsMetrics(s) {
     const el = document.getElementById('jobs-aws-metrics');
     if (!el) return;
@@ -2779,6 +2803,7 @@ function renderJobsMetrics(s) {
         tile('Spent (last 24h)', `<div class="aws-metric-value">$${(s.spend_24h_usd || 0).toFixed(2)}</div>`, 'Self-tracked: burn rate integrated over the trailing 24h'),
         tile('Saved by spot (total)', `<div class="aws-metric-value ok">$${(s.saved_total_usd || 0).toFixed(2)}</div>`, 'Accumulated (on-demand − spot) cost across all finished cloud-batch jobs'),
         tile('Reclaim waste (24h)', `<div class="aws-metric-value${rpct >= 10 ? ' warn' : rpct > 0 ? '' : ' ok'}">${rpct.toFixed(1)}%</div>`, (s.reclaim_24h_lost_min || 0).toFixed(1) + ' min of encoding lost to reclaims in the last 24h'),
+        tile('Local machines', `<div class="aws-metric-value${_distMachines.count > 0 ? ' ok' : ''}" id="dist-machines-val" title="${_distMachines.machines.join(', ') || 'none available'}">${_distMachines.count}</div>`, 'Distributed-local encoder machines currently available (workers polling Temporal). One encode\'s chunks spread across these boxes; hover for names.'),
         tile('Keep warm', `<div class="aws-metric-value${(s.min_vcpus || 0) > 0 ? ' ok' : ''}">${s.min_vcpus || 0} vCPU</div>`, 'Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box (0 when idle).'),
         tile('Max vCPUs', vcpuHtml, 'Batch compute-env max vCPUs. 2× runs ~twice as many machines → roughly half the wall-clock for ~the same total cost.'),
     ].join('');

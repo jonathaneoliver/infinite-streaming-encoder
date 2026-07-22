@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jonathaneoliver/encoder/internal/encode"
 	"github.com/jonathaneoliver/encoder/internal/imageinfo"
@@ -39,6 +41,7 @@ func NewServer(mgr *encode.Manager) *Server {
 		),
 	}
 	s.Mux.HandleFunc("GET /api/version", s.getVersion)
+	s.Mux.HandleFunc("GET /api/dist/workers", s.distWorkers)
 	s.Mux.HandleFunc("GET /api/settings", s.getSettings)
 	s.Mux.HandleFunc("POST /api/settings", s.putSettings)
 	s.Mux.HandleFunc("GET /api/sources", s.listSources)
@@ -94,6 +97,45 @@ func noCache(h http.Handler) http.Handler {
 		w.Header().Set("Expires", "0")
 		h.ServeHTTP(w, r)
 	})
+}
+
+// distWorkers reports the distributed-local encode machines currently available
+// — the workers polling the Temporal task queue. Read from the Temporal UI's
+// HTTP API (distinct poller identities = machines), so no Temporal SDK dep.
+// Best-effort: if the cluster/UI is unreachable, returns an empty list and the
+// UI simply shows 0 machines.
+func (s *Server) distWorkers(w http.ResponseWriter, r *http.Request) {
+	uiAddr := os.Getenv("TEMPORAL_UI_ADDR")
+	if uiAddr == "" {
+		uiAddr = "http://host.docker.internal:8233"
+	}
+	tq := os.Getenv("TEMPORAL_TASK_QUEUE")
+	if tq == "" {
+		tq = "encode"
+	}
+	url := fmt.Sprintf("%s/api/v1/namespaces/default/task-queues/%s?taskQueueType=1",
+		strings.TrimRight(uiAddr, "/"), tq)
+	machines := []string{}
+	seen := map[string]bool{}
+	client := &http.Client{Timeout: 3 * time.Second}
+	if resp, err := client.Get(url); err == nil {
+		defer resp.Body.Close()
+		var body struct {
+			Pollers []struct {
+				Identity string `json:"identity"`
+			} `json:"pollers"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&body) == nil {
+			for _, p := range body.Pollers {
+				if p.Identity != "" && !seen[p.Identity] {
+					seen[p.Identity] = true
+					machines = append(machines, p.Identity)
+				}
+			}
+		}
+	}
+	sort.Strings(machines)
+	writeJSON(w, map[string]any{"count": len(machines), "machines": machines})
 }
 
 func (s *Server) getVersion(w http.ResponseWriter, r *http.Request) {
