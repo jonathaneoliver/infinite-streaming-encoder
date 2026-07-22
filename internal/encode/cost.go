@@ -1,9 +1,17 @@
 package encode
 
 import (
+	"math"
 	"path/filepath"
 	"strconv"
 )
+
+// defaultLocalPerfCores is the assumed local-fleet parallelism when no worker has
+// reported live CPU yet — the full fleet (MacBook 4 + Mac Mini 4 + ubuntu 8 perf
+// cores). Once workers report via ENCODER-FLEET, the real live sum is used
+// instead, so a smaller live fleet (e.g. only the Mac up) predicts proportionally
+// slower.
+const defaultLocalPerfCores = 16.0
 
 // AWS Batch per-vCPU-hour pricing for the Graviton (c/m-7g) fleet. Spot is the
 // steady-state rate we actually pay; on-demand is the reclaim-proof upper bound
@@ -50,29 +58,121 @@ func (m *Manager) projectCloudCost(cfg JobConfig, sourceWidth, fps int, duration
 	return spot, ondemand
 }
 
-// projectAndSetCloudCost probes the job's first source file and stores the
-// compute-based AWS Batch (Graviton) cost projection on the Job. Runs for every
-// target — "what would this cost on our cloud fleet?" is a target-independent
-// comparison — and is idempotent (a reattach recomputes the same value). This is
-// authoritative for AwsSpotUSD / AwsOndemandUSD; the Python ENCODER-COMMERCIAL
-// marker now only supplies the SaaS commercial + MediaConvert baselines. Best-
-// effort: a probe failure or unsized ladder leaves the fields untouched.
-func (m *Manager) projectAndSetCloudCost(job *Job) {
+// localFleetPerfCores is the local fleet's total parallel perf-core budget: the
+// live sum reported by workers (ENCODER-FLEET), or the default full-fleet
+// assumption before any worker has checked in.
+func (m *Manager) localFleetPerfCores() float64 {
+	var sum float64
+	for _, e := range m.FleetCPU() {
+		sum += e.Perf
+	}
+	if sum <= 0 {
+		return defaultLocalPerfCores
+	}
+	return sum
+}
+
+// projectLocalWallSeconds predicts the wall-clock time (end − start) to encode
+// the whole ladder on the LOCAL fleet — the "cost" of the local option, whose
+// only downside is time. Makespan model: sum each variant's CORE-seconds of work
+// (encode wall on a local box × the vCPUs it drives), divide by the fleet's total
+// parallel cores (perfect-packing lower bound, which LPT scheduling + per-variant
+// chunking approaches), and floor by the longest atomic chunk (~a dynamic-target
+// chunk's wall) since no job finishes faster than its single largest piece. Uses
+// LEARNED local speeds, so a running local encode's estimate converges on reality.
+func (m *Manager) projectLocalWallSeconds(cfg JobConfig, sourceWidth, fps int, durationS float64) float64 {
+	if m.Speeds == nil || m.Ladders == nil || durationS <= 0 {
+		return 0
+	}
+	ladderName := cfg.Ladder
+	if ladderName == "" {
+		ladderName = "apple-uniq-live"
+	}
+	cores := m.localFleetPerfCores()
+	if cores <= 0 {
+		cores = 1
+	}
+	var coreSeconds, floor float64
+	for _, c := range parseCodecSel(cfg.Codec) {
+		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, sourceWidth) {
+			twoPass := c == "hevc" && !cfg.HevcSinglePass
+			sp := m.Speeds.LocalSpeed(c, r.Height, twoPass, r.Preset, fps)
+			if sp <= 0 {
+				continue
+			}
+			wall := durationS / sp // serial wall to encode this whole variant on one box
+			vcpuStr, _ := variantResourcesFor(c, r.Height)
+			vcpu, _ := strconv.ParseFloat(vcpuStr, 64)
+			coreSeconds += wall * vcpu
+			// Atomic floor: chunking splits a variant into ~dynamic-target-wall
+			// pieces, so the smallest indivisible unit is min(whole variant,
+			// dynamicTargetWallSeconds). The makespan can't beat the longest one.
+			if atomic := math.Min(wall, dynamicTargetWallSeconds); atomic > floor {
+				floor = atomic
+			}
+		}
+	}
+	return math.Max(coreSeconds/cores, floor)
+}
+
+// ensureSourceProbe probes the job's first source file once (duration/width/fps)
+// and caches the result on the Job, so live re-prediction — called on every
+// encode-speed sample — needn't re-invoke ffprobe. Returns false when the clip
+// can't be sized (no files / ffprobe failure / zero duration).
+func (m *Manager) ensureSourceProbe(job *Job) bool {
+	job.mu.Lock()
+	if job.probeDone {
+		ok := job.probeDuration > 0
+		job.mu.Unlock()
+		return ok
+	}
+	job.mu.Unlock()
+
 	if len(job.Config.Files) == 0 {
-		return
+		return false
 	}
 	src := filepath.Join(m.SourceDir, job.Config.Files[0])
 	dur, err := probeDurationSeconds(src)
-	if err != nil || dur <= 0 {
-		return
+	width, fps := 0, 0
+	if err == nil && dur > 0 {
+		width = probeSourceWidth(src)
+		fps = probeSourceFps(src)
 	}
-	spot, ondemand := m.projectCloudCost(job.Config, probeSourceWidth(src), probeSourceFps(src), dur)
-	if spot <= 0 {
+	job.mu.Lock()
+	job.probeDone = true
+	job.probeDuration, job.probeWidth, job.probeFps = dur, width, fps
+	ok := dur > 0
+	job.mu.Unlock()
+	return ok
+}
+
+// projectAndSetCosts (re)computes and stores the whole cost comparison that needs
+// the learned-speed model: the AWS Batch Graviton cost projection (authoritative
+// for AwsSpotUSD/AwsOndemandUSD — the Python ENCODER-COMMERCIAL marker supplies
+// only the SaaS commercial + MediaConvert baselines) and the predicted local-
+// fleet wall-clock time. Target-independent (both comparisons apply to any run).
+// Cheap once the source is probed, so it's called both at job start AND on every
+// ENCODER-SPEED sample — the estimates then sharpen live as the running encode
+// learns real speeds (a local run refines LocalWallSeconds; a cloud run refines
+// the graviton cost). Idempotent; a reattach recomputes the same values.
+func (m *Manager) projectAndSetCosts(job *Job) {
+	if !m.ensureSourceProbe(job) {
 		return
 	}
 	job.mu.Lock()
-	job.AwsSpotUSD = spot
-	job.AwsOndemandUSD = ondemand
+	dur, width, fps := job.probeDuration, job.probeWidth, job.probeFps
+	job.mu.Unlock()
+
+	spot, ondemand := m.projectCloudCost(job.Config, width, fps, dur)
+	localWall := m.projectLocalWallSeconds(job.Config, width, fps, dur)
+
+	job.mu.Lock()
+	if spot > 0 {
+		job.AwsSpotUSD, job.AwsOndemandUSD = spot, ondemand
+	}
+	if localWall > 0 {
+		job.LocalWallSeconds = localWall
+	}
 	job.mu.Unlock()
 	m.notify(job)
 }

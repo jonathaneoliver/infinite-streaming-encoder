@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -187,6 +188,28 @@ func (s *EncodeSpeedStore) RelativeSpeed(codec string, height int, twoPass bool,
 		return sum / float64(n)
 	}
 	return seedSpeed("any", codec, height, twoPass, preset, fps)
+}
+
+// LocalSpeed is like RelativeSpeed but restricted to the LOCAL fleet (excludes
+// graviton keys), for predicting local-hardware wall time. Averages learned
+// non-graviton keys matching the variant; absent any, seeds from a representative
+// local box (ubuntu, the baseline). Machine-agnostic across the local boxes so
+// the makespan model can treat the fleet's cores as a single pool.
+func (s *EncodeSpeedStore) LocalSpeed(codec string, height int, twoPass bool, preset string, fps int) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var sum float64
+	var n int
+	for k, v := range s.speeds {
+		if v > 0 && !strings.HasPrefix(k, "graviton:") && keyMatchNoMachine(k, codec, height, twoPass, preset, fps) {
+			sum += v
+			n++
+		}
+	}
+	if n > 0 {
+		return sum / float64(n)
+	}
+	return seedSpeed("ubuntu", codec, height, twoPass, preset, fps)
 }
 
 // SpeedDetail returns the speed plus how many learned samples back it (0 =

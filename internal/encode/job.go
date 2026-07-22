@@ -836,8 +836,23 @@ type Job struct {
 	// real encode work (a 4K HEVC 2-pass rendition ~200× a 360p h264 one).
 	AwsSpotUSD     float64 `json:"aws_spot_usd,omitempty"`
 	AwsOndemandUSD float64 `json:"aws_ondemand_usd,omitempty"` // on-demand (reclaim-proof) upper bound
+	// LocalWallSeconds is the "cost" of encoding this ladder on YOUR local fleet:
+	// its only downside is time, so it's reported as predicted wall-clock (end −
+	// start), not dollars. A makespan estimate — total core-seconds of work over
+	// the fleet's parallel cores, floored by the longest atomic chunk — computed
+	// from the learned LOCAL speeds. Recomputed live as the encode learns, so a
+	// running local encode's estimate converges on its own actual runtime.
+	LocalWallSeconds float64 `json:"local_wall_s,omitempty"`
 	// per-execution [spot, ondemand, saved, vcpu_h], summed across files; not serialized.
 	costByExec map[string][4]float64
+
+	// Cached first-source probe (duration/width/fps) for live cost + local-wall
+	// re-prediction, so the per-sample refresh needn't re-invoke ffprobe. Set once
+	// by ensureSourceProbe; guarded by mu.
+	probeDone     bool
+	probeDuration float64
+	probeWidth    int
+	probeFps      int
 
 	// Run efficiency stats (from ENCODER-STATS, computed by the driver from Batch
 	// at job end). EncodeWallS = the Batch encode span (denominator for
@@ -2007,11 +2022,12 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 }
 
 func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int) error {
-	// Project the AWS Batch (Graviton) compute cost of this job's ladder up
-	// front, from the first source file's probe and the learned graviton speed
-	// model. Target-independent (the "what would this cost on our cloud fleet?"
-	// comparison applies to local-dist runs too) and idempotent on reattach.
-	m.projectAndSetCloudCost(job)
+	// Project the cost comparison up front from the first source file's probe +
+	// the learned-speed model: AWS Batch (Graviton) compute cost AND predicted
+	// local-fleet wall-clock time. Target-independent (both "what would this cost
+	// on our cloud fleet?" and "how long on my own hardware?" apply to any run)
+	// and idempotent on reattach; refreshed live below as speeds are learned.
+	m.projectAndSetCosts(job)
 
 	// cloud-batch fans the whole job onto AWS Batch via Step Functions; local-dist
 	// runs one worker container per file below.
@@ -2375,7 +2391,8 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 			}
 		}
 		if m.learnSpeed(line) {
-			continue // telemetry for the dynamic chunk selector, not a log line
+			m.projectAndSetCosts(job) // refine cost + local-wall from the new sample
+			continue                  // telemetry for the dynamic chunk selector, not a log line
 		}
 		if !job.parseMarker(line) {
 			job.AppendLog(line)
@@ -2865,7 +2882,8 @@ func (m *Manager) attachAndWait(job *Job, name string) error {
 			continue
 		}
 		if m.learnSpeed(line) {
-			continue // dynamic-chunk-selector telemetry, not a log line
+			m.projectAndSetCosts(job) // refine cost + local-wall from the new sample
+			continue                  // dynamic-chunk-selector telemetry, not a log line
 		}
 		if m.recordFleetCPU(line) {
 			continue // per-machine CPU sample for the fleet view, not a log line
