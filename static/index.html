@@ -1789,16 +1789,19 @@ function stageElapsed(s) {
 // machine it ran on, and how long it's taken. Shown as a native title tooltip.
 function stageTooltip(s, indexLabel) {
     const parts = [];
-    if (indexLabel) parts.push(indexLabel);
-    if (s.label && s.label !== indexLabel) parts.push(s.label.replace(/:/g, ' '));
-    parts.push('status: ' + (s.status || 'pending'));
+    // Lead with what it is: prefer the descriptive label ("encode hevc 2160p
+    // chunk4"), fall back to the index label.
+    const label = (s.label && s.label !== indexLabel) ? s.label.replace(/:/g, ' ') : indexLabel;
+    if (label) parts.push(label);
+    parts.push((s.status || 'pending').toUpperCase());
     if (s.status !== 'pending' && s.status !== 'skipped' && typeof s.percent === 'number')
-        parts.push(s.percent.toFixed(0) + '%');
+        parts.push(s.percent.toFixed(1) + '% done');
     if (s.status === 'skipped') parts.push('reused from cache');
-    if (s.instance) parts.push('machine: ' + s.instance);
+    // Always show the machine so its absence is explicit (… = starting, — = n/a).
+    parts.push('machine: ' + (s.instance || (s.status === 'running' ? '…' : '—')));
     const el = stageElapsed(s);
     if (el) parts.push(el);
-    return parts.join(' · ');
+    return parts.join('  ·  ');
 }
 
 // Match a per-chunk encode stage key: encode:<codec>:<tier>:chunk<N>.

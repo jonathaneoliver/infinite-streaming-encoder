@@ -687,6 +687,7 @@ async def _emit_temporal_progress(handle, EventType, emitted: dict) -> None:
 # Temporal PendingActivityState.STARTED — an activity actually executing on a
 # worker right now (vs SCHEDULED = still queued). Stable enum value.
 _PA_STARTED = 2
+_HOST_SEEN: dict = {}   # chunk activity_id -> machine, to dedup ENCODER-HOST
 
 
 async def _emit_fleet_cpu(handle, client) -> None:
@@ -724,13 +725,21 @@ async def _emit_fleet_cpu(handle, client) -> None:
         aid = getattr(pa, "activity_id", "") or ""
         if getattr(pa, "state", 0) == _PA_STARTED and aid.startswith("enc-"):
             a["chunks"].append(aid)
-            # Real per-chunk progress: the worker rides ffmpeg's out_time/duration
-            # % on its heartbeat, so a chunk fills 0→100 as it actually encodes
-            # instead of snapping 0→100 on completion.
             key = _stage_key_for(aid)
-            p = (cpu or {}).get("progress")
-            if key and p is not None and 0 < p < 100:
-                emit_stage(key, "running", float(p))
+            if key:
+                # Colour the grid cell by the machine running it, from the START —
+                # authoritative here (last_worker_identity) so the cell matches the
+                # fleet swatch + chip for the whole encode, not just at completion.
+                # Deduped per (chunk, machine) so failover re-tags but we don't spam.
+                if machine and _HOST_SEEN.get(aid) != machine:
+                    _HOST_SEEN[aid] = machine
+                    print(f"[[ENCODER-HOST key={key} instance={machine}]]", flush=True)
+                # Real per-chunk progress: the worker rides ffmpeg's out_time/
+                # duration % on its heartbeat, so a chunk fills 0→100 as it actually
+                # encodes instead of snapping 0→100 on completion.
+                p = (cpu or {}).get("progress")
+                if p is not None and 0 < p < 100:
+                    emit_stage(key, "running", float(p))
     for m, a in agg.items():
         chunks = "|".join(a["chunks"][:16])
         print(f"[[ENCODER-FLEET machine={m} busy={a['busy']} perf={a['perf']} "
