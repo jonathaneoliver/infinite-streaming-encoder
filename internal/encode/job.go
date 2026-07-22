@@ -131,7 +131,12 @@ var (
 	// (4/4/8). Emitted by cli_local_dist from the workers' Temporal heartbeats,
 	// once per machine per poll. Consumed by Manager.recordFleetCPU (not per-job)
 	// to drive the local fleet CPU sparkline.
-	fleetMarkerRe = regexp.MustCompile(`^\[\[ENCODER-FLEET machine=(\S+) busy=([0-9.]+) perf=([0-9.]+)\]\]$`)
+	fleetMarkerRe = regexp.MustCompile(`^\[\[ENCODER-FLEET machine=(\S+) busy=([0-9.]+) perf=([0-9.]+)( chunks=([^\]]*))?\]\]$`)
+	// ENCODER-COMMERCIAL reports what this job's output ladder would have cost on
+	// hosted transcoders — a generic commercial cloud encoder and AWS MediaConvert
+	// — as comparison baselines against our own spot/local cost. Emitted once per
+	// job by the orchestrator (commercial_cloud.py).
+	commercialMarkerRe = regexp.MustCompile(`^\[\[ENCODER-COMMERCIAL commercial=([0-9.]+) mediaconvert=([0-9.]+)\]\]$`)
 )
 
 // learnSpeed folds an ENCODER-SPEED marker into the learned-speed model. Returns
@@ -329,6 +334,15 @@ func (j *Job) parseMarker(line string) bool {
 				break
 			}
 		}
+		j.mu.Unlock()
+		return true
+	}
+	if m := commercialMarkerRe.FindStringSubmatch(line); m != nil {
+		commercial, _ := strconv.ParseFloat(m[1], 64)
+		mediaconvert, _ := strconv.ParseFloat(m[2], 64)
+		j.mu.Lock()
+		j.CommercialUSD = commercial
+		j.MediaConvertUSD = mediaconvert
 		j.mu.Unlock()
 		return true
 	}
@@ -672,6 +686,14 @@ type Job struct {
 	SpotUSD     float64 `json:"spot_usd,omitempty"`
 	OnDemandUSD float64 `json:"ondemand_usd,omitempty"`
 	SavedUSD    float64 `json:"saved_usd,omitempty"`
+	// CommercialUSD / MediaConvertUSD are what this job's output ladder would have
+	// cost on hosted transcoders (a generic commercial cloud encoder, and AWS
+	// MediaConvert) — comparison baselines against our own spot/local cost. Both
+	// are per-output-minute pricing, emitted once per job by the orchestrator
+	// (scripts/encoder/commercial_cloud.py). For local jobs (no SpotUSD) they're
+	// "what you'd have paid a hosted transcoder for the same work".
+	CommercialUSD   float64 `json:"commercial_usd,omitempty"`
+	MediaConvertUSD float64 `json:"mediaconvert_usd,omitempty"`
 	// per-execution [spot, ondemand, saved, vcpu_h], summed across files; not serialized.
 	costByExec map[string][4]float64
 
@@ -839,10 +861,12 @@ type Manager struct {
 	subMu         sync.Mutex
 
 	// fleetCPU holds recent per-machine CPU samples for the distributed-local
-	// fleet view (machine -> ring of samples), fed by ENCODER-FLEET markers off
-	// the orchestrator's stdout. Guarded by fleetMu.
-	fleetMu  sync.Mutex
-	fleetCPU map[string][]fleetSample
+	// fleet view (machine -> ring of samples); fleetChunks holds the chunks
+	// currently running on each machine (activity ids). Both fed by ENCODER-FLEET
+	// markers off the orchestrator's stdout. Guarded by fleetMu.
+	fleetMu     sync.Mutex
+	fleetCPU    map[string][]fleetSample
+	fleetChunks map[string][]string
 }
 
 // fleetSample is one CPU reading for a distributed-local worker box.
@@ -866,15 +890,21 @@ func (m *Manager) recordFleetCPU(line string) bool {
 	}
 	busy, _ := strconv.ParseFloat(mm[2], 64)
 	perf, _ := strconv.ParseFloat(mm[3], 64)
+	var chunks []string
+	if mm[5] != "" {
+		chunks = strings.Split(mm[5], "|")
+	}
 	m.fleetMu.Lock()
 	if m.fleetCPU == nil {
 		m.fleetCPU = map[string][]fleetSample{}
+		m.fleetChunks = map[string][]string{}
 	}
 	s := append(m.fleetCPU[mm[1]], fleetSample{T: time.Now(), Busy: busy, Perf: perf})
 	if len(s) > fleetHistoryLen {
 		s = s[len(s)-fleetHistoryLen:]
 	}
 	m.fleetCPU[mm[1]] = s
+	m.fleetChunks[mm[1]] = chunks
 	m.fleetMu.Unlock()
 	return true
 }
@@ -889,6 +919,7 @@ type FleetCPUEntry struct {
 	Latest  float64   `json:"latest"`
 	History []float64 `json:"history"`
 	AgeS    float64   `json:"age_s"`
+	Chunks  []string  `json:"chunks,omitempty"` // activity ids running on this box now
 }
 
 // FleetCPU returns each machine's recent CPU history for the fleet endpoint,
@@ -914,6 +945,7 @@ func (m *Manager) FleetCPU() []FleetCPUEntry {
 			Latest:  hist[len(hist)-1],
 			History: hist,
 			AgeS:    now.Sub(last.T).Seconds(),
+			Chunks:  m.fleetChunks[machine],
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Machine < out[j].Machine })

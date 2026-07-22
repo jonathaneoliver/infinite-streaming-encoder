@@ -494,6 +494,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
         <div class="aws-summary" id="jobs-aws-metrics"></div>
         <div id="jobs-fleet-full" title="Live cloud fleet — per-instance packing, utilization, and lifecycle (from the AWS inventory)"></div>
     </div>
+    <div class="panel" id="jobs-local-fleet-panel" style="display:none">
+        <h2>Local fleet</h2>
+        <div id="jobs-local-fleet" title="Live local cluster — per-machine CPU, packing, and the chunks running on each box"></div>
+    </div>
     <div class="panel">
         <h2>Jobs</h2>
         <div id="jobs-list">
@@ -1684,21 +1688,23 @@ function _jobConfigHtml(c) {
 // efficiency = avg busy ÷ max vCPUs; slowest chunk = the makespan floor.
 function renderJobStats(el, j) {
     if (!el) return;
-    if (!(j.cpu_vcpu_h > 0)) { el.style.display = 'none'; return; }
+    if (!(j.cpu_vcpu_h > 0) && !(j.commercial_usd > 0)) { el.style.display = 'none'; return; }
     const totalS = (j.started_at && j.ended_at)
         ? (new Date(j.ended_at).getTime() - new Date(j.started_at).getTime()) / 1000
         : (j.started_at ? (Date.now() - new Date(j.started_at).getTime()) / 1000 : 0);
     const stat = (label, val) => `<span class="job-stat">${label} <b>${val}</b></span>`;
     const slowest = (j.slowest_job || '').replace(/:/g, ' ').replace(/^encode /, '');
+    const cloud = j.cpu_vcpu_h > 0;   // cloud-batch jobs have vCPU-hour telemetry
     el.innerHTML =
           stat('total', formatDuration(totalS))
         + (j.encode_wall_s ? stat('encode wall', formatDuration(j.encode_wall_s)) : '')
-        + stat('CPU', j.cpu_vcpu_h.toFixed(1) + ' <span class="u">vCPU-hr</span>')
+        + (cloud ? stat('CPU', j.cpu_vcpu_h.toFixed(1) + ' <span class="u">vCPU-hr</span>') : '')
         + (j.job_count ? stat('jobs', j.job_count) : '')
-        + stat('avg busy', (j.avg_concurrency || 0).toFixed(0) + ' <span class="u">of ' + (j.max_vcpus || '?') + ' vCPU</span>')
-        + stat('efficiency', (j.efficiency_pct || 0).toFixed(0) + '%')
+        + (cloud ? stat('avg busy', (j.avg_concurrency || 0).toFixed(0) + ' <span class="u">of ' + (j.max_vcpus || '?') + ' vCPU</span>') : '')
+        + (cloud ? stat('efficiency', (j.efficiency_pct || 0).toFixed(0) + '%') : '')
         + (j.slowest_job ? stat('slowest chunk', escapeHtml(slowest) + ' <span class="u">' + formatDuration(j.slowest_job_s || 0) + '</span>') : '')
-        + (j.saved_usd > 0 ? stat('cost', '$' + (j.spot_usd || 0).toFixed(2) + ' <span class="u">spot · saved $' + j.saved_usd.toFixed(2) + '</span>') : '');
+        + (j.saved_usd > 0 ? stat('cost', '$' + (j.spot_usd || 0).toFixed(2) + ' <span class="u">spot · saved $' + j.saved_usd.toFixed(2) + '</span>') : '')
+        + ((j.commercial_usd > 0 || j.mediaconvert_usd > 0) ? stat('would cost hosted', `MediaConvert $${(j.mediaconvert_usd || 0).toFixed(2)} · commercial $${(j.commercial_usd || 0).toFixed(2)}` + (j.spot_usd > 0 ? ` <span class="u">· you paid $${j.spot_usd.toFixed(2)} spot</span>` : ` <span class="u">· you: own hardware ~$0</span>`)) : '');
     el.title = 'efficiency = avg vCPUs busy ÷ max vCPUs (how full the fleet ran). '
         + 'slowest chunk = the makespan floor — nothing finishes faster than this one chunk.';
     el.style.display = '';
@@ -2243,6 +2249,7 @@ function connectSSE() {
             const job = JSON.parse(e.data);
             jobs[job.id] = job;
             renderJobs();
+            renderLocalFleet();
         } catch (err) {}
     };
     es.onerror = () => {
@@ -2785,35 +2792,107 @@ function machinePillsHtml() {
     }).join('') + '</div>';
 }
 
-// Live per-machine CPU sparkline for the local cluster — the in-app twin of the
-// cloud fleet's CloudWatch sparklines. History is normalized to each box's perf-
-// core target (100% = its 4/4/8 cores fully busy; >100% = SMT/E-core spill), so
-// the three machines read on one comparable scale despite different core counts.
-// Data rides in on the Temporal heartbeat backchannel (see cli_local_dist).
-function distFleetHtml() {
-    const fleet = (_distMachines.fleet || []).filter(f => (f.history || []).length >= 2);
-    if (!fleet.length) return '';
-    const rows = fleet.map(f => {
-        const color = instanceColor(f.machine) || '#4361ee';
-        const stale = (f.age_s || 0) > 12;   // no recent sample → not encoding now
-        const peak = Math.max(100, ...f.history);
-        const spark = _sparkline(f.history, color, { min: 0, max: peak, w: 84, h: 16 });
-        const pct = Math.round(f.latest || 0);
-        return `<div style="display:flex;align-items:center;gap:8px;font-size:11px;${stale ? 'opacity:.4' : ''}">
-            <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${color}"></span>
-            <span style="min-width:54px;color:#ccc">${f.machine}</span>
-            ${spark}
-            <span style="min-width:88px;color:#aaa">${pct}% <span style="color:#666">of ${f.perf || 0}c target</span></span>
-        </div>`;
-    }).join('');
-    return `<div style="margin-top:8px;display:flex;flex-direction:column;gap:3px">
-        <div style="font-size:10px;color:#666;text-transform:uppercase;letter-spacing:.5px">CPU · live</div>
-        ${rows}</div>`;
+// Friendly label for a running chunk. The fleet marker carries Temporal activity
+// ids ("enc-hevc-720p-c2"); also accept stage keys ("encode:hevc:720p:chunk2").
+function _localChunkFriendly(key) {
+    let m = /^enc-(\w+)-([^-]+)-c(\d+)$/.exec(key || '');
+    if (m) return `${m[1]} ${m[2]} c${m[3]}`;
+    m = /^encode:(\w+):([\w]+):chunk(\d+)$/.exec(key || '');
+    if (m) return `${m[1]} ${m[2]} c${m[3]}`;
+    return (key || '').replace(/^enc-|^encode:/, '').replace(/[-:]/g, ' ');
+}
+
+// One machine row for the local fleet — the local twin of _fleetInstanceRow:
+// swatch (matches the chunk plot's machine colour) + a packing bar of the chunks
+// running on this box (~2 cores each) + a live CPU sparkline (normalized to the
+// perf-core target: 100% = its 4/4/8 cores busy, >100% = SMT/E-core spill) + the
+// list of chunks currently on it. CPU rides in on the Temporal heartbeat.
+function _localFleetRow(inst, maxCores) {
+    const cap = inst.cores || 0;
+    const chunks = inst.chunks || [];
+    const color = instanceColor(inst.machine) || '#4361ee';
+    const divider = 'border-right:2px solid #20252f;';
+    const seg = (w, c, title, extra) => `<div style="width:${Math.max(0, w)}%;background:${c};box-sizing:border-box;${extra || ''}" title="${escapeHtml(title)}"></div>`;
+    // Fill by MEASURED busy cores (from the live CPU%), so the bar tracks real
+    // utilization even before per-chunk placement is known; show discrete chunk
+    // segments once we have them (each chunk ~2 cores).
+    const busy = Math.min(cap, (inst.latest || 0) / 100 * cap);
+    let parts, rightLabel;
+    if (chunks.length) {
+        const used = Math.min(cap, chunks.length * 2);
+        parts = chunks.map(c => seg(cap ? 2 / cap * 100 : 0, color, _localChunkFriendly(c), divider)).join('');
+        if (cap - used > 0) parts += seg((cap - used) / cap * 100, '#20252f', `${cap - used} idle core${cap - used > 1 ? 's' : ''}`);
+        rightLabel = `${used}/${cap} cores · ${chunks.length} chunk${chunks.length > 1 ? 's' : ''}`;
+    } else {
+        parts = seg(cap ? busy / cap * 100 : 0, color, `~${busy.toFixed(1)} cores busy`)
+              + (cap - busy > 0.05 ? seg((cap - busy) / cap * 100, '#20252f', 'idle') : '');
+        rightLabel = busy > 0.3 ? `~${busy.toFixed(1)} / ${cap} cores busy` : `idle (${cap} cores)`;
+    }
+    const barW = maxCores ? cap / maxCores * 100 : 100;
+    const hist = inst.cw || [];
+    const peak = Math.max(100, ...(hist.length ? hist : [100]));
+    const spark = hist.length >= 2 ? _sparkline(hist, '#e0555a', { min: 0, max: peak, w: 54, h: 13 }) + ' ' : '';
+    const cpuLabel = hist.length ? `CPU ${spark}<span style="color:#ccc">${Math.round(inst.latest || 0)}%</span> · ` : '';
+    const swatch = `<span title="machine ${escapeHtml(inst.machine)} — matches its chunk colour in the plot" style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${color};vertical-align:middle;margin-right:6px"></span>`;
+    const chunkList = chunks.length
+        ? `<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:#9aa;margin-top:3px">`
+          + chunks.map(c => `<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${color};vertical-align:middle;margin-right:4px"></span>${escapeHtml(_localChunkFriendly(c))}</span>`).join('')
+          + `</div>`
+        : '';
+    return `<div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-bottom:2px">
+        <span>${swatch}${escapeHtml(inst.machine)} <span style="color:#666">${cap} cores</span></span>
+        <span>${cpuLabel}${rightLabel} · ${formatDuration(inst.age || 0)}</span>
+      </div>
+      <div style="height:16px;width:${barW}%;background:#20252f;border-radius:4px;overflow:hidden;display:flex" title="${cap} cores">${parts}</div>
+      ${chunkList}
+    </div>`;
+}
+
+// The local cluster's "Fleet" panel — the in-app twin of the cloud fleet view.
+// Fed by _distMachines.fleet (live CPU via the Temporal heartbeat backchannel) +
+// the running local-dist job's stages (which chunk is on which machine). Hidden
+// when nothing local is active, so it only appears during a distributed encode.
+function renderLocalFleet() {
+    const panel = document.getElementById('jobs-local-fleet-panel');
+    const el = document.getElementById('jobs-local-fleet');
+    if (!panel || !el) return;
+    // The fleet marker carries both live CPU and the chunks running on each box
+    // (authoritative, from Temporal's pending activities). Show machines reporting
+    // fresh CPU (i.e. actively encoding).
+    const fresh = (_distMachines.fleet || []).filter(f => (f.age_s != null ? f.age_s : 1e9) < 30);
+    if (!fresh.length) { panel.style.display = 'none'; return; }
+    const insts = fresh.slice().sort((a, b) => a.machine.localeCompare(b.machine)).map(f => ({
+        machine: f.machine, cores: f.perf || 0, latest: f.latest || 0,
+        cw: f.history || [], age: f.age_s || 0, chunks: f.chunks || [],
+    }));
+    const maxCores = Math.max(...insts.map(i => i.cores), 1);
+    const totalCores = insts.reduce((a, i) => a + i.cores, 0);
+    // Busy = discrete chunk cores when known, else measured (CPU%) — matches rows.
+    const busyCores = insts.reduce((a, i) => a + (i.chunks.length
+        ? Math.min(i.cores, i.chunks.length * 2)
+        : Math.min(i.cores, (i.latest || 0) / 100 * i.cores)), 0);
+    const usedCores = Math.round(busyCores);
+    const pct = totalCores ? Math.round(busyCores / totalCores * 100) : 0;
+    const totalChunks = insts.reduce((a, i) => a + i.chunks.length, 0);
+    const chunkLabel = totalChunks ? ` · ${totalChunks} chunk${totalChunks !== 1 ? 's' : ''}` : '';
+    const bar = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+        <div style="flex:1;max-width:520px;height:22px;background:#20252f;border-radius:5px;overflow:hidden">
+          <div style="width:${pct}%;height:100%;background:#4a90d9"></div></div>
+        <div style="font-size:13px;color:#ccc"><b>${usedCores}</b> / ${totalCores} cores busy (${pct}%) · <span style="color:#888">${insts.length} machine${insts.length > 1 ? 's' : ''}${chunkLabel}</span></div>
+      </div>`;
+    const rows = insts.map(i => _localFleetRow(i, maxCores)).join('');
+    panel.style.display = '';
+    el.innerHTML = bar + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
+    // Keep the metrics row live in local mode too — its own cloud-stats poll is
+    // slow, but pollDistWorkers/SSE call us every few seconds.
+    const mrow = document.getElementById('jobs-aws-metrics');
+    if (mrow) mrow.innerHTML = _localMetricsTiles();
 }
 
 function renderDistMachines() {
     const el = document.getElementById('aws-dist-machines');
-    if (el) el.innerHTML = machinePillsHtml() + distFleetHtml();
+    if (el) el.innerHTML = machinePillsHtml();
 }
 
 async function toggleMachine(name, enabled) {
@@ -2835,14 +2914,96 @@ async function pollDistWorkers() {
         if (!r.ok) return;
         _distMachines = await r.json();
         renderDistMachines();
+        renderLocalFleet();
     } catch (e) { /* cluster not up */ }
 }
 setInterval(pollDistWorkers, 5000);   // 5s: keeps the live CPU sparkline current
 pollDistWorkers();
 
+// Local-cluster metrics row, shown in place of the cloud-batch tiles when a
+// local/local-dist encode is active — so the summary row is specific to the
+// target (cloud tiles like "Active batch jobs" / "Saved by spot" / "Max vCPUs"
+// are meaningless for local encoding). Machines + cores busy + chunks running,
+// from the live fleet data.
+// Most-recently-started active job (any target) — what the metrics bar's overall
+// progress reflects.
+function _activeJob() {
+    return Object.values(jobs)
+        .filter(j => /running|encoding|queued|pending/i.test(j.status || ''))
+        .sort((a, b) => new Date(b.started_at || 0) - new Date(a.started_at || 0))[0] || null;
+}
+
+// Single overall completion % for an encode, WEIGHTED BY EXPECTED ENCODE COST —
+// a 4K HEVC 2-pass rendition is ~200× the compute of an h264 360p one, so it must
+// count ~200× toward "done". We weight each encode *variant* (not each chunk) by
+// resolution² × codec-factor × pass-factor, grouped by variant so dynamic
+// chunking's chunk-count doesn't double-count; the pipeline stages (mezzanine,
+// package, hls, …) get a small weight. Null when there are no stages yet.
+const _CODEC_COST = { h264: 1, hevc: 3.5, av1: 8 };   // ~relative encode cost/pixel
+function _overallProgress(j) {
+    const st = (j && j.stages) || [];
+    if (!st.length) return null;
+    const hevc2pass = !((j.config || {}).hevc_single_pass);
+    const eff = s => s.status === 'done' ? 100 : s.status === 'failed' ? 0 : (s.percent || 0);
+    const variants = {};   // "codec:height" -> {sum, n, weight}
+    let num = 0, den = 0;
+    st.forEach(s => {
+        const m = /^encode:(\w+):(\d+)p?:chunk/.exec(s.key || '');
+        if (m) {
+            const codec = m[1], h = +m[2], vk = codec + ':' + h;
+            if (!variants[vk]) {
+                const pass = (codec === 'hevc' && hevc2pass) ? 1.8 : 1;
+                variants[vk] = { sum: 0, n: 0, weight: h * h * (_CODEC_COST[codec] || 1) * pass };
+            }
+            variants[vk].sum += eff(s); variants[vk].n++;
+        } else {
+            // pipeline stage (upload/mezzanine/audio/package/fragments/hls/download)
+            // — small fixed weight (~5% of a 1080p·h264 variant) so the tail counts
+            // but never dominates.
+            num += 1080 * 1080 * 0.05 * eff(s);
+            den += 1080 * 1080 * 0.05;
+        }
+    });
+    Object.values(variants).forEach(v => { num += v.weight * (v.sum / v.n); den += v.weight; });
+    return den ? Math.round(num / den) : null;
+}
+
+// A compact "Progress" tile with the overall % + a thin bar, for the metrics row.
+function _progressTile() {
+    const pct = _overallProgress(_activeJob());
+    if (pct == null) return '';
+    const tile = (label, valueHtml, title) => `<div class="aws-metric"><div class="aws-metric-label"${title ? ` title="${title}"` : ''}>${label}</div>${valueHtml}</div>`;
+    return tile('Progress', `<div class="aws-metric-value">${pct}%<div style="height:5px;margin-top:4px;background:#20252f;border-radius:3px;overflow:hidden"><div style="width:${pct}%;height:100%;background:#4a90d9"></div></div></div>`, 'Overall completion of the active encode — mean across all stages (upload → chunks → package → download).');
+}
+
+function _localMetricsTiles() {
+    const tile = (label, valueHtml, title) => `<div class="aws-metric"><div class="aws-metric-label"${title ? ` title="${title}"` : ''}>${label}</div>${valueHtml}</div>`;
+    const fleet = (_distMachines.fleet || []).filter(f => (f.age_s != null ? f.age_s : 1e9) < 30);
+    const on = (_distMachines.machines || []).filter(m => m.on).length;
+    const totalCores = fleet.reduce((a, f) => a + (f.perf || 0), 0);
+    const busyCores = Math.round(fleet.reduce((a, f) => a + Math.min(f.perf || 0, (f.latest || 0) / 100 * (f.perf || 0)), 0));
+    const chunks = fleet.reduce((a, f) => a + ((f.chunks || []).length), 0);
+    return [
+        _progressTile(),
+        tile('Local machines', machinePillsHtml(), 'Distributed-local encoder machines. Click a remote pill to enable/disable that box mid-encode; its chunks re-queue to the others.'),
+        tile('Machines active', `<div class="aws-metric-value ok">${fleet.length || on}</div>`, 'Machines currently reporting CPU / polling'),
+        tile('Cores busy', `<div class="aws-metric-value">${busyCores} <span style="color:#888">/ ${totalCores}</span></div>`, 'Perf-cores busy across the cluster, from live CPU'),
+        tile('Chunks running', `<div class="aws-metric-value">${chunks}</div>`, 'Encode chunks executing across the cluster right now'),
+    ].join('');
+}
+
+// True when a local/local-dist encode is the active target (fresh fleet CPU or a
+// running local-dist job) — the metrics row + fleet then show the LOCAL view.
+function _localModeActive() {
+    if ((_distMachines.fleet || []).some(f => (f.age_s != null ? f.age_s : 1e9) < 30)) return true;
+    return Object.values(jobs).some(j => (j.config || {}).target === 'local-dist'
+        && /running|encoding|queued|pending/i.test(j.status || ''));
+}
+
 function renderJobsMetrics(s) {
     const el = document.getElementById('jobs-aws-metrics');
     if (!el) return;
+    if (_localModeActive()) { el.innerHTML = _localMetricsTiles(); return; }
     const execs = s.running_executions || 0;
     const bjobs = s.active_batch_jobs || 0;
     const running = s.running_instances || 0;
@@ -2860,6 +3021,7 @@ function renderJobsMetrics(s) {
             `<label style="margin-right:10px;cursor:pointer;white-space:nowrap"><input type="radio" name="maxvcpu-jobs" value="${v}" ${v === live ? 'checked' : ''} onchange="setMaxVcpus(${v})" style="width:auto;min-width:0;vertical-align:middle"> ${v} ${v === _MAXVCPU_BASE ? '(1×)' : '(2×)'}</label>`).join('') + '</div>';
     }
     el.innerHTML = [
+        _progressTile(),
         tile('Running executions', `<div class="${cls(execs)}">${execs}</div>`),
         tile('Active batch jobs', `<div class="${cls(bjobs)}">${bjobs}</div>`),
         tile('Running instances', `<div class="${cls(running)}">${running}</div>`),
@@ -2869,7 +3031,7 @@ function renderJobsMetrics(s) {
         tile('Spent (last 24h)', `<div class="aws-metric-value">$${(s.spend_24h_usd || 0).toFixed(2)}</div>`, 'Self-tracked: burn rate integrated over the trailing 24h'),
         tile('Saved by spot (total)', `<div class="aws-metric-value ok">$${(s.saved_total_usd || 0).toFixed(2)}</div>`, 'Accumulated (on-demand − spot) cost across all finished cloud-batch jobs'),
         tile('Reclaim waste (24h)', `<div class="aws-metric-value${rpct >= 10 ? ' warn' : rpct > 0 ? '' : ' ok'}">${rpct.toFixed(1)}%</div>`, (s.reclaim_24h_lost_min || 0).toFixed(1) + ' min of encoding lost to reclaims in the last 24h'),
-        tile('Local machines', machinePillsHtml(), 'Distributed-local encoder machines. Coloured to match the chunk plot; click a remote pill to enable/disable that box (mid-encode too — its chunks re-queue to the others).'),
+        tile('Local machines', machinePillsHtml(), 'Distributed-local encoder machines. Coloured to match the chunk plot; click a remote pill to enable/disable that box (mid-encode too — its chunks re-queue to the others). Live per-machine CPU + packing is in the Local fleet panel below.'),
         tile('Keep warm', `<div class="aws-metric-value${(s.min_vcpus || 0) > 0 ? ' ok' : ''}">${s.min_vcpus || 0} vCPU</div>`, 'Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box (0 when idle).'),
         tile('Max vCPUs', vcpuHtml, 'Batch compute-env max vCPUs. 2× runs ~twice as many machines → roughly half the wall-clock for ~the same total cost.'),
     ].join('');

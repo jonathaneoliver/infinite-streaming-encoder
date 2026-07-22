@@ -478,6 +478,25 @@ def _emit_plan(rungs_by_codec: dict[str, list[Rung]], chunks_by_variant: dict,
     emit_plan(stages)
 
 
+def _emit_commercial_cost(rungs_by_codec, info, input_path) -> None:
+    """Print an ENCODER-COMMERCIAL marker: what this job's ladder would have cost
+    on a commercial cloud encoder. Source bitrate is approximated from file size /
+    duration for the high-bitrate multiplier. Best-effort."""
+    try:
+        from encoder.commercial_cloud import estimate_usd, mediaconvert_usd
+        try:
+            src_mbps = input_path.stat().st_size * 8 / (info.duration_s or 1) / 1e6
+        except OSError:
+            src_mbps = 0.0
+        usd = estimate_usd(rungs_by_codec, info.duration_s, fps=float(info.fps),
+                           has_audio=info.has_audio, src_mbps=src_mbps)
+        mc = mediaconvert_usd(rungs_by_codec, info.duration_s, fps=float(info.fps))
+        print(f"[[ENCODER-COMMERCIAL commercial={usd:.4f} mediaconvert={mc:.4f}]]",
+              flush=True)
+    except Exception:  # noqa: BLE001 — cost estimate is cosmetic, never fail a run
+        pass
+
+
 def run(args: argparse.Namespace) -> int:
     _install_pool_cancel_handler()
     input_path = Path(args.input)
@@ -525,6 +544,7 @@ def run(args: argparse.Namespace) -> int:
         for codec, rungs in rungs_by_codec.items() for r in rungs
     }
     _emit_plan(rungs_by_codec, chunks_by_variant, info.has_audio)
+    _emit_commercial_cost(rungs_by_codec, info, input_path)
 
     pool = build_pool(
         args.worker or ["local"], args.image_local, args.image_remote,
@@ -664,12 +684,17 @@ async def _emit_temporal_progress(handle, EventType, emitted: dict) -> None:
             emit_stage(key, st, 100.0 if st == "done" else 0.0)
 
 
+# Temporal PendingActivityState.STARTED — an activity actually executing on a
+# worker right now (vs SCHEDULED = still queued). Stable enum value.
+_PA_STARTED = 2
+
+
 async def _emit_fleet_cpu(handle, client) -> None:
-    """Read the running activities' heartbeat details (each carries its worker's
-    machine + busy/perf cores) and emit one ENCODER-FLEET marker per machine, so
-    the Go server can build a per-machine CPU sparkline. This is the Temporal-
-    native backchannel: workers already heartbeat, we just read what they attach.
-    Best-effort — never fails the run."""
+    """Emit one ENCODER-FLEET marker per machine with its live CPU (busy/perf,
+    from the workers' heartbeat details) AND the chunks currently RUNNING on it
+    (STARTED pending activities, keyed by last_worker_identity). Both come from a
+    single describe_workflow — the Temporal-native backchannel, no ssh, no extra
+    channel. Best-effort — never fails the run."""
     try:
         desc = await handle.describe()
     except Exception:  # noqa: BLE001
@@ -678,21 +703,31 @@ async def _emit_fleet_cpu(handle, client) -> None:
     if raw is None:
         return
     pcv = client.data_converter.payload_converter
-    latest: dict = {}
+    agg: dict = {}   # machine -> {"busy", "perf", "chunks": [activity_id, ...]}
     for pa in getattr(raw, "pending_activities", []):
+        machine = getattr(pa, "last_worker_identity", "") or ""
+        cpu = None
         hb = getattr(pa, "heartbeat_details", None)
-        if not (hb and hb.payloads):
-            continue
-        try:
-            vals = pcv.from_payloads(list(hb.payloads))
-        except Exception:  # noqa: BLE001
-            continue
-        cpu = next((v for v in vals if isinstance(v, dict) and "machine" in v), None)
+        if hb and hb.payloads:
+            try:
+                vals = pcv.from_payloads(list(hb.payloads))
+                cpu = next((v for v in vals if isinstance(v, dict) and "machine" in v), None)
+            except Exception:  # noqa: BLE001
+                cpu = None
         if cpu and cpu.get("machine"):
-            latest[cpu["machine"]] = cpu  # dedupe: one line per machine
-    for m, cpu in latest.items():
-        print(f"[[ENCODER-FLEET machine={m} busy={cpu.get('busy', 0)} "
-              f"perf={cpu.get('perf', 0)}]]", flush=True)
+            machine = cpu["machine"]
+        if not machine:
+            continue
+        a = agg.setdefault(machine, {"busy": 0, "perf": 0, "chunks": []})
+        if cpu:
+            a["busy"], a["perf"] = cpu.get("busy", 0), cpu.get("perf", 0)
+        aid = getattr(pa, "activity_id", "") or ""
+        if getattr(pa, "state", 0) == _PA_STARTED and aid.startswith("enc-"):
+            a["chunks"].append(aid)
+    for m, a in agg.items():
+        chunks = "|".join(a["chunks"][:16])
+        print(f"[[ENCODER-FLEET machine={m} busy={a['busy']} perf={a['perf']} "
+              f"chunks={chunks}]]", flush=True)
 
 
 def run_temporal(args: argparse.Namespace) -> int:
@@ -724,6 +759,7 @@ def run_temporal(args: argparse.Namespace) -> int:
     _emit_plan(rungs_by_codec,
                {(c, r.label): n_chunks for c, rr in rungs_by_codec.items() for r in rr},
                info.has_audio)
+    _emit_commercial_cost(rungs_by_codec, info, input_path)
     _upload_source(input_path, bucket, src_key)
 
     two_pass = {"hevc": not args.hevc_single_pass, "h264": False, "av1": False}
