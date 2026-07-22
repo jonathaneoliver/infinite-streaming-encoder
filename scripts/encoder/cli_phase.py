@@ -40,7 +40,9 @@ from pathlib import Path
 
 from encoder.audio import AudioSpec, create_audio
 from encoder.chunking import DEFAULT_CHUNK_DURATION_S, plan_chunks
-from encoder.encode_variants import EncodeContext, concat_chunks, encode_variant
+from encoder.encode_variants import (
+    EncodeContext, _coalesce_runt_tail, concat_chunks, encode_variant,
+)
 from encoder.ffprobe import probe
 from encoder.hls import (
     TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls,
@@ -452,6 +454,14 @@ def phase_variant(args: argparse.Namespace) -> int:
     if args.chunk_index is not None:
         chunks = plan_chunks(info.duration_s, _chunk_duration_s(),
                              _SEGMENT_DURATION_S)
+        # Distributed-local sets COALESCE_RUNT_TAIL: fold a sub-frame final
+        # chunk (clip a hair over an exact chunk multiple) into its
+        # predecessor so 2-pass x265 doesn't choke on an empty stats file.
+        # The orchestrator dispatches the same coalesced count, and package-all
+        # globs whatever chunks land, so the three stay consistent. Cloud never
+        # sets the flag, so its Go-computed chunk_count contract is unchanged.
+        if _env_flag("COALESCE_RUNT_TAIL"):
+            chunks = _coalesce_runt_tail(chunks)
         if args.chunk_index >= len(chunks):
             print(f"error: chunk-index {args.chunk_index} out of range "
                   f"(clip has {len(chunks)} chunk(s))", file=sys.stderr)
