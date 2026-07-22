@@ -41,7 +41,7 @@ docker run -d --name "$WORKER_NAME" --restart unless-stopped \
   -e "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
   -e "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
   -e "AWS_REGION=${AWS_REGION}" \
-  "${slots_args[@]}" "${label_args[@]}" "${mount_args[@]}" \
+  ${slots_args[@]+"${slots_args[@]}"} ${label_args[@]+"${label_args[@]}"} ${mount_args[@]+"${mount_args[@]}"} \
   --entrypoint python3 "$ENCODER_IMAGE" -m encoder.temporal_worker
 
 echo "worker '$WORKER_NAME' started (image=$ENCODER_IMAGE, temporal=$TEMPORAL_ADDRESS)"
