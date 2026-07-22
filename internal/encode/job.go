@@ -528,7 +528,19 @@ const (
 	TargetCloud      Target = "cloud"
 	TargetLocal      Target = "local"
 	TargetCloudBatch Target = "cloud-batch"
+	// TargetLocalDist fans one encode's chunks across the local Temporal worker
+	// pool (Mac + any other boxes) via cli_local_dist --backend temporal, with
+	// MinIO as the shared store. Same output contract as TargetLocal.
+	TargetLocalDist Target = "local-dist"
 )
+
+// envOr returns the env var value or a fallback.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 type JobStatus string
 
@@ -1086,6 +1098,9 @@ func (m *Manager) run(job *Job, startIdx int) {
 	script := filepath.Join(m.ScriptsDir, "encoder", "cli_local.py")
 	if job.Config.Target == TargetCloud {
 		script = filepath.Join(m.ScriptsDir, "encoder", "cli_cloud.py")
+	}
+	if job.Config.Target == TargetLocalDist {
+		script = filepath.Join(m.ScriptsDir, "encoder", "cli_local_dist.py")
 	}
 
 	err := m.encodeFilesFrom(job, jobTmpDir, script, startIdx)
@@ -1677,6 +1692,44 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	return args
 }
 
+// distArgsForFile builds the CLI for cli_local_dist.py (the TargetLocalDist
+// worker): plan + start the durable Temporal EncodeWorkflow, which fans the
+// file's chunks across the local worker pool and downloads output_<codec>/ to
+// <outputDir>/<stem>_<codec> — same layout as cli_local, so moveTmpToOutput
+// picks it up unchanged. The S3 job-prefix embeds the unique job ID, so a
+// re-encode always writes a fresh MinIO prefix (no cross-job reuse); force is
+// implicit. MinIO endpoint/creds ride in as env (buildRunArgs).
+func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID string) []string {
+	stem := cfg.OutputStem(filename)
+	base := strings.TrimSuffix(filename, filepath.Ext(filename))
+	args := []string{
+		"--input", sourceDir + "/" + filename,
+		"--output", stem,
+		"--output-dir", outputDir,
+		"--backend", "temporal",
+		"--temporal-address", envOr("TEMPORAL_ADDRESS", "host.docker.internal:7233"),
+		"--s3-bucket", envOr("DIST_S3_BUCKET", "encoder-local"),
+		"--job-prefix", fmt.Sprintf("jobs/%s-%s", jobID, base),
+	}
+	if cfg.Codec != "" {
+		args = append(args, "--codec", cfg.Codec)
+	}
+	if cfg.Ladder != "" {
+		args = append(args, "--ladder", cfg.Ladder)
+	}
+	if cfg.MaxRes != "" {
+		args = append(args, "--max-res", cfg.MaxRes)
+	}
+	if chunk := cfg.localChunkSeconds(); chunk > 0 {
+		args = append(args, "--chunk-duration",
+			strconv.FormatFloat(chunk, 'f', -1, 64))
+	}
+	if cfg.HevcSinglePass {
+		args = append(args, "--hevc-single-pass")
+	}
+	return args
+}
+
 // cloudBatchArgs builds the CLI for cli_cloud.py when it's handling
 // multiple clips in one invocation. Differences vs encodeArgsForFile:
 //
@@ -1786,7 +1839,12 @@ func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int)
 
 		fileCfg := job.Config
 		fileCfg.Codec = codec
-		args := fileCfg.encodeArgsForFile(m.SourceDir, tmpDir, f)
+		var args []string
+		if job.Config.Target == TargetLocalDist {
+			args = fileCfg.distArgsForFile(m.SourceDir, tmpDir, f, job.ID)
+		} else {
+			args = fileCfg.encodeArgsForFile(m.SourceDir, tmpDir, f)
+		}
 		if err := m.runFileContainer(job, i, script, args); err != nil {
 			return fmt.Errorf("%s: %w", f, err)
 		}
@@ -2585,6 +2643,19 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 				runArgs = append(runArgs, "-e", key+"="+v)
 			}
 		}
+	}
+	// TargetLocalDist: the orchestrator reaches Temporal + MinIO. These are the
+	// MinIO creds (as AWS_* for boto3) — kept under distinct MINIO_* server env
+	// so they don't clobber the server's real AWS creds used by the cloud path.
+	if job.Config.Target == TargetLocalDist {
+		runArgs = append(runArgs,
+			"-e", "TEMPORAL_ADDRESS="+envOr("TEMPORAL_ADDRESS", "host.docker.internal:7233"),
+			"-e", "TEMPORAL_TASK_QUEUE="+envOr("TEMPORAL_TASK_QUEUE", "encode"),
+			"-e", "S3_ENDPOINT_URL="+envOr("MINIO_ENDPOINT", "http://host.docker.internal:9000"),
+			"-e", "AWS_ACCESS_KEY_ID="+envOr("MINIO_ACCESS_KEY", "encoder"),
+			"-e", "AWS_SECRET_ACCESS_KEY="+envOr("MINIO_SECRET_KEY", "encoder-secret"),
+			"-e", "AWS_REGION="+envOr("MINIO_REGION", "us-east-1"),
+		)
 	}
 	runArgs = append(runArgs, m.EncoderImage)
 	runArgs = append(runArgs, scriptArgs...)

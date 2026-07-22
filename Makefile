@@ -7,6 +7,15 @@ CONTAINER_NAME ?= encoder
 PORT ?= 8080
 # Temporal UI address the server queries for available distributed-local workers.
 TEMPORAL_UI_ADDR ?= http://host.docker.internal:8233
+# Distributed-local (local-dist target): the server hands these to the
+# cli_local_dist orchestrator container. Defaults match the local cluster
+# (make dist-up). MINIO_* are passed as AWS_* to the worker so they don't
+# clobber the server's real AWS creds used by the cloud path.
+TEMPORAL_ADDRESS ?= host.docker.internal:7233
+MINIO_ENDPOINT ?= http://host.docker.internal:9000
+MINIO_ACCESS_KEY ?= encoder
+MINIO_SECRET_KEY ?= encoder-secret
+DIST_S3_BUCKET ?= encoder-local
 
 # Single source of truth: ./VERSION. Embedded into the Go binary via
 # -ldflags and stamped on every image tag we publish to GHCR. The
@@ -90,6 +99,11 @@ run: require-paths build
 		-e GHCR_PAT=$(GHCR_PAT) \
 		-e STATE_MACHINE_ARN=$(STATE_MACHINE_ARN) \
 		-e TEMPORAL_UI_ADDR=$(TEMPORAL_UI_ADDR) \
+		-e TEMPORAL_ADDRESS=$(TEMPORAL_ADDRESS) \
+		-e MINIO_ENDPOINT=$(MINIO_ENDPOINT) \
+		-e MINIO_ACCESS_KEY=$(MINIO_ACCESS_KEY) \
+		-e MINIO_SECRET_KEY=$(MINIO_SECRET_KEY) \
+		-e DIST_S3_BUCKET=$(DIST_S3_BUCKET) \
 		$(IMAGE_NAME)
 	@echo "Encoder running at http://localhost:$(PORT)"
 
