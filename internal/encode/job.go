@@ -136,7 +136,7 @@ var (
 	// hosted transcoders — a generic commercial cloud encoder and AWS MediaConvert
 	// — as comparison baselines against our own spot/local cost. Emitted once per
 	// job by the orchestrator (commercial_cloud.py).
-	commercialMarkerRe = regexp.MustCompile(`^\[\[ENCODER-COMMERCIAL commercial=([0-9.]+) mediaconvert=([0-9.]+) aws=([0-9.]+)\]\]$`)
+	commercialMarkerRe = regexp.MustCompile(`^\[\[ENCODER-COMMERCIAL commercial=([0-9.]+) mediaconvert=([0-9.]+) aws=([0-9.]+) aws_od=([0-9.]+)\]\]$`)
 )
 
 // learnSpeed folds an ENCODER-SPEED marker into the learned-speed model. Returns
@@ -437,10 +437,12 @@ func (j *Job) parseMarker(line string) bool {
 		commercial, _ := strconv.ParseFloat(m[1], 64)
 		mediaconvert, _ := strconv.ParseFloat(m[2], 64)
 		aws, _ := strconv.ParseFloat(m[3], 64)
+		awsOD, _ := strconv.ParseFloat(m[4], 64)
 		j.mu.Lock()
 		j.CommercialUSD = commercial
 		j.MediaConvertUSD = mediaconvert
 		j.AwsSpotUSD = aws
+		j.AwsOndemandUSD = awsOD
 		j.mu.Unlock()
 		return true
 	}
@@ -796,7 +798,8 @@ type Job struct {
 	// compute-based (encode vCPU-hours × spot rate), summed over every variant, so
 	// unlike the per-output-minute SaaS baselines above it reflects each variant's
 	// real encode work (a 4K HEVC 2-pass rendition ~200× a 360p h264 one).
-	AwsSpotUSD float64 `json:"aws_spot_usd,omitempty"`
+	AwsSpotUSD     float64 `json:"aws_spot_usd,omitempty"`
+	AwsOndemandUSD float64 `json:"aws_ondemand_usd,omitempty"` // on-demand (reclaim-proof) upper bound
 	// per-execution [spot, ondemand, saved, vcpu_h], summed across files; not serialized.
 	costByExec map[string][4]float64
 

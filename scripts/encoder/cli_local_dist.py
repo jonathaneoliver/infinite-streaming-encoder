@@ -486,7 +486,7 @@ def _emit_commercial_cost(rungs_by_codec, info, input_path,
     compute-based, so it weights each variant's real work). Best-effort."""
     try:
         from encoder.commercial_cloud import (
-            estimate_usd, mediaconvert_usd, aws_spot_usd)
+            estimate_usd, mediaconvert_usd, aws_spot_usd, aws_ondemand_usd)
         try:
             src_mbps = input_path.stat().st_size * 8 / (info.duration_s or 1) / 1e6
         except OSError:
@@ -496,8 +496,10 @@ def _emit_commercial_cost(rungs_by_codec, info, input_path,
         mc = mediaconvert_usd(rungs_by_codec, info.duration_s, fps=float(info.fps))
         aws = aws_spot_usd(rungs_by_codec, info.duration_s,
                            hevc_two_pass=hevc_two_pass)
+        aws_od = aws_ondemand_usd(rungs_by_codec, info.duration_s,
+                                  hevc_two_pass=hevc_two_pass)
         print(f"[[ENCODER-COMMERCIAL commercial={usd:.4f} mediaconvert={mc:.4f} "
-              f"aws={aws:.4f}]]", flush=True)
+              f"aws={aws:.4f} aws_od={aws_od:.4f}]]", flush=True)
     except Exception:  # noqa: BLE001 — cost estimate is cosmetic, never fail a run
         pass
 

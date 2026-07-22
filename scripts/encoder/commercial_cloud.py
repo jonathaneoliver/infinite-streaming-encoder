@@ -97,8 +97,9 @@ def _mc_rate(height: int, codec: str) -> float:
 # codec/resolution/pass (mirrors the control plane's seeded speed model), so all
 # variants + resolutions + codecs are accounted for individually.
 _SPEED_1080P = {"h264": 1.5, "hevc": 0.14, "av1": 0.1}   # content-s per wall-s @1080p, 1-pass
-_AWS_SPOT_VCPU_HR = 0.013     # Graviton (c7g) spot ≈ $/vCPU-hr
-_AWS_VCPU_PER_VARIANT = 2     # each encode runs on ~2 vCPU (matches ENCODE_THREADS)
+_AWS_SPOT_VCPU_HR = 0.013      # Graviton (c7g) spot ≈ $/vCPU-hr
+_AWS_ONDEMAND_VCPU_HR = 0.036  # Graviton (c7g) on-demand ≈ $/vCPU-hr (~2.8× spot)
+_AWS_VCPU_PER_VARIANT = 2      # each encode runs on ~2 vCPU (matches ENCODE_THREADS)
 
 
 def _encode_wall_s(codec: str, height: int, two_pass: bool, content_s: float) -> float:
@@ -109,18 +110,31 @@ def _encode_wall_s(codec: str, height: int, two_pass: bool, content_s: float) ->
     return content_s / max(sp, 0.001)
 
 
-def aws_spot_usd(rungs_by_codec, duration_s: float, *, hevc_two_pass: bool = True) -> float:
-    """Compute-based cost to run the ladder on our AWS Batch spot fleet, summed
-    over EVERY variant (codec × resolution × pass) by its modeled encode work."""
-    minutes = max(0.0, duration_s or 0.0)
-    if minutes <= 0:
+def _aws_vcpu_hours(rungs_by_codec, duration_s: float, hevc_two_pass: bool) -> float:
+    """Modeled encode vCPU-hours for the whole ladder, summed over EVERY variant
+    (codec × resolution × pass) by its encode work — the basis for both the spot
+    and on-demand AWS cost."""
+    if (duration_s or 0) <= 0:
         return 0.0
     vcpu_h = 0.0
     for codec, rungs in rungs_by_codec.items():
         tp = codec == "hevc" and hevc_two_pass
         for r in rungs:
-            vcpu_h += _encode_wall_s(codec, r.height, tp, duration_s) * _AWS_VCPU_PER_VARIANT / 3600.0
-    return round(vcpu_h * _AWS_SPOT_VCPU_HR, 4)
+            vcpu_h += (_encode_wall_s(codec, r.height, tp, duration_s)
+                       * _AWS_VCPU_PER_VARIANT / 3600.0)
+    return vcpu_h
+
+
+def aws_spot_usd(rungs_by_codec, duration_s: float, *, hevc_two_pass: bool = True) -> float:
+    """Cost on our AWS Batch SPOT fleet (compute-based)."""
+    return round(_aws_vcpu_hours(rungs_by_codec, duration_s, hevc_two_pass)
+                 * _AWS_SPOT_VCPU_HR, 4)
+
+
+def aws_ondemand_usd(rungs_by_codec, duration_s: float, *, hevc_two_pass: bool = True) -> float:
+    """Cost on AWS ON-DEMAND (no spot) — the reclaim-proof upper bound."""
+    return round(_aws_vcpu_hours(rungs_by_codec, duration_s, hevc_two_pass)
+                 * _AWS_ONDEMAND_VCPU_HR, 4)
 
 
 def mediaconvert_usd(rungs_by_codec, duration_s: float, *, fps: float = 30.0) -> float:
