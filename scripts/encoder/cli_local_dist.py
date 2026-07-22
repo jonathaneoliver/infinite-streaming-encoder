@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -523,6 +524,54 @@ def _resolve_plan(args, info):
     return rungs_by_codec, len(chunks)
 
 
+# Map a Temporal activity_id (set in EncodeWorkflow._phase) back to the UI stage
+# key, so activity progress drives the same per-chunk grid the pool backend does.
+_ENC_ACT_RE = re.compile(r"^enc-(hevc|h264|av1)-(.+)-c(\d+)$")
+
+
+def _stage_key_for(activity_id: str) -> str | None:
+    if activity_id in ("mezzanine", "audio"):
+        return activity_id
+    m = _ENC_ACT_RE.match(activity_id)
+    if m:
+        return f"encode:{m.group(1)}:{m.group(2)}:chunk{m.group(3)}"
+    if activity_id.startswith("pkg-"):
+        return f"package:{activity_id[4:]}"
+    if activity_id.startswith("byteranges-"):
+        return f"fragments:{activity_id[len('byteranges-'):]}"
+    if activity_id.startswith("hls-"):
+        return f"hls:{activity_id[4:]}"
+    return None
+
+
+async def _emit_temporal_progress(handle, EventType, emitted: dict) -> None:
+    """Read the workflow history and emit an ENCODER-STAGE marker for each
+    activity that changed state (scheduled→running, completed→done). Cheap
+    enough at our scale (tens of activities); the Go server scans these off the
+    orchestrator's stdout exactly like the single-container path."""
+    try:
+        hist = await handle.fetch_history()
+    except Exception:  # noqa: BLE001 — progress is best-effort, never fail the run
+        return
+    sched: dict[int, str] = {}
+    states: dict[str, str] = {}
+    for e in hist.events:
+        et = e.event_type
+        if et == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
+            aid = e.activity_task_scheduled_event_attributes.activity_id
+            sched[e.event_id] = aid
+            states.setdefault(aid, "running")
+        elif et == EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED:
+            aid = sched.get(e.activity_task_completed_event_attributes.scheduled_event_id)
+            if aid:
+                states[aid] = "done"
+    for aid, st in states.items():
+        key = _stage_key_for(aid)
+        if key and emitted.get(aid) != st:
+            emitted[aid] = st
+            emit_stage(key, st, 100.0 if st == "done" else 0.0)
+
+
 def run_temporal(args: argparse.Namespace) -> int:
     """Temporal backend: prep locally, then hand the DAG to a durable
     EncodeWorkflow that fans activities across the worker pool. The heavy
@@ -566,12 +615,21 @@ def run_temporal(args: argparse.Namespace) -> int:
     }
 
     async def go():
+        from temporalio.api.enums.v1 import EventType
         client = await Client.connect(args.temporal_address)
         wid = f"encode-{prefix.replace('/', '-')}"
         print(f"[dist] starting workflow {wid} on {args.temporal_address}", flush=True)
         handle = await client.start_workflow(
             "EncodeWorkflow", plan, id=wid, task_queue=args.temporal_task_queue)
-        return await handle.result()
+        # Await the result while streaming per-activity progress to stdout as
+        # ENCODER-STAGE markers (drives the UI chunk grid live).
+        result_task = asyncio.ensure_future(handle.result())
+        emitted: dict = {}
+        while not result_task.done():
+            await _emit_temporal_progress(handle, EventType, emitted)
+            await asyncio.sleep(2)
+        await _emit_temporal_progress(handle, EventType, emitted)
+        return await result_task
 
     try:
         result = asyncio.run(go())
