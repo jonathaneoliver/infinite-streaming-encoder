@@ -103,7 +103,8 @@ func (s *Server) distWorkers(w http.ResponseWriter, r *http.Request) {
 		on++
 		out = append(out, machineOut{Name: name, On: true})
 	}
-	writeJSON(w, map[string]any{"count": on, "machines": out})
+	writeJSON(w, map[string]any{"count": on, "machines": out,
+		"fleet": s.Manager.FleetCPU()})
 }
 
 // toggleDistWorker enables/disables a machine's worker. Disable HARD-stops the

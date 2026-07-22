@@ -91,14 +91,45 @@ physical cores (8/2 = 4 encodes), not 16 logical.**
 > (Macs) boxes "99% busy" ≠ "99% throughput." A future CPU-feedback autoscaler
 > must target well below 95% or it'll oversubscribe for near-zero gain.
 
-## Fact 5 — inside Docker we can't see or steer P/E or SMT (and it costs ~30%)
+## Fact 5 — inside Docker we can't see or steer P/E or SMT
 
 Docker Desktop's Linux VM presents **homogeneous vCPUs** — the guest can't tell P
 from E; macOS places heavy threads on P-cores first, spilling to E as load rises.
 So we can't pin from the container; we only feed the right amount of parallel
-work. And the container itself costs **~30%** vs native (M5: native 48.6 fps →
-container 34.0 fps, 2-thread) from VM overhead + the image's libx265. Sizing is
-therefore done at deploy time from the **host**, not in the container.
+work, sized at deploy time from the **host**, not the container. (What the VM
+*costs* is a separate question — see Fact 6. It's ~10%, not the ~30% this section
+first claimed: that number was a version confound, corrected below.)
+
+## Fact 6 — the VM tax is ~10% (flat), and x265 version dwarfs it
+
+The "~30%" first attributed to the VM was really an **x265-version confound** —
+the same trap as the "2× machine" that was actually 1.35× (Measurement pitfalls,
+#1). The container's ffmpeg carries a newer libx265 than the Mac's Homebrew
+ffmpeg, so any native-vs-container gap mixes *VM overhead* with *x265 version*.
+Isolate them by measuring at a **matched** x265 version — build native x265 4.2 to
+match the container (see Reproducing):
+
+MacBook (M5), 1080p HEVC, real high-motion (FPV) content, native vs in-container:
+
+| x265 | Test | native fps | container fps | container vs native |
+|---|---|---|---|---|
+| **matched 4.2** | 1 core | 9.67 | 8.58 | **13% slower** |
+| **matched 4.2** | 2 enc × 2 thr | 30.0 agg | 27.5 agg | **9% slower** |
+| native **4.1** vs cont. **4.2** | 1 core | 8.20 | 8.86 | container 7% *faster* |
+| native **4.1** vs cont. **4.2** | 2 enc × 2 thr | 24.6 agg | 27.4 agg | container 10% *faster* |
+
+Two clean results fall out:
+
+- **Pure VM tax ≈ 9-13%** (matched 4.2) — modest, and the *loaded* figure (9%) is
+  *lower* than single-core (13%), so it's a **flat** cost, **not E-core spill**.
+  That hypothesis is dead: under the real 2×2 config the VM behaves fine.
+- **x265 4.1 → 4.2 ≈ +20%** (native 8.20→9.67 single, 24.6→30.0 loaded) — a pure
+  version gain, no VM in it.
+
+The +20% version gain **beats** the −10% VM tax, so on the Macs the container
+**out-runs the host's own native ffmpeg** (stuck on Homebrew's x265 4.1). Upshot:
+the VM is not worth optimizing — **keeping x265 current is the only lever that
+matters** (see the Resolved section).
 
 ## How capacity is decided (the code)
 

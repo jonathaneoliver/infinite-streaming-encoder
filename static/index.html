@@ -2785,9 +2785,35 @@ function machinePillsHtml() {
     }).join('') + '</div>';
 }
 
+// Live per-machine CPU sparkline for the local cluster — the in-app twin of the
+// cloud fleet's CloudWatch sparklines. History is normalized to each box's perf-
+// core target (100% = its 4/4/8 cores fully busy; >100% = SMT/E-core spill), so
+// the three machines read on one comparable scale despite different core counts.
+// Data rides in on the Temporal heartbeat backchannel (see cli_local_dist).
+function distFleetHtml() {
+    const fleet = (_distMachines.fleet || []).filter(f => (f.history || []).length >= 2);
+    if (!fleet.length) return '';
+    const rows = fleet.map(f => {
+        const color = instanceColor(f.machine) || '#4361ee';
+        const stale = (f.age_s || 0) > 12;   // no recent sample → not encoding now
+        const peak = Math.max(100, ...f.history);
+        const spark = _sparkline(f.history, color, { min: 0, max: peak, w: 84, h: 16 });
+        const pct = Math.round(f.latest || 0);
+        return `<div style="display:flex;align-items:center;gap:8px;font-size:11px;${stale ? 'opacity:.4' : ''}">
+            <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${color}"></span>
+            <span style="min-width:54px;color:#ccc">${f.machine}</span>
+            ${spark}
+            <span style="min-width:88px;color:#aaa">${pct}% <span style="color:#666">of ${f.perf || 0}c target</span></span>
+        </div>`;
+    }).join('');
+    return `<div style="margin-top:8px;display:flex;flex-direction:column;gap:3px">
+        <div style="font-size:10px;color:#666;text-transform:uppercase;letter-spacing:.5px">CPU · live</div>
+        ${rows}</div>`;
+}
+
 function renderDistMachines() {
     const el = document.getElementById('aws-dist-machines');
-    if (el) el.innerHTML = machinePillsHtml();
+    if (el) el.innerHTML = machinePillsHtml() + distFleetHtml();
 }
 
 async function toggleMachine(name, enabled) {
@@ -2811,7 +2837,7 @@ async function pollDistWorkers() {
         renderDistMachines();
     } catch (e) { /* cluster not up */ }
 }
-setInterval(pollDistWorkers, 10000);
+setInterval(pollDistWorkers, 5000);   // 5s: keeps the live CPU sparkline current
 pollDistWorkers();
 
 function renderJobsMetrics(s) {

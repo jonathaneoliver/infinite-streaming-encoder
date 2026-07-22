@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -125,6 +126,12 @@ var (
 	// floor, job count, and the compute-env max vCPUs). The Job derives avg
 	// concurrency + efficiency from these. Keyed by exec for idempotent reattach.
 	statsMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STATS exec=(\S+) wall_s=([0-9.]+) vcpu_h=([0-9.]+) longest_s=([0-9.]+) slowest=(\S+) jobs=(\d+) max_vcpus=(\d+)\]\]$`)
+	// ENCODER-FLEET reports one distributed-local worker box's live CPU: busy =
+	// logical cores currently busy (from /proc/stat), perf = its perf-core target
+	// (4/4/8). Emitted by cli_local_dist from the workers' Temporal heartbeats,
+	// once per machine per poll. Consumed by Manager.recordFleetCPU (not per-job)
+	// to drive the local fleet CPU sparkline.
+	fleetMarkerRe = regexp.MustCompile(`^\[\[ENCODER-FLEET machine=(\S+) busy=([0-9.]+) perf=([0-9.]+)\]\]$`)
 )
 
 // learnSpeed folds an ENCODER-SPEED marker into the learned-speed model. Returns
@@ -830,6 +837,87 @@ type Manager struct {
 	warmReconcile func()
 	subscribers   []chan *Job
 	subMu         sync.Mutex
+
+	// fleetCPU holds recent per-machine CPU samples for the distributed-local
+	// fleet view (machine -> ring of samples), fed by ENCODER-FLEET markers off
+	// the orchestrator's stdout. Guarded by fleetMu.
+	fleetMu  sync.Mutex
+	fleetCPU map[string][]fleetSample
+}
+
+// fleetSample is one CPU reading for a distributed-local worker box.
+type fleetSample struct {
+	T    time.Time
+	Busy float64 // logical cores busy (from the box's /proc/stat)
+	Perf float64 // its perf-core target (4/4/8); 100% = that many cores busy
+}
+
+// fleetHistoryLen caps the per-machine sample ring (~3 min at the orchestrator's
+// ~2s emit cadence) — enough for a live sparkline without unbounded growth.
+const fleetHistoryLen = 90
+
+// recordFleetCPU folds one ENCODER-FLEET marker into the per-machine CPU history.
+// Returns true when the line was such a marker (so the scanner suppresses it from
+// the log buffer, like the other structured markers).
+func (m *Manager) recordFleetCPU(line string) bool {
+	mm := fleetMarkerRe.FindStringSubmatch(line)
+	if mm == nil {
+		return false
+	}
+	busy, _ := strconv.ParseFloat(mm[2], 64)
+	perf, _ := strconv.ParseFloat(mm[3], 64)
+	m.fleetMu.Lock()
+	if m.fleetCPU == nil {
+		m.fleetCPU = map[string][]fleetSample{}
+	}
+	s := append(m.fleetCPU[mm[1]], fleetSample{T: time.Now(), Busy: busy, Perf: perf})
+	if len(s) > fleetHistoryLen {
+		s = s[len(s)-fleetHistoryLen:]
+	}
+	m.fleetCPU[mm[1]] = s
+	m.fleetMu.Unlock()
+	return true
+}
+
+// FleetCPUEntry is one machine's CPU history for the local fleet view. History is
+// the normalized busy% (busy/perf*100): 100 = the box at its perf-core target,
+// >100 = SMT/E-core spill. Latest/Perf label the current reading; AgeS flags a
+// stale machine (no recent sample = not currently encoding).
+type FleetCPUEntry struct {
+	Machine string    `json:"machine"`
+	Perf    float64   `json:"perf"`
+	Latest  float64   `json:"latest"`
+	History []float64 `json:"history"`
+	AgeS    float64   `json:"age_s"`
+}
+
+// FleetCPU returns each machine's recent CPU history for the fleet endpoint,
+// normalized to its perf-core target. Machines with no samples are omitted.
+func (m *Manager) FleetCPU() []FleetCPUEntry {
+	m.fleetMu.Lock()
+	defer m.fleetMu.Unlock()
+	out := make([]FleetCPUEntry, 0, len(m.fleetCPU))
+	now := time.Now()
+	for machine, samples := range m.fleetCPU {
+		if len(samples) == 0 {
+			continue
+		}
+		hist := make([]float64, len(samples))
+		for i, s := range samples {
+			if s.Perf > 0 {
+				hist[i] = s.Busy / s.Perf * 100
+			}
+		}
+		last := samples[len(samples)-1]
+		out = append(out, FleetCPUEntry{
+			Machine: machine, Perf: last.Perf,
+			Latest:  hist[len(hist)-1],
+			History: hist,
+			AgeS:    now.Sub(last.T).Seconds(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Machine < out[j].Machine })
+	return out
 }
 
 // signalLaunch wakes any jobs waiting for their launch turn to re-check (called
@@ -2712,6 +2800,9 @@ func (m *Manager) attachAndWait(job *Job, name string) error {
 		}
 		if m.learnSpeed(line) {
 			continue // dynamic-chunk-selector telemetry, not a log line
+		}
+		if m.recordFleetCPU(line) {
+			continue // per-machine CPU sample for the fleet view, not a log line
 		}
 		// Structured progress markers update Job.Stages and are suppressed
 		// from the log buffer so the viewer stays readable. Anything else

@@ -21,6 +21,8 @@ import asyncio
 import os
 import shutil
 import subprocess
+import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -31,6 +33,54 @@ from temporalio.common import RetryPolicy
 from temporalio.worker import Worker
 
 TASK_QUEUE = os.environ.get("TEMPORAL_TASK_QUEUE", "encode")
+
+
+def _terminate(proc: subprocess.Popen) -> None:
+    """Best-effort stop a phase subprocess: SIGTERM, then SIGKILL after a grace.
+    No-op if it already exited."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --- fleet CPU reporting -----------------------------------------------------
+# This box's identity + perf-core target, set in main(). Each activity stamps
+# them onto its heartbeat so the orchestrator can surface a per-machine CPU
+# sparkline, normalized to the perf-core target (100% = the box's 4/4/8-core
+# target fully busy; >100% = SMT/E-core spill).
+_MACHINE = ""
+_PERF_CORES = 0
+_CPU_LOCK = threading.Lock()
+_CPU_PREV = {"t": 0.0, "total": 0, "idle": 0, "busy": 0.0}
+
+
+def _busy_cores() -> float:
+    """Logical CPUs currently busy, from /proc/stat deltas. Throttled to ~2s and
+    cached between samples (heartbeats fire far more often). 0 if unavailable."""
+    now = time.monotonic()
+    with _CPU_LOCK:
+        try:
+            with open("/proc/stat") as f:
+                v = [int(x) for x in f.readline().split()[1:]]
+            total, idle = sum(v), v[3] + (v[4] if len(v) > 4 else 0)
+        except (OSError, ValueError, IndexError):
+            return 0.0
+        prev_t = _CPU_PREV["t"]
+        if prev_t and now - prev_t < 2.0:
+            return _CPU_PREV["busy"]
+        dt, di = total - _CPU_PREV["total"], idle - _CPU_PREV["idle"]
+        _CPU_PREV.update(t=now, total=total, idle=idle)
+        if not prev_t or dt <= 0:
+            return _CPU_PREV["busy"]
+        busy = max(0.0, (1.0 - di / dt) * (os.cpu_count() or 1))
+        _CPU_PREV["busy"] = busy
+        return busy
 
 
 @activity.defn(name="EncodePhase")
@@ -64,9 +114,21 @@ def encode_phase(spec: dict) -> None:
             last = line.rstrip("\n")
             if last.startswith("[[ENCODER"):
                 print(last, flush=True)
-            activity.heartbeat(last[:180])
+            activity.heartbeat(last[:180], {
+                "machine": _MACHINE, "busy": round(_busy_cores(), 2),
+                "perf": _PERF_CORES})
+            # Cancellation (from a workflow cancel when the user cancels the job)
+            # rides in on the heartbeat response. Kill ffmpeg now so a cancelled
+            # chunk stops immediately instead of running to completion on this
+            # remote worker.
+            if activity.is_cancelled():
+                print("[temporal-worker] activity cancelled — killing encode",
+                      flush=True)
+                _terminate(proc)
+                raise asyncio.CancelledError
         rc = proc.wait()
     finally:
+        _terminate(proc)  # guards the readline-EOF path; no-op if already exited
         shutil.rmtree(work_dir, ignore_errors=True)
     if rc != 0:
         raise RuntimeError(f"cli_phase {spec['args'][:2]} exit {rc}: {last[:200]}")
@@ -222,6 +284,8 @@ async def main() -> None:
     # which box ran each chunk and colour the UI plot by machine. Defaults to
     # the hostname.
     identity = os.environ.get("WORKER_LABEL") or socket.gethostname()
+    global _MACHINE, _PERF_CORES
+    _MACHINE, _PERF_CORES = identity, slots * 2
     client = await Client.connect(address, identity=identity)
     print(f"[temporal-worker] connected {address} queue={TASK_QUEUE} "
           f"slots={slots} identity={identity}", flush=True)

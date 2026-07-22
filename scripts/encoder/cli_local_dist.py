@@ -37,10 +37,12 @@ import argparse
 import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -57,6 +59,35 @@ _SEGMENT_DURATION_S = 6.0
 # encode_variants._MIN_TAIL_CHUNK_S; the worker does the same via
 # COALESCE_RUNT_TAIL, so the dispatched count matches what it encodes).
 _MAX_RETRIES_PER_CHUNK = 3
+
+
+# In-flight phase containers for the POOL backend, so a cancel can `docker kill`
+# them on every worker instead of orphaning remote encodes. The Go control plane
+# cancels a job by `docker stop`-ing THIS orchestrator (SIGTERM + 30s grace);
+# without this, killing the orchestrator leaves the remote `docker run` chunks
+# running on their daemons. (The Temporal backend cancels the durable workflow
+# instead — see run_temporal.)
+_POOL_CONTAINERS: set = set()          # {(host_args_tuple, container_name)}
+_POOL_LOCK = threading.Lock()
+
+
+def _install_pool_cancel_handler() -> None:
+    """On SIGTERM/SIGINT, `docker kill` every in-flight chunk container across all
+    workers, then exit — so a cancelled distributed encode stops now, everywhere."""
+    def _handler(signum, frame):  # noqa: ARG001
+        print("[dist] cancel (SIGTERM) — killing in-flight chunk containers "
+              "across workers", flush=True)
+        with _POOL_LOCK:
+            items = list(_POOL_CONTAINERS)
+        for host_args, name in items:
+            try:
+                subprocess.run(["docker", *host_args, "kill", name], timeout=20,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:  # noqa: BLE001
+                pass
+        raise SystemExit(130)
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
 
 
 # ---------------------------------------------------------------------------
@@ -253,28 +284,40 @@ def run_phase(w: Worker, phase_args: list[str], *, env: dict[str, str],
     output live (each line tagged with the host so the UI can colour by
     machine). Returns the container exit code; non-zero = the caller re-queues.
     """
-    cmd = ["docker", *w.host_args, "run", "--rm",
+    # Name the container so the cancel handler can `docker kill` it by name on the
+    # right daemon; register it for the duration of the run.
+    cname = f"encdist-{uuid.uuid4().hex[:12]}"
+    cmd = ["docker", *w.host_args, "run", "--rm", "--name", cname,
            *_phase_env(env)]
     if w.code_mount:
         cmd += ["-v", f"{w.code_mount}:/app/scripts/encoder:ro"]
     cmd += ["--entrypoint", "python3", w.image,
             "-m", "encoder.cli_phase", *phase_args]
+    key = (tuple(w.host_args), cname)
+    with _POOL_LOCK:
+        _POOL_CONTAINERS.add(key)
     try:
         proc = subprocess.Popen(cmd, text=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
     except Exception as e:
+        with _POOL_LOCK:
+            _POOL_CONTAINERS.discard(key)
         print(f"[{log_prefix}@{w.label()}] launch failed: {e}", flush=True)
         return 1
     assert proc.stdout is not None
-    for line in proc.stdout:
-        line = line.rstrip("\n")
-        # Pass ENCODER-STAGE / ENCODER-SPEED markers through verbatim so the Go
-        # log scanner still sees them; tag everything else with the host.
-        if line.startswith("[[ENCODER"):
-            print(line, flush=True)
-        else:
-            print(f"[{w.label()}] {line}", flush=True)
-    return proc.wait()
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            # Pass ENCODER-STAGE / ENCODER-SPEED markers through verbatim so the Go
+            # log scanner still sees them; tag everything else with the host.
+            if line.startswith("[[ENCODER"):
+                print(line, flush=True)
+            else:
+                print(f"[{w.label()}] {line}", flush=True)
+        return proc.wait()
+    finally:
+        with _POOL_LOCK:
+            _POOL_CONTAINERS.discard(key)
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +479,7 @@ def _emit_plan(rungs_by_codec: dict[str, list[Rung]], chunks_by_variant: dict,
 
 
 def run(args: argparse.Namespace) -> int:
+    _install_pool_cancel_handler()
     input_path = Path(args.input)
     if not os.access(input_path, os.R_OK):
         print(f"error: cannot read input: {input_path}", file=sys.stderr)
@@ -620,6 +664,37 @@ async def _emit_temporal_progress(handle, EventType, emitted: dict) -> None:
             emit_stage(key, st, 100.0 if st == "done" else 0.0)
 
 
+async def _emit_fleet_cpu(handle, client) -> None:
+    """Read the running activities' heartbeat details (each carries its worker's
+    machine + busy/perf cores) and emit one ENCODER-FLEET marker per machine, so
+    the Go server can build a per-machine CPU sparkline. This is the Temporal-
+    native backchannel: workers already heartbeat, we just read what they attach.
+    Best-effort — never fails the run."""
+    try:
+        desc = await handle.describe()
+    except Exception:  # noqa: BLE001
+        return
+    raw = getattr(desc, "raw_description", None)
+    if raw is None:
+        return
+    pcv = client.data_converter.payload_converter
+    latest: dict = {}
+    for pa in getattr(raw, "pending_activities", []):
+        hb = getattr(pa, "heartbeat_details", None)
+        if not (hb and hb.payloads):
+            continue
+        try:
+            vals = pcv.from_payloads(list(hb.payloads))
+        except Exception:  # noqa: BLE001
+            continue
+        cpu = next((v for v in vals if isinstance(v, dict) and "machine" in v), None)
+        if cpu and cpu.get("machine"):
+            latest[cpu["machine"]] = cpu  # dedupe: one line per machine
+    for m, cpu in latest.items():
+        print(f"[[ENCODER-FLEET machine={m} busy={cpu.get('busy', 0)} "
+              f"perf={cpu.get('perf', 0)}]]", flush=True)
+
+
 def run_temporal(args: argparse.Namespace) -> int:
     """Temporal backend: prep locally, then hand the DAG to a durable
     EncodeWorkflow that fans activities across the worker pool. The heavy
@@ -669,13 +744,43 @@ def run_temporal(args: argparse.Namespace) -> int:
         print(f"[dist] starting workflow {wid} on {args.temporal_address}", flush=True)
         handle = await client.start_workflow(
             "EncodeWorkflow", plan, id=wid, task_queue=args.temporal_task_queue)
+
+        # Cancel plumbing: the Go control plane cancels a job by `docker stop`-ing
+        # THIS orchestrator container (SIGTERM + 30s grace). The encode DAG is a
+        # durable Temporal workflow that outlives us — if we just exit, it keeps
+        # dispatching chunks to the remote workers. So on SIGTERM we cancel the
+        # workflow; the Temporal server then delivers cancellation to every running
+        # activity (each kills its ffmpeg via activity.is_cancelled()) and stops
+        # scheduling new ones — even after we're gone. That's what actually stops
+        # the remote chunk encodes.
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except (NotImplementedError, RuntimeError):
+                pass
+
         # Await the result while streaming per-activity progress to stdout as
         # ENCODER-STAGE markers (drives the UI chunk grid live).
         result_task = asyncio.ensure_future(handle.result())
         emitted: dict = {}
         while not result_task.done():
+            if stop.is_set():
+                print("[dist] cancel requested — cancelling workflow "
+                      "(stops remote chunk encodes)", flush=True)
+                try:
+                    await handle.cancel()
+                except Exception as e:  # noqa: BLE001
+                    print(f"[dist] workflow cancel failed: {e}", flush=True)
+                result_task.cancel()
+                return "cancelled"
             await _emit_temporal_progress(handle, EventType, emitted)
-            await asyncio.sleep(2)
+            await _emit_fleet_cpu(handle, client)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                pass
         await _emit_temporal_progress(handle, EventType, emitted)
         return await result_task
 
@@ -684,6 +789,9 @@ def run_temporal(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001
         print(f"[dist] workflow failed: {e}", file=sys.stderr)
         return 1
+    if result == "cancelled":
+        print("[dist] cancelled — skipping output download", flush=True)
+        return 130
     print(f"[dist] workflow result: {result}", flush=True)
 
     out_dir = Path(args.output_dir)
