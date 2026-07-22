@@ -388,3 +388,22 @@ dist-logs:            ## follow the local worker log
 dist-ps:              ## cluster + worker containers
 	docker compose -f $(DIST_COMPOSE) ps
 	@docker ps --filter name=encode-worker --format 'table {{.Names}}\t{{.Status}}'
+
+# DIST_WORKERS: space-separated label=ssh_target pairs of remote worker boxes,
+# e.g. DIST_WORKERS = ubuntu=jonathanoliver@jonathanoliver-ubuntu.local
+# MASTER_IP: the master box's LAN IP that workers dial for Temporal + MinIO.
+DIST_WORKERS ?=
+MASTER_IP ?= 192.168.0.110
+.PHONY: dist-deploy-workers dist-deploy
+
+dist-deploy-workers:  ## rsync code + rebuild image + (re)start worker on each DIST_WORKERS box
+	@if [ -z "$(DIST_WORKERS)" ]; then echo "set DIST_WORKERS=label=ssh_target [..] (in .env)"; exit 1; fi
+	@for w in $(DIST_WORKERS); do \
+	  label=$${w%%=*}; host=$${w#*=}; \
+	  MASTER_IP=$(MASTER_IP) MINIO_ROOT_USER=$(MINIO_ROOT_USER) MINIO_ROOT_PASSWORD=$(MINIO_ROOT_PASSWORD) \
+	    bash infra/local-cluster/deploy-worker.sh "$$host" "$$label" || exit 1; \
+	done
+	@echo ">>> remote workers deployed."
+
+dist-deploy: build dist-worker dist-deploy-workers  ## deploy distributed-local to the master + all remote boxes
+	@echo ">>> distributed-local deployed: master worker + $(words $(DIST_WORKERS)) remote box(es)."
