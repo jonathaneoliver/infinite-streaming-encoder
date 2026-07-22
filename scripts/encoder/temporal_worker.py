@@ -32,10 +32,6 @@ from temporalio.worker import Worker
 
 TASK_QUEUE = os.environ.get("TEMPORAL_TASK_QUEUE", "encode")
 
-# ffmpeg threads per encode, sized in main() to cores/slots so the box's cores
-# stay busy even when RAM caps concurrency. 0 until set (workflow default wins).
-_ENCODE_THREADS = 0
-
 
 @activity.defn(name="EncodePhase")
 def encode_phase(spec: dict) -> None:
@@ -58,11 +54,6 @@ def encode_phase(spec: dict) -> None:
     # chunks download the mezzanine once instead of once each. cli_phase symlinks
     # it into each activity's work dir zero-copy.
     env.setdefault("MEZZ_CACHE_DIR", "/tmp/mezz-cache")
-    # Fill the cores: when concurrency is memory-capped (few slots), give each
-    # encode more threads so slots × threads ≈ cores. Sized per worker (it knows
-    # its cores + slots); overrides the workflow's conservative default.
-    if _ENCODE_THREADS:
-        env["ENCODE_THREADS"] = str(_ENCODE_THREADS)
     cmd = ["python3", "-m", "encoder.cli_phase", *spec["args"]]
     proc = subprocess.Popen(cmd, text=True, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -205,8 +196,6 @@ async def main() -> None:
     import socket
     address = os.environ.get("TEMPORAL_ADDRESS", "127.0.0.1:7233")
     slots = int(os.environ.get("ENCODE_SLOTS", "0")) or _default_slots()
-    global _ENCODE_THREADS
-    _ENCODE_THREADS = max(2, (os.cpu_count() or 4) // slots)
     # Friendly, stable worker identity (WORKER_LABEL, e.g. "mac"/"ubuntu"): it
     # rides on every ActivityTaskStarted event, so the orchestrator can tell
     # which box ran each chunk and colour the UI plot by machine. Defaults to
@@ -214,7 +203,7 @@ async def main() -> None:
     identity = os.environ.get("WORKER_LABEL") or socket.gethostname()
     client = await Client.connect(address, identity=identity)
     print(f"[temporal-worker] connected {address} queue={TASK_QUEUE} "
-          f"slots={slots} threads/encode={_ENCODE_THREADS} identity={identity}", flush=True)
+          f"slots={slots} identity={identity}", flush=True)
     with ThreadPoolExecutor(max_workers=slots) as pool:
         worker = Worker(
             client, task_queue=TASK_QUEUE,
