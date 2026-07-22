@@ -222,7 +222,7 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cfg.Target == "" {
-		cfg.Target = encode.TargetLocal
+		cfg.Target = encode.TargetLocalDist
 	}
 	if cfg.Codec == "" {
 		cfg.Codec = "both"

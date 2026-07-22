@@ -1337,13 +1337,11 @@ func (m *Manager) run(job *Job, startIdx int) {
 	jobTmpDir := filepath.Join(m.TmpDir, job.ID)
 	os.MkdirAll(jobTmpDir, 0755)
 
-	script := filepath.Join(m.ScriptsDir, "encoder", "cli_local.py")
-	if job.Config.Target == TargetCloud {
-		script = filepath.Join(m.ScriptsDir, "encoder", "cli_cloud.py")
-	}
-	if job.Config.Target == TargetLocalDist {
-		script = filepath.Join(m.ScriptsDir, "encoder", "cli_local_dist.py")
-	}
+	// local-dist is the only script-based (worker-container) path now; cloud-batch
+	// branches to its SFN driver inside encodeFilesFrom. (Legacy single-box "local"
+	// and direct-EC2 "cloud" targets were retired — cli_local.py survives only as
+	// the phase entry point cloud-batch's Batch job-defs invoke.)
+	script := filepath.Join(m.ScriptsDir, "encoder", "cli_local_dist.py")
 
 	err := m.encodeFilesFrom(job, jobTmpDir, script, startIdx)
 
@@ -1972,87 +1970,11 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	return args
 }
 
-// cloudBatchArgs builds the CLI for cli_cloud.py when it's handling
-// multiple clips in one invocation. Differences vs encodeArgsForFile:
-//
-//   - `--input` appears once per filename (cli_cloud.py uses
-//     action="append" on that flag)
-//   - `--output` is omitted — each clip's output stem is derived on
-//     the remote inside the user-data loop as `${stem}_p200`
-//   - `--output-dir` is the local tmp dir where outputs sync back
-//     before moveTmpToOutput picks them up
-func (cfg *JobConfig) cloudBatchArgs(sourceDir, outputDir string, filenames []string) []string {
-	var args []string
-	for _, f := range filenames {
-		args = append(args, "--input", sourceDir+"/"+f)
-	}
-	args = append(args, "--output-dir", outputDir)
-
-	// These get passed through cli_cloud.py to the remote cli_local.py
-	// via the parse_known_args passthrough channel — same flags the
-	// local path uses.
-	if cfg.Codec != "" {
-		args = append(args, "--codec", cfg.Codec)
-	}
-	if cfg.Ladder != "" {
-		args = append(args, "--ladder", cfg.Ladder)
-	}
-	if cfg.MaxRes != "" {
-		args = append(args, "--max-res", cfg.MaxRes)
-	}
-	if cfg.Time != "" {
-		args = append(args, "--time", cfg.Time)
-	}
-	if cfg.SegmentDuration != "" {
-		args = append(args, "--segment-duration", cfg.SegmentDuration)
-	}
-	if cfg.PartialDuration != "" {
-		args = append(args, "--partial-duration", cfg.PartialDuration)
-	}
-	if cfg.GopDuration != "" {
-		args = append(args, "--gop-duration", cfg.GopDuration)
-	}
-	if cfg.HlsFormat != "" {
-		args = append(args, "--hls-format", cfg.HlsFormat)
-	}
-	switch cfg.Padding {
-	case "black":
-		args = append(args, "--padding")
-	case "pink":
-		args = append(args, "--padding-pink")
-	case "none":
-		args = append(args, "--no-padding")
-	}
-	if cfg.KeepMezzanine {
-		args = append(args, "--keep-mezzanine")
-	}
-	if cfg.HevcSinglePass {
-		args = append(args, "--hevc-single-pass")
-	}
-	if cfg.CpuArch != "" {
-		args = append(args, "--cpu-arch", cfg.CpuArch)
-	}
-	if cfg.UseSpot != nil && !*cfg.UseSpot {
-		args = append(args, "--no-spot")
-	}
-	if cfg.ResumeFromJobID != "" {
-		args = append(args, "--resume-from-job-id", cfg.ResumeFromJobID)
-	}
-	if cfg.SimulateInterruptAfterS > 0 {
-		args = append(args, "--simulate-interrupt-after",
-			strconv.Itoa(cfg.SimulateInterruptAfterS))
-	}
-	return args
-}
-
 func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int) error {
 	// Cloud jobs batch every remaining file into a single cli_cloud.py
 	// invocation so one EC2 instance handles the whole job — boot once,
 	// docker pull once, amortize the launch + pull overhead across N
 	// clips. Local jobs still run one worker per file.
-	if job.Config.Target == TargetCloud {
-		return m.encodeCloudBatch(job, tmpDir, script, startIdx)
-	}
 	if job.Config.Target == TargetCloudBatch {
 		return m.encodeCloudBatchSFN(job, tmpDir, startIdx)
 	}
@@ -2090,59 +2012,6 @@ func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int)
 		if err := m.runFileContainer(job, i, script, args); err != nil {
 			return fmt.Errorf("%s: %w", f, err)
 		}
-	}
-	return nil
-}
-
-// encodeCloudBatch runs ALL remaining files through a single
-// cli_cloud.py invocation, which launches one EC2 instance and its
-// user-data bash loops through every clip on that same machine. The
-// EC2 boot + docker-pull overhead is paid once per job instead of
-// per clip.
-//
-// Pre-filters files via resolveCodec so we don't ship work for
-// already-fully-encoded clips to the cloud, same as the local path.
-func (m *Manager) encodeCloudBatch(job *Job, tmpDir, script string, startIdx int) error {
-	// Figure out which files genuinely need work. When !ForceReencode
-	// and everything's already in OutputDir, the whole batch collapses
-	// to zero clips — skip the instance launch entirely.
-	var filesToEncode []string
-	chosenCodec := job.Config.Codec
-	for i := startIdx; i < len(job.Config.Files); i++ {
-		f := job.Config.Files[i]
-		if job.Config.ForceReencode {
-			filesToEncode = append(filesToEncode, f)
-			continue
-		}
-		c := m.resolveCodec(job.Config, f)
-		if c == "" {
-			job.AppendLog(fmt.Sprintf("skipping %s — all codecs already encoded", f))
-			continue
-		}
-		filesToEncode = append(filesToEncode, f)
-		// If clips in the same job need different codec subsets, the
-		// batch uses the first non-empty resolved codec; edge case,
-		// only relevant when some clips partially exist in OutputDir.
-		if c != job.Config.Codec {
-			chosenCodec = c
-		}
-	}
-
-	if len(filesToEncode) == 0 {
-		return nil
-	}
-
-	job.Progress = fmt.Sprintf("cloud encode: %d clip(s) on one instance",
-		len(filesToEncode))
-	m.notify(job)
-	m.persistState(job, startIdx)
-
-	batchCfg := job.Config
-	batchCfg.Codec = chosenCodec
-	args := batchCfg.cloudBatchArgs(m.SourceDir, tmpDir, filesToEncode)
-
-	if err := m.runFileContainer(job, startIdx, script, args); err != nil {
-		return fmt.Errorf("cloud batch: %w", err)
 	}
 	return nil
 }

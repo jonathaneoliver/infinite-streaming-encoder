@@ -344,10 +344,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group">
                 <label>Target</label>
                 <select id="target" onchange="onTargetChange()">
-                    <option value="local">Local</option>
-                    <option value="local-dist">Local (distributed — all machines)</option>
+                    <option value="local-dist">Local (all machines)</option>
                     <option value="cloud-batch">Cloud (AWS Batch)</option>
-                    <option value="cloud">Cloud (legacy — EC2 spot, deprecated)</option>
                 </select>
             </div>
             <div class="control-group" id="cpu-arch-group" style="display:none">
@@ -1706,7 +1704,7 @@ function renderJobStats(el, j) {
         + (cloud ? stat('efficiency', (j.efficiency_pct || 0).toFixed(0) + '%') : '')
         + (j.slowest_job ? stat('slowest chunk', escapeHtml(slowest) + ' <span class="u">' + formatDuration(j.slowest_job_s || 0) + '</span>') : '')
         + (j.saved_usd > 0 ? stat('cost', '$' + (j.spot_usd || 0).toFixed(2) + ' <span class="u">spot · saved $' + j.saved_usd.toFixed(2) + '</span>') : '')
-        + ((j.commercial_usd > 0 || j.mediaconvert_usd > 0 || j.aws_spot_usd > 0) ? stat('would cost', `MediaConvert $${(j.mediaconvert_usd || 0).toFixed(2)} · commercial $${(j.commercial_usd || 0).toFixed(2)} · AWS on-demand $${(j.aws_ondemand_usd || 0).toFixed(2)} · AWS spot $${(j.aws_spot_usd || 0).toFixed(2)} · <span class="u">local hardware ~$0</span>`) : '');
+        + ((j.commercial_usd > 0 || j.mediaconvert_usd > 0 || j.aws_spot_usd > 0) ? stat('would cost', `MediaConvert $${(j.mediaconvert_usd || 0).toFixed(2)} · commercial $${(j.commercial_usd || 0).toFixed(2)} · AWS on-demand $${(j.aws_ondemand_usd || 0).toFixed(2)} · AWS spot $${(j.aws_spot_usd || 0).toFixed(2)} · <span class="u">local hardware ~${formatDuration(totalS)} of your time</span>`) : '');
     el.title = 'efficiency = avg vCPUs busy ÷ max vCPUs (how full the fleet ran). '
         + 'slowest chunk = the makespan floor — nothing finishes faster than this one chunk.';
     el.style.display = '';
