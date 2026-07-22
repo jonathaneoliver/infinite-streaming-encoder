@@ -153,10 +153,49 @@ class EncodeWorkflow:
             retry_policy=_RETRY, activity_id=act_id)
 
 
+_GB = 1024 ** 3
+# A 2-pass 4K (2160p) x265 encode peaks at a few GB; too many at once OOM-kills
+# the container (ffmpeg exit -9). Cap concurrency so each concurrent encode has
+# ~this much RAM headroom. Conservative — a big-RAM box still packs by cores.
+_MEM_PER_ENCODE_BYTES = 3 * _GB
+
+
+def _container_mem_bytes() -> int:
+    """RAM available to this worker — the cgroup limit if set, else /proc/meminfo.
+    0 if unknown."""
+    for path in ("/sys/fs/cgroup/memory.max",                    # cgroup v2
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"):  # cgroup v1
+        try:
+            v = open(path).read().strip()
+            if v not in ("max", ""):
+                n = int(v)
+                if 0 < n < (1 << 62):  # v1 sentinel for "unlimited" is huge
+                    return n
+        except (OSError, ValueError):
+            pass
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _default_slots() -> int:
+    """Concurrent encodes: min of cores/2 and RAM/3GB, so a small Docker-Desktop
+    VM doesn't OOM on concurrent 4K 2-pass encodes. Override with ENCODE_SLOTS."""
+    by_cores = max(1, (os.cpu_count() or 4) // 2)
+    mem = _container_mem_bytes()
+    if mem <= 0:
+        return by_cores
+    return min(by_cores, max(1, int(mem // _MEM_PER_ENCODE_BYTES)))
+
+
 async def main() -> None:
     import socket
     address = os.environ.get("TEMPORAL_ADDRESS", "127.0.0.1:7233")
-    slots = int(os.environ.get("ENCODE_SLOTS", "0")) or max(1, (os.cpu_count() or 4) // 2)
+    slots = int(os.environ.get("ENCODE_SLOTS", "0")) or _default_slots()
     # Friendly, stable worker identity (WORKER_LABEL, e.g. "mac"/"ubuntu"): it
     # rides on every ActivityTaskStarted event, so the orchestrator can tell
     # which box ran each chunk and colour the UI plot by machine. Defaults to
