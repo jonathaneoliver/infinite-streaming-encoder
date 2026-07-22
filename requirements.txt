@@ -1,1 +1,4 @@
 boto3==1.35.99
+# Distributed-local encode: the Temporal activity worker (encoder.temporal_worker)
+# runs inside this image on each box. Harmless for the cloud/local paths.
+temporalio==1.30.0

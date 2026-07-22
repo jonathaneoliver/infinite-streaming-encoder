@@ -361,3 +361,30 @@ clear-costs:          ## kill every idle AWS cost: sweep tagged instances/volume
 	$(MAKE) unbake-ami
 	@echo ">>> Idle cost generators cleared (AMI pointer self-cleared to pull-on-boot)."
 	@echo ">>> The Batch stack stays (it's ~\$$0 at rest). Full teardown: make infra-destroy"
+
+# ---- Distributed-local encoding (Temporal + MinIO, no AWS) --------------------
+# All-container control plane on this (master) box; workers run one-per-box and
+# pull work. See infra/local-cluster/README.md.
+DIST_COMPOSE = infra/local-cluster/docker-compose.yml
+.PHONY: dist-up dist-down dist-worker dist-logs dist-ps
+
+dist-up:              ## bring up the local cluster (temporal + ui + postgres + minio)
+	docker compose -f $(DIST_COMPOSE) up -d
+	@echo ">>> Temporal UI: http://localhost:8233   MinIO console: http://localhost:9001"
+
+dist-down:            ## stop the local cluster (volumes persist; add ARGS=-v to wipe)
+	docker compose -f $(DIST_COMPOSE) down $(ARGS)
+
+dist-worker: build    ## run an encode worker on THIS box (uses the freshly-built image)
+	ENCODER_IMAGE=$(ENCODER_IMAGE) TEMPORAL_ADDRESS=$${TEMPORAL_ADDRESS:-host.docker.internal:7233} \
+	S3_ENDPOINT_URL=$${S3_ENDPOINT_URL:-http://host.docker.internal:9000} \
+	AWS_ACCESS_KEY_ID=$${MINIO_ROOT_USER:-encoder} \
+	AWS_SECRET_ACCESS_KEY=$${MINIO_ROOT_PASSWORD:-encoder-secret} \
+	infra/local-cluster/run-worker.sh
+
+dist-logs:            ## follow the local worker log
+	docker logs -f $${WORKER_NAME:-encode-worker}
+
+dist-ps:              ## cluster + worker containers
+	docker compose -f $(DIST_COMPOSE) ps
+	@docker ps --filter name=encode-worker --format 'table {{.Names}}\t{{.Status}}'
