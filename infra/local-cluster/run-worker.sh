@@ -28,6 +28,14 @@ AWS_REGION="${AWS_REGION:-us-east-1}"
 
 mount_args=()
 [ -n "${CODE_MOUNT:-}" ] && mount_args=(-v "${CODE_MOUNT}:/app/scripts/encoder:ro")
+# Apple Silicon: the Docker VM hides performance vs efficiency cores, so size
+# concurrency from the HOST's performance-core count (perflevel0) — P-cores / 2,
+# with 2 threads each, fills the P-cores and leaves the weak E-cores idle. Linux
+# boxes leave ENCODE_SLOTS unset; the worker detects physical cores in-container.
+if [ -z "${ENCODE_SLOTS:-}" ] && sysctl -n hw.perflevel0.physicalcpu >/dev/null 2>&1; then
+  P=$(sysctl -n hw.perflevel0.physicalcpu)
+  ENCODE_SLOTS=$(( P > 1 ? P / 2 : 1 ))
+fi
 slots_args=()
 [ -n "${ENCODE_SLOTS:-}" ] && slots_args=(-e "ENCODE_SLOTS=${ENCODE_SLOTS}")
 # WORKER_LABEL (e.g. mac/ubuntu) becomes the worker's Temporal identity, which

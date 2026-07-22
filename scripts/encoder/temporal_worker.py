@@ -32,10 +32,6 @@ from temporalio.worker import Worker
 
 TASK_QUEUE = os.environ.get("TEMPORAL_TASK_QUEUE", "encode")
 
-# ffmpeg threads per encode, sized in main() to cores/slots so the box's cores
-# stay busy even when RAM caps concurrency. 0 until set (workflow default wins).
-_ENCODE_THREADS = 0
-
 
 @activity.defn(name="EncodePhase")
 def encode_phase(spec: dict) -> None:
@@ -58,11 +54,6 @@ def encode_phase(spec: dict) -> None:
     # chunks download the mezzanine once instead of once each. cli_phase symlinks
     # it into each activity's work dir zero-copy.
     env.setdefault("MEZZ_CACHE_DIR", "/tmp/mezz-cache")
-    # Fill the cores: when concurrency is memory-capped (few slots), give each
-    # encode more threads so slots × threads ≈ cores. Sized per worker (it knows
-    # its cores + slots); overrides the workflow's conservative default.
-    if _ENCODE_THREADS:
-        env["ENCODE_THREADS"] = str(_ENCODE_THREADS)
     cmd = ["python3", "-m", "encoder.cli_phase", *spec["args"]]
     proc = subprocess.Popen(cmd, text=True, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -191,10 +182,31 @@ def _container_mem_bytes() -> int:
     return 0
 
 
+def _physical_cores() -> int:
+    """Physical cores, NOT logical — so SMT siblings aren't counted as capacity
+    (a 2nd HEVC encode on a core's SMT sibling adds ~25%, not 100%). Linux reads
+    /sys topology; elsewhere (a Docker-Desktop VM that hides P/E cores) it falls
+    back to the logical count — those boxes should set ENCODE_SLOTS explicitly."""
+    try:
+        import glob
+        cores = set()
+        for f in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/core_id"):
+            pkg = f.replace("core_id", "physical_package_id")
+            pid = open(pkg).read().strip() if os.path.exists(pkg) else "0"
+            cores.add((pid, open(f).read().strip()))
+        if cores:
+            return len(cores)
+    except OSError:
+        pass
+    return os.cpu_count() or 4
+
+
 def _default_slots() -> int:
-    """Concurrent encodes: min of cores/2 and RAM/3GB, so a small Docker-Desktop
-    VM doesn't OOM on concurrent 4K 2-pass encodes. Override with ENCODE_SLOTS."""
-    by_cores = max(1, (os.cpu_count() or 4) // 2)
+    """Concurrent encodes when ENCODE_SLOTS is unset: physical-cores/2 (with the
+    workflow's 2 threads each this fills the physical cores and skips SMT),
+    capped by RAM/3GB so a small VM doesn't OOM on 4K. A box that can't reveal
+    its performance cores (a Mac's Docker VM hides P/E) should set ENCODE_SLOTS."""
+    by_cores = max(1, _physical_cores() // 2)
     mem = _container_mem_bytes()
     if mem <= 0:
         return by_cores
@@ -205,8 +217,6 @@ async def main() -> None:
     import socket
     address = os.environ.get("TEMPORAL_ADDRESS", "127.0.0.1:7233")
     slots = int(os.environ.get("ENCODE_SLOTS", "0")) or _default_slots()
-    global _ENCODE_THREADS
-    _ENCODE_THREADS = max(2, (os.cpu_count() or 4) // slots)
     # Friendly, stable worker identity (WORKER_LABEL, e.g. "mac"/"ubuntu"): it
     # rides on every ActivityTaskStarted event, so the orchestrator can tell
     # which box ran each chunk and colour the UI plot by machine. Defaults to
@@ -214,7 +224,7 @@ async def main() -> None:
     identity = os.environ.get("WORKER_LABEL") or socket.gethostname()
     client = await Client.connect(address, identity=identity)
     print(f"[temporal-worker] connected {address} queue={TASK_QUEUE} "
-          f"slots={slots} threads/encode={_ENCODE_THREADS} identity={identity}", flush=True)
+          f"slots={slots} identity={identity}", flush=True)
     with ThreadPoolExecutor(max_workers=slots) as pool:
         worker = Worker(
             client, task_queue=TASK_QUEUE,
