@@ -30,6 +30,9 @@ mount_args=()
 [ -n "${CODE_MOUNT:-}" ] && mount_args=(-v "${CODE_MOUNT}:/app/scripts/encoder:ro")
 slots_args=()
 [ -n "${ENCODE_SLOTS:-}" ] && slots_args=(-e "ENCODE_SLOTS=${ENCODE_SLOTS}")
+# WORKER_LABEL (e.g. mac/ubuntu) becomes the worker's Temporal identity, which
+# is how the UI colours each chunk by the box that ran it. Default: WORKER_NAME.
+label_args=(-e "WORKER_LABEL=${WORKER_LABEL:-$WORKER_NAME}")
 
 docker rm -f "$WORKER_NAME" >/dev/null 2>&1 || true
 docker run -d --name "$WORKER_NAME" --restart unless-stopped \
@@ -38,7 +41,7 @@ docker run -d --name "$WORKER_NAME" --restart unless-stopped \
   -e "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
   -e "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
   -e "AWS_REGION=${AWS_REGION}" \
-  "${slots_args[@]}" "${mount_args[@]}" \
+  "${slots_args[@]}" "${label_args[@]}" "${mount_args[@]}" \
   --entrypoint python3 "$ENCODER_IMAGE" -m encoder.temporal_worker
 
 echo "worker '$WORKER_NAME' started (image=$ENCODER_IMAGE, temporal=$TEMPORAL_ADDRESS)"

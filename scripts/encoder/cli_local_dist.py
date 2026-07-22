@@ -555,19 +555,32 @@ async def _emit_temporal_progress(handle, EventType, emitted: dict) -> None:
         return
     sched: dict[int, str] = {}
     states: dict[str, str] = {}
+    hosts: dict[str, str] = {}   # activity_id -> worker identity (which box ran it)
     for e in hist.events:
         et = e.event_type
         if et == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
             aid = e.activity_task_scheduled_event_attributes.activity_id
             sched[e.event_id] = aid
             states.setdefault(aid, "running")
+        elif et == EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED:
+            a = e.activity_task_started_event_attributes
+            aid = sched.get(a.scheduled_event_id)
+            if aid and a.identity:
+                hosts[aid] = a.identity
         elif et == EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED:
             aid = sched.get(e.activity_task_completed_event_attributes.scheduled_event_id)
             if aid:
                 states[aid] = "done"
     for aid, st in states.items():
         key = _stage_key_for(aid)
-        if key and emitted.get(aid) != st:
+        if not key:
+            continue
+        # Which machine ran this stage → colours the UI chunk/phase plot by box.
+        host = hosts.get(aid)
+        if host and emitted.get(f"host:{aid}") != host:
+            emitted[f"host:{aid}"] = host
+            print(f"[[ENCODER-HOST key={key} instance={host}]]", flush=True)
+        if emitted.get(aid) != st:
             emitted[aid] = st
             emit_stage(key, st, 100.0 if st == "done" else 0.0)
 

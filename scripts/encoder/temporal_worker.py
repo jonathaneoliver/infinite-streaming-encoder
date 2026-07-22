@@ -150,11 +150,17 @@ class EncodeWorkflow:
 
 
 async def main() -> None:
+    import socket
     address = os.environ.get("TEMPORAL_ADDRESS", "127.0.0.1:7233")
     slots = int(os.environ.get("ENCODE_SLOTS", "0")) or max(1, (os.cpu_count() or 4) // 2)
-    client = await Client.connect(address)
-    print(f"[temporal-worker] connected {address} queue={TASK_QUEUE} slots={slots}",
-          flush=True)
+    # Friendly, stable worker identity (WORKER_LABEL, e.g. "mac"/"ubuntu"): it
+    # rides on every ActivityTaskStarted event, so the orchestrator can tell
+    # which box ran each chunk and colour the UI plot by machine. Defaults to
+    # the hostname.
+    identity = os.environ.get("WORKER_LABEL") or socket.gethostname()
+    client = await Client.connect(address, identity=identity)
+    print(f"[temporal-worker] connected {address} queue={TASK_QUEUE} "
+          f"slots={slots} identity={identity}", flush=True)
     with ThreadPoolExecutor(max_workers=slots) as pool:
         worker = Worker(
             client, task_queue=TASK_QUEUE,
