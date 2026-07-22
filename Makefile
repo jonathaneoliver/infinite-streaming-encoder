@@ -16,6 +16,10 @@ MINIO_ENDPOINT ?= http://host.docker.internal:9000
 MINIO_ACCESS_KEY ?= encoder
 MINIO_SECRET_KEY ?= encoder-secret
 DIST_S3_BUCKET ?= encoder-local
+# Label for the master box's own worker + the container name workers run as
+# (run-worker.sh WORKER_NAME) — used by the server to toggle machines on/off.
+LOCAL_WORKER_LABEL ?= mac
+DIST_WORKER_CONTAINER ?= encode-worker
 
 # Single source of truth: ./VERSION. Embedded into the Go binary via
 # -ldflags and stamped on every image tag we publish to GHCR. The
@@ -104,6 +108,9 @@ run: require-paths build
 		-e MINIO_ACCESS_KEY=$(MINIO_ACCESS_KEY) \
 		-e MINIO_SECRET_KEY=$(MINIO_SECRET_KEY) \
 		-e DIST_S3_BUCKET=$(DIST_S3_BUCKET) \
+		-e 'DIST_WORKERS=$(DIST_WORKERS)' \
+		-e LOCAL_WORKER_LABEL=$(LOCAL_WORKER_LABEL) \
+		-e DIST_WORKER_CONTAINER=$(DIST_WORKER_CONTAINER) \
 		$(IMAGE_NAME)
 	@echo "Encoder running at http://localhost:$(PORT)"
 

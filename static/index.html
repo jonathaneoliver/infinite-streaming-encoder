@@ -189,6 +189,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .aws-metric-label { color: #888; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
 .aws-metric-value { color: #e0e0e0; font-size: 1.4rem; font-weight: 600; font-variant-numeric: tabular-nums; }
 .aws-metric-value.warn { color: #ffa94d; }
+.machine-pills { display: flex; flex-wrap: wrap; gap: 5px; justify-content: center; padding-top: 2px; }
+.machine-pill { padding: 3px 9px; border-radius: 11px; font-size: 0.74rem; font-weight: 700; white-space: nowrap; letter-spacing: 0.2px; user-select: none; }
+.machine-pill.toggle { cursor: pointer; transition: transform 0.08s, filter 0.12s; }
+.machine-pill.toggle:hover { filter: brightness(1.12); transform: translateY(-1px); }
 .aws-metric-value.ok { color: #06d6a0; }
 
 .aws-section { margin-bottom: 20px; }
@@ -2755,22 +2759,55 @@ const _MAXVCPU_BASE = 48;
 // the same inventory summary `s` that renderAws already fetched — full innerHTML
 // re-render each 10s tick is fine (radios re-check from live state, no text
 // input to lose focus on).
-// Distributed-local encoder machines available — the workers polling the
-// Temporal task queue, from /api/dist/workers (distinct poller identities).
-// Feeds the "Local machines" tile; best-effort, shows 0 if the cluster's down.
+// Distributed-local encoder machines — from /api/dist/workers, each
+// {name, on, local}. Rendered as colour-coded pills (same instanceColor() the
+// chunk plot uses). Remote pills are buttons: click to enable/disable a box
+// even mid-encode — disabling hard-stops its worker, so Temporal re-queues its
+// in-flight chunks onto the other machines. Best-effort; empty if cluster down.
 let _distMachines = { count: 0, machines: [] };
+
+function machinePillsHtml() {
+    const ms = _distMachines.machines || [];
+    if (!ms.length) return '<span class="u" style="font-size:0.8rem">none</span>';
+    return '<div class="machine-pills">' + ms.map(m => {
+        const color = instanceColor(m.name) || '#4361ee';
+        const clickable = !m.local;   // the master box is always on
+        const style = m.on
+            ? `background:${color};color:#0b1020;border:1px solid ${color}`
+            : `background:transparent;color:${color};border:1px dashed ${color};opacity:.5`;
+        const onclick = clickable ? ` onclick="toggleMachine('${m.name}', ${!m.on})"` : '';
+        const title = !clickable ? `${m.name} — master (always on)`
+            : (m.on ? `Disable ${m.name}: its in-flight chunks are dropped and re-queued to the other machines`
+                    : `Enable ${m.name}: rejoin the encode pool`);
+        return `<span class="machine-pill${clickable ? ' toggle' : ''}" style="${style}"${onclick} title="${title}">${m.name}${m.on ? '' : ' · off'}</span>`;
+    }).join('') + '</div>';
+}
+
+function renderDistMachines() {
+    const el = document.getElementById('aws-dist-machines');
+    if (el) el.innerHTML = machinePillsHtml();
+}
+
+async function toggleMachine(name, enabled) {
+    const m = (_distMachines.machines || []).find(x => x.name === name);
+    if (m) m.on = enabled;                 // optimistic
+    renderDistMachines();
+    try {
+        await fetch('/api/dist/workers/' + encodeURIComponent(name), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled }),
+        });
+    } catch (e) { /* revert on next poll */ }
+    setTimeout(pollDistWorkers, 1500);
+}
+
 async function pollDistWorkers() {
     try {
         const r = await fetch('/api/dist/workers');
         if (!r.ok) return;
         _distMachines = await r.json();
-        const el = document.getElementById('aws-dist-machines');
-        if (el) {
-            el.textContent = _distMachines.count;
-            el.classList.toggle('ok', _distMachines.count > 0);
-            el.title = _distMachines.machines.join(', ') || 'none available';
-        }
-    } catch (e) { /* cluster not up — leave at 0 */ }
+        renderDistMachines();
+    } catch (e) { /* cluster not up */ }
 }
 setInterval(pollDistWorkers, 10000);
 pollDistWorkers();
@@ -2804,7 +2841,7 @@ function renderJobsMetrics(s) {
         tile('Spent (last 24h)', `<div class="aws-metric-value">$${(s.spend_24h_usd || 0).toFixed(2)}</div>`, 'Self-tracked: burn rate integrated over the trailing 24h'),
         tile('Saved by spot (total)', `<div class="aws-metric-value ok">$${(s.saved_total_usd || 0).toFixed(2)}</div>`, 'Accumulated (on-demand − spot) cost across all finished cloud-batch jobs'),
         tile('Reclaim waste (24h)', `<div class="aws-metric-value${rpct >= 10 ? ' warn' : rpct > 0 ? '' : ' ok'}">${rpct.toFixed(1)}%</div>`, (s.reclaim_24h_lost_min || 0).toFixed(1) + ' min of encoding lost to reclaims in the last 24h'),
-        tile('Local machines', `<div class="aws-metric-value${_distMachines.count > 0 ? ' ok' : ''}" id="dist-machines-val" title="${_distMachines.machines.join(', ') || 'none available'}">${_distMachines.count}</div>`, 'Distributed-local encoder machines currently available (workers polling Temporal). One encode\'s chunks spread across these boxes; hover for names.'),
+        tile('Local machines', machinePillsHtml(), 'Distributed-local encoder machines. Coloured to match the chunk plot; click a remote pill to enable/disable that box (mid-encode too — its chunks re-queue to the others).'),
         tile('Keep warm', `<div class="aws-metric-value${(s.min_vcpus || 0) > 0 ? ' ok' : ''}">${s.min_vcpus || 0} vCPU</div>`, 'Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box (0 when idle).'),
         tile('Max vCPUs', vcpuHtml, 'Batch compute-env max vCPUs. 2× runs ~twice as many machines → roughly half the wall-clock for ~the same total cost.'),
     ].join('');
