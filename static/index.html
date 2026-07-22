@@ -2779,7 +2779,9 @@ function machinePillsHtml() {
         const title = !clickable ? `${m.name} — master (always on)`
             : (m.on ? `Disable ${m.name}: its in-flight chunks are dropped and re-queued to the other machines`
                     : `Enable ${m.name}: rejoin the encode pool`);
-        return `<span class="machine-pill${clickable ? ' toggle' : ''}" style="${style}"${onclick} title="${title}">${m.name}${m.on ? '' : ' · off'}</span>`;
+        const nameHtml = m.on ? m.name
+            : `<span style="text-decoration:line-through">${m.name}</span>`;
+        return `<span class="machine-pill${clickable ? ' toggle' : ''}" style="${style}"${onclick} title="${title}">${nameHtml}</span>`;
     }).join('') + '</div>';
 }
 

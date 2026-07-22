@@ -50,6 +50,10 @@ def encode_phase(spec: dict) -> None:
     # MinIO, so a private scratch dir is correct; clean it up after.
     work_dir = f"/tmp/act-{uuid.uuid4().hex}"
     env["ENCODER_WORK_DIR"] = work_dir
+    # Shared (per-worker, NOT per-activity) mezzanine cache, so all this box's
+    # chunks download the mezzanine once instead of once each. cli_phase symlinks
+    # it into each activity's work dir zero-copy.
+    env.setdefault("MEZZ_CACHE_DIR", "/tmp/mezz-cache")
     cmd = ["python3", "-m", "encoder.cli_phase", *spec["args"]]
     proc = subprocess.Popen(cmd, text=True, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

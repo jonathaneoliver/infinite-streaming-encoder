@@ -164,9 +164,32 @@ def _s3():
     )
 
 
+def _progress_cb(stage_key: str, total_bytes: int):
+    """A boto3 transfer Callback that emits throttled ENCODER-STAGE progress
+    (every ~2%) for a byte transfer — so the UI shows a moving bar for the
+    otherwise-dark source upload / output download."""
+    total = max(1, total_bytes)
+    sent = [0]
+    last = [-5.0]
+
+    def cb(n: int) -> None:
+        sent[0] += n
+        pct = min(99.0, sent[0] / total * 100.0)
+        if pct - last[0] >= 2.0:
+            last[0] = pct
+            emit_stage(stage_key, "running", pct)
+
+    return cb
+
+
 def _upload_source(local: Path, bucket: str, key: str) -> None:
-    print(f"[dist] uploading source -> s3://{bucket}/{key}", flush=True)
-    _s3().upload_file(str(local), bucket, key)
+    total = local.stat().st_size
+    print(f"[dist] uploading source ({total / 1e6:.0f} MB) -> s3://{bucket}/{key}",
+          flush=True)
+    emit_stage("upload:source", "running", 0.0)
+    _s3().upload_file(str(local), bucket, key,
+                      Callback=_progress_cb("upload:source", total))
+    emit_stage("upload:source", "done", 100.0)
 
 
 def _object_exists(bucket: str, key: str) -> bool:
@@ -179,19 +202,26 @@ def _object_exists(bucket: str, key: str) -> bool:
 
 def _download_prefix(bucket: str, prefix: str, dest: Path) -> int:
     """Download every object under `prefix` into `dest`, preserving the tail
-    path after `prefix`. Returns the file count."""
+    path after `prefix`. Emits throttled download:outputs progress by bytes.
+    Returns the file count."""
     s3 = _s3()
     dest.mkdir(parents=True, exist_ok=True)
-    n = 0
+    objs = []
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            rel = obj["Key"][len(prefix):].lstrip("/")
-            if not rel:
-                continue
-            out = dest / rel
-            out.parent.mkdir(parents=True, exist_ok=True)
-            s3.download_file(bucket, obj["Key"], str(out))
-            n += 1
+        objs.extend(page.get("Contents", []))
+    total = sum(o.get("Size", 0) for o in objs)
+    emit_stage("download:outputs", "running", 0.0)
+    cb = _progress_cb("download:outputs", total)
+    n = 0
+    for obj in objs:
+        rel = obj["Key"][len(prefix):].lstrip("/")
+        if not rel:
+            continue
+        out = dest / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        s3.download_file(bucket, obj["Key"], str(out), Callback=cb)
+        n += 1
+    emit_stage("download:outputs", "done", 100.0)
     return n
 
 
@@ -380,9 +410,13 @@ def encode_chunks_distributed(pool: list[Worker], tasks: list[ChunkTask],
 
 def _emit_plan(rungs_by_codec: dict[str, list[Rung]], chunks_by_variant: dict,
                has_audio: bool) -> None:
-    """Announce mezzanine + every chunk + audio + package/fragments/hls, so the
-    UI lays out the full per-chunk grid up front (like the cloud plan)."""
-    stages: list[Stage] = [Stage(key="mezzanine", label="mezzanine")]
+    """Announce upload + mezzanine + every chunk + audio + package/fragments/hls
+    + download, so the UI lays out the full grid up front (like the cloud plan).
+    The upload/download rows animate from the orchestrator's own S3 transfers."""
+    stages: list[Stage] = [
+        Stage(key="upload:source", label="upload source"),
+        Stage(key="mezzanine", label="mezzanine"),
+    ]
     for codec, rungs in rungs_by_codec.items():
         for rung in rungs:
             n = chunks_by_variant[(codec, rung.label)]
@@ -397,6 +431,7 @@ def _emit_plan(rungs_by_codec: dict[str, list[Rung]], chunks_by_variant: dict,
         stages.append(Stage(key=f"package:{codec}", label=f"package {codec}"))
         stages.append(Stage(key=f"fragments:{codec}", label=f"fragments {codec}"))
         stages.append(Stage(key=f"hls:{codec}", label=f"HLS {codec}"))
+    stages.append(Stage(key="download:outputs", label="download outputs"))
     emit_plan(stages)
 
 

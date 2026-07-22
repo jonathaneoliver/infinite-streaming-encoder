@@ -217,6 +217,55 @@ def _download_if_complete(s3_uri: str, dst: Path,
     return recorded == dst.stat().st_size
 
 
+def _prune_mezz_cache(cache_dir: Path, keep: int = 6) -> None:
+    """Keep only the `keep` most-recent cached mezzanines — they're large. Recent
+    ones (any active job's) survive, so this won't yank a symlink target from
+    under a running encode in practice."""
+    mezzes = sorted(cache_dir.glob("mezz-*.mp4"),
+                    key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in mezzes[keep:]:
+        for f in (old, old.with_suffix(".mp4.done"),
+                  cache_dir / (old.name.rsplit(".", 1)[0] + ".lock")):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
+def _fetch_mezz_cached(mezz_uri: str, mezz_local: Path) -> bool:
+    """Fetch the mezzanine, cached PER WORKER so N chunks on one box download it
+    once instead of once per chunk. Keyed by the mezz URI (unique per job, so it
+    hits across that job's chunks) and symlinked into the per-activity work dir
+    (zero-copy). A file lock makes concurrent chunks on the same box share one
+    download. MEZZ_CACHE_DIR unset → plain per-chunk download (the AWS Batch path,
+    where each chunk is its own ephemeral container anyway)."""
+    cache_dir = os.environ.get("MEZZ_CACHE_DIR")
+    if not cache_dir:
+        return _download_if_complete(mezz_uri, mezz_local)
+    import fcntl
+    import hashlib
+    os.makedirs(cache_dir, exist_ok=True)
+    key = hashlib.sha256(mezz_uri.encode()).hexdigest()[:16]
+    cached = Path(cache_dir) / f"mezz-{key}.mp4"
+    cached_done = cached.with_suffix(".mp4.done")
+    with open(Path(cache_dir) / f"mezz-{key}.lock", "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        if cached.is_file() and cached_done.is_file():
+            print("[phase variant] mezzanine served from worker cache", flush=True)
+        else:
+            print("[phase variant] caching mezzanine (first chunk on this box)", flush=True)
+            if not _download_if_complete(mezz_uri, cached):
+                return False
+            _prune_mezz_cache(Path(cache_dir))
+    try:
+        if mezz_local.is_symlink() or mezz_local.exists():
+            mezz_local.unlink()
+        mezz_local.symlink_to(cached)
+    except OSError:
+        shutil.copy(cached, mezz_local)
+    return True
+
+
 def _prepare_work_dir() -> Path:
     """Wipe + re-create the scratch dir so successive phase invocations
     inside the same container (rare, but happens during local testing)
@@ -412,8 +461,8 @@ def phase_variant(args: argparse.Namespace) -> int:
 
     mezz_uri = args.s3_mezz.rstrip("/") + "/mezzanine.mp4"
     mezz_local = work / "mezzanine.mp4"
-    print(f"[phase variant] downloading {mezz_uri}", flush=True)
-    if not _download_if_complete(mezz_uri, mezz_local):
+    print(f"[phase variant] fetching {mezz_uri}", flush=True)
+    if not _fetch_mezz_cached(mezz_uri, mezz_local):
         print("error: mezzanine.done missing or size mismatch", file=sys.stderr)
         return 1
     timer.mark("fetch")
