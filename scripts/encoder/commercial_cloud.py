@@ -89,6 +89,40 @@ def _mc_rate(height: int, codec: str) -> float:
     return table[-1][1]
 
 
+# --- our own AWS Batch spot fleet ------------------------------------------
+# Predict what THIS ladder would cost on our cloud path. Unlike the SaaS models
+# above (per output-minute), this is COMPUTE-based: each variant's encode
+# wall-time × its vCPU allocation × the spot rate — so it weights a slow 4K HEVC
+# 2-pass rendition ~200× a fast 360p h264 one. Encode speed is modeled per
+# codec/resolution/pass (mirrors the control plane's seeded speed model), so all
+# variants + resolutions + codecs are accounted for individually.
+_SPEED_1080P = {"h264": 1.5, "hevc": 0.14, "av1": 0.1}   # content-s per wall-s @1080p, 1-pass
+_AWS_SPOT_VCPU_HR = 0.013     # Graviton (c7g) spot ≈ $/vCPU-hr
+_AWS_VCPU_PER_VARIANT = 2     # each encode runs on ~2 vCPU (matches ENCODE_THREADS)
+
+
+def _encode_wall_s(codec: str, height: int, two_pass: bool, content_s: float) -> float:
+    base = _SPEED_1080P.get(codec, 0.14)
+    sp = base * (1080.0 * 1080.0) / (max(1, height) ** 2)   # scale ~1/pixels
+    if two_pass:
+        sp /= 2
+    return content_s / max(sp, 0.001)
+
+
+def aws_spot_usd(rungs_by_codec, duration_s: float, *, hevc_two_pass: bool = True) -> float:
+    """Compute-based cost to run the ladder on our AWS Batch spot fleet, summed
+    over EVERY variant (codec × resolution × pass) by its modeled encode work."""
+    minutes = max(0.0, duration_s or 0.0)
+    if minutes <= 0:
+        return 0.0
+    vcpu_h = 0.0
+    for codec, rungs in rungs_by_codec.items():
+        tp = codec == "hevc" and hevc_two_pass
+        for r in rungs:
+            vcpu_h += _encode_wall_s(codec, r.height, tp, duration_s) * _AWS_VCPU_PER_VARIANT / 3600.0
+    return round(vcpu_h * _AWS_SPOT_VCPU_HR, 4)
+
+
 def mediaconvert_usd(rungs_by_codec, duration_s: float, *, fps: float = 30.0) -> float:
     """AWS MediaConvert-equivalent cost for the ladder. H.264 → Basic tier,
     HEVC/AV1 → Professional tier; ×2 above 30 fps."""

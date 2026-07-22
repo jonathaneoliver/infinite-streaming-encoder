@@ -478,12 +478,15 @@ def _emit_plan(rungs_by_codec: dict[str, list[Rung]], chunks_by_variant: dict,
     emit_plan(stages)
 
 
-def _emit_commercial_cost(rungs_by_codec, info, input_path) -> None:
-    """Print an ENCODER-COMMERCIAL marker: what this job's ladder would have cost
-    on a commercial cloud encoder. Source bitrate is approximated from file size /
-    duration for the high-bitrate multiplier. Best-effort."""
+def _emit_commercial_cost(rungs_by_codec, info, input_path,
+                          hevc_two_pass=True) -> None:
+    """Print an ENCODER-COMMERCIAL marker with three cost baselines for this
+    ladder: a commercial cloud encoder + AWS MediaConvert (both per output-minute
+    of SOURCE duration) and our own AWS Batch spot fleet (per ENCODING hour —
+    compute-based, so it weights each variant's real work). Best-effort."""
     try:
-        from encoder.commercial_cloud import estimate_usd, mediaconvert_usd
+        from encoder.commercial_cloud import (
+            estimate_usd, mediaconvert_usd, aws_spot_usd)
         try:
             src_mbps = input_path.stat().st_size * 8 / (info.duration_s or 1) / 1e6
         except OSError:
@@ -491,8 +494,10 @@ def _emit_commercial_cost(rungs_by_codec, info, input_path) -> None:
         usd = estimate_usd(rungs_by_codec, info.duration_s, fps=float(info.fps),
                            has_audio=info.has_audio, src_mbps=src_mbps)
         mc = mediaconvert_usd(rungs_by_codec, info.duration_s, fps=float(info.fps))
-        print(f"[[ENCODER-COMMERCIAL commercial={usd:.4f} mediaconvert={mc:.4f}]]",
-              flush=True)
+        aws = aws_spot_usd(rungs_by_codec, info.duration_s,
+                           hevc_two_pass=hevc_two_pass)
+        print(f"[[ENCODER-COMMERCIAL commercial={usd:.4f} mediaconvert={mc:.4f} "
+              f"aws={aws:.4f}]]", flush=True)
     except Exception:  # noqa: BLE001 — cost estimate is cosmetic, never fail a run
         pass
 
@@ -544,7 +549,8 @@ def run(args: argparse.Namespace) -> int:
         for codec, rungs in rungs_by_codec.items() for r in rungs
     }
     _emit_plan(rungs_by_codec, chunks_by_variant, info.has_audio)
-    _emit_commercial_cost(rungs_by_codec, info, input_path)
+    _emit_commercial_cost(rungs_by_codec, info, input_path,
+                          hevc_two_pass=not args.hevc_single_pass)
 
     pool = build_pool(
         args.worker or ["local"], args.image_local, args.image_remote,
@@ -775,7 +781,8 @@ def run_temporal(args: argparse.Namespace) -> int:
     _emit_plan(rungs_by_codec,
                {(c, r.label): n_chunks for c, rr in rungs_by_codec.items() for r in rr},
                info.has_audio)
-    _emit_commercial_cost(rungs_by_codec, info, input_path)
+    _emit_commercial_cost(rungs_by_codec, info, input_path,
+                          hevc_two_pass=not args.hevc_single_pass)
     _upload_source(input_path, bucket, src_key)
 
     two_pass = {"hevc": not args.hevc_single_pass, "h264": False, "av1": False}

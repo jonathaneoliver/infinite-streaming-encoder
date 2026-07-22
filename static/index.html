@@ -1706,7 +1706,7 @@ function renderJobStats(el, j) {
         + (cloud ? stat('efficiency', (j.efficiency_pct || 0).toFixed(0) + '%') : '')
         + (j.slowest_job ? stat('slowest chunk', escapeHtml(slowest) + ' <span class="u">' + formatDuration(j.slowest_job_s || 0) + '</span>') : '')
         + (j.saved_usd > 0 ? stat('cost', '$' + (j.spot_usd || 0).toFixed(2) + ' <span class="u">spot · saved $' + j.saved_usd.toFixed(2) + '</span>') : '')
-        + ((j.commercial_usd > 0 || j.mediaconvert_usd > 0) ? stat('would cost hosted', `MediaConvert $${(j.mediaconvert_usd || 0).toFixed(2)} · commercial $${(j.commercial_usd || 0).toFixed(2)}` + (j.spot_usd > 0 ? ` <span class="u">· you paid $${j.spot_usd.toFixed(2)} spot</span>` : ` <span class="u">· you: own hardware ~$0</span>`)) : '');
+        + ((j.commercial_usd > 0 || j.mediaconvert_usd > 0 || j.aws_spot_usd > 0) ? stat('would cost', `AWS spot $${(j.aws_spot_usd || 0).toFixed(2)} · MediaConvert $${(j.mediaconvert_usd || 0).toFixed(2)} · commercial $${(j.commercial_usd || 0).toFixed(2)}` + (j.spot_usd > 0 ? ` <span class="u">· you paid $${j.spot_usd.toFixed(2)}</span>` : ` <span class="u">· you: own hardware ~$0</span>`)) : '');
     el.title = 'efficiency = avg vCPUs busy ÷ max vCPUs (how full the fleet ran). '
         + 'slowest chunk = the makespan floor — nothing finishes faster than this one chunk.';
     el.style.display = '';
@@ -2921,10 +2921,13 @@ function renderLocalFleet() {
     const pct = totalCores ? Math.round(busyCores / totalCores * 100) : 0;
     const totalChunks = insts.reduce((a, i) => a + i.chunks.length, 0);
     const chunkLabel = totalChunks ? ` · ${totalChunks} chunk${totalChunks !== 1 ? 's' : ''}` : '';
+    const aj = _activeJob();
+    const awsUsd = (aj && aj.aws_spot_usd) || 0;
+    const awsLabel = awsUsd > 0 ? ` · <span style="color:#6ab04c" title="what this whole encode would cost on our AWS Batch spot fleet — compute-based (encode vCPU-hours) summed across every variant">would cost ~$${awsUsd.toFixed(2)} on AWS spot</span>` : '';
     const bar = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
         <div style="flex:1;max-width:520px;height:22px;background:#20252f;border-radius:5px;overflow:hidden">
           <div style="width:${pct}%;height:100%;background:#4a90d9"></div></div>
-        <div style="font-size:13px;color:#ccc"><b>${usedCores}</b> / ${totalCores} cores busy (${pct}%) · <span style="color:#888">${insts.length} machine${insts.length > 1 ? 's' : ''}${chunkLabel}</span></div>
+        <div style="font-size:13px;color:#ccc"><b>${usedCores}</b> / ${totalCores} cores busy (${pct}%) · <span style="color:#888">${insts.length} machine${insts.length > 1 ? 's' : ''}${chunkLabel}${awsLabel}</span></div>
       </div>`;
     const rows = insts.map(i => _localFleetRow(i, maxCores)).join('');
     panel.style.display = '';
