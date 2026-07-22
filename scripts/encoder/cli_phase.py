@@ -562,13 +562,19 @@ def phase_variant(args: argparse.Namespace) -> int:
                cpu_s=f"{cpu_s:.2f}", mem_mib=f"{peak_mib:.0f}")
 
     # Feed the control plane's learned-speed model (drives the dynamic chunk
-    # selector): content-seconds encoded vs encode wall-seconds for this
-    # (codec, height, pass). The Go server's Manager.learnSpeed consumes it.
+    # selector, cost, and ETA): content-seconds encoded vs encode wall-seconds,
+    # keyed by every dimension that moves encode time. machine = this worker's
+    # label (mac/ubuntu/macmini for local-dist, unset on cloud batch → its
+    # workers are all Graviton, so "graviton"); preset + fps because encode time
+    # scales with both. The Go server's Manager.learnSpeed consumes it.
     content_s = (chunk.end_s - chunk.start_s) if chunk is not None else info.duration_s
     two_pass = 1 if (args.codec == "hevc" and ctx.hevc_two_pass) else 0
+    machine = os.environ.get("WORKER_LABEL") or "graviton"
+    fps_i = max(1, round(float(info.fps)))
     if encode_wall_s > 0 and content_s > 0:
-        print(f"[[ENCODER-SPEED codec={args.codec} height={rung.height} "
-              f"two_pass={two_pass} content_s={content_s:.1f} "
+        print(f"[[ENCODER-SPEED machine={machine} codec={args.codec} "
+              f"height={rung.height} two_pass={two_pass} preset={args.preset} "
+              f"fps={fps_i} content_s={content_s:.1f} "
               f"encode_s={encode_wall_s:.1f}]]", flush=True)
     return 0
 

@@ -75,6 +75,33 @@ func probeSourceWidth(path string) int {
 	return w
 }
 
+// probeSourceFps reads a clip's video frame rate (rounded to the nearest whole
+// fps) via ffprobe, so the speed model — which keys on fps because encode time
+// scales with frame count — can size cloud-batch chunks and rank priorities at
+// the right rate. Returns 0 on failure (callers treat that as "unknown" → 30).
+func probeSourceFps(path string) int {
+	cmd := exec.Command("ffprobe", "-v", "error",
+		"-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
+		"-of", "default=noprint_wrappers=1:nokey=1", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	s := strings.TrimSpace(string(out))
+	if n, d, ok := strings.Cut(s, "/"); ok {
+		num, e1 := strconv.ParseFloat(n, 64)
+		den, e2 := strconv.ParseFloat(d, 64)
+		if e1 == nil && e2 == nil && den > 0 {
+			return int(math.Round(num / den))
+		}
+		return 0
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return int(math.Round(f))
+	}
+	return 0
+}
+
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\[\?[0-9;]*[a-zA-Z]|\x1b[()][0-9A-B]|\x1b\][^\x07]*\x07|\r`)
 
 func stripANSI(s string) string {
@@ -108,9 +135,11 @@ var (
 	// "AMI cache hit" signal for the UI, independent of timing.
 	bootMarkerRe = regexp.MustCompile(`^\[\[ENCODER-BOOT ami=(\S+)\]\]$`)
 	// ENCODER-SPEED reports a completed encode's content-seconds vs wall-seconds
-	// so the control plane can learn each (codec, height, pass)'s speed for the
-	// dynamic chunk selector. Consumed by Manager.learnSpeed (not per-job).
-	speedMarkerRe = regexp.MustCompile(`^\[\[ENCODER-SPEED codec=(\S+) height=(\d+) two_pass=([01]) content_s=([0-9.]+) encode_s=([0-9.]+)\]\]$`)
+	// so the control plane can learn each variant's speed for the dynamic chunk
+	// selector, cost, and ETA. Keyed by every dimension that moves encode time:
+	// machine (mac/ubuntu/macmini local worker label, or "graviton" on cloud
+	// batch), codec, height, pass, preset, fps. Consumed by Manager.learnSpeed.
+	speedMarkerRe = regexp.MustCompile(`^\[\[ENCODER-SPEED machine=(\S+) codec=(\S+) height=(\d+) two_pass=([01]) preset=(\S+) fps=(\d+) content_s=([0-9.]+) encode_s=([0-9.]+)\]\]$`)
 	// ENCODER-RECLAIM reports one encode chunk's spot-reclaim accounting:
 	// count (# reclaimed attempts), lost_s (encode wall-time thrown away), and
 	// total_s (all attempts' wall-time = the "total encoded" denominator).
@@ -146,11 +175,15 @@ func (m *Manager) learnSpeed(line string) bool {
 	if sm == nil {
 		return false
 	}
-	height, _ := strconv.Atoi(sm[2])
-	contentS, _ := strconv.ParseFloat(sm[4], 64)
-	encodeS, _ := strconv.ParseFloat(sm[5], 64)
+	machine, codec := sm[1], sm[2]
+	height, _ := strconv.Atoi(sm[3])
+	twoPass := sm[4] == "1"
+	preset := sm[5]
+	fps, _ := strconv.Atoi(sm[6])
+	contentS, _ := strconv.ParseFloat(sm[7], 64)
+	encodeS, _ := strconv.ParseFloat(sm[8], 64)
 	if m.Speeds != nil {
-		m.Speeds.Update(sm[1], height, sm[3] == "1", contentS, encodeS)
+		m.Speeds.Update(machine, codec, height, twoPass, preset, fps, contentS, encodeS)
 	}
 	return true
 }
@@ -202,7 +235,10 @@ func (m *Manager) computeProgress(job *Job) {
 			height, _ := strconv.Atoi(mm[2])
 			sp := 0.1
 			if m.Speeds != nil {
-				sp = m.Speeds.Speed(mm[1], height, mm[1] == "hevc" && twoPass)
+				// Machine-agnostic: relative weights across variants cancel the
+				// per-machine/preset/fps factors, so this need only rank variants
+				// by cost. hevc honours the job's 2-pass setting; others 1-pass.
+				sp = m.Speeds.RelativeSpeed(mm[1], height, mm[1] == "hevc" && twoPass, "", 0)
 			}
 			if sp <= 0 {
 				sp = 0.001
@@ -434,15 +470,15 @@ func (j *Job) parseMarker(line string) bool {
 		return true
 	}
 	if m := commercialMarkerRe.FindStringSubmatch(line); m != nil {
+		// Only the SaaS baselines come from Python now (per-output-minute pricing
+		// needs no learned data). The AWS spot/on-demand numbers are computed
+		// server-side from the learned graviton speed model (projectCloudCost),
+		// so the marker's aws/aws_od fields (m[3]/m[4]) are intentionally ignored.
 		commercial, _ := strconv.ParseFloat(m[1], 64)
 		mediaconvert, _ := strconv.ParseFloat(m[2], 64)
-		aws, _ := strconv.ParseFloat(m[3], 64)
-		awsOD, _ := strconv.ParseFloat(m[4], 64)
 		j.mu.Lock()
 		j.CommercialUSD = commercial
 		j.MediaConvertUSD = mediaconvert
-		j.AwsSpotUSD = aws
-		j.AwsOndemandUSD = awsOD
 		j.mu.Unlock()
 		return true
 	}
@@ -1971,10 +2007,14 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 }
 
 func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int) error {
-	// Cloud jobs batch every remaining file into a single cli_cloud.py
-	// invocation so one EC2 instance handles the whole job — boot once,
-	// docker pull once, amortize the launch + pull overhead across N
-	// clips. Local jobs still run one worker per file.
+	// Project the AWS Batch (Graviton) compute cost of this job's ladder up
+	// front, from the first source file's probe and the learned graviton speed
+	// model. Target-independent (the "what would this cost on our cloud fleet?"
+	// comparison applies to local-dist runs too) and idempotent on reattach.
+	m.projectAndSetCloudCost(job)
+
+	// cloud-batch fans the whole job onto AWS Batch via Step Functions; local-dist
+	// runs one worker container per file below.
 	if job.Config.Target == TargetCloudBatch {
 		return m.encodeCloudBatchSFN(job, tmpDir, startIdx)
 	}
@@ -2208,7 +2248,10 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		if srcWidth > 0 {
 			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
 		}
-		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, srcWidth, durationS, job.Config.ChunkDuration, m.jobPriorityBase(job), job.AppendLog)
+		// Source fps: keys the speed model (encode time ∝ frame count), so chunk
+		// sizes/priorities match the graviton keys learned at the same rate.
+		srcFps := probeSourceFps(localSrc)
+		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, srcWidth, srcFps, durationS, job.Config.ChunkDuration, m.jobPriorityBase(job), job.AppendLog)
 		expectedEncodes = expEnc
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
@@ -2356,10 +2399,10 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 // learned encode speed (slow → 12s floor, cheap → whole clip); "whole" → one
 // chunk; a number → that fixed size. clipS==0 (duration unknown) collapses to
 // whole downstream.
-func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, codec string, height int, twoPass bool) float64 {
+func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, codec string, height int, twoPass bool, preset string, fps int) float64 {
 	switch cfg {
 	case "dynamic", "":
-		return dynamicChunkSeconds(speeds, codec, height, twoPass, clipS)
+		return dynamicChunkSeconds(speeds, codec, height, twoPass, preset, fps, clipS)
 	case "whole":
 		if clipS > 0 {
 			return clipS
@@ -2379,12 +2422,12 @@ func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, co
 // speed model as the dynamic chunk selector, so ordering sharpens as speeds are
 // learned. Clamped to Batch's [1, 9999] priority range. When the clip duration
 // is unknown (0), content falls back to 1 so variants still rank by 1/speed.
-func predictedPriority(speeds *EncodeSpeedStore, codec string, height int, twoPass bool, clipS float64) int {
+func predictedPriority(speeds *EncodeSpeedStore, codec string, height int, twoPass bool, preset string, fps int, clipS float64) int {
 	content := clipS
 	if content <= 0 {
 		content = 1
 	}
-	p := int(math.Round(content / speeds.Speed(codec, height, twoPass)))
+	p := int(math.Round(content / speeds.Speed("graviton", codec, height, twoPass, preset, fps)))
 	if p < 1 {
 		p = 1
 	}
@@ -2398,7 +2441,7 @@ func predictedPriority(speeds *EncodeSpeedStore, codec string, height int, twoPa
 // how many chunks, the per-chunk length, and — for the dynamic selector — the
 // speed (learned or seeded) and target that produced it. This is what makes a
 // "why is h264 1080p one whole chunk?" question answerable from the log alone.
-func chunkPlanLine(cfg, codec, label string, height int, twoPass bool, speeds *EncodeSpeedStore, chunkS float64, count int, clipS float64) string {
+func chunkPlanLine(cfg, codec, label string, height int, twoPass bool, preset string, fps int, speeds *EncodeSpeedStore, chunkS float64, count int, clipS float64) string {
 	pass := "1-pass"
 	if twoPass {
 		pass = "2-pass"
@@ -2411,7 +2454,7 @@ func chunkPlanLine(cfg, codec, label string, height int, twoPass bool, speeds *E
 		codec, label, pass, mode, chunkS)
 	switch cfg {
 	case "dynamic", "":
-		sp, n := speeds.SpeedDetail(codec, height, twoPass)
+		sp, n := speeds.SpeedDetail("graviton", codec, height, twoPass, preset, fps)
 		src := fmt.Sprintf("seeded %.3gx", sp)
 		if n > 0 {
 			src = fmt.Sprintf("learned %.3gx (%d samples)", sp, n)
@@ -2493,7 +2536,7 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached bool, sourceWidth int, clipDurationS float64, chunkCfg string, priorityBase int, logf func(string)) (string, int) {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached bool, sourceWidth, sourceFps int, clipDurationS float64, chunkCfg string, priorityBase int, logf func(string)) (string, int) {
 	if ladderName == "" {
 		ladderName = "apple-uniq-live"
 	}
@@ -2553,7 +2596,7 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			// resolution-tier + HEVC-bump heuristic — pixels, codec, and pass
 			// all fold into the speed model, so 1080p sorts ahead of 1044p and
 			// 4K HEVC 2-pass far ahead of any H.264, self-correcting as learned.
-			prio := predictedPriority(speeds, c, r.Height, twoPass, clipDurationS)
+			prio := predictedPriority(speeds, c, r.Height, twoPass, r.Preset, sourceFps, clipDurationS)
 			// Compress the within-job priority to 0-999 (order preserved; very slow
 			// variants tie at the top) and lift it into this job's band.
 			if prio > 999 {
@@ -2562,14 +2605,14 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			prio = clampPrio(priorityBase + prio)
 			// Per-variant chunking: size this variant's chunks (dynamic by
 			// complexity, or the job's fixed/whole config), then enumerate them.
-			cs := variantChunkSeconds(chunkCfg, clipDurationS, speeds, c, r.Height, twoPass)
+			cs := variantChunkSeconds(chunkCfg, clipDurationS, speeds, c, r.Height, twoPass, r.Preset, sourceFps)
 			nc := chunkCountForDuration(clipDurationS, cs)
 			idx := make([]int, nc)
 			for k := range idx {
 				idx[k] = k
 			}
 			if logf != nil {
-				logf(chunkPlanLine(chunkCfg, c, r.Label, r.Height, twoPass, speeds, cs, nc, clipDurationS))
+				logf(chunkPlanLine(chunkCfg, c, r.Label, r.Height, twoPass, r.Preset, sourceFps, speeds, cs, nc, clipDurationS))
 			}
 			variants = append(variants, sfnVariant{
 				Codec:         c,
