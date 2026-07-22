@@ -476,7 +476,13 @@ def phase_variant(args: argparse.Namespace) -> int:
     # the vCPU we pay for is crunching video vs sitting idle-reserved.
     ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
     _enc_t0 = time.monotonic()
-    out_path = encode_variant(ctx, args.codec, rung, chunk=chunk)
+    # ENCODE_THREADS pins ffmpeg's thread count independent of the node: under a
+    # scheduler (Nomad) the CPU reservation is for bin-packing, not a hard core
+    # cap, so we can't rely on cgroup detection to size the encode. When unset
+    # (0), fall back to the cgroup quota (the AWS Batch path, where vCPU == cap).
+    _threads_env = int(os.environ.get("ENCODE_THREADS", "0") or "0")
+    out_path = encode_variant(ctx, args.codec, rung, chunk=chunk,
+                              threads=_threads_env or None)
     encode_wall_s = time.monotonic() - _enc_t0
     ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu_s = (ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime)

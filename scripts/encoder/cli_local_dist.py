@@ -505,6 +505,90 @@ def run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_plan(args, info):
+    """Shared prep: resolve rungs_by_codec + coalesced chunk count from the
+    source probe. Used by both the pool DAG and the Temporal plan."""
+    ladder_def = get_ladder(args.ladder)
+    overrides = {"hevc": parse_bitrate_override(args.bitrate_override_hevc),
+                 "h264": parse_bitrate_override(args.bitrate_override_h264), "av1": {}}
+    codecs = {"both": ["hevc", "h264"], "all": ["hevc", "h264", "av1"]}.get(
+        args.codec, [args.codec])
+    rungs_by_codec: dict[str, list[Rung]] = {}
+    for codec in codecs:
+        rr = select_rungs(ladder_def, codec, args.max_res, info.width, overrides[codec])
+        if rr:
+            rungs_by_codec[codec] = rr
+    chunks = _coalesce_runt_tail(
+        plan_chunks(info.duration_s, args.chunk_duration_s, _SEGMENT_DURATION_S))
+    return rungs_by_codec, len(chunks)
+
+
+def run_temporal(args: argparse.Namespace) -> int:
+    """Temporal backend: prep locally, then hand the DAG to a durable
+    EncodeWorkflow that fans activities across the worker pool. The heavy
+    lifting + failover live in Temporal; this just plans, uploads, starts the
+    workflow, waits, and pulls the output down."""
+    import asyncio
+    from temporalio.client import Client
+
+    input_path = Path(args.input)
+    if not os.access(input_path, os.R_OK):
+        print(f"error: cannot read input: {input_path}", file=sys.stderr)
+        return 1
+    try:
+        info = probe(input_path)
+    except ProbeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    bucket = args.s3_bucket
+    prefix = args.job_prefix.strip("/")
+    src_key = f"{prefix}/input{input_path.suffix}"
+    rungs_by_codec, n_chunks = _resolve_plan(args, info)
+    if not rungs_by_codec:
+        print("error: no ladder rungs fit this source", file=sys.stderr)
+        return 1
+
+    _emit_plan(rungs_by_codec,
+               {(c, r.label): n_chunks for c, rr in rungs_by_codec.items() for r in rr},
+               info.has_audio)
+    _upload_source(input_path, bucket, src_key)
+
+    two_pass = {"hevc": not args.hevc_single_pass, "h264": False, "av1": False}
+    plan = {
+        "bucket": bucket, "job_prefix": prefix, "src_key": src_key,
+        "has_audio": info.has_audio, "chunk_duration_s": args.chunk_duration_s,
+        "n_chunks": n_chunks,
+        "codecs": {c: {"two_pass": two_pass[c],
+                       "rungs": [{"label": r.label, "width": r.width,
+                                  "height": r.height, "bitrate": r.bitrate} for r in rr]}
+                   for c, rr in rungs_by_codec.items()},
+    }
+
+    async def go():
+        client = await Client.connect(args.temporal_address)
+        wid = f"encode-{prefix.replace('/', '-')}"
+        print(f"[dist] starting workflow {wid} on {args.temporal_address}", flush=True)
+        handle = await client.start_workflow(
+            "EncodeWorkflow", plan, id=wid, task_queue=args.temporal_task_queue)
+        return await handle.result()
+
+    try:
+        result = asyncio.run(go())
+    except Exception as e:  # noqa: BLE001
+        print(f"[dist] workflow failed: {e}", file=sys.stderr)
+        return 1
+    print(f"[dist] workflow result: {result}", flush=True)
+
+    out_dir = Path(args.output_dir)
+    for codec in rungs_by_codec:
+        dest = out_dir / f"{args.output}_{codec}"
+        n = _download_prefix(bucket, f"{prefix}/out/output_{codec}/", dest)
+        print(f"[dist] downloaded {n} file(s) -> {dest}", flush=True)
+    print("[dist] done", flush=True)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cli_local_dist")
     p.add_argument("--input", required=True)
@@ -533,11 +617,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--remote-code-mount", default=None, dest="remote_code_mount",
                    help="host path to mount over /app/scripts/encoder on remote "
                         "workers (for a stale remote image)")
+    # Backend: 'pool' = hand-rolled docker/ssh pool; 'temporal' = durable
+    # EncodeWorkflow across Temporal workers.
+    p.add_argument("--backend", choices=("pool", "temporal"), default="pool")
+    p.add_argument("--temporal-address", default="127.0.0.1:7233",
+                   dest="temporal_address")
+    p.add_argument("--temporal-task-queue", default="encode",
+                   dest="temporal_task_queue")
     return p
 
 
 def main() -> int:
-    return run(build_parser().parse_args())
+    args = build_parser().parse_args()
+    return run_temporal(args) if args.backend == "temporal" else run(args)
 
 
 if __name__ == "__main__":
