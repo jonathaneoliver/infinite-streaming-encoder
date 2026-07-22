@@ -31,19 +31,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         rsync openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
-# ffmpeg + ffprobe: latest static GPL build (BtbN), which ships a much newer
+# ffmpeg + ffprobe: PINNED static GPL build (BtbN), which ships a much newer
 # libx265 than Debian's apt package — measurably faster HEVC (see
 # infra/local-cluster/PERFORMANCE.md). Multi-arch; self-contained binaries.
+# Pinned (tag + build) for reproducible images; bump both to update.
+ARG FFMPEG_TAG=autobuild-2026-07-22-13-36
+ARG FFMPEG_BUILD=ffmpeg-N-125716-g1b1f602699
 RUN set -eux; \
     case "${TARGETARCH}" in \
         amd64) farch="linux64" ;; \
         arm64) farch="linuxarm64" ;; \
         *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-${farch}-gpl.tar.xz" -o /tmp/ffmpeg.tar.xz; \
+    curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_TAG}/${FFMPEG_BUILD}-${farch}-gpl.tar.xz" -o /tmp/ffmpeg.tar.xz; \
     tar -xJf /tmp/ffmpeg.tar.xz -C /tmp; \
-    mv /tmp/ffmpeg-master-latest-${farch}-gpl/bin/ffmpeg \
-       /tmp/ffmpeg-master-latest-${farch}-gpl/bin/ffprobe /usr/local/bin/; \
+    mv /tmp/${FFMPEG_BUILD}-${farch}-gpl/bin/ffmpeg \
+       /tmp/${FFMPEG_BUILD}-${farch}-gpl/bin/ffprobe /usr/local/bin/; \
     rm -rf /tmp/ffmpeg*; \
     ffmpeg -version | head -1
 
