@@ -155,6 +155,102 @@ func (m *Manager) learnSpeed(line string) bool {
 	return true
 }
 
+// encodeStageKeyRe parses an encode stage key into codec + output height, for
+// cost-weighting the overall progress. Matches chunked ("encode:hevc:1080p:chunk3")
+// and whole-variant ("encode:h264:1080p") keys alike.
+var encodeStageKeyRe = regexp.MustCompile(`^encode:([a-z0-9]+):(\d+)p?(:chunk\d+)?$`)
+
+// computeProgress sets job.OverallProgress + job.ETASeconds. It weights each
+// encode VARIANT by its expected wall-time (1 / learned content-per-wall speed),
+// so a slow 4K HEVC 2-pass rendition dominates a fast h264 360p one — and the
+// weighting self-corrects as the learned-speed model fills in from finished
+// chunks. Grouped by variant so dynamic chunking's chunk COUNT doesn't double-
+// count cost; pipeline stages (mezzanine/audio/package/…) share ~10% of the
+// weight so the tail counts but never dominates. ETA is a linear extrapolation
+// of the weighted progress over elapsed wall-time.
+func (m *Manager) computeProgress(job *Job) {
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	if len(job.Stages) == 0 {
+		return
+	}
+	twoPass := !job.Config.HevcSinglePass
+	eff := func(s StageProgress) float64 {
+		switch s.Status {
+		case "done":
+			return 100
+		case "failed":
+			return 0
+		}
+		return s.Percent
+	}
+	type vagg struct {
+		sum, weight float64
+		n           int
+	}
+	variants := map[string]*vagg{}
+	var pipeline []float64
+	for _, s := range job.Stages {
+		mm := encodeStageKeyRe.FindStringSubmatch(s.Key)
+		if mm == nil {
+			pipeline = append(pipeline, eff(s))
+			continue
+		}
+		vk := mm[1] + ":" + mm[2]
+		v := variants[vk]
+		if v == nil {
+			height, _ := strconv.Atoi(mm[2])
+			sp := 0.1
+			if m.Speeds != nil {
+				sp = m.Speeds.Speed(mm[1], height, mm[1] == "hevc" && twoPass)
+			}
+			if sp <= 0 {
+				sp = 0.001
+			}
+			v = &vagg{weight: 1.0 / sp}
+			variants[vk] = v
+		}
+		v.sum += eff(s)
+		v.n++
+	}
+	var num, den, variantTotal float64
+	var outSum float64
+	var outN int
+	for _, v := range variants {
+		if v.n > 0 {
+			vp := v.sum / float64(v.n)
+			num += v.weight * vp
+			den += v.weight
+			variantTotal += v.weight
+			outSum += vp // output-time %: every rendition equal, cost-blind
+			outN++
+		}
+	}
+	if outN > 0 {
+		job.OutputProgress = outSum / float64(outN)
+	}
+	if len(pipeline) > 0 {
+		pw := 1.0
+		if variantTotal > 0 {
+			pw = 0.10 * variantTotal / float64(len(pipeline)) // pipeline ≈ 10% of the bar
+		}
+		for _, p := range pipeline {
+			num += pw * p
+			den += pw
+		}
+	}
+	if den <= 0 {
+		return
+	}
+	prog := num / den
+	job.OverallProgress = prog
+	if prog > 1 && prog < 99.5 && !job.StartedAt.IsZero() {
+		job.ETASeconds = time.Since(job.StartedAt).Seconds() * (100 - prog) / prog
+	} else {
+		job.ETASeconds = 0
+	}
+}
+
 // upsertStage sets (or creates) a stage by key with the given label, status and
 // percent, stamping StartedAt/EndedAt on transitions. For Go-side stages (the
 // input upload) that aren't part of the worker's PLAN. Set before the worker's
@@ -728,6 +824,21 @@ type Job struct {
 	// files land in StagesHistory.
 	Stages []StageProgress `json:"stages,omitempty"`
 
+	// OverallProgress is a single 0–100% for the whole encode, WEIGHTED by each
+	// variant's expected wall-time (1/learned-speed) so a slow 4K HEVC 2-pass
+	// rendition counts far more than a fast h264 360p one — and it self-corrects
+	// as the learned-speed model updates from finished chunks. ETASeconds is a
+	// linear extrapolation of that weighted progress over elapsed time (0 when
+	// not estimable). Both recomputed on every notify by Manager.computeProgress.
+	OverallProgress float64 `json:"overall_progress,omitempty"`
+	ETASeconds      float64 `json:"eta_seconds,omitempty"`
+	// OutputProgress is the OTHER progress metric: % of the output video timeline
+	// produced (content-seconds done ÷ total), every rendition weighted equally
+	// regardless of encode cost. Differs from OverallProgress (compute-weighted)
+	// because 4K HEVC is cheap in output-minutes but huge in compute. "Processing"
+	// vs "output-time" — most people want OverallProgress; this is the companion.
+	OutputProgress float64 `json:"output_progress,omitempty"`
+
 	// Per-file progress indicators. CurrentFile/FileIndex/TotalFiles
 	// populate on the first [[ENCODER-FILE]] marker (or the Go loop's
 	// direct call for local encodes). UI renders "File N of M: name"
@@ -1065,6 +1176,7 @@ func (m *Manager) Unsubscribe(ch chan *Job) {
 }
 
 func (m *Manager) notify(j *Job) {
+	m.computeProgress(j) // refresh weighted progress + ETA before pushing to SSE
 	m.subMu.Lock()
 	defer m.subMu.Unlock()
 	for _, ch := range m.subscribers {

@@ -91,6 +91,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .job-cancel:hover { text-decoration: underline; }
 .job-retry { cursor: pointer; color: #8cf; font-size: 0.8rem; margin-left: 12px; font-weight: 600; }
 .job-retry:hover { text-decoration: underline; }
+.job-redo { cursor: pointer; color: #d0883a; font-size: 0.8rem; margin-left: 12px; font-weight: 600; }
+.job-redo:hover { text-decoration: underline; }
 .job-simulate { cursor: pointer; color: #ffa94d; font-size: 0.8rem; margin-left: 12px; }
 .job-simulate:hover { text-decoration: underline; }
 .stages-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.8rem; }
@@ -2069,6 +2071,23 @@ function updateJobRow(row, j) {
         retryEl.remove();
     }
 
+    // Redo action — re-encode the WHOLE job from scratch, reusing nothing. Shown
+    // on ANY terminal job (done/failed/cancelled), unlike Retry which resumes a
+    // partial. Own class so the Retry selector above doesn't grab it.
+    let redoEl = actions.querySelector('.job-redo');
+    const redoable = (j.status === 'done' || j.status === 'failed' || j.status === 'cancelled') &&
+                     j.config && j.config.target;
+    if (redoable && !redoEl) {
+        redoEl = document.createElement('span');
+        redoEl.className = 'job-redo';
+        redoEl.textContent = 'Redo';
+        redoEl.title = 'Re-encode the whole job from scratch — reuses nothing (forces re-encode of every rendition).';
+        redoEl.setAttribute('onclick', `redoJob('${j.id}')`);
+        actions.appendChild(redoEl);
+    } else if (!redoable && redoEl) {
+        redoEl.remove();
+    }
+
     // Simulate-interrupt test action — running jobs only.
     //   cloud: needs cloud_job_id so the S3 sentinel points at the
     //          right prefix; triggers the remote's spot-interrupt
@@ -2201,6 +2220,29 @@ async function retryJob(id) {
         switchTab('jobs');
     } catch (e) {
         showToast('Retry failed: ' + e, 'error');
+    }
+}
+
+async function redoJob(id) {
+    const confirmed = await showDialog(
+        'Redo job from scratch',
+        'Re-encode this entire job again, reusing nothing? Every rendition is produced fresh (existing outputs are archived/replaced) — this does the full amount of work again.',
+        [
+            { label: 'Cancel', value: false, class: 'btn-secondary' },
+            { label: 'Redo', value: true, class: 'btn-primary' }
+        ]
+    );
+    if (!confirmed) return;
+    try {
+        const res = await fetch('/api/jobs/' + id + '/redo', { method: 'POST' });
+        if (!res.ok) {
+            showToast('Redo failed: ' + await res.text(), 'error');
+            return;
+        }
+        showToast('Redo submitted — re-encoding the whole job from scratch', 'success');
+        switchTab('jobs');
+    } catch (e) {
+        showToast('Redo failed: ' + e, 'error');
     }
 }
 
@@ -2970,10 +3012,18 @@ function _overallProgress(j) {
 
 // A compact "Progress" tile with the overall % + a thin bar, for the metrics row.
 function _progressTile() {
-    const pct = _overallProgress(_activeJob());
-    if (pct == null) return '';
+    const j = _activeJob();
+    if (!j) return '';
+    // Prefer the server's cost-weighted "processing" %, "output-time" %, and ETA
+    // (from the learned-speed model); fall back to the client estimate for old
+    // jobs that predate it.
+    const proc = (j.overall_progress > 0) ? Math.round(j.overall_progress) : _overallProgress(j);
+    if (proc == null) return '';
+    const out = (j.output_progress > 0) ? Math.round(j.output_progress) : null;
+    const eta = (j.eta_seconds > 0) ? formatDuration(j.eta_seconds) : null;
+    const sub = [out != null ? `${out}% output` : '', eta ? `ETA ${eta}` : ''].filter(Boolean).join(' · ');
     const tile = (label, valueHtml, title) => `<div class="aws-metric"><div class="aws-metric-label"${title ? ` title="${title}"` : ''}>${label}</div>${valueHtml}</div>`;
-    return tile('Progress', `<div class="aws-metric-value">${pct}%<div style="height:5px;margin-top:4px;background:#20252f;border-radius:3px;overflow:hidden"><div style="width:${pct}%;height:100%;background:#4a90d9"></div></div></div>`, 'Overall completion of the active encode — mean across all stages (upload → chunks → package → download).');
+    return tile('Progress', `<div class="aws-metric-value">${proc}%<div style="height:5px;margin-top:4px;background:#20252f;border-radius:3px;overflow:hidden"><div style="width:${proc}%;height:100%;background:#4a90d9"></div></div>${sub ? `<div style="font-size:10px;color:#888;margin-top:3px">${sub}</div>` : ''}</div>`, 'Processing % — weighted by expected encode cost (compute/time), so a 4K HEVC rendition counts far more than a 360p one. Sub-line: % of the output video timeline produced (cost-blind) + ETA.');
 }
 
 function _localMetricsTiles() {

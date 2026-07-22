@@ -98,6 +98,10 @@ RUN chmod +x /app/scripts/*.sh 2>/dev/null || true; \
 # PYTHONPATH lets `python3 -m encoder.foo` and `from encoder.foo import bar`
 # resolve regardless of the worker container's CWD.
 ENV PYTHONPATH=/app/scripts
+# Unbuffered stdout/stderr: our progress markers use flush=True, but this makes
+# EVERY print (incl. plain log lines + subprocess output) reach the Go log scanner
+# immediately instead of block-buffering when stdout is a pipe (it always is).
+ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 EXPOSE 8080

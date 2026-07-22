@@ -70,6 +70,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/jobs/stream", s.streamJobs)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/cancel", s.cancelJob)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/retry", s.retryJob)
+	s.Mux.HandleFunc("POST /api/jobs/{id}/redo", s.redoJob)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/simulate-interrupt", s.simulateInterrupt)
 	s.Mux.HandleFunc("GET /api/jobs/{id}/workdir", s.jobWorkdir)
 	// AWS inventory + cleanup (issue #5)
@@ -445,6 +446,31 @@ func (s *Server) retryJob(w http.ResponseWriter, r *http.Request) {
 	// lives at TMPDIR/encode_<stem>/ on the host filesystem, so
 	// variants + mezzanine from a prior partial run are still there
 	// when the new worker starts. No config plumbing needed.
+	job := s.Manager.Submit(cfg)
+	writeJSON(w, job)
+}
+
+// redoJob submits a new job with the same config as `id` but re-encodes the WHOLE
+// thing from scratch — no reuse. Unlike Retry (which resumes from prior staging
+// and keeps already-completed variants), Redo sets ForceReencode and clears any
+// resume pointer, so every rendition is produced again. Works on any terminal
+// job (done, failed, or cancelled) — "do it all over."
+func (s *Server) redoJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	orig := s.Manager.GetJob(id)
+	if orig == nil {
+		http.Error(w, "job not found", 404)
+		return
+	}
+	switch orig.Status {
+	case encode.StatusDone, encode.StatusFailed, encode.StatusCancelled:
+	default:
+		http.Error(w, "job is still active — cancel it before redoing", 400)
+		return
+	}
+	cfg := orig.Config
+	cfg.ForceReencode = true // re-encode every rendition, ignore existing outputs
+	cfg.ResumeFromJobID = "" // no prior staging — start fresh
 	job := s.Manager.Submit(cfg)
 	writeJSON(w, job)
 }

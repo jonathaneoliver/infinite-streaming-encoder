@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -33,6 +34,9 @@ from temporalio.common import RetryPolicy
 from temporalio.worker import Worker
 
 TASK_QUEUE = os.environ.get("TEMPORAL_TASK_QUEUE", "encode")
+
+# Pulls the live % out of an ENCODER-STAGE marker so it can ride the heartbeat.
+_STAGE_PCT_RE = re.compile(r"percent=([0-9.]+)\]\]")
 
 
 def _terminate(proc: subprocess.Popen) -> None:
@@ -109,14 +113,24 @@ def encode_phase(spec: dict) -> None:
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     assert proc.stdout is not None
     last = ""
+    progress = 0.0
     try:
         for line in proc.stdout:
             last = line.rstrip("\n")
             if last.startswith("[[ENCODER"):
                 print(last, flush=True)
+                # cli_phase's run_ffmpeg_with_progress emits ENCODER-STAGE with the
+                # live out_time/duration %. Capture it so the orchestrator can show
+                # real per-chunk progress instead of a binary 0→100 on completion.
+                mp = _STAGE_PCT_RE.search(last)
+                if mp:
+                    try:
+                        progress = float(mp.group(1))
+                    except ValueError:
+                        pass
             activity.heartbeat(last[:180], {
                 "machine": _MACHINE, "busy": round(_busy_cores(), 2),
-                "perf": _PERF_CORES})
+                "perf": _PERF_CORES, "progress": round(progress, 1)})
             # Cancellation (from a workflow cancel when the user cancels the job)
             # rides in on the heartbeat response. Kill ffmpeg now so a cancelled
             # chunk stops immediately instead of running to completion on this
