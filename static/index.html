@@ -61,6 +61,19 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .job-files { font-family: 'SF Mono', Menlo, monospace; font-size: 0.85rem; }
 .job-meta { font-size: 0.8rem; color: #888; }
 .job-progress { margin-top: 8px; font-family: 'SF Mono', Menlo, monospace; font-size: 0.8rem; color: #4cc9f0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Per-job progress %, bar, and ETA — moved off the fleet metrics so each job
+   carries its own (two jobs, even on one target, need separate progress). */
+.job-prog { margin-top: 8px; }
+.job-prog-row { display: flex; align-items: center; gap: 10px; }
+.job-prog-pct { font-weight: 700; font-size: 0.95rem; color: #cfe6f5; min-width: 3ch; }
+.job-prog-bar { flex: 1; max-width: 420px; height: 7px; background: #20252f; border-radius: 4px; overflow: hidden; }
+.job-prog-bar > div { height: 100%; background: #4a90d9; transition: width .4s ease; }
+.job-prog-sub { font-size: 0.72rem; color: #8a94a2; white-space: nowrap; }
+/* Jobs-tab overview strip + per-target group headers. */
+.jobs-overview { padding: 10px 16px; margin-bottom: 12px; background: #151a24; border: 1px solid #232a36; border-radius: 8px; font-size: 0.9rem; color: #aeb7c2; }
+.jobs-overview b { color: #e6edf3; }
+.jobs-group-hdr { margin: 14px 0 6px; padding-bottom: 4px; border-bottom: 1px solid #232a36; font-size: 0.82rem; letter-spacing: .02em; color: #8a94a2; text-transform: none; }
+.jobs-group-hdr:first-child { margin-top: 0; }
 
 .status-queued { color: #888; }
 .status-running { color: #4cc9f0; }
@@ -489,13 +502,15 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
 <!-- JOBS TAB -->
 <div id="tab-jobs" class="tab-content">
-    <div class="panel" id="jobs-fleet-panel">
-        <h2>Fleet</h2>
-        <div class="aws-summary" id="jobs-aws-metrics"></div>
+    <div class="jobs-overview" id="jobs-overview" style="display:none"></div>
+    <div class="panel" id="jobs-cloud-fleet-panel" style="display:none">
+        <h2>Cloud Fleet</h2>
+        <div class="aws-summary" id="jobs-cloud-metrics"></div>
         <div id="jobs-fleet-full" title="Live cloud fleet — per-instance packing, utilization, and lifecycle (from the AWS inventory)"></div>
     </div>
     <div class="panel" id="jobs-local-fleet-panel" style="display:none">
-        <h2>Local fleet</h2>
+        <h2>Local Fleet</h2>
+        <div class="aws-summary" id="jobs-local-metrics"></div>
         <div id="jobs-local-fleet" title="Live local cluster — per-machine CPU, packing, and the chunks running on each box"></div>
     </div>
     <div class="panel">
@@ -1742,6 +1757,7 @@ function jobRowHtml(j) {
             </div>
             ${_jobConfigHtml(j.config)}
             <div class="job-progress"></div>
+            <div class="job-prog" style="display:none"></div>
             <div class="job-error" style="color:#ef476f;font-size:0.8rem;margin-top:4px;display:none"></div>
             <div class="current-file" style="display:none;font-size:0.85rem;color:#8cf;margin-top:8px;font-weight:600"></div>
             <table class="stages-table" style="display:none"><tbody></tbody></table>
@@ -1985,6 +2001,29 @@ function updateJobRow(row, j) {
     }
     row.querySelector('.job-progress').textContent = j.progress || '';
 
+    // Per-job progress %, bar, and ETA — the cost-weighted "processing" % from the
+    // learned-speed model (falls back to the client estimate for old jobs), with
+    // output-time % + ETA on the sub-line. Only while the job is live.
+    const progEl = row.querySelector('.job-prog');
+    if (progEl) {
+        const live = /running|encoding|starting|pending|queued/i.test(j.status || '');
+        const p = (j.overall_progress > 0) ? Math.round(j.overall_progress)
+                : (live ? _overallProgress(j) : null);
+        if (live && p != null) {
+            const out = (j.output_progress > 0) ? Math.round(j.output_progress) : null;
+            const eta = (j.eta_seconds > 0) ? formatDuration(j.eta_seconds) : null;
+            const sub = [out != null ? `${out}% output` : '', eta ? `ETA ${eta}` : ''].filter(Boolean).join(' · ');
+            progEl.innerHTML = `<div class="job-prog-row" title="Processing % — weighted by expected encode cost (a 4K HEVC rendition counts far more than a 360p one). Sub-line: % of output video timeline produced + ETA.">`
+                + `<span class="job-prog-pct">${p}%</span>`
+                + `<div class="job-prog-bar"><div style="width:${p}%"></div></div>`
+                + (sub ? `<span class="job-prog-sub">${sub}</span>` : '')
+                + `</div>`;
+            progEl.style.display = '';
+        } else {
+            progEl.style.display = 'none';
+        }
+    }
+
     // Pre-baked AMI badge — set once the worker reports its boot AMI and the
     // server confirms it matches the baked worker AMI (image already resident).
     const amiEl = row.querySelector('.job-ami-badge');
@@ -2130,31 +2169,91 @@ function updateJobRow(row, j) {
     if (openLogs.has(j.id)) refreshLog(j.id);
 }
 
+// A job runs on the cloud fleet iff its target is cloud(-batch); everything else
+// (local-dist) is the local fleet.
+function _isCloudJob(j) {
+    const t = (j.config || {}).target || '';
+    return t === 'cloud' || t === 'cloud-batch';
+}
+function _jobRunning(j) {
+    return /running|encoding|starting|pending|queued/i.test(j.status || '');
+}
+
+// Overview strip: how many encodes are live, split by fleet. Hidden when idle.
+function renderJobsOverview(all) {
+    const el = document.getElementById('jobs-overview');
+    if (!el) return;
+    const running = all.filter(_jobRunning);
+    if (!running.length) { el.style.display = 'none'; return; }
+    const cloud = running.filter(_isCloudJob).length;
+    const local = running.length - cloud;
+    const parts = [];
+    if (cloud) parts.push(`<b>☁ ${cloud}</b> cloud`);
+    if (local) parts.push(`<b>🖥 ${local}</b> local`);
+    el.style.display = '';
+    el.innerHTML = `<b>${running.length}</b> encode${running.length > 1 ? 's' : ''} running · ${parts.join(' · ')}`;
+}
+
+// Show the Cloud Fleet panel only while something cloud is live (a running
+// cloud-batch job, or a running EC2 instance in the last inventory). The Local
+// Fleet panel is toggled by renderLocalFleet.
+function _cloudActive() {
+    if (Object.values(jobs).some(j => _isCloudJob(j) && _jobRunning(j))) return true;
+    const insts = (_lastFleet && _lastFleet.instances) || [];
+    return insts.some(i => i.state === 'running');
+}
+function syncFleetPanels() {
+    const cp = document.getElementById('jobs-cloud-fleet-panel');
+    if (cp) cp.style.display = _cloudActive() ? '' : 'none';
+}
+
 function renderJobs() {
     const list = document.getElementById('jobs-list');
-    const sorted = Object.values(jobs).sort((a, b) =>
-        new Date(b.started_at) - new Date(a.started_at));
+    const all = Object.values(jobs);
+    renderJobsOverview(all);
+    syncFleetPanels();
 
-    if (sorted.length === 0) {
+    if (all.length === 0) {
         list.innerHTML = '<div class="no-files">No jobs yet</div>';
         return;
     }
-    // Replace the "no jobs" placeholder on the first real render.
     if (list.querySelector('.no-files')) list.innerHTML = '';
 
-    // Upsert each job into the list, preserving existing DOM (and the
-    // log viewer's open state) for rows that already exist.
+    // Group by fleet so cloud and local jobs cluster under the sections above.
+    // Headers appear only when BOTH fleets have jobs (a single-target run reads
+    // like the old flat list). Reordering uses appendChild, which MOVES existing
+    // rows — preserving each row's DOM and its open log viewer.
+    const groups = [
+        { key: 'cloud', label: '☁ Cloud (cloud-batch)', jobs: all.filter(_isCloudJob) },
+        { key: 'local', label: '🖥 Local (local-dist)', jobs: all.filter(j => !_isCloudJob(j)) },
+    ];
+    const showHeaders = groups.every(g => g.jobs.length > 0);
     const seen = new Set();
-    for (const j of sorted) {
-        seen.add(j.id);
-        let row = document.getElementById('job-' + j.id);
-        if (!row) {
-            const tmp = document.createElement('div');
-            tmp.innerHTML = jobRowHtml(j);
-            row = tmp.firstElementChild;
-            list.prepend(row);
+    for (const g of groups) {
+        let hdr = document.getElementById('jobs-group-' + g.key);
+        if (!g.jobs.length || !showHeaders) {
+            if (hdr) hdr.remove();
+        } else {
+            if (!hdr) {
+                hdr = document.createElement('div');
+                hdr.id = 'jobs-group-' + g.key;
+                hdr.className = 'jobs-group-hdr';
+            }
+            hdr.textContent = `${g.label} · ${g.jobs.length}`;
+            list.appendChild(hdr); // move into position
         }
-        updateJobRow(row, j);
+        g.jobs.sort((a, b) => new Date(b.started_at) - new Date(a.started_at));
+        for (const j of g.jobs) {
+            seen.add(j.id);
+            let row = document.getElementById('job-' + j.id);
+            if (!row) {
+                const tmp = document.createElement('div');
+                tmp.innerHTML = jobRowHtml(j);
+                row = tmp.firstElementChild;
+            }
+            list.appendChild(row); // move into grouped order (preserves DOM/logs)
+            updateJobRow(row, j);
+        }
     }
 
     // Drop any rows whose job is no longer in the set.
@@ -2919,21 +3018,17 @@ function renderLocalFleet() {
     const pct = totalCores ? Math.round(busyCores / totalCores * 100) : 0;
     const totalChunks = insts.reduce((a, i) => a + i.chunks.length, 0);
     const chunkLabel = totalChunks ? ` · ${totalChunks} chunk${totalChunks !== 1 ? 's' : ''}` : '';
-    const aj = _activeJob();
-    const awsUsd = (aj && aj.aws_spot_usd) || 0;
-    const awsOd = (aj && aj.aws_ondemand_usd) || 0;
-    const awsLabel = awsUsd > 0 ? ` · <span style="color:#6ab04c" title="what this whole encode would cost on AWS — compute-based (encode vCPU-hours) summed across every variant. Spot is cheaper but reclaimable; on-demand is the guaranteed price.">would cost ~$${awsUsd.toFixed(2)} spot / $${awsOd.toFixed(2)} on-demand on AWS</span>` : '';
     const bar = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
         <div style="flex:1;max-width:520px;height:22px;background:#20252f;border-radius:5px;overflow:hidden">
           <div style="width:${pct}%;height:100%;background:#4a90d9"></div></div>
-        <div style="font-size:13px;color:#ccc"><b>${usedCores}</b> / ${totalCores} cores busy (${pct}%) · <span style="color:#888">${insts.length} machine${insts.length > 1 ? 's' : ''}${chunkLabel}${awsLabel}</span></div>
+        <div style="font-size:13px;color:#ccc"><b>${usedCores}</b> / ${totalCores} cores busy (${pct}%) · <span style="color:#888">${insts.length} machine${insts.length > 1 ? 's' : ''}${chunkLabel}</span></div>
       </div>`;
     const rows = insts.map(i => _localFleetRow(i, maxCores)).join('');
     panel.style.display = '';
     el.innerHTML = bar + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
-    // Keep the metrics row live in local mode too — its own cloud-stats poll is
-    // slow, but pollDistWorkers/SSE call us every few seconds.
-    const mrow = document.getElementById('jobs-aws-metrics');
+    // Local metrics tiles live in THIS panel (not the cloud one). Their own
+    // cloud-stats poll is slow, but pollDistWorkers/SSE call us every few seconds.
+    const mrow = document.getElementById('jobs-local-metrics');
     if (mrow) mrow.innerHTML = _localMetricsTiles();
 }
 
@@ -2966,19 +3061,6 @@ async function pollDistWorkers() {
 }
 setInterval(pollDistWorkers, 5000);   // 5s: keeps the live CPU sparkline current
 pollDistWorkers();
-
-// Local-cluster metrics row, shown in place of the cloud-batch tiles when a
-// local/local-dist encode is active — so the summary row is specific to the
-// target (cloud tiles like "Active batch jobs" / "Saved by spot" / "Max vCPUs"
-// are meaningless for local encoding). Machines + cores busy + chunks running,
-// from the live fleet data.
-// Most-recently-started active job (any target) — what the metrics bar's overall
-// progress reflects.
-function _activeJob() {
-    return Object.values(jobs)
-        .filter(j => /running|encoding|queued|pending/i.test(j.status || ''))
-        .sort((a, b) => new Date(b.started_at || 0) - new Date(a.started_at || 0))[0] || null;
-}
 
 // Single overall completion % for an encode, WEIGHTED BY EXPECTED ENCODE COST —
 // a 4K HEVC 2-pass rendition is ~200× the compute of an h264 360p one, so it must
@@ -3015,22 +3097,6 @@ function _overallProgress(j) {
     return den ? Math.round(num / den) : null;
 }
 
-// A compact "Progress" tile with the overall % + a thin bar, for the metrics row.
-function _progressTile() {
-    const j = _activeJob();
-    if (!j) return '';
-    // Prefer the server's cost-weighted "processing" %, "output-time" %, and ETA
-    // (from the learned-speed model); fall back to the client estimate for old
-    // jobs that predate it.
-    const proc = (j.overall_progress > 0) ? Math.round(j.overall_progress) : _overallProgress(j);
-    if (proc == null) return '';
-    const out = (j.output_progress > 0) ? Math.round(j.output_progress) : null;
-    const eta = (j.eta_seconds > 0) ? formatDuration(j.eta_seconds) : null;
-    const sub = [out != null ? `${out}% output` : '', eta ? `ETA ${eta}` : ''].filter(Boolean).join(' · ');
-    const tile = (label, valueHtml, title) => `<div class="aws-metric"><div class="aws-metric-label"${title ? ` title="${title}"` : ''}>${label}</div>${valueHtml}</div>`;
-    return tile('Progress', `<div class="aws-metric-value">${proc}%<div style="height:5px;margin-top:4px;background:#20252f;border-radius:3px;overflow:hidden"><div style="width:${proc}%;height:100%;background:#4a90d9"></div></div>${sub ? `<div style="font-size:10px;color:#888;margin-top:3px">${sub}</div>` : ''}</div>`, 'Processing % — weighted by expected encode cost (compute/time), so a 4K HEVC rendition counts far more than a 360p one. Sub-line: % of the output video timeline produced (cost-blind) + ETA.');
-}
-
 function _localMetricsTiles() {
     const tile = (label, valueHtml, title) => `<div class="aws-metric"><div class="aws-metric-label"${title ? ` title="${title}"` : ''}>${label}</div>${valueHtml}</div>`;
     const fleet = (_distMachines.fleet || []).filter(f => (f.age_s != null ? f.age_s : 1e9) < 30);
@@ -3039,7 +3105,6 @@ function _localMetricsTiles() {
     const busyCores = Math.round(fleet.reduce((a, f) => a + Math.min(f.perf || 0, (f.latest || 0) / 100 * (f.perf || 0)), 0));
     const chunks = fleet.reduce((a, f) => a + ((f.chunks || []).length), 0);
     return [
-        _progressTile(),
         tile('Local machines', machinePillsHtml(), 'Distributed-local encoder machines. Click a remote pill to enable/disable that box mid-encode; its chunks re-queue to the others.'),
         tile('Machines active', `<div class="aws-metric-value ok">${fleet.length || on}</div>`, 'Machines currently reporting CPU / polling'),
         tile('Cores busy', `<div class="aws-metric-value">${busyCores} <span style="color:#888">/ ${totalCores}</span></div>`, 'Perf-cores busy across the cluster, from live CPU'),
@@ -3047,18 +3112,9 @@ function _localMetricsTiles() {
     ].join('');
 }
 
-// True when a local/local-dist encode is the active target (fresh fleet CPU or a
-// running local-dist job) — the metrics row + fleet then show the LOCAL view.
-function _localModeActive() {
-    if ((_distMachines.fleet || []).some(f => (f.age_s != null ? f.age_s : 1e9) < 30)) return true;
-    return Object.values(jobs).some(j => (j.config || {}).target === 'local-dist'
-        && /running|encoding|queued|pending/i.test(j.status || ''));
-}
-
 function renderJobsMetrics(s) {
-    const el = document.getElementById('jobs-aws-metrics');
+    const el = document.getElementById('jobs-cloud-metrics');
     if (!el) return;
-    if (_localModeActive()) { el.innerHTML = _localMetricsTiles(); return; }
     const execs = s.running_executions || 0;
     const bjobs = s.active_batch_jobs || 0;
     const running = s.running_instances || 0;
@@ -3076,7 +3132,6 @@ function renderJobsMetrics(s) {
             `<label style="margin-right:10px;cursor:pointer;white-space:nowrap"><input type="radio" name="maxvcpu-jobs" value="${v}" ${v === live ? 'checked' : ''} onchange="setMaxVcpus(${v})" style="width:auto;min-width:0;vertical-align:middle"> ${v} ${v === _MAXVCPU_BASE ? '(1×)' : '(2×)'}</label>`).join('') + '</div>';
     }
     el.innerHTML = [
-        _progressTile(),
         tile('Running executions', `<div class="${cls(execs)}">${execs}</div>`),
         tile('Active batch jobs', `<div class="${cls(bjobs)}">${bjobs}</div>`),
         tile('Running instances', `<div class="${cls(running)}">${running}</div>`),
@@ -3086,10 +3141,10 @@ function renderJobsMetrics(s) {
         tile('Spent (last 24h)', `<div class="aws-metric-value">$${(s.spend_24h_usd || 0).toFixed(2)}</div>`, 'Self-tracked: burn rate integrated over the trailing 24h'),
         tile('Saved by spot (total)', `<div class="aws-metric-value ok">$${(s.saved_total_usd || 0).toFixed(2)}</div>`, 'Accumulated (on-demand − spot) cost across all finished cloud-batch jobs'),
         tile('Reclaim waste (24h)', `<div class="aws-metric-value${rpct >= 10 ? ' warn' : rpct > 0 ? '' : ' ok'}">${rpct.toFixed(1)}%</div>`, (s.reclaim_24h_lost_min || 0).toFixed(1) + ' min of encoding lost to reclaims in the last 24h'),
-        tile('Local machines', machinePillsHtml(), 'Distributed-local encoder machines. Coloured to match the chunk plot; click a remote pill to enable/disable that box (mid-encode too — its chunks re-queue to the others). Live per-machine CPU + packing is in the Local fleet panel below.'),
         tile('Keep warm', `<div class="aws-metric-value${(s.min_vcpus || 0) > 0 ? ' ok' : ''}">${s.min_vcpus || 0} vCPU</div>`, 'Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box (0 when idle).'),
         tile('Max vCPUs', vcpuHtml, 'Batch compute-env max vCPUs. 2× runs ~twice as many machines → roughly half the wall-clock for ~the same total cost.'),
     ].join('');
+    syncFleetPanels(); // show/hide the Cloud Fleet panel on the AWS-poll cadence too
 }
 
 function renderMaxVcpuRadio(live) {
