@@ -48,6 +48,10 @@ type Config struct {
 	// live), so it stays warm across the gap between sequential jobs and only
 	// drops when the whole app job queue is empty. Nil disables this signal.
 	ActiveJobs func() int
+	// Trigger fires an immediate inventory check + warm reconcile out of band
+	// (e.g. a job just started or finalized), so the keep-warm floor reacts at
+	// once instead of on the next Interval tick. Nil = poll-only.
+	Trigger <-chan struct{}
 }
 
 type inventoryDoc struct {
@@ -95,6 +99,10 @@ func Run(ctx context.Context, cfg Config) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			runCheck(cfg)
+		case <-cfg.Trigger:
+			// Out-of-band nudge (job start/finalize). A nil Trigger channel never
+			// fires, so this is a no-op when the feature is unwired.
 			runCheck(cfg)
 		}
 	}

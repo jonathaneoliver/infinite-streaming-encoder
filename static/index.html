@@ -61,6 +61,32 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .job-files { font-family: 'SF Mono', Menlo, monospace; font-size: 0.85rem; }
 .job-meta { font-size: 0.8rem; color: #888; }
 .job-progress { margin-top: 8px; font-family: 'SF Mono', Menlo, monospace; font-size: 0.8rem; color: #4cc9f0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Per-job progress %, bar, and ETA — moved off the fleet metrics so each job
+   carries its own (two jobs, even on one target, need separate progress). */
+.job-prog { margin-top: 8px; }
+.job-prog-row { display: flex; align-items: center; gap: 10px; }
+.job-prog-pct { font-weight: 700; font-size: 0.95rem; color: #cfe6f5; min-width: 3ch; }
+.job-prog-bar { flex: 1; max-width: 420px; height: 7px; background: #20252f; border-radius: 4px; overflow: hidden; }
+.job-prog-bar > div { height: 100%; background: #4a90d9; transition: width .4s ease; }
+.job-prog-sub { font-size: 0.72rem; color: #8a94a2; white-space: nowrap; }
+/* Per-job foldable details (the stages table + stats). Finished jobs fold by
+   default; a click remembers your choice for the session. */
+.details-toggle { cursor: pointer; user-select: none; display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 0.75rem; color: #8a94a2; }
+.details-toggle:hover { color: #cfd8e3; }
+.job.details-collapsed .job-details { display: none; }
+.job.details-collapsed .details-toggle .fold-chevron { transform: rotate(-90deg); }
+/* Jobs-tab overview strip + per-target group headers. */
+.jobs-overview { padding: 10px 16px; margin-bottom: 12px; background: #151a24; border: 1px solid #232a36; border-radius: 8px; font-size: 0.9rem; color: #aeb7c2; }
+.jobs-overview b { color: #e6edf3; }
+.jobs-group-hdr { margin: 14px 0 6px; padding-bottom: 4px; border-bottom: 1px solid #232a36; font-size: 0.82rem; letter-spacing: .02em; color: #8a94a2; text-transform: none; }
+.jobs-group-hdr:first-child { margin-top: 0; }
+/* Foldable fleet panels: click the header to collapse the body; a compact
+   summary stays in the header so it's still at-a-glance when folded. */
+.fleet-h2 { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 8px; }
+.fold-chevron { display: inline-block; font-size: 0.7em; color: #8a94a2; transition: transform .15s ease; }
+.fleet-panel.collapsed .fold-chevron { transform: rotate(-90deg); }
+.fleet-panel.collapsed .fleet-body { display: none; }
+.fleet-summary { font-size: 0.75rem; font-weight: 400; color: #8a94a2; margin-left: auto; }
 
 .status-queued { color: #888; }
 .status-running { color: #4cc9f0; }
@@ -91,6 +117,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .job-cancel:hover { text-decoration: underline; }
 .job-retry { cursor: pointer; color: #8cf; font-size: 0.8rem; margin-left: 12px; font-weight: 600; }
 .job-retry:hover { text-decoration: underline; }
+.job-redo { cursor: pointer; color: #d0883a; font-size: 0.8rem; margin-left: 12px; font-weight: 600; }
+.job-redo:hover { text-decoration: underline; }
 .job-simulate { cursor: pointer; color: #ffa94d; font-size: 0.8rem; margin-left: 12px; }
 .job-simulate:hover { text-decoration: underline; }
 .stages-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.8rem; }
@@ -99,6 +127,12 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .stages-table td.stage-bar { width: 55%; }
 .stages-table td.stage-pct { color: #888; white-space: nowrap; text-align: right; font-variant-numeric: tabular-nums; width: 10%; }
 .stages-table tr.stage-pending { opacity: 0.45; }
+/* The wide gap between the short label and the far-right bar makes it hard to
+   track which row is which. Zebra striping aids static scanning; a full-row
+   hover highlight ties label ↔ bar ↔ % together on the row you're pointing at. */
+.stages-table tbody tr:nth-child(even) { background: rgba(255,255,255,0.028); }
+.stages-table tbody tr:hover { background: rgba(67,97,238,0.16); }
+.stages-table tbody tr:hover td.stage-label { color: #dfe6f2; }
 .stage-bar-track { height: 6px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
 .stage-bar-fill { height: 100%; background: #4361ee; transition: width 0.3s ease; }
 .stage-bar-fill.stage-fill-done { background: #06d6a0; }
@@ -119,6 +153,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .encode-hint { margin-top: 10px; font-size: 12px; color: #8a9bb5; line-height: 1.5; }
 .encode-hint b { color: #cdd6e6; font-weight: 600; }
 .encode-hint kbd { display: inline-block; padding: 1px 5px; font-size: 11px; font-family: inherit; color: #dfe6f2; background: #232b3d; border: 1px solid #3a4560; border-radius: 4px; }
+/* Drag-and-drop source upload. */
+#sources-panel { transition: background 0.12s, outline 0.12s; }
+#sources-panel.dropzone-active { outline: 2px dashed #4cc9f0; outline-offset: -6px; background: rgba(76,201,240,0.07); }
+#upload-progress { margin: 8px 0; padding: 8px 12px; background: #14233a; border-radius: 6px; font-size: 12px; color: #cdd6e6; }
 /* Codec multi-select checkboxes (any subset of h264/hevc/av1). */
 .codec-checks { display: flex; gap: 16px; align-items: center; padding: 6px 0; }
 .codec-checks label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; font-weight: 400; }
@@ -147,13 +185,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .ladder-title { font-size: 0.9rem; color: #8cf; font-weight: 600; margin-bottom: 8px; }
 .ladder-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
 .ladder-table th { text-align: left; color: #aac; font-weight: 600; padding: 6px 10px 6px 0; border-bottom: 1px solid #2a2a3a; }
+.ladder-table th.num { text-align: right; }
 .ladder-table td { padding: 6px 10px 6px 0; vertical-align: middle; color: #eee; border-bottom: 1px solid #1f1f2e; }
 .ladder-table tbody tr:last-child td { border-bottom: none; }
 .ladder-res { font-weight: 600; color: #8cf; }
 .ladder-dim { color: #888; font-variant-numeric: tabular-nums; }
 .ladder-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.ladder-bar-cell { width: 30%; }
-.ladder-bar-track { display: inline-block; vertical-align: middle; position: relative; width: calc(100% - 50px); height: 10px; background: #2a2a3a; border-radius: 3px; overflow: visible; }
+.ladder-bar-cell { width: 200px; white-space: nowrap; }
+.ladder-bar-track { display: inline-block; vertical-align: middle; position: relative; width: 130px; height: 10px; background: #2a2a3a; border-radius: 3px; overflow: visible; }
 .ladder-bar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px 0 0 3px; }
 .ladder-bar-overshoot { position: absolute; left: 100%; top: -1px; bottom: -1px; background: repeating-linear-gradient(45deg, #ef476f, #ef476f 4px, #b83450 4px, #b83450 8px); border-radius: 0 3px 3px 0; opacity: 0.85; }
 .ladder-bar-good { background: #3aa76d; }
@@ -179,6 +218,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .aws-metric-label { color: #888; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
 .aws-metric-value { color: #e0e0e0; font-size: 1.4rem; font-weight: 600; font-variant-numeric: tabular-nums; }
 .aws-metric-value.warn { color: #ffa94d; }
+.machine-pills { display: flex; flex-wrap: wrap; gap: 5px; justify-content: center; padding-top: 2px; }
+.machine-pill { padding: 3px 9px; border-radius: 11px; font-size: 0.74rem; font-weight: 700; white-space: nowrap; letter-spacing: 0.2px; user-select: none; }
+.machine-pill.toggle { cursor: pointer; transition: transform 0.08s, filter 0.12s; }
+.machine-pill.toggle:hover { filter: brightness(1.12); transform: translateY(-1px); }
 .aws-metric-value.ok { color: #06d6a0; }
 
 .aws-section { margin-bottom: 20px; }
@@ -300,13 +343,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
 <!-- ENCODE TAB -->
 <div id="tab-originals" class="tab-content active">
-    <div class="panel">
-        <h2>Source Files</h2>
+    <div class="panel" id="sources-panel">
+        <h2>Source Files <span style="font-size:0.7rem;color:#5d6b82;font-weight:400">— or drag &amp; drop videos here to upload</span></h2>
         <div class="select-actions">
             <button class="btn-select" onclick="selectAll()">Select All</button>
             <button class="btn-select" onclick="selectNone()">Select None</button>
             <span id="selected-count" style="color:#888;font-size:0.85rem;line-height:2;margin-left:8px"></span>
         </div>
+        <div id="upload-progress" style="display:none"></div>
         <div id="file-list" class="file-list">
             <div class="no-files">Loading...</div>
         </div>
@@ -327,9 +371,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group">
                 <label>Target</label>
                 <select id="target" onchange="onTargetChange()">
-                    <option value="local">Local</option>
+                    <option value="local-dist">Local (all machines)</option>
                     <option value="cloud-batch">Cloud (AWS Batch)</option>
-                    <option value="cloud">Cloud (legacy — EC2 spot, deprecated)</option>
                 </select>
             </div>
             <div class="control-group" id="cpu-arch-group" style="display:none">
@@ -367,7 +410,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 </div>
             </div>
             <div class="control-group">
-                <label title="Bitrate ladder (resolutions + target bitrates). Manage ladders in the Ladders tab.">Ladder</label>
+                <label title="Bitrate ladder (resolutions + target bitrates) AND its output timing (segment / partial / GOP). Manage ladders in the Ladders tab.">Ladder / Profile</label>
                 <select id="ladder">
                     <option value="apple-uniq-live">apple-uniq-live</option>
                 </select>
@@ -386,18 +429,6 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group">
                 <label>Duration (s)</label>
                 <input type="text" id="time-limit" placeholder="full clip">
-            </div>
-            <div class="control-group">
-                <label>Segment (s)</label>
-                <input type="text" id="segment-duration" placeholder="6" value="6">
-            </div>
-            <div class="control-group">
-                <label>Partial (s)</label>
-                <input type="text" id="partial-duration" placeholder="0.2" value="0.2">
-            </div>
-            <div class="control-group">
-                <label>GOP (s)</label>
-                <input type="text" id="gop-duration" placeholder="1.0" value="1.0">
             </div>
             <div class="control-group">
                 <label>HLS Format</label>
@@ -473,10 +504,20 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
 <!-- JOBS TAB -->
 <div id="tab-jobs" class="tab-content">
-    <div class="panel" id="jobs-fleet-panel">
-        <h2>Fleet</h2>
-        <div class="aws-summary" id="jobs-aws-metrics"></div>
-        <div id="jobs-fleet-full" title="Live cloud fleet — per-instance packing, utilization, and lifecycle (from the AWS inventory)"></div>
+    <div class="jobs-overview" id="jobs-overview" style="display:none"></div>
+    <div class="panel fleet-panel" id="jobs-cloud-fleet-panel" style="display:none">
+        <h2 class="fleet-h2" onclick="toggleFleet('cloud')"><span class="fold-chevron">▾</span>Cloud Fleet<span class="fleet-summary" id="cloud-fleet-summary"></span></h2>
+        <div class="fleet-body">
+            <div class="aws-summary" id="jobs-cloud-metrics"></div>
+            <div id="jobs-fleet-full" title="Live cloud fleet — per-instance packing, utilization, and lifecycle (from the AWS inventory)"></div>
+        </div>
+    </div>
+    <div class="panel fleet-panel" id="jobs-local-fleet-panel" style="display:none">
+        <h2 class="fleet-h2" onclick="toggleFleet('local')"><span class="fold-chevron">▾</span>Local Fleet<span class="fleet-summary" id="local-fleet-summary"></span></h2>
+        <div class="fleet-body">
+            <div class="aws-summary" id="jobs-local-metrics"></div>
+            <div id="jobs-local-fleet" title="Live local cluster — per-machine CPU, packing, and the chunks running on each box"></div>
+        </div>
     </div>
     <div class="panel">
         <h2>Jobs</h2>
@@ -542,16 +583,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <div class="aws-metric-value" id="aws-hourly">—</div>
             </div>
             <div class="aws-metric">
-                <div class="aws-metric-label" title="Self-tracked: burn rate integrated over the trailing 24h">Spent (last 24h)</div>
-                <div class="aws-metric-value" id="aws-spend-24h">—</div>
-            </div>
-            <div class="aws-metric">
-                <div class="aws-metric-label" title="Accumulated (on-demand − spot) cost across all finished cloud-batch jobs — what running on spot has saved you">Saved by spot (total)</div>
-                <div class="aws-metric-value ok" id="aws-saved">—</div>
-            </div>
-            <div class="aws-metric">
-                <div class="aws-metric-label" title="Trailing 24h: encode-minutes thrown away by spot reclaims ÷ total encode-minutes. High = reclaims are eating your spot savings.">Reclaim waste (24h)</div>
-                <div class="aws-metric-value" id="aws-reclaim-pct">—</div>
+                <div class="aws-metric-label" title="Distributed-local encoder machines currently available (workers polling Temporal). One encode's chunks spread across these boxes; hover the value for names.">Local machines</div>
+                <div class="aws-metric-value" id="aws-dist-machines">—</div>
             </div>
             <div class="aws-metric">
                 <div class="aws-metric-label" title="Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box instead of cold-starting. 0 when idle; WARM_MIN_VCPUS (a whole box) during a run.">Keep warm</div>
@@ -919,19 +952,23 @@ function _ladderBandsSVG(d, T, dHi) {
     return `<svg width="${W}" height="${H}" style="font-family:inherit">${grid}${cols}</svg>`;
 }
 
-// Three side-by-side charts (1s / 2s / 6s segments) sharing one Y scale, so the
-// bands visibly grow as segments shorten — and a tight bufsize keeps that
-// growth small.
+// Bitrate-band charts. A ladder that PINS a segment_duration is used only at that
+// length, so it gets a SINGLE chart; the flexible base (no pinned segment) shows
+// 1s/2s/6s side-by-side so you can see the bands grow as segments shorten (and a
+// tight bufsize keeps that growth small). They share one Y scale.
 function _ladderBandsCharts(d) {
     const pct = (d.maxrate_percent || 124) / 100;
     const bufMult = d.bufsize_multiplier || 0.25;
     let maxAvg = 0;
     _CODEC_ORDER.forEach(c => (d.codecs && d.codecs[c] || []).forEach(r => { maxAvg = Math.max(maxAvg, r[2]); }));
     if (!maxAvg) return '';
-    // Biggest peak is at the shortest segment (1s); pad 4% for headroom.
-    const sharedDHi = maxAvg * (pct + bufMult / 1) * 1.04;
+    const fixedSeg = parseFloat(d.segment_duration);
+    const segs = (fixedSeg && fixedSeg > 0) ? [fixedSeg] : [1, 2, 6];
+    // Biggest peak is at the shortest segment; pad 4% for headroom.
+    const shortestT = Math.min(...segs);
+    const sharedDHi = maxAvg * (pct + bufMult / shortestT) * 1.04;
     // peak/avg = maxrate% + bufsize×/T, the SAME for every rung in a chart.
-    return [1, 2, 6].map(T => {
+    return segs.map(T => {
         const mult = pct + bufMult / T;
         return `<div>
         <div style="text-align:center;color:#ccc;font-size:12px;font-weight:600;margin-bottom:2px">${T}s segments
@@ -951,6 +988,15 @@ function _stepColor(r) { return r < 1.25 ? '#d06666' : (r > 2.4 ? '#d0a24a' : '#
 // limit (≤ 2×), red = over VOD.
 function _peakColor(m) { return m <= 1.25 ? '#6ab04c' : (m <= 2.0 ? '#d0a24a' : '#d06666'); }
 
+// The output-name suffix for a ladder: explicit output_tag if set, else "xs" for
+// the flexible base (no pinned segment — the master go-live repackages into
+// 1/2/6s), or "" for a fixed-segment profile (served as-is). Mirrors Go's
+// deriveOutputTag.
+function _ladderSuffix(d) {
+    if (d.output_tag) return d.output_tag;
+    return (parseFloat(d.segment_duration) > 0) ? '' : 'xs';
+}
+
 function renderLaddersTab() {
     const el = document.getElementById('ladders-list');
     if (!el) return;
@@ -958,9 +1004,15 @@ function renderLaddersTab() {
     if (!names.length) { el.innerHTML = '<div class="no-files">No ladders</div>'; return; }
     el.innerHTML = names.map(name => {
         const d = laddersCache[name] || {};
+        const fixed = parseFloat(d.segment_duration);
+        const partOff = d.partial_duration === '0' || parseFloat(d.partial_duration) === 0;
         const vbv = [
             `maxrate ${d.maxrate_percent || 124}%`,
             `bufsize ${d.bufsize_multiplier || 0.25}×`,
+            (fixed && fixed > 0) ? `segment ${d.segment_duration}s (fixed)` : `segment 1/2/6s`,
+            partOff ? `no parts` : `partial ${d.partial_duration || '0.2'}s`,
+            `gop ${d.gop_duration || '1.0'}s`,
+            _ladderSuffix(d) ? `suffix _${_ladderSuffix(d)} (go-live → 1/2/6s)` : `no suffix (served as-is)`,
         ];
         const actions = d.seed
             ? `<span class="job-ami-badge" title="Built-in, read-only">built-in</span>`
@@ -1007,6 +1059,13 @@ function _edFromDef(name, def, isNew) {
         description: def.description || '',
         maxrate_percent: def.maxrate_percent || 124,
         bufsize_multiplier: def.bufsize_multiplier || 0.25,
+        // Profile timing (strings; "" = inherit the global default). A pinned
+        // segment_duration marks a fixed-segment profile (one chart, output tag);
+        // partial_duration "0" turns LL-HLS parts off (VOD).
+        segment_duration: def.segment_duration || '',
+        partial_duration: def.partial_duration || '',
+        gop_duration: def.gop_duration || '',
+        output_tag: def.output_tag || '',
         codecs,
     };
 }
@@ -1064,7 +1123,7 @@ function _hideCloneMenu() { const m = document.getElementById('ctx-clone'); if (
 // input keeps focus. Structural edits (add/remove/clone) re-render the editor.
 function _edSet(field, val, kind) {
     _ed[field] = kind === 'int' ? (parseInt(val, 10) || 0) : kind === 'float' ? (parseFloat(val) || 0) : val;
-    if (field === 'maxrate_percent' || field === 'bufsize_multiplier') _edPreview();
+    if (['maxrate_percent', 'bufsize_multiplier', 'segment_duration', 'partial_duration', 'gop_duration'].includes(field)) _edPreview();
 }
 function _edRung(c, i, field, val) { _ed.codecs[c][i][field] = parseInt(val, 10) || 0; _edPreview(); }
 function _edDelRung(c, i) { _ed.codecs[c].splice(i, 1); if (!_ed.codecs[c].length) delete _ed.codecs[c]; _renderLadderEditor(); }
@@ -1117,6 +1176,17 @@ function _renderLadderEditor() {
         <div class="control-group"><label title="VBV buffer = target × this. Smaller = more constant bitrate; 0.10× keeps 1s peaks ≤~1.20×.">Bufsize ×</label>
           <input type="number" step="0.05" value="${e.bufsize_multiplier}" style="width:88px" oninput="_edSet('bufsize_multiplier',this.value,'float')"></div>
       </div>
+      <div style="color:#888;font-size:12px;margin:12px 0 4px">output timing (blank = inherit default). A pinned segment marks a fixed-segment profile (one chart); partial 0 = no LL-HLS parts (VOD).</div>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
+        <div class="control-group"><label title="HLS segment length (s). Pin it to make this a fixed-segment profile — the ladder page then shows one chart instead of 1/2/6s. Blank inherits 6.">Segment (s)</label>
+          <input type="text" value="${_escAttr(e.segment_duration)}" placeholder="6" style="width:80px" oninput="_edSet('segment_duration',this.value)"></div>
+        <div class="control-group"><label title="LL-HLS partial (part) length (s). 0 turns parts OFF (plain VOD). Blank inherits 0.2.">Partial (s)</label>
+          <input type="text" value="${_escAttr(e.partial_duration)}" placeholder="0.2" style="width:80px" oninput="_edSet('partial_duration',this.value)"></div>
+        <div class="control-group"><label title="GOP / keyframe interval (s). VOD can use a long GOP (=segment) for efficiency; live keeps ~1s. Blank inherits 1.0.">GOP (s)</label>
+          <input type="text" value="${_escAttr(e.gop_duration)}" placeholder="1.0" style="width:80px" oninput="_edSet('gop_duration',this.value)"></div>
+        <div class="control-group"><label title="Suffix appended to the output dir name. '_xs' tells go-live to generate 1s/2s/6s segments from this master; anything else (no suffix) is served as-is. Blank = auto: the flexible base (no pinned segment) → 'xs', a fixed-segment profile → none.">Output suffix</label>
+          <input type="text" value="${_escAttr(e.output_tag)}" placeholder="auto: ${_ladderSuffix({ segment_duration: e.segment_duration }) || 'none'}" style="width:110px" oninput="_edSet('output_tag',this.value)"></div>
+      </div>
       <div class="control-group" style="margin-top:8px"><label>Description</label>
         <input value="${_escAttr(e.description)}" placeholder="what this ladder is for" oninput="_edSet('description',this.value)" style="width:100%;max-width:600px"></div>
       <div style="color:#888;font-size:12px;margin:12px 0 4px">rungs per codec — edit the bitrate (kbps), width or height; add/remove rungs. Burn-in is derived from height.</div>
@@ -1139,6 +1209,8 @@ async function saveLadder() {
         body: JSON.stringify({
             name, description: _ed.description,
             maxrate_percent: _ed.maxrate_percent, bufsize_multiplier: _ed.bufsize_multiplier,
+            segment_duration: _ed.segment_duration, partial_duration: _ed.partial_duration,
+            gop_duration: _ed.gop_duration, output_tag: _ed.output_tag,
             codecs: _ed.codecs,
         })
     });
@@ -1189,10 +1261,76 @@ async function loadSources() {
     }
 }
 
+// Names to auto-check on the next render (freshly uploaded files).
+let _preselectSources = new Set();
+
+// --- Drag-and-drop upload into SOURCE_DIR ---
+
+const _VIDEO_EXT = /\.(mp4|mkv|mov|avi|webm|ts)$/i;
+
+function initDropUpload() {
+    const panel = document.getElementById('sources-panel');
+    if (!panel) return;
+    let depth = 0; // enter/leave fire per child; count to avoid flicker
+    panel.addEventListener('dragenter', e => { e.preventDefault(); if (++depth === 1) panel.classList.add('dropzone-active'); });
+    panel.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+    panel.addEventListener('dragleave', e => { if (--depth <= 0) { depth = 0; panel.classList.remove('dropzone-active'); } });
+    panel.addEventListener('drop', e => {
+        e.preventDefault();
+        depth = 0; panel.classList.remove('dropzone-active');
+        uploadSources(Array.from(e.dataTransfer.files || []));
+    });
+}
+
+async function uploadSources(fileObjs) {
+    const vids = fileObjs.filter(f => _VIDEO_EXT.test(f.name));
+    if (!vids.length) { showToast('Drop a video file (mp4/mkv/mov/avi/webm/ts)', 'error'); return; }
+    const prog = document.getElementById('upload-progress');
+    const uploaded = [];
+    for (let i = 0; i < vids.length; i++) {
+        const f = vids[i];
+        prog.style.display = 'block';
+        prog.textContent = `Uploading ${f.name} (${i + 1}/${vids.length})…`;
+        try {
+            await uploadOneSource(f, pct => {
+                prog.textContent = `Uploading ${f.name} (${i + 1}/${vids.length}) — ${pct}% of ${formatSize(f.size)}`;
+            });
+            uploaded.push(f.name);
+        } catch (err) {
+            showToast(`Upload failed: ${f.name} — ${err}`, 'error');
+        }
+    }
+    prog.style.display = 'none';
+    if (uploaded.length) {
+        _preselectSources = new Set(uploaded); // check them on reload
+        await loadSources();
+        showToast(`Uploaded ${uploaded.length} file${uploaded.length === 1 ? '' : 's'} — selected, ready to encode`, 'success');
+    }
+}
+
+function uploadOneSource(file, onProgress) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/sources/upload');
+        xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(Math.round(e.loaded / e.total * 100)); };
+        xhr.onload = () => (xhr.status >= 200 && xhr.status < 300) ? resolve() : reject(xhr.responseText || ('HTTP ' + xhr.status));
+        xhr.onerror = () => reject('network error');
+        const fd = new FormData();
+        fd.append('file', file, file.name);
+        xhr.send(fd);
+    });
+}
+
 function renderSources() {
     const list = document.getElementById('file-list');
+    // Preserve the current selection across re-renders (the 60s poll rebuilds this
+    // list) and add any freshly-uploaded files, so a drop → encode flow keeps them
+    // checked. _preselectSources is one-shot.
+    const checked = new Set([...document.querySelectorAll('#file-list input:checked')].map(cb => cb.value));
+    _preselectSources.forEach(n => checked.add(n));
+    _preselectSources.clear();
     if (!files || files.length === 0) {
-        list.innerHTML = '<div class="no-files">No video files found in source directory</div>';
+        list.innerHTML = '<div class="no-files">No video files — drag &amp; drop a video here to upload one</div>';
         return;
     }
     const sorted = sortBy(files, sourceSort.key, sourceSort.asc);
@@ -1204,7 +1342,7 @@ function renderSources() {
         </div>
     ` + sorted.map(f => `
         <div class="file-item" oncontextmenu="showSourceContextMenu(event, '${escapeAttr(f.name)}')">
-            <input type="checkbox" value="${f.name}" onclick="event.stopPropagation(); updateSelectedCount()">
+            <input type="checkbox" value="${f.name}" ${checked.has(f.name) ? 'checked' : ''} onclick="event.stopPropagation(); updateSelectedCount()">
             <span class="file-name" onclick="this.parentElement.querySelector('input').click()">${f.name}</span>
             <span class="file-size">${formatSize(f.size)}</span>
             <span class="file-date">${formatDate(f.mod_time)}</span>
@@ -1308,9 +1446,6 @@ async function startEncode(force = false) {
         codec: codecValue(),
         max_res: document.getElementById('max-res').value,
         time: document.getElementById('time-limit').value,
-        segment_duration: document.getElementById('segment-duration').value,
-        partial_duration: document.getElementById('partial-duration').value,
-        gop_duration: document.getElementById('gop-duration').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
         hevc_single_pass: document.getElementById('hevc-pass').value === '1',
@@ -1515,27 +1650,31 @@ async function loadOutputDetail(name) {
     }
 }
 
-// Ladder matrix: one row per tier with target vs actual bitrate + size.
-// The delta bar visualizes actual/target — >100% means the encoder
-// overshot its budget (x265 commonly does at low targets). Keeps the
-// view compact: 4 columns fit inside the outputs list width.
+// Ladder matrix: one row per rung with target vs peak/avg/ACTUAL bitrate,
+// VMAF (when measured), budget, and size — plus the profile + extra config the
+// output was made with (from encode.json). Budget = ACTUAL average ÷ target.
 function renderLadderTable(ladder) {
     if (!ladder || !ladder.tiers || ladder.tiers.length === 0) return '';
+    const kb = v => v > 0 ? v.toLocaleString() + ' k' : '—';
     const rows = ladder.tiers.map(t => {
-        const ratio = t.target_kbps > 0 ? (t.actual_kbps / t.target_kbps) : 0;
+        // Budget compares the TRUE average (actual) to target; fall back to peak
+        // if we couldn't measure the average.
+        const measured = t.actual_kbps > 0 ? t.actual_kbps : t.peak_kbps;
+        const ratio = t.target_kbps > 0 ? (measured / t.target_kbps) : 0;
         const pct = Math.min(150, Math.round(ratio * 100));
-        // Bar colour: green ≤110%, amber 110-125%, red >125%
         const cls = ratio === 0 ? 'ladder-bar-empty'
                   : ratio <= 1.10 ? 'ladder-bar-good'
                   : ratio <= 1.25 ? 'ladder-bar-warn'
                   : 'ladder-bar-bad';
-        const actualDisp = t.actual_kbps > 0 ? t.actual_kbps.toLocaleString() : '—';
         return `
             <tr>
                 <td class="ladder-res">${t.res}</td>
                 <td class="ladder-dim">${t.width}×${t.height}</td>
-                <td class="ladder-num">${t.target_kbps.toLocaleString()} k</td>
-                <td class="ladder-num">${actualDisp} k</td>
+                <td class="ladder-num">${kb(t.target_kbps)}</td>
+                <td class="ladder-num" title="peak segment bitrate (manifest BANDWIDTH)">${kb(t.peak_kbps)}</td>
+                <td class="ladder-num" title="declared average (manifest AVERAGE-BANDWIDTH)">${kb(t.avg_kbps)}</td>
+                <td class="ladder-num" title="measured average = size × 8 ÷ duration">${kb(t.actual_kbps)}</td>
+                <td class="ladder-num" title="VMAF (measured post-encode; — until the VMAF audit runs)">${t.vmaf > 0 ? t.vmaf.toFixed(1) : '—'}</td>
                 <td class="ladder-bar-cell">
                     <div class="ladder-bar-track">
                         <div class="ladder-bar-fill ${cls}" style="width:${Math.min(100, pct)}%"></div>
@@ -1547,22 +1686,44 @@ function renderLadderTable(ladder) {
             </tr>
         `;
     }).join('');
+    const p = ladder.profile;
+    const chip = (label, on) => on ? `<span style="color:#8cf"> · ${label}</span>` : '';
+    const profileLine = p
+        ? `<div style="font-size:12px;color:#aab;margin:2px 0 8px">
+             profile <b style="color:#cfe6f5">${escapeHtml(p.name || '—')}</b>
+             · maxrate ${p.maxrate_percent}% · bufsize ${p.bufsize_multiplier}×
+             · seg ${p.segment_s}s · partial ${p.partial_s}s · gop ${p.gop_s}s
+             ${p.output_tag ? ` · suffix _${escapeHtml(p.output_tag)}` : ''}
+             ${p.max_res ? ` · max-res ${escapeHtml(p.max_res)}` : ''}
+             ${chip('hevc single-pass', p.hevc_single_pass)}
+             ${p.padding && p.padding !== 'off' ? ` · padding ${escapeHtml(p.padding)}` : ''}
+             ${p.chunk_duration ? ` · chunk ${escapeHtml(p.chunk_duration)}` : ''}
+             ${chip('force re-encode', p.force_reencode)}
+             ${p.encoded_at ? `<span style="color:#889"> · ${new Date(p.encoded_at).toLocaleString()}</span>` : ''}
+           </div>`
+        : `<div style="font-size:12px;color:#889;margin:2px 0 8px">no encode.json (encoded before profile metadata) — targets/config best-effort</div>`;
     return `
         <div class="ladder-panel">
             <div class="ladder-title">ABR ladder — ${ladder.codec.toUpperCase()}</div>
+            ${profileLine}
+            <div style="overflow-x:auto">
             <table class="ladder-table">
                 <thead>
                     <tr>
                         <th>Tier</th>
                         <th>Dim</th>
-                        <th>Target</th>
-                        <th>Actual</th>
-                        <th>Budget usage</th>
-                        <th>Size</th>
+                        <th class="num">Target</th>
+                        <th class="num" title="peak segment bitrate (manifest BANDWIDTH), video-only">Peak</th>
+                        <th class="num" title="declared average (manifest AVERAGE-BANDWIDTH), video-only">Avg</th>
+                        <th class="num" title="measured average = size × 8 ÷ duration">Actual</th>
+                        <th class="num" title="VMAF (— until the VMAF audit runs)">VMAF</th>
+                        <th>Budget (actual/target)</th>
+                        <th class="num">Size</th>
                     </tr>
                 </thead>
                 <tbody>${rows}</tbody>
             </table>
+            </div>
         </div>
     `;
 }
@@ -1598,21 +1759,23 @@ function _jobConfigHtml(c) {
 // efficiency = avg busy ÷ max vCPUs; slowest chunk = the makespan floor.
 function renderJobStats(el, j) {
     if (!el) return;
-    if (!(j.cpu_vcpu_h > 0)) { el.style.display = 'none'; return; }
+    if (!(j.cpu_vcpu_h > 0) && !(j.commercial_usd > 0) && !(j.aws_spot_usd > 0) && !(j.local_wall_s > 0)) { el.style.display = 'none'; return; }
     const totalS = (j.started_at && j.ended_at)
         ? (new Date(j.ended_at).getTime() - new Date(j.started_at).getTime()) / 1000
         : (j.started_at ? (Date.now() - new Date(j.started_at).getTime()) / 1000 : 0);
     const stat = (label, val) => `<span class="job-stat">${label} <b>${val}</b></span>`;
     const slowest = (j.slowest_job || '').replace(/:/g, ' ').replace(/^encode /, '');
+    const cloud = j.cpu_vcpu_h > 0;   // cloud-batch jobs have vCPU-hour telemetry
     el.innerHTML =
           stat('total', formatDuration(totalS))
         + (j.encode_wall_s ? stat('encode wall', formatDuration(j.encode_wall_s)) : '')
-        + stat('CPU', j.cpu_vcpu_h.toFixed(1) + ' <span class="u">vCPU-hr</span>')
+        + (cloud ? stat('CPU', j.cpu_vcpu_h.toFixed(1) + ' <span class="u">vCPU-hr</span>') : '')
         + (j.job_count ? stat('jobs', j.job_count) : '')
-        + stat('avg busy', (j.avg_concurrency || 0).toFixed(0) + ' <span class="u">of ' + (j.max_vcpus || '?') + ' vCPU</span>')
-        + stat('efficiency', (j.efficiency_pct || 0).toFixed(0) + '%')
+        + (cloud ? stat('avg busy', (j.avg_concurrency || 0).toFixed(0) + ' <span class="u">of ' + (j.max_vcpus || '?') + ' vCPU</span>') : '')
+        + (cloud ? stat('efficiency', (j.efficiency_pct || 0).toFixed(0) + '%') : '')
         + (j.slowest_job ? stat('slowest chunk', escapeHtml(slowest) + ' <span class="u">' + formatDuration(j.slowest_job_s || 0) + '</span>') : '')
-        + (j.saved_usd > 0 ? stat('cost', '$' + (j.spot_usd || 0).toFixed(2) + ' <span class="u">spot · saved $' + j.saved_usd.toFixed(2) + '</span>') : '');
+        + (j.saved_usd > 0 ? stat('cost', '$' + (j.spot_usd || 0).toFixed(2) + ' <span class="u">spot · saved $' + j.saved_usd.toFixed(2) + '</span>') : '')
+        + ((j.commercial_usd > 0 || j.mediaconvert_usd > 0 || j.aws_spot_usd > 0 || j.local_wall_s > 0) ? stat('would cost', `MediaConvert $${(j.mediaconvert_usd || 0).toFixed(2)} · commercial $${(j.commercial_usd || 0).toFixed(2)} · AWS on-demand $${(j.aws_ondemand_usd || 0).toFixed(2)} · AWS spot $${(j.aws_spot_usd || 0).toFixed(2)} · <span class="u">local hardware ~${formatDuration(j.local_wall_s || totalS)} of your time</span>`) : '');
     el.title = 'efficiency = avg vCPUs busy ÷ max vCPUs (how full the fleet ran). '
         + 'slowest chunk = the makespan floor — nothing finishes faster than this one chunk.';
     el.style.display = '';
@@ -1649,10 +1812,14 @@ function jobRowHtml(j) {
                 <span class="job-status status-${j.status}">${j.status.toUpperCase()}</span>
             </div>
             ${_jobConfigHtml(j.config)}
+            <div class="job-prog" style="display:none"></div>
             <div class="job-progress"></div>
             <div class="job-error" style="color:#ef476f;font-size:0.8rem;margin-top:4px;display:none"></div>
-            <div class="current-file" style="display:none;font-size:0.85rem;color:#8cf;margin-top:8px;font-weight:600"></div>
-            <table class="stages-table" style="display:none"><tbody></tbody></table>
+            <div class="details-toggle" style="display:none" onclick="toggleDetails('${j.id}')"><span class="fold-chevron">▾</span><span class="details-toggle-label">details</span></div>
+            <div class="job-details">
+                <div class="current-file" style="display:none;font-size:0.85rem;color:#8cf;margin-top:8px;font-weight:600"></div>
+                <table class="stages-table" style="display:none"><tbody></tbody></table>
+            </div>
             <div class="job-stats" style="display:none"></div>
             <div class="job-actions">
                 <span class="log-toggle" onclick="toggleLog('${j.id}')">Show log</span>
@@ -1695,16 +1862,19 @@ function stageElapsed(s) {
 // machine it ran on, and how long it's taken. Shown as a native title tooltip.
 function stageTooltip(s, indexLabel) {
     const parts = [];
-    if (indexLabel) parts.push(indexLabel);
-    if (s.label && s.label !== indexLabel) parts.push(s.label.replace(/:/g, ' '));
-    parts.push('status: ' + (s.status || 'pending'));
+    // Lead with what it is: prefer the descriptive label ("encode hevc 2160p
+    // chunk4"), fall back to the index label.
+    const label = (s.label && s.label !== indexLabel) ? s.label.replace(/:/g, ' ') : indexLabel;
+    if (label) parts.push(label);
+    parts.push((s.status || 'pending').toUpperCase());
     if (s.status !== 'pending' && s.status !== 'skipped' && typeof s.percent === 'number')
-        parts.push(s.percent.toFixed(0) + '%');
+        parts.push(s.percent.toFixed(1) + '% done');
     if (s.status === 'skipped') parts.push('reused from cache');
-    if (s.instance) parts.push('machine: ' + s.instance);
+    // Always show the machine so its absence is explicit (… = starting, — = n/a).
+    parts.push('machine: ' + (s.instance || (s.status === 'running' ? '…' : '—')));
     const el = stageElapsed(s);
     if (el) parts.push(el);
-    return parts.join(' · ');
+    return parts.join('  ·  ');
 }
 
 // Match a per-chunk encode stage key: encode:<codec>:<tier>:chunk<N>.
@@ -1890,6 +2060,41 @@ function updateJobRow(row, j) {
     }
     row.querySelector('.job-progress').textContent = j.progress || '';
 
+    // Per-job progress %, bar, and ETA — the cost-weighted "processing" % from the
+    // learned-speed model (falls back to the client estimate for old jobs), with
+    // output-time % + ETA on the sub-line. Only while the job is live.
+    const progEl = row.querySelector('.job-prog');
+    if (progEl) {
+        const live = /running|encoding|starting|pending|queued/i.test(j.status || '');
+        const p = (j.overall_progress > 0) ? Math.round(j.overall_progress)
+                : (live ? _overallProgress(j) : null);
+        if (live && p != null) {
+            const out = (j.output_progress > 0) ? Math.round(j.output_progress) : null;
+            const eta = (j.eta_seconds > 0) ? formatDuration(j.eta_seconds) : null;
+            const sub = [out != null ? `${out}% output` : '', eta ? `ETA ${eta}` : ''].filter(Boolean).join(' · ');
+            progEl.innerHTML = `<div class="job-prog-row" title="Processing % — weighted by expected encode cost (a 4K HEVC rendition counts far more than a 360p one). Sub-line: % of output video timeline produced + ETA.">`
+                + `<span class="job-prog-pct">${p}%</span>`
+                + `<div class="job-prog-bar"><div style="width:${p}%"></div></div>`
+                + (sub ? `<span class="job-prog-sub">${sub}</span>` : '')
+                + `</div>`;
+            progEl.style.display = '';
+        } else {
+            progEl.style.display = 'none';
+        }
+    }
+
+    // Foldable details: show the toggle only once there are stages to show, label
+    // it with the count, and apply the collapse state (finished jobs fold by
+    // default; an explicit user choice sticks).
+    const dt = row.querySelector('.details-toggle');
+    if (dt) {
+        const nStages = (j.stages || []).length;
+        dt.style.display = nStages ? '' : 'none';
+        const lbl = dt.querySelector('.details-toggle-label');
+        if (lbl) lbl.textContent = nStages ? `details (${nStages} stages)` : 'details';
+    }
+    row.classList.toggle('details-collapsed', _detailsCollapsed(j));
+
     // Pre-baked AMI badge — set once the worker reports its boot AMI and the
     // server confirms it matches the baked worker AMI (image already resident).
     const amiEl = row.querySelector('.job-ami-badge');
@@ -1977,6 +2182,23 @@ function updateJobRow(row, j) {
         retryEl.remove();
     }
 
+    // Redo action — re-encode the WHOLE job from scratch, reusing nothing. Shown
+    // on ANY terminal job (done/failed/cancelled), unlike Retry which resumes a
+    // partial. Own class so the Retry selector above doesn't grab it.
+    let redoEl = actions.querySelector('.job-redo');
+    const redoable = (j.status === 'done' || j.status === 'failed' || j.status === 'cancelled') &&
+                     j.config && j.config.target;
+    if (redoable && !redoEl) {
+        redoEl = document.createElement('span');
+        redoEl.className = 'job-redo';
+        redoEl.textContent = 'Redo';
+        redoEl.title = 'Re-encode the whole job from scratch — reuses nothing (forces re-encode of every rendition).';
+        redoEl.setAttribute('onclick', `redoJob('${j.id}')`);
+        actions.appendChild(redoEl);
+    } else if (!redoable && redoEl) {
+        redoEl.remove();
+    }
+
     // Simulate-interrupt test action — running jobs only.
     //   cloud: needs cloud_job_id so the S3 sentinel points at the
     //          right prefix; triggers the remote's spot-interrupt
@@ -2018,31 +2240,123 @@ function updateJobRow(row, j) {
     if (openLogs.has(j.id)) refreshLog(j.id);
 }
 
+// A job runs on the cloud fleet iff its target is cloud(-batch); everything else
+// (local-dist) is the local fleet.
+function _isCloudJob(j) {
+    const t = (j.config || {}).target || '';
+    return t === 'cloud' || t === 'cloud-batch';
+}
+function _jobRunning(j) {
+    return /running|encoding|starting|pending|queued/i.test(j.status || '');
+}
+
+// Per-job details fold. Default: finished jobs fold (compact history), active
+// jobs stay open. A click records an explicit choice for the session, which then
+// overrides the default on every re-render.
+const jobDetailsPref = {}; // id -> 'open' | 'closed'
+function _detailsCollapsed(j) {
+    const p = jobDetailsPref[j.id];
+    if (p) return p === 'closed';
+    return !_jobRunning(j); // finished/queued-terminal → folded by default
+}
+function toggleDetails(id) {
+    const row = document.getElementById('job-' + id);
+    if (!row) return;
+    const nowCollapsed = !row.classList.contains('details-collapsed');
+    jobDetailsPref[id] = nowCollapsed ? 'closed' : 'open';
+    row.classList.toggle('details-collapsed', nowCollapsed);
+}
+
+// Overview strip: how many encodes are live, split by fleet. Hidden when idle.
+function renderJobsOverview(all) {
+    const el = document.getElementById('jobs-overview');
+    if (!el) return;
+    const running = all.filter(_jobRunning);
+    if (!running.length) { el.style.display = 'none'; return; }
+    const cloud = running.filter(_isCloudJob).length;
+    const local = running.length - cloud;
+    const parts = [];
+    if (cloud) parts.push(`<b>☁ ${cloud}</b> cloud`);
+    if (local) parts.push(`<b>🖥 ${local}</b> local`);
+    el.style.display = '';
+    el.innerHTML = `<b>${running.length}</b> encode${running.length > 1 ? 's' : ''} running · ${parts.join(' · ')}`;
+}
+
+// Show the Cloud Fleet panel only while something cloud is live (a running
+// cloud-batch job, or a running EC2 instance in the last inventory). The Local
+// Fleet panel is toggled by renderLocalFleet.
+function _cloudActive() {
+    if (Object.values(jobs).some(j => _isCloudJob(j) && _jobRunning(j))) return true;
+    const insts = (_lastFleet && _lastFleet.instances) || [];
+    return insts.some(i => i.state === 'running');
+}
+function syncFleetPanels() {
+    const cp = document.getElementById('jobs-cloud-fleet-panel');
+    if (cp) cp.style.display = _cloudActive() ? '' : 'none';
+}
+
+// Foldable fleet panels — collapse state persists per fleet in localStorage, so
+// the fleets stay out of the way when you don't need them but keep a one-line
+// summary in the header. The panel show/hide (based on activity) is separate.
+function toggleFleet(key) {
+    const collapsed = localStorage.getItem('fleet-collapsed-' + key) === '1';
+    localStorage.setItem('fleet-collapsed-' + key, collapsed ? '0' : '1');
+    applyFleetCollapse(key);
+}
+function applyFleetCollapse(key) {
+    const panel = document.getElementById('jobs-' + key + '-fleet-panel');
+    if (panel) panel.classList.toggle('collapsed', localStorage.getItem('fleet-collapsed-' + key) === '1');
+}
+applyFleetCollapse('cloud');
+applyFleetCollapse('local');
+
 function renderJobs() {
     const list = document.getElementById('jobs-list');
-    const sorted = Object.values(jobs).sort((a, b) =>
-        new Date(b.started_at) - new Date(a.started_at));
+    const all = Object.values(jobs);
+    renderJobsOverview(all);
+    syncFleetPanels();
 
-    if (sorted.length === 0) {
+    if (all.length === 0) {
         list.innerHTML = '<div class="no-files">No jobs yet</div>';
         return;
     }
-    // Replace the "no jobs" placeholder on the first real render.
     if (list.querySelector('.no-files')) list.innerHTML = '';
 
-    // Upsert each job into the list, preserving existing DOM (and the
-    // log viewer's open state) for rows that already exist.
+    // Group by fleet so cloud and local jobs cluster under the sections above.
+    // Headers appear only when BOTH fleets have jobs (a single-target run reads
+    // like the old flat list). Reordering uses appendChild, which MOVES existing
+    // rows — preserving each row's DOM and its open log viewer.
+    const groups = [
+        { key: 'cloud', label: '☁ Cloud (cloud-batch)', jobs: all.filter(_isCloudJob) },
+        { key: 'local', label: '🖥 Local (local-dist)', jobs: all.filter(j => !_isCloudJob(j)) },
+    ];
+    const showHeaders = groups.every(g => g.jobs.length > 0);
     const seen = new Set();
-    for (const j of sorted) {
-        seen.add(j.id);
-        let row = document.getElementById('job-' + j.id);
-        if (!row) {
-            const tmp = document.createElement('div');
-            tmp.innerHTML = jobRowHtml(j);
-            row = tmp.firstElementChild;
-            list.prepend(row);
+    for (const g of groups) {
+        let hdr = document.getElementById('jobs-group-' + g.key);
+        if (!g.jobs.length || !showHeaders) {
+            if (hdr) hdr.remove();
+        } else {
+            if (!hdr) {
+                hdr = document.createElement('div');
+                hdr.id = 'jobs-group-' + g.key;
+                hdr.className = 'jobs-group-hdr';
+            }
+            hdr.textContent = `${g.label} · ${g.jobs.length}`;
+            list.appendChild(hdr); // move into position
         }
-        updateJobRow(row, j);
+        g.jobs.sort((a, b) => new Date(b.started_at) - new Date(a.started_at));
+        for (const j of g.jobs) {
+            seen.add(j.id);
+            let row = document.getElementById('job-' + j.id);
+            if (!row) {
+                const tmp = document.createElement('div');
+                tmp.innerHTML = jobRowHtml(j);
+                row = tmp.firstElementChild;
+            }
+            list.appendChild(row); // move into grouped order (preserves DOM/logs)
+            updateJobRow(row, j);
+        }
     }
 
     // Drop any rows whose job is no longer in the set.
@@ -2112,6 +2426,29 @@ async function retryJob(id) {
     }
 }
 
+async function redoJob(id) {
+    const confirmed = await showDialog(
+        'Redo job from scratch',
+        'Re-encode this entire job again, reusing nothing? Every rendition is produced fresh (existing outputs are archived/replaced) — this does the full amount of work again.',
+        [
+            { label: 'Cancel', value: false, class: 'btn-secondary' },
+            { label: 'Redo', value: true, class: 'btn-primary' }
+        ]
+    );
+    if (!confirmed) return;
+    try {
+        const res = await fetch('/api/jobs/' + id + '/redo', { method: 'POST' });
+        if (!res.ok) {
+            showToast('Redo failed: ' + await res.text(), 'error');
+            return;
+        }
+        showToast('Redo submitted — re-encoding the whole job from scratch', 'success');
+        switchTab('jobs');
+    } catch (e) {
+        showToast('Redo failed: ' + e, 'error');
+    }
+}
+
 function escapeHtml(s) {
     const div = document.createElement('div');
     div.textContent = s;
@@ -2157,6 +2494,7 @@ function connectSSE() {
             const job = JSON.parse(e.data);
             jobs[job.id] = job;
             renderJobs();
+            renderLocalFleet();
         } catch (err) {}
     };
     es.onerror = () => {
@@ -2219,13 +2557,6 @@ function renderAws(data) {
     const hourlyEl = document.getElementById('aws-hourly');
     hourlyEl.textContent = '$' + hourly.toFixed(2);
     hourlyEl.className = 'aws-metric-value' + (hourly > 0 ? ' warn' : ' ok');
-    document.getElementById('aws-spend-24h').textContent = '$' + (s.spend_24h_usd || 0).toFixed(2);
-    document.getElementById('aws-saved').textContent = '$' + (s.saved_total_usd || 0).toFixed(2);
-    const rpct = s.reclaim_24h_pct || 0;
-    const rEl = document.getElementById('aws-reclaim-pct');
-    rEl.textContent = rpct.toFixed(1) + '%';
-    rEl.className = 'aws-metric-value' + (rpct >= 10 ? ' warn' : rpct > 0 ? '' : ' ok');
-    rEl.title = (s.reclaim_24h_lost_min || 0).toFixed(1) + ' min of encoding lost to reclaims in the last 24h';
     const warm = s.min_vcpus || 0;
     const warmEl = document.getElementById('aws-warm');
     warmEl.textContent = warm + ' vCPU';
@@ -2520,7 +2851,7 @@ function renderFleet(fleet, instances) {
           </div>
           <div style="font-size:13px;color:#ccc"><b>${used}</b> / ${total} vCPU busy (${pct}%) · <span style="color:#888">${idle} idle</span></div>
         </div>
-        <div style="color:#888;font-size:12px;margin-bottom:12px">${fleet.instance_count || running.length} instances · ${fleet.running_jobs || 0} running / ${fleet.queued_jobs || 0} queued jobs · $${(fleet.estimated_hourly_usd || 0).toFixed(2)}/hr · $${(fleet.spend_24h_usd || 0).toFixed(2)} last 24h</div>`;
+        <div style="color:#888;font-size:12px;margin-bottom:12px">${fleet.instance_count || running.length} instances · ${fleet.running_jobs || 0} running / ${fleet.queued_jobs || 0} queued jobs · $${(fleet.estimated_hourly_usd || 0).toFixed(2)}/hr</div>`;
         // If jobs couldn't be mapped to instances (missing ecs perm), say so.
         const mapped = running.some(i => (i.jobs || []).length);
         const note = (used > 0 && !mapped)
@@ -2673,15 +3004,220 @@ const _MAXVCPU_BASE = 48;
 // the same inventory summary `s` that renderAws already fetched — full innerHTML
 // re-render each 10s tick is fine (radios re-check from live state, no text
 // input to lose focus on).
+// Distributed-local encoder machines — from /api/dist/workers, each
+// {name, on, local}. Rendered as colour-coded pills (same instanceColor() the
+// chunk plot uses). Remote pills are buttons: click to enable/disable a box
+// even mid-encode — disabling hard-stops its worker, so Temporal re-queues its
+// in-flight chunks onto the other machines. Best-effort; empty if cluster down.
+let _distMachines = { count: 0, machines: [] };
+
+function machinePillsHtml() {
+    const ms = _distMachines.machines || [];
+    if (!ms.length) return '<span class="u" style="font-size:0.8rem">none</span>';
+    return '<div class="machine-pills">' + ms.map(m => {
+        const color = instanceColor(m.name) || '#4361ee';
+        const clickable = !m.local;   // the master box is always on
+        const style = m.on
+            ? `background:${color};color:#0b1020;border:1px solid ${color}`
+            : `background:transparent;color:${color};border:1px dashed ${color};opacity:.5`;
+        const onclick = clickable ? ` onclick="toggleMachine('${m.name}', ${!m.on})"` : '';
+        const title = !clickable ? `${m.name} — master (always on)`
+            : (m.on ? `Disable ${m.name}: its in-flight chunks are dropped and re-queued to the other machines`
+                    : `Enable ${m.name}: rejoin the encode pool`);
+        const nameHtml = m.on ? m.name
+            : `<span style="text-decoration:line-through">${m.name}</span>`;
+        return `<span class="machine-pill${clickable ? ' toggle' : ''}" style="${style}"${onclick} title="${title}">${nameHtml}</span>`;
+    }).join('') + '</div>';
+}
+
+// Friendly label for a running chunk. The fleet marker carries Temporal activity
+// ids ("enc-hevc-720p-c2"); also accept stage keys ("encode:hevc:720p:chunk2").
+function _localChunkFriendly(key) {
+    let m = /^enc-(\w+)-([^-]+)-c(\d+)$/.exec(key || '');
+    if (m) return `${m[1]} ${m[2]} c${m[3]}`;
+    m = /^encode:(\w+):([\w]+):chunk(\d+)$/.exec(key || '');
+    if (m) return `${m[1]} ${m[2]} c${m[3]}`;
+    return (key || '').replace(/^enc-|^encode:/, '').replace(/[-:]/g, ' ');
+}
+
+// One machine row for the local fleet — the local twin of _fleetInstanceRow:
+// swatch (matches the chunk plot's machine colour) + a packing bar of the chunks
+// running on this box (~2 cores each) + a live CPU sparkline (normalized to the
+// perf-core target: 100% = its 4/4/8 cores busy, >100% = SMT/E-core spill) + the
+// list of chunks currently on it. CPU rides in on the Temporal heartbeat.
+function _localFleetRow(inst, maxCores) {
+    const cap = inst.cores || 0;
+    const chunks = inst.chunks || [];
+    const color = instanceColor(inst.machine) || '#4361ee';
+    const divider = 'border-right:2px solid #20252f;';
+    const seg = (w, c, title, extra) => `<div style="width:${Math.max(0, w)}%;background:${c};box-sizing:border-box;${extra || ''}" title="${escapeHtml(title)}"></div>`;
+    // Fill by MEASURED busy cores (from the live CPU%), so the bar tracks real
+    // utilization even before per-chunk placement is known; show discrete chunk
+    // segments once we have them (each chunk ~2 cores).
+    const busy = Math.min(cap, (inst.latest || 0) / 100 * cap);
+    let parts, rightLabel;
+    if (chunks.length) {
+        const used = Math.min(cap, chunks.length * 2);
+        parts = chunks.map(c => seg(cap ? 2 / cap * 100 : 0, color, _localChunkFriendly(c), divider)).join('');
+        if (cap - used > 0) parts += seg((cap - used) / cap * 100, '#20252f', `${cap - used} idle core${cap - used > 1 ? 's' : ''}`);
+        rightLabel = `${used}/${cap} cores · ${chunks.length} chunk${chunks.length > 1 ? 's' : ''}`;
+    } else {
+        parts = seg(cap ? busy / cap * 100 : 0, color, `~${busy.toFixed(1)} cores busy`)
+              + (cap - busy > 0.05 ? seg((cap - busy) / cap * 100, '#20252f', 'idle') : '');
+        rightLabel = busy > 0.3 ? `~${busy.toFixed(1)} / ${cap} cores busy` : `idle (${cap} cores)`;
+    }
+    const barW = maxCores ? cap / maxCores * 100 : 100;
+    const hist = inst.cw || [];
+    const peak = Math.max(100, ...(hist.length ? hist : [100]));
+    const spark = hist.length >= 2 ? _sparkline(hist, '#e0555a', { min: 0, max: peak, w: 54, h: 13 }) + ' ' : '';
+    const cpuLabel = hist.length ? `CPU ${spark}<span style="color:#ccc">${Math.round(inst.latest || 0)}%</span> · ` : '';
+    const swatch = `<span title="machine ${escapeHtml(inst.machine)} — matches its chunk colour in the plot" style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${color};vertical-align:middle;margin-right:6px"></span>`;
+    const chunkList = chunks.length
+        ? `<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:#9aa;margin-top:3px">`
+          + chunks.map(c => `<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${color};vertical-align:middle;margin-right:4px"></span>${escapeHtml(_localChunkFriendly(c))}</span>`).join('')
+          + `</div>`
+        : '';
+    return `<div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-bottom:2px">
+        <span>${swatch}${escapeHtml(inst.machine)} <span style="color:#666">${cap} cores</span></span>
+        <span>${cpuLabel}${rightLabel}${(inst.age || 0) > 5 ? ` · <span style="color:#d0a24a" title="seconds since this machine last reported CPU — it may have gone quiet / dropped out">${formatDuration(inst.age)} stale</span>` : ''}</span>
+      </div>
+      <div style="height:16px;width:${barW}%;background:#20252f;border-radius:4px;overflow:hidden;display:flex" title="${cap} cores">${parts}</div>
+      ${chunkList}
+    </div>`;
+}
+
+// The local cluster's "Fleet" panel — the in-app twin of the cloud fleet view.
+// Fed by _distMachines.fleet (live CPU via the Temporal heartbeat backchannel) +
+// the running local-dist job's stages (which chunk is on which machine). Hidden
+// when nothing local is active, so it only appears during a distributed encode.
+function renderLocalFleet() {
+    const panel = document.getElementById('jobs-local-fleet-panel');
+    const el = document.getElementById('jobs-local-fleet');
+    if (!panel || !el) return;
+    // The fleet marker carries both live CPU and the chunks running on each box
+    // (authoritative, from Temporal's pending activities). Show machines reporting
+    // fresh CPU (i.e. actively encoding).
+    const fresh = (_distMachines.fleet || []).filter(f => (f.age_s != null ? f.age_s : 1e9) < 30);
+    if (!fresh.length) { panel.style.display = 'none'; return; }
+    const insts = fresh.slice().sort((a, b) => a.machine.localeCompare(b.machine)).map(f => ({
+        machine: f.machine, cores: f.perf || 0, latest: f.latest || 0,
+        cw: f.history || [], age: f.age_s || 0, chunks: f.chunks || [],
+    }));
+    const maxCores = Math.max(...insts.map(i => i.cores), 1);
+    const totalCores = insts.reduce((a, i) => a + i.cores, 0);
+    // Busy = discrete chunk cores when known, else measured (CPU%) — matches rows.
+    const busyCores = insts.reduce((a, i) => a + (i.chunks.length
+        ? Math.min(i.cores, i.chunks.length * 2)
+        : Math.min(i.cores, (i.latest || 0) / 100 * i.cores)), 0);
+    const usedCores = Math.round(busyCores);
+    const pct = totalCores ? Math.round(busyCores / totalCores * 100) : 0;
+    const totalChunks = insts.reduce((a, i) => a + i.chunks.length, 0);
+    const chunkLabel = totalChunks ? ` · ${totalChunks} chunk${totalChunks !== 1 ? 's' : ''}` : '';
+    const bar = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+        <div style="flex:1;max-width:520px;height:22px;background:#20252f;border-radius:5px;overflow:hidden">
+          <div style="width:${pct}%;height:100%;background:#4a90d9"></div></div>
+        <div style="font-size:13px;color:#ccc"><b>${usedCores}</b> / ${totalCores} cores busy (${pct}%) · <span style="color:#888">${insts.length} machine${insts.length > 1 ? 's' : ''}${chunkLabel}</span></div>
+      </div>`;
+    const rows = insts.map(i => _localFleetRow(i, maxCores)).join('');
+    panel.style.display = '';
+    el.innerHTML = bar + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
+    const ls = document.getElementById('local-fleet-summary');
+    if (ls) ls.textContent = `${usedCores}/${totalCores} cores · ${totalChunks} chunk${totalChunks !== 1 ? 's' : ''} · ${insts.length} machine${insts.length > 1 ? 's' : ''}`;
+    // Local metrics tiles live in THIS panel (not the cloud one). Their own
+    // cloud-stats poll is slow, but pollDistWorkers/SSE call us every few seconds.
+    const mrow = document.getElementById('jobs-local-metrics');
+    if (mrow) mrow.innerHTML = _localMetricsTiles();
+}
+
+function renderDistMachines() {
+    const el = document.getElementById('aws-dist-machines');
+    if (el) el.innerHTML = machinePillsHtml();
+}
+
+async function toggleMachine(name, enabled) {
+    const m = (_distMachines.machines || []).find(x => x.name === name);
+    if (m) m.on = enabled;                 // optimistic
+    renderDistMachines();
+    try {
+        await fetch('/api/dist/workers/' + encodeURIComponent(name), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled }),
+        });
+    } catch (e) { /* revert on next poll */ }
+    setTimeout(pollDistWorkers, 1500);
+}
+
+async function pollDistWorkers() {
+    try {
+        const r = await fetch('/api/dist/workers');
+        if (!r.ok) return;
+        _distMachines = await r.json();
+        renderDistMachines();
+        renderLocalFleet();
+    } catch (e) { /* cluster not up */ }
+}
+setInterval(pollDistWorkers, 5000);   // 5s: keeps the live CPU sparkline current
+pollDistWorkers();
+
+// Single overall completion % for an encode, WEIGHTED BY EXPECTED ENCODE COST —
+// a 4K HEVC 2-pass rendition is ~200× the compute of an h264 360p one, so it must
+// count ~200× toward "done". We weight each encode *variant* (not each chunk) by
+// resolution² × codec-factor × pass-factor, grouped by variant so dynamic
+// chunking's chunk-count doesn't double-count; the pipeline stages (mezzanine,
+// package, hls, …) get a small weight. Null when there are no stages yet.
+const _CODEC_COST = { h264: 1, hevc: 3.5, av1: 8 };   // ~relative encode cost/pixel
+function _overallProgress(j) {
+    const st = (j && j.stages) || [];
+    if (!st.length) return null;
+    const hevc2pass = !((j.config || {}).hevc_single_pass);
+    const eff = s => s.status === 'done' ? 100 : s.status === 'failed' ? 0 : (s.percent || 0);
+    const variants = {};   // "codec:height" -> {sum, n, weight}
+    let num = 0, den = 0;
+    st.forEach(s => {
+        const m = /^encode:(\w+):(\d+)p?:chunk/.exec(s.key || '');
+        if (m) {
+            const codec = m[1], h = +m[2], vk = codec + ':' + h;
+            if (!variants[vk]) {
+                const pass = (codec === 'hevc' && hevc2pass) ? 1.8 : 1;
+                variants[vk] = { sum: 0, n: 0, weight: h * h * (_CODEC_COST[codec] || 1) * pass };
+            }
+            variants[vk].sum += eff(s); variants[vk].n++;
+        } else {
+            // pipeline stage (upload/mezzanine/audio/package/fragments/hls/download)
+            // — small fixed weight (~5% of a 1080p·h264 variant) so the tail counts
+            // but never dominates.
+            num += 1080 * 1080 * 0.05 * eff(s);
+            den += 1080 * 1080 * 0.05;
+        }
+    });
+    Object.values(variants).forEach(v => { num += v.weight * (v.sum / v.n); den += v.weight; });
+    return den ? Math.round(num / den) : null;
+}
+
+function _localMetricsTiles() {
+    const tile = (label, valueHtml, title) => `<div class="aws-metric"><div class="aws-metric-label"${title ? ` title="${title}"` : ''}>${label}</div>${valueHtml}</div>`;
+    const fleet = (_distMachines.fleet || []).filter(f => (f.age_s != null ? f.age_s : 1e9) < 30);
+    const on = (_distMachines.machines || []).filter(m => m.on).length;
+    const totalCores = fleet.reduce((a, f) => a + (f.perf || 0), 0);
+    const busyCores = Math.round(fleet.reduce((a, f) => a + Math.min(f.perf || 0, (f.latest || 0) / 100 * (f.perf || 0)), 0));
+    const chunks = fleet.reduce((a, f) => a + ((f.chunks || []).length), 0);
+    return [
+        tile('Local machines', machinePillsHtml(), 'Distributed-local encoder machines. Click a remote pill to enable/disable that box mid-encode; its chunks re-queue to the others.'),
+        tile('Machines active', `<div class="aws-metric-value ok">${fleet.length || on}</div>`, 'Machines currently reporting CPU / polling'),
+        tile('Cores busy', `<div class="aws-metric-value">${busyCores} <span style="color:#888">/ ${totalCores}</span></div>`, 'Perf-cores busy across the cluster, from live CPU'),
+        tile('Chunks running', `<div class="aws-metric-value">${chunks}</div>`, 'Encode chunks executing across the cluster right now'),
+    ].join('');
+}
+
 function renderJobsMetrics(s) {
-    const el = document.getElementById('jobs-aws-metrics');
+    const el = document.getElementById('jobs-cloud-metrics');
     if (!el) return;
     const execs = s.running_executions || 0;
     const bjobs = s.active_batch_jobs || 0;
     const running = s.running_instances || 0;
     const orphans = s.orphan_volumes || 0;
     const hourly = s.estimated_hourly_usd || 0;
-    const rpct = s.reclaim_24h_pct || 0;
     const live = s.max_vcpus || 0;
     const cls = (v, warnAbove) => 'aws-metric-value' + (v > (warnAbove || 0) ? ' warn' : ' ok');
     const tile = (label, valueHtml, title) =>
@@ -2699,12 +3235,12 @@ function renderJobsMetrics(s) {
         tile('Orphan volumes', `<div class="${cls(orphans)}">${orphans}</div>`),
         tile('S3 staged', `<div class="aws-metric-value">${formatBytes(s.total_s3_bytes || 0)}</div>`),
         tile('Est. hourly spend', `<div class="${cls(hourly)}">$${hourly.toFixed(2)}</div>`),
-        tile('Spent (last 24h)', `<div class="aws-metric-value">$${(s.spend_24h_usd || 0).toFixed(2)}</div>`, 'Self-tracked: burn rate integrated over the trailing 24h'),
-        tile('Saved by spot (total)', `<div class="aws-metric-value ok">$${(s.saved_total_usd || 0).toFixed(2)}</div>`, 'Accumulated (on-demand − spot) cost across all finished cloud-batch jobs'),
-        tile('Reclaim waste (24h)', `<div class="aws-metric-value${rpct >= 10 ? ' warn' : rpct > 0 ? '' : ' ok'}">${rpct.toFixed(1)}%</div>`, (s.reclaim_24h_lost_min || 0).toFixed(1) + ' min of encoding lost to reclaims in the last 24h'),
         tile('Keep warm', `<div class="aws-metric-value${(s.min_vcpus || 0) > 0 ? ' ok' : ''}">${s.min_vcpus || 0} vCPU</div>`, 'Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box (0 when idle).'),
         tile('Max vCPUs', vcpuHtml, 'Batch compute-env max vCPUs. 2× runs ~twice as many machines → roughly half the wall-clock for ~the same total cost.'),
     ].join('');
+    const cs = document.getElementById('cloud-fleet-summary');
+    if (cs) cs.textContent = `${running} inst · ${execs} exec · $${hourly.toFixed(2)}/hr`;
+    syncFleetPanels(); // show/hide the Cloud Fleet panel on the AWS-poll cadence too
 }
 
 function renderMaxVcpuRadio(live) {
@@ -2957,9 +3493,6 @@ async function forceReencode(fileName) {
         codec: codecValue(),
         max_res: document.getElementById('max-res').value,
         time: document.getElementById('time-limit').value,
-        segment_duration: document.getElementById('segment-duration').value,
-        partial_duration: document.getElementById('partial-duration').value,
-        gop_duration: document.getElementById('gop-duration').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
         hevc_single_pass: document.getElementById('hevc-pass').value === '1',
@@ -3190,6 +3723,7 @@ function closePlayer(modal) {
 }
 
 loadSources();
+initDropUpload();
 connectSSE();
 setInterval(loadSources, 60000);
 startAwsAutoRefresh();

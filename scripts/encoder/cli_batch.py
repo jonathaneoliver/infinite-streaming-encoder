@@ -162,6 +162,56 @@ def _short_label(jobname: str) -> str:
             }.get(jobname.split("-", 1)[0], jobname.split("-", 1)[0])
 
 
+def _tag_hosts_for_jobs(described_jobs: list, log_state: dict) -> None:
+    """Emit ENCODER-HOST for each described Batch job's stage keys, so the UI
+    colours those rows/cells by the EC2 instance the job ran on. Deduped per
+    (stage key, instance) via log_state, so a job is only announced once. Shared
+    by the live RUNNING poll, the SUCCEEDED backfill, and the end-of-run sweep."""
+    for j in described_jobs:
+        keys = _host_stage_keys(j.get("jobName", ""))
+        ci_arn = j.get("container", {}).get("containerInstanceArn")
+        if not (keys and ci_arn):
+            continue
+        inst = _ec2_for_container_instance(ci_arn)
+        if not inst:
+            continue
+        for key in keys:
+            seen_key = "_host:" + key
+            if log_state.get(seen_key) != inst:
+                log_state[seen_key] = inst
+                _emit_host(key, inst)
+
+
+def _backfill_completed_hosts(exec_name: str, log_state: dict) -> None:
+    """Colour chunks that completed BETWEEN polls. A short chunk (small H.264
+    rung) can start and finish inside one poll interval, so it's never observed
+    RUNNING and never tagged — its cell falls back to the default (blue). A
+    SUCCEEDED job keeps its containerInstanceArn, so describe the ones whose stage
+    keys aren't coloured yet and emit their host. Bounded: only untagged jobs are
+    described (via the name, no API call), so each is described at most once."""
+    batch = _batch()
+    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    try:
+        done = batch.list_jobs(jobQueue=queue, jobStatus="SUCCEEDED"
+                               ).get("jobSummaryList", [])
+    except ClientError:
+        return
+    ids = []
+    for j in done:
+        name = j.get("jobName", "")
+        if exec_name not in name:
+            continue
+        keys = _host_stage_keys(name)
+        if keys and any(log_state.get("_host:" + k) is None for k in keys):
+            ids.append(j["jobId"])
+    for i in range(0, len(ids), 100):
+        try:
+            jobs = batch.describe_jobs(jobs=ids[i:i + 100]).get("jobs", [])
+        except ClientError:
+            continue
+        _tag_hosts_for_jobs(jobs, log_state)
+
+
 def _forward_running_logs(exec_name: str, log_state: dict) -> None:
     """Tail the CloudWatch streams of currently-RUNNING jobs and forward their
     [progress]/[phase] lines into the app log — so long phases (mezzanine,
@@ -181,23 +231,12 @@ def _forward_running_logs(exec_name: str, log_state: dict) -> None:
         except ClientError:
             continue
         for j in jobs:
-            container = j.get("container", {})
-            stream = container.get("logStreamName")
+            stream = j.get("container", {}).get("logStreamName")
             if stream:
                 _tail_progress(stream, _short_label(j.get("jobName", "")), log_state)
-            # Report which machine each running job landed on, once per stage
-            # key, so the UI can colour EVERY row (encode chunks + mezzanine /
-            # audio / package / fragments / hls) by instance. Best-effort.
-            keys = _host_stage_keys(j.get("jobName", ""))
-            ci_arn = container.get("containerInstanceArn")
-            if keys and ci_arn:
-                inst = _ec2_for_container_instance(ci_arn)
-                if inst:
-                    for key in keys:
-                        seen_key = "_host:" + key
-                        if log_state.get(seen_key) != inst:
-                            log_state[seen_key] = inst
-                            _emit_host(key, inst)
+        # Colour every running job's rows (encode chunks + mezzanine / audio /
+        # package / fragments / hls) by the instance it landed on. Best-effort.
+        _tag_hosts_for_jobs(jobs, log_state)
 
 
 def _tail_progress(stream: str, label: str, log_state: dict) -> None:
@@ -273,19 +312,39 @@ _STEP_TO_STAGE: dict[str, str] = {
 }
 
 
-def _emit_plan(do_h264: bool = True, do_hevc: bool = True) -> None:
+def _emit_plan(variants: "list | None" = None,
+               do_h264: bool = True, do_hevc: bool = True) -> None:
     """Announce the pipeline stages for THIS run. Only the codecs actually being
     encoded are listed, so a h264-only run doesn't render empty hevc rows.
     Package order is package -> fragments -> hls (the LL-HLS playlists embed the
     fragment byteranges, so hls must run last). The trailing download:outputs
     stage is the driver's own S3 -> local sync-back of the finished package.
-    Variant encode stages are emitted dynamically as Map iterations start."""
+
+    The full per-variant/per-chunk encode grid is declared up front from the SFN
+    input's `variants` (each carries codec, label, chunk_indices, chunked), so a
+    28-chunk 2160p variant shows all 28 cells from the start instead of the bar
+    growing as Map iterations trickle in. Chunk stage keys match the running
+    jobs: chunked -> encode:<codec>:<label>:chunk<i>, whole -> encode:<codec>:<label>."""
     keys = ["mezzanine", "audio"]
+    for v in variants or []:
+        codec, label = v.get("codec"), v.get("label")
+        if not codec or not label:
+            continue
+        if str(v.get("chunked", "")).lower() == "true":
+            for i in v.get("chunk_indices") or [0]:
+                keys.append(f"encode:{codec}:{label}:chunk{i}")
+        else:
+            keys.append(f"encode:{codec}:{label}")
     for codec, on in (("h264", do_h264), ("hevc", do_hevc)):
         if on:
             keys += [f"package:{codec}", f"fragments:{codec}", f"hls:{codec}"]
     keys.append("download:outputs")
-    stages = [{"key": k, "label": k.replace(":", " ")} for k in keys]
+    seen: set = set()
+    stages = []
+    for k in keys:  # de-dupe, preserve order
+        if k not in seen:
+            seen.add(k)
+            stages.append({"key": k, "label": k.replace(":", " ")})
     print(f"[[ENCODER-PLAN {json.dumps(stages)}]]", flush=True)
 
 
@@ -700,16 +759,19 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
             _report_task_failure(ev.get("taskFailedEventDetails", {}))
 
 
-def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "") -> int:
+def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "",
+                      output_tag: str = "") -> int:
     """Mirror s3://.../<prefix>/output_<codec>/ into local_dir.
 
     The state machine writes each codec's packaged dir as output_<codec>/. When
     output_stem is given, each is downloaded to a per-codec top-level directory
-    named <output_stem>_<codec>/ (e.g. myclip_p200_hevc/master.m3u8) — matching
-    the local pipeline's naming contract (OutputStem + codec suffix). That lets
-    moveTmpToOutput move each codec independently, so codecs of the same clip
-    COEXIST in OUTPUT_DIR instead of one replacing the other's <stem> wrapper.
+    named <output_stem>_<codec>[_<output_tag>]/ (e.g. myclip_p200_hevc_xs/) —
+    matching the local pipeline's naming contract (OutputStem + codec + profile
+    tag appended LAST so the _p200_<codec> shape smashing keys off stays intact).
+    That lets moveTmpToOutput move each codec independently, so codecs of the same
+    clip COEXIST in OUTPUT_DIR instead of one replacing the other's <stem> wrapper.
     Without output_stem (legacy), the raw output_<codec>/ layout is preserved."""
+    tag_suffix = f"_{output_tag}" if output_tag else ""
     if not s3_prefix.startswith("s3://"):
         return 0
     rest = s3_prefix[len("s3://"):].rstrip("/")
@@ -725,7 +787,7 @@ def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "") ->
         if not tail or not head.startswith("output_"):
             return None  # dir marker or unexpected key — skip
         codec = head[len("output_"):]
-        return local_dir / f"{output_stem}_{codec}" / tail
+        return local_dir / f"{output_stem}_{codec}{tag_suffix}" / tail
 
     # List everything first so the sync-back can drive a real progress bar
     # (weighted by bytes — segment counts vary wildly in size). This runs in the
@@ -816,13 +878,17 @@ def _collect_exec_jobs(exec_name: str) -> list:
     return jobs
 
 
-def _emit_cost_summary(exec_name: str) -> None:
+def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
     """At job end, sum the execution's Batch compute and emit two markers the
     control plane consumes: ENCODER-COST (spot-vs-on-demand savings, accumulated
     into 'saved by using spot') and ENCODER-STATS (run efficiency: encode wall,
     vCPU-hours, the slowest single chunk = makespan floor, job count, max vCPUs).
     exec= keeps both idempotent across a reattach."""
     jobs = _collect_exec_jobs(exec_name)
+    # Definitive host sweep: every job is fully described here (with its
+    # containerInstanceArn), so colour any chunk the live poll missed — nothing
+    # is left the default blue by the time the run finishes.
+    _tag_hosts_for_jobs(jobs, log_state if log_state is not None else {})
     vcpu_s = 0.0
     mn = mx = None
     longest_s = 0.0
@@ -868,14 +934,16 @@ def cmd_poll(args: argparse.Namespace) -> int:
     # Read the execution input up front so the plan lists only the codecs we're
     # actually encoding (do_h264 / do_hevc from buildSFNInput).
     do_h264 = do_hevc = True
+    variants: list = []
     try:
         inp = json.loads(sfn.describe_execution(
             executionArn=args.execution_arn).get("input") or "{}")
         do_h264 = bool(inp.get("do_h264", True))
         do_hevc = bool(inp.get("do_hevc", True))
+        variants = inp.get("variants") or []
     except (ClientError, ValueError, TypeError):
         pass
-    _emit_plan(do_h264, do_hevc)
+    _emit_plan(variants, do_h264, do_hevc)
 
     seen: set[int] = set()
     log_state: dict[str, int] = {}  # stream -> last-forwarded timestamp
@@ -923,6 +991,12 @@ def cmd_poll(args: argparse.Namespace) -> int:
             _forward_running_logs(exec_name, log_state)
         except Exception:  # noqa: BLE001 — live tailing is cosmetic
             pass
+        # Backfill instance colour for chunks that finished between polls (short
+        # rungs never seen RUNNING), so their cells aren't left the default blue.
+        try:
+            _backfill_completed_hosts(exec_name, log_state)
+        except Exception:  # noqa: BLE001 — host colouring is cosmetic
+            pass
 
         desc = sfn.describe_execution(executionArn=args.execution_arn)
         status = desc["status"]
@@ -938,10 +1012,11 @@ def cmd_poll(args: argparse.Namespace) -> int:
                             _emit_stage(f"{k}:{codec}", "done", 100.0)
                 print(f"    downloading outputs from {args.s3_prefix}", flush=True)
                 n = _download_outputs(args.s3_prefix, Path(args.local_dir),
-                                      getattr(args, "output_stem", ""))
+                                      getattr(args, "output_stem", ""),
+                                      getattr(args, "output_tag", ""))
                 print(f"    downloaded {n} files", flush=True)
                 try:
-                    _emit_cost_summary(exec_name)  # spot-vs-on-demand savings
+                    _emit_cost_summary(exec_name, log_state)  # cost + host sweep
                 except Exception:  # noqa: BLE001 — cost summary is best-effort
                     pass
                 return 0
@@ -976,6 +1051,8 @@ def main(argv: list[str] | None = None) -> int:
     # Base output name (OutputStem, no codec). When set, each codec's outputs
     # land in <output-stem>_<codec>/ so codecs coexist in OUTPUT_DIR.
     pp.add_argument("--output-stem", dest="output_stem", default="")
+    pp.add_argument("--output-tag", dest="output_tag", default="",
+                    help="profile suffix appended AFTER the codec (e.g. 'xs')")
     pp.set_defaults(fn=cmd_poll)
 
     args = p.parse_args(argv)

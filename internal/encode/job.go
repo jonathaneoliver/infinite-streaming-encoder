@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,6 +75,60 @@ func probeSourceWidth(path string) int {
 	return w
 }
 
+// probeSourceFps reads a clip's video frame rate (rounded to the nearest whole
+// fps) via ffprobe, so the speed model — which keys on fps because encode time
+// scales with frame count — can size cloud-batch chunks and rank priorities at
+// the right rate. Returns 0 on failure (callers treat that as "unknown" → 30).
+func probeSourceFps(path string) int {
+	cmd := exec.Command("ffprobe", "-v", "error",
+		"-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
+		"-of", "default=noprint_wrappers=1:nokey=1", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	s := strings.TrimSpace(string(out))
+	if n, d, ok := strings.Cut(s, "/"); ok {
+		num, e1 := strconv.ParseFloat(n, 64)
+		den, e2 := strconv.ParseFloat(d, 64)
+		if e1 == nil && e2 == nil && den > 0 {
+			return int(math.Round(num / den))
+		}
+		return 0
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return int(math.Round(f))
+	}
+	return 0
+}
+
+// probeHasAudio reports whether the source has at least one audio stream, for
+// the commercial cost model's per-track audio add-on.
+func probeHasAudio(path string) bool {
+	cmd := exec.Command("ffprobe", "-v", "error",
+		"-select_streams", "a", "-show_entries", "stream=index",
+		"-of", "csv=p=0", path)
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
+}
+
+// probeSourceMbps reads the source's overall bitrate in Mbit/s (0 on failure),
+// for the commercial model's high-bitrate multiplier (+25% per 50 Mbps > 50).
+func probeSourceMbps(path string) float64 {
+	cmd := exec.Command("ffprobe", "-v", "error",
+		"-show_entries", "format=bit_rate",
+		"-of", "default=noprint_wrappers=1:nokey=1", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	bps, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil || bps <= 0 {
+		return 0
+	}
+	return bps / 1e6
+}
+
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\[\?[0-9;]*[a-zA-Z]|\x1b[()][0-9A-B]|\x1b\][^\x07]*\x07|\r`)
 
 func stripANSI(s string) string {
@@ -107,9 +162,11 @@ var (
 	// "AMI cache hit" signal for the UI, independent of timing.
 	bootMarkerRe = regexp.MustCompile(`^\[\[ENCODER-BOOT ami=(\S+)\]\]$`)
 	// ENCODER-SPEED reports a completed encode's content-seconds vs wall-seconds
-	// so the control plane can learn each (codec, height, pass)'s speed for the
-	// dynamic chunk selector. Consumed by Manager.learnSpeed (not per-job).
-	speedMarkerRe = regexp.MustCompile(`^\[\[ENCODER-SPEED codec=(\S+) height=(\d+) two_pass=([01]) content_s=([0-9.]+) encode_s=([0-9.]+)\]\]$`)
+	// so the control plane can learn each variant's speed for the dynamic chunk
+	// selector, cost, and ETA. Keyed by every dimension that moves encode time:
+	// machine (mac/ubuntu/macmini local worker label, or "graviton" on cloud
+	// batch), codec, height, pass, preset, fps. Consumed by Manager.learnSpeed.
+	speedMarkerRe = regexp.MustCompile(`^\[\[ENCODER-SPEED machine=(\S+) codec=(\S+) height=(\d+) two_pass=([01]) preset=(\S+) fps=(\d+) content_s=([0-9.]+) encode_s=([0-9.]+)\]\]$`)
 	// ENCODER-RECLAIM reports one encode chunk's spot-reclaim accounting:
 	// count (# reclaimed attempts), lost_s (encode wall-time thrown away), and
 	// total_s (all attempts' wall-time = the "total encoded" denominator).
@@ -125,6 +182,17 @@ var (
 	// floor, job count, and the compute-env max vCPUs). The Job derives avg
 	// concurrency + efficiency from these. Keyed by exec for idempotent reattach.
 	statsMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STATS exec=(\S+) wall_s=([0-9.]+) vcpu_h=([0-9.]+) longest_s=([0-9.]+) slowest=(\S+) jobs=(\d+) max_vcpus=(\d+)\]\]$`)
+	// ENCODER-FLEET reports one distributed-local worker box's live CPU: busy =
+	// logical cores currently busy (from /proc/stat), perf = its perf-core target
+	// (4/4/8). Emitted by cli_local_dist from the workers' Temporal heartbeats,
+	// once per machine per poll. Consumed by Manager.recordFleetCPU (not per-job)
+	// to drive the local fleet CPU sparkline.
+	fleetMarkerRe = regexp.MustCompile(`^\[\[ENCODER-FLEET machine=(\S+) busy=([0-9.]+) perf=([0-9.]+)( chunks=([^\]]*))?\]\]$`)
+	// ENCODER-COMMERCIAL reports what this job's output ladder would have cost on
+	// hosted transcoders — a generic commercial cloud encoder and AWS MediaConvert
+	// — as comparison baselines against our own spot/local cost. Emitted once per
+	// job by the orchestrator (commercial_cloud.py).
+	commercialMarkerRe = regexp.MustCompile(`^\[\[ENCODER-COMMERCIAL commercial=([0-9.]+) mediaconvert=([0-9.]+) aws=([0-9.]+) aws_od=([0-9.]+)\]\]$`)
 )
 
 // learnSpeed folds an ENCODER-SPEED marker into the learned-speed model. Returns
@@ -134,13 +202,125 @@ func (m *Manager) learnSpeed(line string) bool {
 	if sm == nil {
 		return false
 	}
-	height, _ := strconv.Atoi(sm[2])
-	contentS, _ := strconv.ParseFloat(sm[4], 64)
-	encodeS, _ := strconv.ParseFloat(sm[5], 64)
+	machine, codec := sm[1], sm[2]
+	height, _ := strconv.Atoi(sm[3])
+	twoPass := sm[4] == "1"
+	preset := sm[5]
+	fps, _ := strconv.Atoi(sm[6])
+	contentS, _ := strconv.ParseFloat(sm[7], 64)
+	encodeS, _ := strconv.ParseFloat(sm[8], 64)
 	if m.Speeds != nil {
-		m.Speeds.Update(sm[1], height, sm[3] == "1", contentS, encodeS)
+		m.Speeds.Update(machine, codec, height, twoPass, preset, fps, contentS, encodeS)
 	}
 	return true
+}
+
+// encodeStageKeyRe parses an encode stage key into codec + output height, for
+// cost-weighting the overall progress. Matches chunked ("encode:hevc:1080p:chunk3")
+// and whole-variant ("encode:h264:1080p") keys alike.
+var encodeStageKeyRe = regexp.MustCompile(`^encode:([a-z0-9]+):(\d+)p?(:chunk\d+)?$`)
+
+// computeProgress sets job.OverallProgress + job.ETASeconds. It weights each
+// encode VARIANT by its expected wall-time (1 / learned content-per-wall speed),
+// so a slow 4K HEVC 2-pass rendition dominates a fast h264 360p one — and the
+// weighting self-corrects as the learned-speed model fills in from finished
+// chunks. Grouped by variant so dynamic chunking's chunk COUNT doesn't double-
+// count cost; pipeline stages (mezzanine/audio/package/…) share ~10% of the
+// weight so the tail counts but never dominates. ETA is a linear extrapolation
+// of the weighted progress over elapsed wall-time.
+func (m *Manager) computeProgress(job *Job) {
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	if len(job.Stages) == 0 {
+		return
+	}
+	twoPass := !job.Config.HevcSinglePass
+	eff := func(s StageProgress) float64 {
+		switch s.Status {
+		case "done":
+			return 100
+		case "failed":
+			return 0
+		}
+		return s.Percent
+	}
+	type vagg struct {
+		sum, weight float64
+		n           int
+	}
+	variants := map[string]*vagg{}
+	var pipeline []float64
+	for _, s := range job.Stages {
+		mm := encodeStageKeyRe.FindStringSubmatch(s.Key)
+		if mm == nil {
+			pipeline = append(pipeline, eff(s))
+			continue
+		}
+		vk := mm[1] + ":" + mm[2]
+		v := variants[vk]
+		if v == nil {
+			height, _ := strconv.Atoi(mm[2])
+			sp := 0.1
+			if m.Speeds != nil {
+				// Machine-agnostic: relative weights across variants cancel the
+				// per-machine/preset/fps factors, so this need only rank variants
+				// by cost. hevc honours the job's 2-pass setting; others 1-pass.
+				sp = m.Speeds.RelativeSpeed(mm[1], height, mm[1] == "hevc" && twoPass, "", 0)
+			}
+			if sp <= 0 {
+				sp = 0.001
+			}
+			v = &vagg{weight: 1.0 / sp}
+			variants[vk] = v
+		}
+		v.sum += eff(s)
+		v.n++
+	}
+	var num, den, variantTotal float64
+	var outSum float64
+	var outN int
+	for _, v := range variants {
+		if v.n > 0 {
+			vp := v.sum / float64(v.n)
+			num += v.weight * vp
+			den += v.weight
+			variantTotal += v.weight
+			outSum += vp // output-time %: every rendition equal, cost-blind
+			outN++
+		}
+	}
+	if outN > 0 {
+		job.OutputProgress = outSum / float64(outN)
+	}
+	if len(pipeline) > 0 {
+		pw := 1.0
+		if variantTotal > 0 {
+			pw = 0.10 * variantTotal / float64(len(pipeline)) // pipeline ≈ 10% of the bar
+		}
+		for _, p := range pipeline {
+			num += pw * p
+			den += pw
+		}
+	}
+	if den <= 0 {
+		return
+	}
+	prog := num / den
+	job.OverallProgress = prog
+	if prog > 1 && prog < 99.5 && !job.StartedAt.IsZero() {
+		job.ETASeconds = time.Since(job.StartedAt).Seconds() * (100 - prog) / prog
+		// For a running LOCAL-DIST job, the local-hardware "cost" (predicted
+		// end−start wall clock) is best given by the MEASURED total: elapsed +
+		// ETA. Keep it consistent with the per-job ETA rather than the seed
+		// makespan model (projectLocalWallSeconds), which over-predicts until
+		// local speeds are learned. The model still covers the cloud "what-if"
+		// and the pre-progress estimate.
+		if job.Config.Target == TargetLocalDist {
+			job.LocalWallSeconds = time.Since(job.StartedAt).Seconds() + job.ETASeconds
+		}
+	} else {
+		job.ETASeconds = 0
+	}
 }
 
 // upsertStage sets (or creates) a stage by key with the given label, status and
@@ -323,6 +503,12 @@ func (j *Job) parseMarker(line string) bool {
 			}
 		}
 		j.mu.Unlock()
+		return true
+	}
+	if commercialMarkerRe.MatchString(line) {
+		// ALL cost baselines are now computed server-side from the ladder + probe
+		// (Manager.projectAndSetCosts) so cloud-batch and local-dist agree — the
+		// old local-only ENCODER-COMMERCIAL marker is just swallowed (not logged).
 		return true
 	}
 	if m := fileMarkerRe.FindStringSubmatch(line); m != nil {
@@ -528,7 +714,19 @@ const (
 	TargetCloud      Target = "cloud"
 	TargetLocal      Target = "local"
 	TargetCloudBatch Target = "cloud-batch"
+	// TargetLocalDist fans one encode's chunks across the local Temporal worker
+	// pool (Mac + any other boxes) via cli_local_dist --backend temporal, with
+	// MinIO as the shared store. Same output contract as TargetLocal.
+	TargetLocalDist Target = "local-dist"
 )
+
+// envOr returns the env var value or a fallback.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 type JobStatus string
 
@@ -556,9 +754,15 @@ type JobConfig struct {
 	// = size each variant's chunks by learned encode speed (slow → 30s floor,
 	// cheap → whole clip, so all variants finish ~together); "whole" = one job
 	// per variant (max efficiency, no joins); or a fixed seconds value
-	// (multiple of the 6s segment duration). Only affects the cloud-batch target.
+	// (multiple of the 6s segment duration). On cloud-batch it sizes the Batch
+	// fan-out; on local it sizes cli_local's parallel chunk pool (see
+	// localChunkSeconds) — "dynamic"/"" default to 2×segment there.
 	ChunkDuration string `json:"chunk_duration,omitempty"`
 	GopDuration   string `json:"gop_duration"`
+	// OutputTag is appended to the output dir name ("<stem>_<tag>_<codec>"). Not a
+	// user field — filled from the selected ladder's output_tag by resolveTimings,
+	// so a profile like apple-uniq-live-6s marks its outputs ("_6s") for go-live.
+	OutputTag     string `json:"output_tag,omitempty"`
 	HlsFormat     string `json:"hls_format"`
 	Padding       string `json:"padding"`
 	KeepMezzanine bool   `json:"keep_mezzanine"`
@@ -651,8 +855,39 @@ type Job struct {
 	SpotUSD     float64 `json:"spot_usd,omitempty"`
 	OnDemandUSD float64 `json:"ondemand_usd,omitempty"`
 	SavedUSD    float64 `json:"saved_usd,omitempty"`
+	// CommercialUSD / MediaConvertUSD are what this job's output ladder would have
+	// cost on hosted transcoders (a generic commercial cloud encoder, and AWS
+	// MediaConvert) — comparison baselines against our own spot/local cost. Both
+	// are per-output-minute pricing, emitted once per job by the orchestrator
+	// (scripts/encoder/commercial_cloud.py). For local jobs (no SpotUSD) they're
+	// "what you'd have paid a hosted transcoder for the same work".
+	CommercialUSD   float64 `json:"commercial_usd,omitempty"`
+	MediaConvertUSD float64 `json:"mediaconvert_usd,omitempty"`
+	// AwsSpotUSD is what this ladder would cost on OUR AWS Batch spot fleet —
+	// compute-based (encode vCPU-hours × spot rate), summed over every variant, so
+	// unlike the per-output-minute SaaS baselines above it reflects each variant's
+	// real encode work (a 4K HEVC 2-pass rendition ~200× a 360p h264 one).
+	AwsSpotUSD     float64 `json:"aws_spot_usd,omitempty"`
+	AwsOndemandUSD float64 `json:"aws_ondemand_usd,omitempty"` // on-demand (reclaim-proof) upper bound
+	// LocalWallSeconds is the "cost" of encoding this ladder on YOUR local fleet:
+	// its only downside is time, so it's reported as predicted wall-clock (end −
+	// start), not dollars. A makespan estimate — total core-seconds of work over
+	// the fleet's parallel cores, floored by the longest atomic chunk — computed
+	// from the learned LOCAL speeds. Recomputed live as the encode learns, so a
+	// running local encode's estimate converges on its own actual runtime.
+	LocalWallSeconds float64 `json:"local_wall_s,omitempty"`
 	// per-execution [spot, ondemand, saved, vcpu_h], summed across files; not serialized.
 	costByExec map[string][4]float64
+
+	// Cached first-source probe (duration/width/fps) for live cost + local-wall
+	// re-prediction, so the per-sample refresh needn't re-invoke ffprobe. Set once
+	// by ensureSourceProbe; guarded by mu.
+	probeDone     bool
+	probeDuration float64
+	probeWidth    int
+	probeFps      int
+	probeHasAudio bool
+	probeSrcMbps  float64
 
 	// Run efficiency stats (from ENCODER-STATS, computed by the driver from Batch
 	// at job end). EncodeWallS = the Batch encode span (denominator for
@@ -672,6 +907,11 @@ type Job struct {
 	// per-execution stats, summed/maxed across files; not serialized.
 	statsByExec map[string]runStat
 
+	// launchComplete is set once this cloud job has submitted ALL its encode jobs
+	// (fully fanned out); the age-ordered launch gate lets the next-oldest job
+	// proceed only after this is true (or the job goes terminal). Not serialized.
+	launchComplete bool
+
 	// Stages is populated from [[ENCODER-PLAN]] + [[ENCODER-STAGE]]
 	// markers the Python orchestrator emits. Empty when the job hasn't
 	// reached the Python side yet (still queued, pre-run) or for old
@@ -679,6 +919,21 @@ type Job struct {
 	// Stages reflects ONLY the currently-processing file; finished
 	// files land in StagesHistory.
 	Stages []StageProgress `json:"stages,omitempty"`
+
+	// OverallProgress is a single 0–100% for the whole encode, WEIGHTED by each
+	// variant's expected wall-time (1/learned-speed) so a slow 4K HEVC 2-pass
+	// rendition counts far more than a fast h264 360p one — and it self-corrects
+	// as the learned-speed model updates from finished chunks. ETASeconds is a
+	// linear extrapolation of that weighted progress over elapsed time (0 when
+	// not estimable). Both recomputed on every notify by Manager.computeProgress.
+	OverallProgress float64 `json:"overall_progress,omitempty"`
+	ETASeconds      float64 `json:"eta_seconds,omitempty"`
+	// OutputProgress is the OTHER progress metric: % of the output video timeline
+	// produced (content-seconds done ÷ total), every rendition weighted equally
+	// regardless of encode cost. Differs from OverallProgress (compute-weighted)
+	// because 4K HEVC is cheap in output-minutes but huge in compute. "Processing"
+	// vs "output-time" — most people want OverallProgress; this is the companion.
+	OutputProgress float64 `json:"output_progress,omitempty"`
 
 	// Per-file progress indicators. CurrentFile/FileIndex/TotalFiles
 	// populate on the first [[ENCODER-FILE]] marker (or the Go loop's
@@ -801,14 +1056,151 @@ type Manager struct {
 	settings   Settings
 
 	sem chan struct{}
-	// launchGate (size 1) serializes the cloud-batch launch → fan-out phase across
-	// jobs: a job holds it from start-execution until its encodes are submitted,
-	// so an earlier job floods the queue with its higher-priority chunks before a
-	// later job's execution starts. Batch never preempts, so a later job that
-	// fanned out first would keep the vCPUs it grabbed regardless of priority.
-	launchGate  chan struct{}
-	subscribers []chan *Job
-	subMu       sync.Mutex
+	// launchMu/launchCond order the cloud-batch launch → fan-out phase by QUEUE
+	// AGE: a job waits until every OLDER active cloud job has fully fanned out
+	// (submitted all its jobs) before submitting its own execution. Age-ordered,
+	// not first-come — so an earlier job floods the fleet with its higher-priority
+	// jobs first regardless of upload timing (Batch never preempts).
+	launchMu      sync.Mutex
+	launchCond    *sync.Cond
+	warmReconcile func()
+	subscribers   []chan *Job
+	subMu         sync.Mutex
+
+	// fleetCPU holds recent per-machine CPU samples for the distributed-local
+	// fleet view (machine -> ring of samples); fleetChunks holds the chunks
+	// currently running on each machine (activity ids). Both fed by ENCODER-FLEET
+	// markers off the orchestrator's stdout. Guarded by fleetMu.
+	fleetMu     sync.Mutex
+	fleetCPU    map[string][]fleetSample
+	fleetChunks map[string][]string
+}
+
+// fleetSample is one CPU reading for a distributed-local worker box.
+type fleetSample struct {
+	T    time.Time
+	Busy float64 // logical cores busy (from the box's /proc/stat)
+	Perf float64 // its perf-core target (4/4/8); 100% = that many cores busy
+}
+
+// fleetHistoryLen caps the per-machine sample ring (~3 min at the orchestrator's
+// ~2s emit cadence) — enough for a live sparkline without unbounded growth.
+const fleetHistoryLen = 90
+
+// recordFleetCPU folds one ENCODER-FLEET marker into the per-machine CPU history.
+// Returns true when the line was such a marker (so the scanner suppresses it from
+// the log buffer, like the other structured markers).
+func (m *Manager) recordFleetCPU(line string) bool {
+	mm := fleetMarkerRe.FindStringSubmatch(line)
+	if mm == nil {
+		return false
+	}
+	busy, _ := strconv.ParseFloat(mm[2], 64)
+	perf, _ := strconv.ParseFloat(mm[3], 64)
+	var chunks []string
+	if mm[5] != "" {
+		chunks = strings.Split(mm[5], "|")
+	}
+	m.fleetMu.Lock()
+	if m.fleetCPU == nil {
+		m.fleetCPU = map[string][]fleetSample{}
+		m.fleetChunks = map[string][]string{}
+	}
+	s := append(m.fleetCPU[mm[1]], fleetSample{T: time.Now(), Busy: busy, Perf: perf})
+	if len(s) > fleetHistoryLen {
+		s = s[len(s)-fleetHistoryLen:]
+	}
+	m.fleetCPU[mm[1]] = s
+	m.fleetChunks[mm[1]] = chunks
+	m.fleetMu.Unlock()
+	return true
+}
+
+// FleetCPUEntry is one machine's CPU history for the local fleet view. History is
+// the normalized busy% (busy/perf*100): 100 = the box at its perf-core target,
+// >100 = SMT/E-core spill. Latest/Perf label the current reading; AgeS flags a
+// stale machine (no recent sample = not currently encoding).
+type FleetCPUEntry struct {
+	Machine string    `json:"machine"`
+	Perf    float64   `json:"perf"`
+	Latest  float64   `json:"latest"`
+	History []float64 `json:"history"`
+	AgeS    float64   `json:"age_s"`
+	Chunks  []string  `json:"chunks,omitempty"` // activity ids running on this box now
+}
+
+// FleetCPU returns each machine's recent CPU history for the fleet endpoint,
+// normalized to its perf-core target. Machines with no samples are omitted.
+func (m *Manager) FleetCPU() []FleetCPUEntry {
+	m.fleetMu.Lock()
+	defer m.fleetMu.Unlock()
+	out := make([]FleetCPUEntry, 0, len(m.fleetCPU))
+	now := time.Now()
+	for machine, samples := range m.fleetCPU {
+		if len(samples) == 0 {
+			continue
+		}
+		hist := make([]float64, len(samples))
+		for i, s := range samples {
+			if s.Perf > 0 {
+				hist[i] = s.Busy / s.Perf * 100
+			}
+		}
+		last := samples[len(samples)-1]
+		out = append(out, FleetCPUEntry{
+			Machine: machine, Perf: last.Perf,
+			Latest:  hist[len(hist)-1],
+			History: hist,
+			AgeS:    now.Sub(last.T).Seconds(),
+			Chunks:  m.fleetChunks[machine],
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Machine < out[j].Machine })
+	return out
+}
+
+// signalLaunch wakes any jobs waiting for their launch turn to re-check (called
+// when a job fully fans out or finalizes, so the next-oldest can proceed).
+func (m *Manager) signalLaunch() {
+	m.launchMu.Lock()
+	m.launchCond.Broadcast()
+	m.launchMu.Unlock()
+}
+
+// waitForLaunchTurn blocks the caller until no OLDER active cloud job is still
+// launching (queued/running without having fully fanned out). Guarantees cloud
+// executions start in queue order.
+func (m *Manager) waitForLaunchTurn(job *Job) {
+	m.launchMu.Lock()
+	defer m.launchMu.Unlock()
+	for m.olderStillLaunching(job) {
+		m.launchCond.Wait()
+	}
+}
+
+func (m *Manager) olderStillLaunching(job *Job) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, j := range m.jobs {
+		if j == job || j.ID >= job.ID { // IDs are ascending timestamps → older = smaller
+			continue
+		}
+		if j.Config.Target != TargetCloud && j.Config.Target != TargetCloudBatch {
+			continue
+		}
+		if (j.Status == StatusQueued || j.Status == StatusRunning) && !j.isLaunchComplete() {
+			return true
+		}
+	}
+	return false
+}
+
+// triggerWarm nudges the awswatch keep-warm loop to re-evaluate now (job start /
+// finalize), so the floor doesn't lag a poll interval behind the queue.
+func (m *Manager) triggerWarm() {
+	if m.warmReconcile != nil {
+		m.warmReconcile()
+	}
 }
 
 type ManagerConfig struct {
@@ -824,6 +1216,10 @@ type ManagerConfig struct {
 	EncoderImage    string
 	StateMachineArn string
 	MaxConcurrent   int
+	// WarmReconcile, if set, is called on a job START and FINALIZE so the
+	// awswatch keep-warm floor reacts immediately (raise on start, drop when the
+	// queue empties) instead of waiting for its next poll. Non-blocking.
+	WarmReconcile func()
 }
 
 func NewManager(cfg ManagerConfig) *Manager {
@@ -834,7 +1230,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		cfg.EncoderImage = "encoder:latest"
 	}
 	os.MkdirAll(cfg.TmpDir, 0755)
-	return &Manager{
+	m := &Manager{
 		Ladders:         LoadLadderStore(filepath.Join(cfg.TmpDir, "ladders.json")),
 		Speeds:          LoadEncodeSpeedStore(filepath.Join(cfg.TmpDir, "encode_speeds.json")),
 		SourceDir:       cfg.SourceDir,
@@ -849,8 +1245,10 @@ func NewManager(cfg ManagerConfig) *Manager {
 		EncoderImage:    cfg.EncoderImage,
 		StateMachineArn: cfg.StateMachineArn,
 		sem:             make(chan struct{}, cfg.MaxConcurrent),
-		launchGate:      make(chan struct{}, 1),
+		warmReconcile:   cfg.WarmReconcile,
 	}
+	m.launchCond = sync.NewCond(&m.launchMu)
+	return m
 }
 
 func (m *Manager) Subscribe() chan *Job {
@@ -874,6 +1272,7 @@ func (m *Manager) Unsubscribe(ch chan *Job) {
 }
 
 func (m *Manager) notify(j *Job) {
+	m.computeProgress(j) // refresh weighted progress + ETA before pushing to SSE
 	m.subMu.Lock()
 	defer m.subMu.Unlock()
 	for _, ch := range m.subscribers {
@@ -926,6 +1325,20 @@ func (j *Job) markFanOut() {
 		now := time.Now()
 		j.FanOutAt = &now
 	}
+}
+
+// markLaunchComplete records that this job has submitted ALL its encode jobs
+// (fully fanned out) — the signal that lets the next-oldest cloud job launch.
+func (j *Job) markLaunchComplete() {
+	j.mu.Lock()
+	j.launchComplete = true
+	j.mu.Unlock()
+}
+
+func (j *Job) isLaunchComplete() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.launchComplete
 }
 
 func (m *Manager) jobPriorityBase(job *Job) int {
@@ -986,6 +1399,9 @@ func (m *Manager) run(job *Job, startIdx int) {
 	m.notify(job)
 	m.sem <- struct{}{}
 	defer func() { <-m.sem }()
+	// Job reached terminal state (any return path below) → nudge keep-warm to
+	// re-evaluate now, so the floor drops the moment the queue empties.
+	defer m.triggerWarm()
 
 	// If cancel fired while this job was queued, skip straight to cleanup.
 	if job.IsCancelled() {
@@ -994,6 +1410,7 @@ func (m *Manager) run(job *Job, startIdx int) {
 	}
 
 	job.Status = StatusRunning
+	m.triggerWarm() // run starting → warm a box promptly, don't wait for the poll
 	if startIdx == 0 {
 		job.Progress = "starting"
 	} else {
@@ -1006,10 +1423,11 @@ func (m *Manager) run(job *Job, startIdx int) {
 	jobTmpDir := filepath.Join(m.TmpDir, job.ID)
 	os.MkdirAll(jobTmpDir, 0755)
 
-	script := filepath.Join(m.ScriptsDir, "encoder", "cli_local.py")
-	if job.Config.Target == TargetCloud {
-		script = filepath.Join(m.ScriptsDir, "encoder", "cli_cloud.py")
-	}
+	// local-dist is the only script-based (worker-container) path now; cloud-batch
+	// branches to its SFN driver inside encodeFilesFrom. (Legacy single-box "local"
+	// and direct-EC2 "cloud" targets were retired — cli_local.py survives only as
+	// the phase entry point cloud-batch's Batch job-defs invoke.)
+	script := filepath.Join(m.ScriptsDir, "encoder", "cli_local_dist.py")
 
 	err := m.encodeFilesFrom(job, jobTmpDir, script, startIdx)
 
@@ -1034,6 +1452,10 @@ func (m *Manager) run(job *Job, startIdx int) {
 		} else {
 			job.Status = StatusDone
 			job.Progress = "complete"
+			// Write the profile metadata (encode.json + a one-line manifest
+			// comment) into each output dir BEFORE promote, so a promoted copy
+			// carries it too.
+			m.writeEncodeMetaForDirs(job, moved)
 			if job.Config.PromoteAfter {
 				m.autoPromote(job, moved)
 			}
@@ -1487,7 +1909,52 @@ func (cfg *JobConfig) OutputStem(filename string) string {
 	case "pink":
 		stem += "_padpink"
 	}
+	// NOTE: the profile output tag (e.g. "xs") is NOT part of the stem — the
+	// encode script appends it AFTER the codec ("<stem>_p200_<codec>_xs"), so the
+	// "_p200_<codec>" shape smashing/go-live keys off stays intact (its clip-ID
+	// regex is _p200_(codec)(_|$), which needs the codec right after _p200).
 	return stem
+}
+
+// outputCodecDir is the final output directory name for one codec: the stem +
+// "_<codec>" + the profile suffix appended LAST ("<stem>_p200_h264_xs"). The
+// encode scripts build the same name; Go uses it for skip/matching.
+func (cfg *JobConfig) outputCodecDir(filename, codec string) string {
+	name := cfg.OutputStem(filename) + "_" + codec
+	if cfg.OutputTag != "" {
+		name += "_" + cfg.OutputTag
+	}
+	return name
+}
+
+// localChunkSeconds resolves the fixed chunk size for a LOCAL encode, driving
+// cli_local's --local-chunk-duration. Unlike the cloud (per-variant, complexity
+// aware), cli_local applies ONE chunk duration to every variant, so the cloud's
+// "dynamic"/"per-variant" modes collapse here to a fixed default of 2×segment
+// (12s by default): small enough that any real-length clip yields plenty of
+// chunks to fill the cores — a lone x265 encode only ~half-fills a box, so
+// chunking is what lets a single HEVC variant saturate the machine — yet large
+// enough to amortize 2-pass startup. "whole" disables chunking (0). A numeric
+// value is used verbatim. The result must stay a whole multiple of the segment
+// duration (plan_chunks enforces this; 2×segment always is).
+func (cfg *JobConfig) localChunkSeconds() float64 {
+	seg := 6.0
+	if cfg.SegmentDuration != "" {
+		if v, err := strconv.ParseFloat(cfg.SegmentDuration, 64); err == nil && v > 0 {
+			seg = v
+		}
+	}
+	switch cfg.ChunkDuration {
+	case "whole":
+		return 0
+	case "dynamic", "":
+		return 2 * seg
+	default:
+		if v, err := strconv.ParseFloat(cfg.ChunkDuration, 64); err == nil && v > 0 {
+			return v
+		}
+		return 2 * seg
+	}
 }
 
 func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) []string {
@@ -1517,6 +1984,9 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	if cfg.GopDuration != "" {
 		args = append(args, "--gop-duration", cfg.GopDuration)
 	}
+	if cfg.OutputTag != "" {
+		args = append(args, "--output-tag", cfg.OutputTag)
+	}
 	if cfg.HlsFormat != "" {
 		args = append(args, "--hls-format", cfg.HlsFormat)
 	}
@@ -1533,6 +2003,23 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	}
 	if cfg.HevcSinglePass {
 		args = append(args, "--hevc-single-pass")
+	}
+	// Local: chunk each variant so concurrent encodes fill the cores (the
+	// cloud gets this from Batch fan-out; locally cli_local runs a bounded
+	// pool over the chunks). Concurrency/threads are left to cli_local's
+	// core-aware auto-sizing so it adapts to whatever host runs the worker.
+	if cfg.Target == TargetLocal {
+		if chunk := cfg.localChunkSeconds(); chunk > 0 {
+			args = append(args, "--local-chunk-duration",
+				strconv.FormatFloat(chunk, 'f', -1, 64))
+		}
+		// The per-clip work dir is keyed by filename and persists across jobs,
+		// so a force re-encode must tell cli_local to drop the prior run's
+		// complete variants (else encode_all reuses them). resolveCodec is
+		// already bypassed for force upstream; this closes the worker-side reuse.
+		if cfg.ForceReencode {
+			args = append(args, "--force-reencode")
+		}
 	}
 	// CPU arch only makes sense for cloud encodes (local runs on the
 	// host's own architecture), and cli_local.py doesn't accept the
@@ -1553,25 +2040,25 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	return args
 }
 
-// cloudBatchArgs builds the CLI for cli_cloud.py when it's handling
-// multiple clips in one invocation. Differences vs encodeArgsForFile:
-//
-//   - `--input` appears once per filename (cli_cloud.py uses
-//     action="append" on that flag)
-//   - `--output` is omitted — each clip's output stem is derived on
-//     the remote inside the user-data loop as `${stem}_p200`
-//   - `--output-dir` is the local tmp dir where outputs sync back
-//     before moveTmpToOutput picks them up
-func (cfg *JobConfig) cloudBatchArgs(sourceDir, outputDir string, filenames []string) []string {
-	var args []string
-	for _, f := range filenames {
-		args = append(args, "--input", sourceDir+"/"+f)
+// distArgsForFile builds the CLI for cli_local_dist.py (the TargetLocalDist
+// worker): plan + start the durable Temporal EncodeWorkflow, which fans the
+// file's chunks across the local worker pool and downloads output_<codec>/ to
+// <outputDir>/<stem>_<codec> — same layout as cli_local, so moveTmpToOutput
+// picks it up unchanged. The S3 job-prefix embeds the unique job ID, so a
+// re-encode always writes a fresh MinIO prefix (no cross-job reuse); force is
+// implicit. MinIO endpoint/creds ride in as env (buildRunArgs).
+func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID string) []string {
+	stem := cfg.OutputStem(filename)
+	base := strings.TrimSuffix(filename, filepath.Ext(filename))
+	args := []string{
+		"--input", sourceDir + "/" + filename,
+		"--output", stem,
+		"--output-dir", outputDir,
+		"--backend", "temporal",
+		"--temporal-address", envOr("TEMPORAL_ADDRESS", "host.docker.internal:7233"),
+		"--s3-bucket", envOr("DIST_S3_BUCKET", "encoder-local"),
+		"--job-prefix", fmt.Sprintf("jobs/%s-%s", jobID, base),
 	}
-	args = append(args, "--output-dir", outputDir)
-
-	// These get passed through cli_cloud.py to the remote cli_local.py
-	// via the parse_known_args passthrough channel — same flags the
-	// local path uses.
 	if cfg.Codec != "" {
 		args = append(args, "--codec", cfg.Codec)
 	}
@@ -1581,59 +2068,83 @@ func (cfg *JobConfig) cloudBatchArgs(sourceDir, outputDir string, filenames []st
 	if cfg.MaxRes != "" {
 		args = append(args, "--max-res", cfg.MaxRes)
 	}
-	if cfg.Time != "" {
-		args = append(args, "--time", cfg.Time)
+	if chunk := cfg.localChunkSeconds(); chunk > 0 {
+		args = append(args, "--chunk-duration",
+			strconv.FormatFloat(chunk, 'f', -1, 64))
 	}
-	if cfg.SegmentDuration != "" {
-		args = append(args, "--segment-duration", cfg.SegmentDuration)
-	}
-	if cfg.PartialDuration != "" {
-		args = append(args, "--partial-duration", cfg.PartialDuration)
-	}
-	if cfg.GopDuration != "" {
-		args = append(args, "--gop-duration", cfg.GopDuration)
-	}
-	if cfg.HlsFormat != "" {
-		args = append(args, "--hls-format", cfg.HlsFormat)
-	}
-	switch cfg.Padding {
-	case "black":
-		args = append(args, "--padding")
-	case "pink":
-		args = append(args, "--padding-pink")
-	case "none":
-		args = append(args, "--no-padding")
-	}
-	if cfg.KeepMezzanine {
-		args = append(args, "--keep-mezzanine")
+	if cfg.OutputTag != "" {
+		args = append(args, "--output-tag", cfg.OutputTag)
 	}
 	if cfg.HevcSinglePass {
 		args = append(args, "--hevc-single-pass")
 	}
-	if cfg.CpuArch != "" {
-		args = append(args, "--cpu-arch", cfg.CpuArch)
-	}
-	if cfg.UseSpot != nil && !*cfg.UseSpot {
-		args = append(args, "--no-spot")
-	}
-	if cfg.ResumeFromJobID != "" {
-		args = append(args, "--resume-from-job-id", cfg.ResumeFromJobID)
-	}
-	if cfg.SimulateInterruptAfterS > 0 {
-		args = append(args, "--simulate-interrupt-after",
-			strconv.Itoa(cfg.SimulateInterruptAfterS))
-	}
 	return args
 }
 
-func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int) error {
-	// Cloud jobs batch every remaining file into a single cli_cloud.py
-	// invocation so one EC2 instance handles the whole job — boot once,
-	// docker pull once, amortize the launch + pull overhead across N
-	// clips. Local jobs still run one worker per file.
-	if job.Config.Target == TargetCloud {
-		return m.encodeCloudBatch(job, tmpDir, script, startIdx)
+// effectiveTiming resolves one profile timing value with precedence
+// job > ladder > global default. "" means "unset" at both the job and ladder
+// level; "0" is an explicit value (e.g. partial="0" turns LL-HLS parts off).
+func effectiveTiming(jobVal, ladderVal, globalDefault string) string {
+	if jobVal != "" {
+		return jobVal
 	}
+	if ladderVal != "" {
+		return ladderVal
+	}
+	return globalDefault
+}
+
+// resolveTimings fills a config's segment/partial/GOP from the selected ladder
+// (then the global default) wherever the job didn't set them, so the ladder
+// defines the profile's output timing. Mutates the passed (copied) cfg.
+func (m *Manager) resolveTimings(cfg *JobConfig) {
+	var def LadderDef
+	if m.Ladders != nil {
+		def, _ = m.Ladders.Get(cfg.Ladder)
+	}
+	cfg.SegmentDuration = effectiveTiming(cfg.SegmentDuration, def.SegmentDuration, "6")
+	cfg.PartialDuration = effectiveTiming(cfg.PartialDuration, def.PartialDuration, "0.2")
+	cfg.GopDuration = effectiveTiming(cfg.GopDuration, def.GopDuration, "1.0")
+	// Output suffix: explicit (job or ladder output_tag) wins; otherwise only the
+	// FLEXIBLE base (no pinned segment) is tagged "xs" — that's the master go-live
+	// repackages into 1s/2s/6s. A fixed-segment profile is served as-is, so it
+	// gets NO suffix (go-live doesn't repackage it or need its segment length).
+	tag := cfg.OutputTag
+	if tag == "" {
+		tag = def.OutputTag
+	}
+	cfg.OutputTag = deriveOutputTag(tag, def.SegmentDuration)
+}
+
+// deriveOutputTag returns the explicit tag if set; else "xs" for the flexible
+// base (no pinned segment — the repackage-into-1/2/6s master go-live treats
+// specially), or "" for a fixed-segment profile (served as-is, no marker needed).
+func deriveOutputTag(explicit, ladderSegment string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if ladderSegment == "" {
+		return "xs"
+	}
+	return ""
+}
+
+func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int) error {
+	// Project the cost comparison up front from the first source file's probe +
+	// the learned-speed model: AWS Batch (Graviton) compute cost AND predicted
+	// local-fleet wall-clock time. Target-independent (both "what would this cost
+	// on our cloud fleet?" and "how long on my own hardware?" apply to any run)
+	// and idempotent on reattach; refreshed live below as speeds are learned.
+	m.projectAndSetCosts(job)
+
+	// Resolve profile timing + output tag from the selected ladder into the job's
+	// effective config ONCE (job value wins, else ladder, else global default), so
+	// both the encode args AND the skip/output naming (resolveCodec, OutputStem)
+	// see the same values. Idempotent on reattach.
+	m.resolveTimings(&job.Config)
+
+	// cloud-batch fans the whole job onto AWS Batch via Step Functions; local-dist
+	// runs one worker container per file below.
 	if job.Config.Target == TargetCloudBatch {
 		return m.encodeCloudBatchSFN(job, tmpDir, startIdx)
 	}
@@ -1660,65 +2171,17 @@ func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int)
 		job.startFile(f, i+1, total)
 		m.notify(job)
 
-		fileCfg := job.Config
+		fileCfg := job.Config // already timing-resolved above
 		fileCfg.Codec = codec
-		args := fileCfg.encodeArgsForFile(m.SourceDir, tmpDir, f)
+		var args []string
+		if job.Config.Target == TargetLocalDist {
+			args = fileCfg.distArgsForFile(m.SourceDir, tmpDir, f, job.ID)
+		} else {
+			args = fileCfg.encodeArgsForFile(m.SourceDir, tmpDir, f)
+		}
 		if err := m.runFileContainer(job, i, script, args); err != nil {
 			return fmt.Errorf("%s: %w", f, err)
 		}
-	}
-	return nil
-}
-
-// encodeCloudBatch runs ALL remaining files through a single
-// cli_cloud.py invocation, which launches one EC2 instance and its
-// user-data bash loops through every clip on that same machine. The
-// EC2 boot + docker-pull overhead is paid once per job instead of
-// per clip.
-//
-// Pre-filters files via resolveCodec so we don't ship work for
-// already-fully-encoded clips to the cloud, same as the local path.
-func (m *Manager) encodeCloudBatch(job *Job, tmpDir, script string, startIdx int) error {
-	// Figure out which files genuinely need work. When !ForceReencode
-	// and everything's already in OutputDir, the whole batch collapses
-	// to zero clips — skip the instance launch entirely.
-	var filesToEncode []string
-	chosenCodec := job.Config.Codec
-	for i := startIdx; i < len(job.Config.Files); i++ {
-		f := job.Config.Files[i]
-		if job.Config.ForceReencode {
-			filesToEncode = append(filesToEncode, f)
-			continue
-		}
-		c := m.resolveCodec(job.Config, f)
-		if c == "" {
-			job.AppendLog(fmt.Sprintf("skipping %s — all codecs already encoded", f))
-			continue
-		}
-		filesToEncode = append(filesToEncode, f)
-		// If clips in the same job need different codec subsets, the
-		// batch uses the first non-empty resolved codec; edge case,
-		// only relevant when some clips partially exist in OutputDir.
-		if c != job.Config.Codec {
-			chosenCodec = c
-		}
-	}
-
-	if len(filesToEncode) == 0 {
-		return nil
-	}
-
-	job.Progress = fmt.Sprintf("cloud encode: %d clip(s) on one instance",
-		len(filesToEncode))
-	m.notify(job)
-	m.persistState(job, startIdx)
-
-	batchCfg := job.Config
-	batchCfg.Codec = chosenCodec
-	args := batchCfg.cloudBatchArgs(m.SourceDir, tmpDir, filesToEncode)
-
-	if err := m.runFileContainer(job, startIdx, script, args); err != nil {
-		return fmt.Errorf("cloud batch: %w", err)
 	}
 	return nil
 }
@@ -1797,22 +2260,24 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	// of re-uploading + re-submitting (which would orphan the old execution and
 	// duplicate the work). Only if the persisted ARN is still RUNNING/SUCCEEDED.
 	execArn := job.CloudExecArn()
-	// Serialize the launch → fan-out phase across cloud jobs (see launchGate).
-	// Held from start-execution until this job's encodes are submitted; released
-	// on the first encode stage marker in the poll loop, or on return (fallback).
-	launchHeld := false
-	releaseLaunch := func() {
-		if launchHeld {
-			launchHeld = false
-			<-m.launchGate
-		}
-	}
-	defer releaseLaunch()
-	// Encode jobs this fan-out will submit + the distinct encode stage keys seen
-	// so far; the gate releases only once every job has been submitted (fully
-	// fanned out), not on the first one. 0 on reattach (gate not held).
+	// Age-ordered launch: this job waits (below, before submit) until every older
+	// cloud job has fully fanned out, then marks itself launch-complete once it has
+	// submitted all its own encode jobs — releasing the next-oldest job. Counting
+	// distinct encode stage keys vs the expected total detects "fully fanned out";
+	// markLaunched is idempotent and always runs on return (so a job that fails
+	// before fan-out still unblocks the queue).
 	expectedEncodes := 0
 	seenEncodes := map[string]bool{}
+	var launchStart time.Time
+	launchDone := false
+	markLaunched := func() {
+		if !launchDone {
+			launchDone = true
+			job.markLaunchComplete()
+			m.signalLaunch()
+		}
+	}
+	defer markLaunched()
 	if execArn != "" && m.cloudExecutionResumable(execArn) {
 		job.AppendLog("[cloud-batch] reattaching to execution " + execArn)
 		m.notify(job)
@@ -1913,19 +2378,30 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		if srcWidth > 0 {
 			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: source width %dpx — ladder capped to native (no upscaling)", filename, srcWidth))
 		}
-		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, srcWidth, durationS, job.Config.ChunkDuration, m.jobPriorityBase(job), job.AppendLog)
+		// Source fps: keys the speed model (encode time ∝ frame count), so chunk
+		// sizes/priorities match the graviton keys learned at the same rate.
+		srcFps := probeSourceFps(localSrc)
+		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, srcWidth, srcFps, durationS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), job.AppendLog)
 		expectedEncodes = expEnc
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
 			return fmt.Errorf("write input json: %w", err)
 		}
 
-		// Hold the launch gate so an earlier queued job fully fans out (floods the
-		// fleet with its higher-priority chunks) before this execution starts —
-		// Batch never preempts, so a later job that grabbed vCPUs early keeps them.
-		job.AppendLog("[cloud-batch] waiting for launch gate (earlier jobs fan out first)…")
-		m.launchGate <- struct{}{}
-		launchHeld = true
+		// Wait our turn: block until every OLDER queued/running cloud job has fully
+		// fanned out, so an earlier job floods the fleet with its higher-priority
+		// jobs before this execution starts (Batch never preempts, so a later job
+		// that fanned out first would keep the vCPUs it grabbed).
+		job.AppendLog("[cloud-batch] waiting for launch turn (older jobs fan out first)…")
+		m.waitForLaunchTurn(job)
+		launchStart = time.Now()
+		// A cancel can fire while we were waiting our turn (minutes, if an earlier
+		// job is still uploading/mezzanine). Bail before submitting so we don't spin
+		// up an execution + Batch jobs for a cancelled job — run() finalizes it as
+		// cancelled; the deferred markLaunched unblocks the queue.
+		if job.IsCancelled() {
+			return nil
+		}
 
 		// Submit.
 		submit := exec.Command("python3", "-m", "encoder.cli_batch", "submit",
@@ -1949,11 +2425,15 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	// <stem>/output_<codec>/ wrapper), so moveTmpToOutput moves each codec
 	// independently and codecs of the same clip COEXIST in OUTPUT_DIR — matching
 	// the local pipeline + the OutputStem/resolveCodec/watcher naming contract.
-	poll := exec.Command("python3", "-m", "encoder.cli_batch", "poll",
+	pollArgs := []string{"poll",
 		"--execution-arn", execArn,
 		"--s3-prefix", s3Prefix,
 		"--local-dir", tmpDir,
-		"--output-stem", job.Config.OutputStem(filename))
+		"--output-stem", job.Config.OutputStem(filename)}
+	if job.Config.OutputTag != "" {
+		pollArgs = append(pollArgs, "--output-tag", job.Config.OutputTag)
+	}
+	poll := exec.Command("python3", append([]string{"-m", "encoder.cli_batch"}, pollArgs...)...)
 	poll.Env = os.Environ()
 	stdout, err := poll.StdoutPipe()
 	if err != nil {
@@ -2012,18 +2492,25 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// job's execution can't start while this one still has higher-priority
 		// jobs to submit. Batch never preempts, so a partial release would let the
 		// later job grab vCPUs this job's remaining jobs should have had.
-		if launchHeld {
+		if !launchDone {
 			if m := stageMarkerRe.FindStringSubmatch(line); m != nil && strings.HasPrefix(m[1], "encode:") {
 				job.markFanOut() // encode start (first job); idempotent
 				seenEncodes[m[1]] = true
-				if len(seenEncodes) >= expectedEncodes {
-					releaseLaunch()
-					job.AppendLog(fmt.Sprintf("[cloud-batch] fully fanned out (%d encode jobs) — releasing launch gate", expectedEncodes))
-				}
+			}
+			// Mark launch-complete once ALL expected encode jobs are submitted —
+			// this releases the next-oldest job. Checked on every line so:
+			// expectedEncodes==0 (source below the smallest rung → no encodes)
+			// completes at once, and a Go/Python count divergence can't stall the
+			// queue for the whole job — a safety timeout (10min, well past any
+			// mezzanine + atomic fan-out) releases it.
+			if len(seenEncodes) >= expectedEncodes || (!launchStart.IsZero() && time.Since(launchStart) > 10*time.Minute) {
+				markLaunched()
+				job.AppendLog(fmt.Sprintf("[cloud-batch] fully fanned out (%d/%d encode jobs) — next job may launch", len(seenEncodes), expectedEncodes))
 			}
 		}
 		if m.learnSpeed(line) {
-			continue // telemetry for the dynamic chunk selector, not a log line
+			m.projectAndSetCosts(job) // refine cost + local-wall from the new sample
+			continue                  // telemetry for the dynamic chunk selector, not a log line
 		}
 		if !job.parseMarker(line) {
 			job.AppendLog(line)
@@ -2047,10 +2534,10 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 // learned encode speed (slow → 12s floor, cheap → whole clip); "whole" → one
 // chunk; a number → that fixed size. clipS==0 (duration unknown) collapses to
 // whole downstream.
-func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, codec string, height int, twoPass bool) float64 {
+func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, codec string, height int, twoPass bool, preset string, fps int) float64 {
 	switch cfg {
 	case "dynamic", "":
-		return dynamicChunkSeconds(speeds, codec, height, twoPass, clipS)
+		return dynamicChunkSeconds(speeds, codec, height, twoPass, preset, fps, clipS)
 	case "whole":
 		if clipS > 0 {
 			return clipS
@@ -2064,32 +2551,11 @@ func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, co
 	}
 }
 
-// predictedPriority ranks a variant by its predicted encode WALL time
-// (content ÷ learned-or-seeded speed) so the slowest variant gets the highest
-// Batch SchedulingPriorityOverride and enters the fleet first. Reuses the same
-// speed model as the dynamic chunk selector, so ordering sharpens as speeds are
-// learned. Clamped to Batch's [1, 9999] priority range. When the clip duration
-// is unknown (0), content falls back to 1 so variants still rank by 1/speed.
-func predictedPriority(speeds *EncodeSpeedStore, codec string, height int, twoPass bool, clipS float64) int {
-	content := clipS
-	if content <= 0 {
-		content = 1
-	}
-	p := int(math.Round(content / speeds.Speed(codec, height, twoPass)))
-	if p < 1 {
-		p = 1
-	}
-	if p > 9999 {
-		p = 9999
-	}
-	return p
-}
-
 // chunkPlanLine explains one variant's chunk-size decision for the job log:
 // how many chunks, the per-chunk length, and — for the dynamic selector — the
 // speed (learned or seeded) and target that produced it. This is what makes a
 // "why is h264 1080p one whole chunk?" question answerable from the log alone.
-func chunkPlanLine(cfg, codec, label string, height int, twoPass bool, speeds *EncodeSpeedStore, chunkS float64, count int, clipS float64) string {
+func chunkPlanLine(cfg, codec, label string, height int, twoPass bool, preset string, fps int, speeds *EncodeSpeedStore, chunkS float64, count int, clipS float64) string {
 	pass := "1-pass"
 	if twoPass {
 		pass = "2-pass"
@@ -2102,7 +2568,7 @@ func chunkPlanLine(cfg, codec, label string, height int, twoPass bool, speeds *E
 		codec, label, pass, mode, chunkS)
 	switch cfg {
 	case "dynamic", "":
-		sp, n := speeds.SpeedDetail(codec, height, twoPass)
+		sp, n := speeds.SpeedDetail("graviton", codec, height, twoPass, preset, fps)
 		src := fmt.Sprintf("seeded %.3gx", sp)
 		if n > 0 {
 			src = fmt.Sprintf("learned %.3gx (%d samples)", sp, n)
@@ -2184,7 +2650,7 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached bool, sourceWidth int, clipDurationS float64, chunkCfg string, priorityBase int, logf func(string)) (string, int) {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached bool, sourceWidth, sourceFps int, clipDurationS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, logf func(string)) (string, int) {
 	if ladderName == "" {
 		ladderName = "apple-uniq-live"
 	}
@@ -2212,12 +2678,19 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	if bufMult <= 0 {
 		bufMult = 0.25
 	}
+	// Profile timing: job value wins, else the ladder's, else the global default.
+	// So a VOD ladder (0 partial, 6s GOP) drives the cloud encode the same way it
+	// drives local — cli_phase reads these off env (previously hardcoded).
+	segDur = effectiveTiming(segDur, ladderDef.SegmentDuration, "6")
+	partDur = effectiveTiming(partDur, ladderDef.PartialDuration, "0.2")
+	gopDur = effectiveTiming(gopDur, ladderDef.GopDuration, "1.0")
 	codecs := parseCodecSel(codecSel)
 	// Build the per-codec rung list from the ladder store. resolveLadderRungs
 	// caps each codec at the source width (no upscale) and --max-res, and
 	// assigns ordinal labels for repeated resolutions — identical to
 	// ladder.select_rungs, so cloud and local agree on {codec}_{label}.
 	var variants []sfnVariant
+	var scores []float64 // predicted encode wall per variant, aligned with variants (for rank-based priority)
 	doH264, doHevc, doAV1 := false, false, false
 	for _, c := range codecs {
 		rungs := store.resolveRungs(ladderName, c, maxRes, sourceWidth)
@@ -2239,28 +2712,27 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			// two-passes by default unless the user asked for a single-pass
 			// comparison run (hevcSinglePass).
 			twoPass := c == "hevc" && !hevcSinglePass
-			// Priority = predicted encode WALL time (content ÷ learned speed):
-			// the slowest variant enters the fleet first. Subsumes the old
-			// resolution-tier + HEVC-bump heuristic — pixels, codec, and pass
-			// all fold into the speed model, so 1080p sorts ahead of 1044p and
-			// 4K HEVC 2-pass far ahead of any H.264, self-correcting as learned.
-			prio := predictedPriority(speeds, c, r.Height, twoPass, clipDurationS)
-			// Compress the within-job priority to 0-999 (order preserved; very slow
-			// variants tie at the top) and lift it into this job's band.
-			if prio > 999 {
-				prio = 999
+			// Ranking score = predicted encode WALL (content ÷ graviton speed). The
+			// banded SchedulingPriority is assigned by RANK of this score AFTER the
+			// loop (not by clamping the raw score), so the heaviest variant strictly
+			// outranks the merely-heavy — pixels, codec, and pass all fold into the
+			// speed model, self-correcting as speeds are learned.
+			score := clipDurationS
+			if score <= 0 {
+				score = 1
 			}
-			prio = clampPrio(priorityBase + prio)
+			score /= speeds.Speed("graviton", c, r.Height, twoPass, r.Preset, sourceFps)
+			scores = append(scores, score)
 			// Per-variant chunking: size this variant's chunks (dynamic by
 			// complexity, or the job's fixed/whole config), then enumerate them.
-			cs := variantChunkSeconds(chunkCfg, clipDurationS, speeds, c, r.Height, twoPass)
+			cs := variantChunkSeconds(chunkCfg, clipDurationS, speeds, c, r.Height, twoPass, r.Preset, sourceFps)
 			nc := chunkCountForDuration(clipDurationS, cs)
 			idx := make([]int, nc)
 			for k := range idx {
 				idx[k] = k
 			}
 			if logf != nil {
-				logf(chunkPlanLine(chunkCfg, c, r.Label, r.Height, twoPass, speeds, cs, nc, clipDurationS))
+				logf(chunkPlanLine(chunkCfg, c, r.Label, r.Height, twoPass, r.Preset, sourceFps, speeds, cs, nc, clipDurationS))
 			}
 			variants = append(variants, sfnVariant{
 				Codec:         c,
@@ -2271,7 +2743,7 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 				Preset:        r.Preset,
 				VCPU:          vcpu,
 				Memory:        mem,
-				Priority:      prio,
+				Priority:      0, // assigned by rank below
 				TwoPass:       strconv.FormatBool(twoPass),
 				ChunkIndices:  idx,
 				ChunkDuration: strconv.FormatFloat(cs, 'f', -1, 64),
@@ -2279,9 +2751,26 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			})
 		}
 	}
-	// Submit slowest-first (high resolution, then HEVC before H.264) so the
-	// long poles enter the queue early; schedulingPriority enforces it, but a
-	// good submission order helps too.
+	// Assign the banded SchedulingPriority by RANK of predicted encode wall: the
+	// heaviest variant gets 999 within this job's band, the next 998, and so on —
+	// strictly decreasing. Ranking (rather than clamping the raw score to 999) is
+	// what stops 4K H.264 and 4K HEVC 2-pass — both far past the old 999 cap —
+	// from tying at 999 and letting Batch start the cheaper H.264 first. A ladder
+	// has ≤ ~40 variants, so ranks never collide within the 999-wide band.
+	order := make([]int, len(variants))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return scores[order[a]] > scores[order[b]] })
+	for rank, vi := range order {
+		within := 999 - rank
+		if within < 1 {
+			within = 1
+		}
+		variants[vi].Priority = clampPrio(priorityBase + within)
+	}
+	// Submit slowest-first too (Priority desc) so submission order reinforces the
+	// scheduler's priority — the long poles enter the queue first.
 	sortRungsSlowestFirst(variants)
 	// chunk_indices / chunk_duration / chunked are PER-VARIANT now (on each
 	// sfnVariant above): each variant sizes its own chunks by complexity, so the
@@ -2309,6 +2798,11 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		// so a custom ladder's VBV is honored in the cloud, not just locally.
 		"maxrate_percent":    strconv.Itoa(maxratePct),
 		"bufsize_multiplier": strconv.FormatFloat(bufMult, 'f', -1, 64),
+		// Profile timing (ladder-resolved) → containerOverrides env → cli_phase.
+		// Same for every variant/package job of a run (like the VBV knobs above).
+		"segment_duration": segDur,
+		"partial_duration": partDur,
+		"gop_duration":     gopDur,
 		// Banded priorities for the fixed phases (chunks carry their own banded
 		// priority per variant). Keeps a job's whole pipeline in one band so an
 		// earlier job's package isn't starved by a later job's chunks.
@@ -2336,7 +2830,6 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 // resolveCodec checks which codecs are already encoded in OutputDir and returns
 // the codec flag that covers only the missing ones. Returns "" if all exist.
 func (m *Manager) resolveCodec(cfg JobConfig, filename string) string {
-	stem := cfg.OutputStem(filename)
 	want := map[string]bool{}
 	for _, c := range parseCodecSel(cfg.Codec) { // handles "", both, all, comma-list, single
 		want[c] = true
@@ -2344,7 +2837,7 @@ func (m *Manager) resolveCodec(cfg JobConfig, filename string) string {
 	// The still-missing codecs, in canonical order.
 	var missing []string
 	for _, c := range []string{"h264", "hevc", "av1"} {
-		if want[c] && !dirExistsWithFiles(filepath.Join(m.OutputDir, stem+"_"+c)) {
+		if want[c] && !dirExistsWithFiles(filepath.Join(m.OutputDir, cfg.outputCodecDir(filename, c))) {
 			missing = append(missing, c)
 		}
 	}
@@ -2446,6 +2939,19 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 			}
 		}
 	}
+	// TargetLocalDist: the orchestrator reaches Temporal + MinIO. These are the
+	// MinIO creds (as AWS_* for boto3) — kept under distinct MINIO_* server env
+	// so they don't clobber the server's real AWS creds used by the cloud path.
+	if job.Config.Target == TargetLocalDist {
+		runArgs = append(runArgs,
+			"-e", "TEMPORAL_ADDRESS="+envOr("TEMPORAL_ADDRESS", "host.docker.internal:7233"),
+			"-e", "TEMPORAL_TASK_QUEUE="+envOr("TEMPORAL_TASK_QUEUE", "encode"),
+			"-e", "S3_ENDPOINT_URL="+envOr("MINIO_ENDPOINT", "http://host.docker.internal:9000"),
+			"-e", "AWS_ACCESS_KEY_ID="+envOr("MINIO_ACCESS_KEY", "encoder"),
+			"-e", "AWS_SECRET_ACCESS_KEY="+envOr("MINIO_SECRET_KEY", "encoder-secret"),
+			"-e", "AWS_REGION="+envOr("MINIO_REGION", "us-east-1"),
+		)
+	}
 	runArgs = append(runArgs, m.EncoderImage)
 	runArgs = append(runArgs, scriptArgs...)
 	return runArgs
@@ -2500,7 +3006,11 @@ func (m *Manager) attachAndWait(job *Job, name string) error {
 			continue
 		}
 		if m.learnSpeed(line) {
-			continue // dynamic-chunk-selector telemetry, not a log line
+			m.projectAndSetCosts(job) // refine cost + local-wall from the new sample
+			continue                  // dynamic-chunk-selector telemetry, not a log line
+		}
+		if m.recordFleetCPU(line) {
+			continue // per-machine CPU sample for the fleet view, not a log line
 		}
 		// Structured progress markers update Job.Stages and are suppressed
 		// from the log buffer so the viewer stays readable. Anything else

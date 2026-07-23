@@ -31,6 +31,103 @@ _NS = {"mpd": _DASH_NS}
 
 
 # ---------------------------------------------------------------------------
+# Fragment byte-ranges → mpd (self-contained, no sidecar at serve time)
+# ---------------------------------------------------------------------------
+
+def write_fragmented_mpd(package_dir: Path) -> int:
+    """Write manifest_fragmented.mpd beside manifest.mpd: expand each whole-segment
+    <SegmentURL> into one per-fragment <SegmentURL media mediaRange> (standard DASH
+    byte-range addressing into the same .m4s), with a matching per-fragment
+    SegmentTimeline — each segment's duration split evenly across its fragments,
+    the same way go-live derives them. This puts the fragment index IN the manifest
+    (mirroring how the HLS m3u8 already carries EXT-X-PART), so a player / go-live
+    needs no .byteranges sidecar at serve time. Leaves manifest.mpd untouched for
+    A/B. Requires the sidecars to already exist. Returns representations expanded.
+    """
+    package_dir = Path(package_dir)
+    src = package_dir / "manifest.mpd"
+    if not src.exists():
+        cands = [p for p in package_dir.glob("*.mpd") if "_fragmented" not in p.name]
+        if not cands:
+            return 0
+        src = cands[0]
+
+    ET.register_namespace("", _DASH_NS)
+    ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
+    tree = ET.parse(src)
+    root = tree.getroot()
+
+    n = 0
+    for sl in root.findall(".//mpd:SegmentList", _NS):
+        timeline = sl.find("mpd:SegmentTimeline", _NS)
+        seg_urls = sl.findall("mpd:SegmentURL", _NS)
+        if timeline is None or not seg_urls:
+            continue
+        # Flatten <S t d r> into a per-segment duration list.
+        durs: list[int] = []
+        for s in timeline.findall("mpd:S", _NS):
+            try:
+                d = int(s.get("d"))
+            except (TypeError, ValueError):
+                d = 0
+            durs.extend([d] * (int(s.get("r", "0")) + 1))
+        if len(durs) != len(seg_urls):
+            continue  # can't map fragments to segment durations safely — skip rep
+
+        new_durs: list[int] = []
+        new_urls: list[tuple[str, str | None]] = []
+        for i, surl in enumerate(seg_urls):
+            media = surl.get("media") or ""
+            seg_dur = durs[i]
+            frags = _load_byteranges(package_dir / media) if media else None
+            if frags:
+                base, rem = divmod(seg_dur, len(frags))
+                for k, fr in enumerate(frags):
+                    fd = base + (1 if k < rem else 0)
+                    off = int(fr.get("offset", 0))
+                    end = off + int(fr.get("length", 0)) - 1
+                    new_durs.append(max(fd, 1))
+                    new_urls.append((media, f"{off}-{max(end, off)}"))
+            else:
+                new_durs.append(seg_dur)
+                new_urls.append((media, None))
+
+        # Rebuild in DASH order: Initialization, SegmentTimeline, SegmentURL*.
+        for surl in seg_urls:
+            sl.remove(surl)
+        sl.remove(timeline)
+        new_tl = ET.SubElement(sl, "SegmentTimeline")
+        t = i = 0
+        while i < len(new_durs):
+            d = new_durs[i]
+            r = 0
+            while i + r + 1 < len(new_durs) and new_durs[i + r + 1] == d:
+                r += 1
+            s = ET.SubElement(new_tl, "S")
+            s.set("t", str(t))
+            s.set("d", str(d))
+            if r:
+                s.set("r", str(r))
+            t += d * (r + 1)
+            i += r + 1
+        for media, mr in new_urls:
+            u = ET.SubElement(sl, "SegmentURL")
+            u.set("media", media)
+            if mr:
+                u.set("mediaRange", mr)
+        n += 1
+
+    if n == 0:
+        return 0
+    out = src.with_name("manifest_fragmented.mpd")
+    dom = minidom.parseString(ET.tostring(root, encoding="UTF-8"))
+    pretty = dom.toprettyxml(indent="  ", encoding="UTF-8").decode("UTF-8")
+    out.write_text("\n".join(l for l in pretty.split("\n") if l.strip()) + "\n", encoding="UTF-8")
+    print(f"Wrote {out.name}: {n} representation(s) expanded to per-fragment mediaRange")
+    return n
+
+
+# ---------------------------------------------------------------------------
 # SegmentTemplate → SegmentList
 # ---------------------------------------------------------------------------
 

@@ -24,6 +24,19 @@ type LadderDef struct {
 	Seed              bool    `json:"seed,omitempty"`
 	MaxratePercent    int     `json:"maxrate_percent,omitempty"`
 	BufsizeMultiplier float64 `json:"bufsize_multiplier,omitempty"`
+	// Output timing that defines the profile as much as its bitrates: HLS segment
+	// length, LL-HLS partial length ("0" = off → plain VOD, no parts), and GOP /
+	// keyframe interval. Strings so "" means "inherit the global default" while
+	// "0" is an explicit value; a per-encode job value still overrides. Live
+	// profiles set 6/0.2/1.0; a VOD profile sets 6/0/6.
+	SegmentDuration string `json:"segment_duration,omitempty"`
+	PartialDuration string `json:"partial_duration,omitempty"`
+	GopDuration     string `json:"gop_duration,omitempty"`
+	// OutputTag, when set, is appended to the output directory name (e.g. "6s" →
+	// "<stem>_6s_<codec>"). It marks the profile in the filename so a downstream
+	// consumer (e.g. go-live) can tell a repackage-once profile from the default
+	// repackage-into-1s/2s/6s one. Empty = no tag (dir names unchanged).
+	OutputTag string `json:"output_tag,omitempty"`
 	// Codecs maps a codec ("h264"/"hevc"/"av1") to its rungs, each a
 	// [width, height, bitrate_kbps] triple. Preset defaults to "medium".
 	Codecs map[string][][]int `json:"codecs"`
@@ -82,6 +95,39 @@ func defaultSeedLadders() map[string]LadderDef {
 			Seed:              true,
 			MaxratePercent:    110,
 			BufsizeMultiplier: 0.10,
+			// No pinned segment_duration: this is the FLEXIBLE base — the tight VBV
+			// is safe to repackage into 1s/2s/6s, so the ladder page shows all three
+			// segment charts. partial/gop are its LL-HLS live settings.
+			PartialDuration: "0.2",
+			GopDuration:     "1.0",
+			Codecs: map[string][][]int{
+				"h264": appleUniqH264,
+				"hevc": appleUniqHEVC,
+				"av1":  appleUniqHEVC,
+			},
+		},
+		"apple-uniq-live-6s": {
+			Description:       "apple-uniq LL-HLS for 6s segments ONLY. The tight 110%/0.10x VBV on apple-uniq-live existed to keep the delivered per-segment peak reasonable even at 1s (delivered peak ~= maxrate + bufsize/T). Fixed at 6s the bufsize/T term is 6x smaller, so relax to 150%/1.0x for better quality on complex scenes while the delivered peak stays ~1.67x avg. Keeps LL-HLS parts (0.2s) + 1s GOP.",
+			Seed:              true,
+			MaxratePercent:    150,
+			BufsizeMultiplier: 1.0,
+			SegmentDuration:   "6", // fixed → suffix auto-derives to "_6s"
+			PartialDuration:   "0.2",
+			GopDuration:       "1.0",
+			Codecs: map[string][][]int{
+				"h264": appleUniqH264,
+				"hevc": appleUniqHEVC,
+				"av1":  appleUniqHEVC,
+			},
+		},
+		"apple-uniq-vod": {
+			Description:       "apple-uniq bitrates tuned for VOD: 6s segments, NO LL-HLS parts, long 6s GOP (fewer keyframes -> better efficiency), and a relaxed VBV (peak <= 2x avg per Apple's VOD guidance, 2.0x buffer). Bits redistribute toward complex scenes; average bitrate and size are unchanged.",
+			Seed:              true,
+			MaxratePercent:    200,
+			BufsizeMultiplier: 2.0,
+			SegmentDuration:   "6",
+			PartialDuration:   "0",
+			GopDuration:       "6",
 			Codecs: map[string][][]int{
 				"h264": appleUniqH264,
 				"hevc": appleUniqHEVC,

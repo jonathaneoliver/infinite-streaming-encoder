@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -24,11 +25,14 @@ const (
 )
 
 // EncodeSpeedStore learns each variant's encode SPEED — content-seconds encoded
-// per wall-second — keyed by {codec}:{height}:{pass}, persisted to
-// $TmpDir/encode_speeds.json. The dynamic chunk selector uses it to size each
-// variant's chunks: slow variants (4K HEVC ~0.03×) get many 30s chunks for max
-// parallelism; cheap ones (small H264, many× real-time) get one whole chunk and
-// pay no join cost. Learned values (from completed encodes) override the model.
+// per wall-second — keyed by {machine}:{codec}:{height}:{pass}:{preset}:{fps}
+// (see speedKey), persisted to $TmpDir/encode_speeds.json. Three consumers: the
+// dynamic chunk selector sizes each variant's chunks (slow 4K HEVC → many 12s
+// chunks for parallelism; cheap H264 → one whole chunk, no join cost); cloud
+// cost projects graviton wall-time; ETA extrapolates. Machine-keyed because a
+// Mac, a Ryzen box, and a Graviton vCPU differ widely — RelativeSpeed averages
+// across machines when only relative variant weight matters. Learned values
+// (from completed encodes) override the seed model.
 type EncodeSpeedStore struct {
 	mu      sync.Mutex
 	path    string
@@ -36,12 +40,60 @@ type EncodeSpeedStore struct {
 	samples map[string]int
 }
 
-func speedKey(codec string, height int, twoPass bool) string {
+// speedKey identifies a learned encode speed by every dimension that materially
+// changes encode time: MACHINE (mac/ubuntu/macmini/graviton — hardware varies
+// widely, and this also encodes local-vs-cloud), codec, output height, 1-vs-2
+// pass, encoder preset, and source fps (encode time ∝ frames). Empty machine or
+// preset default to "any"/"medium"; fps<=0 → 30.
+func speedKey(machine, codec string, height int, twoPass bool, preset string, fps int) string {
 	p := 1
 	if twoPass {
 		p = 2
 	}
-	return codec + ":" + strconv.Itoa(height) + ":" + strconv.Itoa(p)
+	if machine == "" {
+		machine = "any"
+	}
+	if preset == "" {
+		preset = "medium"
+	}
+	if fps <= 0 {
+		fps = 30
+	}
+	return machine + ":" + codec + ":" + strconv.Itoa(height) + ":" +
+		strconv.Itoa(p) + ":" + preset + ":" + strconv.Itoa(fps)
+}
+
+// keyMatch reports whether a stored key matches (codec,height,pass,preset,fps)
+// ignoring the machine — used by machine-agnostic lookups.
+func keyMatchNoMachine(key, codec string, height int, twoPass bool, preset string, fps int) bool {
+	suffix := speedKey("", codec, height, twoPass, preset, fps)
+	suffix = suffix[len("any"):] // ":codec:height:pass:preset:fps"
+	return len(key) > len(suffix) && key[len(key)-len(suffix):] == suffix
+}
+
+// _presetSpeedMult scales the seed speed by encoder preset (relative to medium):
+// faster presets encode faster, slower ones slower.
+func _presetSpeedMult(preset string) float64 {
+	switch preset {
+	case "ultrafast":
+		return 8
+	case "superfast":
+		return 5
+	case "veryfast":
+		return 3
+	case "faster":
+		return 1.8
+	case "fast":
+		return 1.3
+	case "slow":
+		return 0.5
+	case "slower":
+		return 0.3
+	case "veryslow":
+		return 0.18
+	default: // medium
+		return 1
+	}
 }
 
 // LoadEncodeSpeedStore reads the persisted model (empty if absent/corrupt).
@@ -64,17 +116,12 @@ func LoadEncodeSpeedStore(path string) *EncodeSpeedStore {
 	return s
 }
 
-// Speed returns content-seconds-per-wall-second for (codec, height, pass). A
-// learned value for the exact key wins; otherwise a model seeded from measured
-// baselines: base speed at 1080p single-pass, scaled ~1/pixels (area), halved
-// for two-pass. Never <= 0.
-func (s *EncodeSpeedStore) Speed(codec string, height int, twoPass bool) float64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if v, ok := s.speeds[speedKey(codec, height, twoPass)]; ok && v > 0 {
-		return v
-	}
-	// Measured baselines at 1080p, single-pass (content/wall):
+// seedSpeed is the model estimate for a variant on a given machine, used when no
+// learned value exists. base speed at 1080p/medium/30fps single-pass, scaled
+// ~1/pixels (area), by preset, by 30/fps (encode time ∝ frame count), halved for
+// two-pass, and by the machine's relative throughput. Never <= 0.
+func seedSpeed(machine, codec string, height int, twoPass bool, preset string, fps int) float64 {
+	// Measured baselines at 1080p, medium, 30fps, single-pass (content/wall):
 	//   h264 ~1.5×, hevc ~0.14× (=> 4K ~0.035×, matching the observed ~0.03×),
 	//   av1 (SVT preset 6) ~0.1×.
 	base := map[string]float64{"h264": 1.5, "hevc": 0.14, "av1": 0.1}[codec]
@@ -84,31 +131,105 @@ func (s *EncodeSpeedStore) Speed(codec string, height int, twoPass bool) float64
 	if height <= 0 {
 		height = 1080
 	}
+	if fps <= 0 {
+		fps = 30
+	}
 	sp := base * (1080.0 * 1080.0) / (float64(height) * float64(height))
+	sp *= _presetSpeedMult(preset)
+	sp *= 30.0 / float64(fps)
 	if twoPass {
 		sp /= 2
 	}
+	sp *= _machineSpeedMult(machine)
 	return math.Max(sp, 0.001)
+}
+
+// _machineSpeedMult scales the seed by hardware. The baselines were measured on
+// the ubuntu box (Ryzen); other machines are relative to it. graviton (cloud
+// c7g) is the cost/ETA reference for cloud-batch.
+func _machineSpeedMult(machine string) float64 {
+	switch machine {
+	case "mac", "macmini": // Apple Silicon perf cores, fewer of them
+		return 0.8
+	case "graviton": // c7g, per-vCPU comparable but arm x265 a touch slower
+		return 0.7
+	default: // ubuntu (baseline) / any / unknown
+		return 1
+	}
+}
+
+// Speed returns content-seconds-per-wall-second for the exact key. A learned
+// value wins; otherwise the seed model. Never <= 0.
+func (s *EncodeSpeedStore) Speed(machine, codec string, height int, twoPass bool, preset string, fps int) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if v, ok := s.speeds[speedKey(machine, codec, height, twoPass, preset, fps)]; ok && v > 0 {
+		return v
+	}
+	return seedSpeed(machine, codec, height, twoPass, preset, fps)
+}
+
+// RelativeSpeed is a machine-AGNOSTIC speed for a variant, used to weight
+// progress/work across variants (the machine cancels out of relative weights).
+// It averages every learned key matching (codec,height,pass,preset,fps) across
+// machines; absent any, falls back to the machine-neutral seed ("any").
+func (s *EncodeSpeedStore) RelativeSpeed(codec string, height int, twoPass bool, preset string, fps int) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var sum float64
+	var n int
+	for k, v := range s.speeds {
+		if v > 0 && keyMatchNoMachine(k, codec, height, twoPass, preset, fps) {
+			sum += v
+			n++
+		}
+	}
+	if n > 0 {
+		return sum / float64(n)
+	}
+	return seedSpeed("any", codec, height, twoPass, preset, fps)
+}
+
+// LocalSpeed is like RelativeSpeed but restricted to the LOCAL fleet (excludes
+// graviton keys), for predicting local-hardware wall time. Averages learned
+// non-graviton keys matching the variant; absent any, seeds from a representative
+// local box (ubuntu, the baseline). Machine-agnostic across the local boxes so
+// the makespan model can treat the fleet's cores as a single pool.
+func (s *EncodeSpeedStore) LocalSpeed(codec string, height int, twoPass bool, preset string, fps int) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var sum float64
+	var n int
+	for k, v := range s.speeds {
+		if v > 0 && !strings.HasPrefix(k, "graviton:") && keyMatchNoMachine(k, codec, height, twoPass, preset, fps) {
+			sum += v
+			n++
+		}
+	}
+	if n > 0 {
+		return sum / float64(n)
+	}
+	return seedSpeed("ubuntu", codec, height, twoPass, preset, fps)
 }
 
 // SpeedDetail returns the speed plus how many learned samples back it (0 =
 // seeded from the model, not yet observed). For chunk-plan logging.
-func (s *EncodeSpeedStore) SpeedDetail(codec string, height int, twoPass bool) (float64, int) {
+func (s *EncodeSpeedStore) SpeedDetail(machine, codec string, height int, twoPass bool, preset string, fps int) (float64, int) {
 	s.mu.Lock()
-	n := s.samples[speedKey(codec, height, twoPass)]
+	n := s.samples[speedKey(machine, codec, height, twoPass, preset, fps)]
 	s.mu.Unlock()
-	return s.Speed(codec, height, twoPass), n
+	return s.Speed(machine, codec, height, twoPass, preset, fps), n
 }
 
 // Update folds a completed encode's (content_s / wall_s) into a rolling average
 // and persists. Ignored for non-positive inputs.
-func (s *EncodeSpeedStore) Update(codec string, height int, twoPass bool, contentS, wallS float64) {
+func (s *EncodeSpeedStore) Update(machine, codec string, height int, twoPass bool, preset string, fps int, contentS, wallS float64) {
 	if wallS <= 0 || contentS <= 0 {
 		return
 	}
 	sample := contentS / wallS
 	s.mu.Lock()
-	k := speedKey(codec, height, twoPass)
+	k := speedKey(machine, codec, height, twoPass, preset, fps)
 	if s.samples[k] == 0 || s.speeds[k] <= 0 {
 		s.speeds[k] = sample
 	} else {
@@ -133,8 +254,9 @@ func (s *EncodeSpeedStore) Update(codec string, height int, twoPass bool, conten
 // learned speed, clamped to [dynamicMinChunkSeconds, clip]. Slow variants clamp
 // to the floor (most parallel); fast variants reach the whole clip (one chunk,
 // no joins).
-func dynamicChunkSeconds(speeds *EncodeSpeedStore, codec string, height int, twoPass bool, clipDurationS float64) float64 {
-	c := dynamicTargetWallSeconds * speeds.Speed(codec, height, twoPass)
+func dynamicChunkSeconds(speeds *EncodeSpeedStore, codec string, height int, twoPass bool, preset string, fps int, clipDurationS float64) float64 {
+	// Cloud-batch fans onto Graviton, so size chunks by graviton throughput.
+	c := dynamicTargetWallSeconds * speeds.Speed("graviton", codec, height, twoPass, preset, fps)
 	// Quantize to a whole multiple of the minimum (12/24/36/…), floored at the
 	// minimum. Keeps sizes clean and segment-aligned (12 | 6).
 	c = math.Round(c/dynamicMinChunkSeconds) * dynamicMinChunkSeconds

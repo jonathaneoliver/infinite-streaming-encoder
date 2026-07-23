@@ -5,6 +5,21 @@ export
 IMAGE_NAME ?= encoder
 CONTAINER_NAME ?= encoder
 PORT ?= 8080
+# Temporal UI address the server queries for available distributed-local workers.
+TEMPORAL_UI_ADDR ?= http://host.docker.internal:8233
+# Distributed-local (local-dist target): the server hands these to the
+# cli_local_dist orchestrator container. Defaults match the local cluster
+# (make dist-up). MINIO_* are passed as AWS_* to the worker so they don't
+# clobber the server's real AWS creds used by the cloud path.
+TEMPORAL_ADDRESS ?= host.docker.internal:7233
+MINIO_ENDPOINT ?= http://host.docker.internal:9000
+MINIO_ACCESS_KEY ?= encoder
+MINIO_SECRET_KEY ?= encoder-secret
+DIST_S3_BUCKET ?= encoder-local
+# Label for the master box's own worker + the container name workers run as
+# (run-worker.sh WORKER_NAME) — used by the server to toggle machines on/off.
+LOCAL_WORKER_LABEL ?= mac
+DIST_WORKER_CONTAINER ?= encode-worker
 
 # Single source of truth: ./VERSION. Embedded into the Go binary via
 # -ldflags and stamped on every image tag we publish to GHCR. The
@@ -52,7 +67,7 @@ run: require-paths build
 	docker run --rm -d \
 		--name $(CONTAINER_NAME) \
 		-p $(PORT):8080 \
-		-v $(SOURCE_DIR):/media/originals:ro \
+		-v $(SOURCE_DIR):/media/originals \
 		-v $(OUTPUT_DIR):/media/dynamic_content \
 		-v $(TMP_DIR):/media/tmp \
 		-v /var/run/docker.sock:/var/run/docker.sock \
@@ -87,6 +102,15 @@ run: require-paths build
 		-e INSTANCE_TYPE=$(INSTANCE_TYPE) \
 		-e GHCR_PAT=$(GHCR_PAT) \
 		-e STATE_MACHINE_ARN=$(STATE_MACHINE_ARN) \
+		-e TEMPORAL_UI_ADDR=$(TEMPORAL_UI_ADDR) \
+		-e TEMPORAL_ADDRESS=$(TEMPORAL_ADDRESS) \
+		-e MINIO_ENDPOINT=$(MINIO_ENDPOINT) \
+		-e MINIO_ACCESS_KEY=$(MINIO_ACCESS_KEY) \
+		-e MINIO_SECRET_KEY=$(MINIO_SECRET_KEY) \
+		-e DIST_S3_BUCKET=$(DIST_S3_BUCKET) \
+		-e 'DIST_WORKERS=$(DIST_WORKERS)' \
+		-e LOCAL_WORKER_LABEL=$(LOCAL_WORKER_LABEL) \
+		-e DIST_WORKER_CONTAINER=$(DIST_WORKER_CONTAINER) \
 		$(IMAGE_NAME)
 	@echo "Encoder running at http://localhost:$(PORT)"
 
@@ -361,3 +385,49 @@ clear-costs:          ## kill every idle AWS cost: sweep tagged instances/volume
 	$(MAKE) unbake-ami
 	@echo ">>> Idle cost generators cleared (AMI pointer self-cleared to pull-on-boot)."
 	@echo ">>> The Batch stack stays (it's ~\$$0 at rest). Full teardown: make infra-destroy"
+
+# ---- Distributed-local encoding (Temporal + MinIO, no AWS) --------------------
+# All-container control plane on this (master) box; workers run one-per-box and
+# pull work. See infra/local-cluster/README.md.
+DIST_COMPOSE = infra/local-cluster/docker-compose.yml
+.PHONY: dist-up dist-down dist-worker dist-logs dist-ps
+
+dist-up:              ## bring up the local cluster (temporal + ui + postgres + minio)
+	docker compose -f $(DIST_COMPOSE) up -d
+	@echo ">>> Temporal UI: http://localhost:8233   MinIO console: http://localhost:9001"
+
+dist-down:            ## stop the local cluster (volumes persist; add ARGS=-v to wipe)
+	docker compose -f $(DIST_COMPOSE) down $(ARGS)
+
+dist-worker: build    ## run an encode worker on THIS box (uses the freshly-built image)
+	ENCODER_IMAGE=$(ENCODER_IMAGE) TEMPORAL_ADDRESS=$${TEMPORAL_ADDRESS:-host.docker.internal:7233} \
+	S3_ENDPOINT_URL=$${S3_ENDPOINT_URL:-http://host.docker.internal:9000} \
+	AWS_ACCESS_KEY_ID=$${MINIO_ROOT_USER:-encoder} \
+	AWS_SECRET_ACCESS_KEY=$${MINIO_ROOT_PASSWORD:-encoder-secret} \
+	infra/local-cluster/run-worker.sh
+
+dist-logs:            ## follow the local worker log
+	docker logs -f $${WORKER_NAME:-encode-worker}
+
+dist-ps:              ## cluster + worker containers
+	docker compose -f $(DIST_COMPOSE) ps
+	@docker ps --filter name=encode-worker --format 'table {{.Names}}\t{{.Status}}'
+
+# DIST_WORKERS: space-separated label=ssh_target pairs of remote worker boxes,
+# e.g. DIST_WORKERS = ubuntu=jonathanoliver@jonathanoliver-ubuntu.local
+# MASTER_IP: the master box's LAN IP that workers dial for Temporal + MinIO.
+DIST_WORKERS ?=
+MASTER_IP ?= 192.168.0.110
+.PHONY: dist-deploy-workers dist-deploy
+
+dist-deploy-workers:  ## rsync code + rebuild image + (re)start worker on each DIST_WORKERS box
+	@if [ -z "$(DIST_WORKERS)" ]; then echo "set DIST_WORKERS=label=ssh_target [..] (in .env)"; exit 1; fi
+	@for w in $(DIST_WORKERS); do \
+	  label=$${w%%=*}; host=$${w#*=}; \
+	  MASTER_IP=$(MASTER_IP) MINIO_ROOT_USER=$(MINIO_ROOT_USER) MINIO_ROOT_PASSWORD=$(MINIO_ROOT_PASSWORD) \
+	    bash infra/local-cluster/deploy-worker.sh "$$host" "$$label" || exit 1; \
+	done
+	@echo ">>> remote workers deployed."
+
+dist-deploy: build dist-worker dist-deploy-workers  ## deploy distributed-local to the master + all remote boxes
+	@echo ">>> distributed-local deployed: master worker + $(words $(DIST_WORKERS)) remote box(es)."

@@ -40,11 +40,14 @@ from pathlib import Path
 
 from encoder.audio import AudioSpec, create_audio
 from encoder.chunking import DEFAULT_CHUNK_DURATION_S, plan_chunks
-from encoder.encode_variants import EncodeContext, concat_chunks, encode_variant
+from encoder.encode_variants import (
+    EncodeContext, _coalesce_runt_tail, concat_chunks, encode_variant,
+)
 from encoder.ffprobe import probe
 from encoder.hls import (
     TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls,
 )
+from encoder.manifests import write_fragmented_mpd
 from encoder.ladder import (
     BUFSIZE_MULTIPLIER, DEFAULT_MAXRATE_PERCENT, Rung, burnin_for_height,
     label_res_name,
@@ -66,9 +69,22 @@ except ImportError:  # pragma: no cover — boto3 is in requirements.txt for the
 # their own ephemeral filesystem; no need for per-phase isolation.
 _WORK_DIR = Path(os.environ.get("ENCODER_WORK_DIR", "/tmp/work"))
 
-_SEGMENT_DURATION_S = 6.0
-_PARTIAL_DURATION_S = 0.2
-_GOP_DURATION_S = 1.0
+# Profile timing (segment / LL-HLS partial / GOP), read from env so the ladder's
+# values — injected by the Step Functions containerOverrides (SEGMENT_DURATION /
+# PARTIAL_DURATION / GOP_DURATION) — drive the cloud encode too. Previously
+# hardcoded, so cloud ignored the job's/ladder's timing. Falls back to the live
+# defaults. PARTIAL_DURATION=0 turns LL-HLS parts off (VOD).
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name, "")
+        return float(v) if v != "" else default
+    except ValueError:
+        return default
+
+
+_SEGMENT_DURATION_S = _env_float("SEGMENT_DURATION", 6.0)
+_PARTIAL_DURATION_S = _env_float("PARTIAL_DURATION", 0.2)
+_GOP_DURATION_S = _env_float("GOP_DURATION", 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +228,55 @@ def _download_if_complete(s3_uri: str, dst: Path,
     except (OSError, ValueError):
         return False
     return recorded == dst.stat().st_size
+
+
+def _prune_mezz_cache(cache_dir: Path, keep: int = 6) -> None:
+    """Keep only the `keep` most-recent cached mezzanines — they're large. Recent
+    ones (any active job's) survive, so this won't yank a symlink target from
+    under a running encode in practice."""
+    mezzes = sorted(cache_dir.glob("mezz-*.mp4"),
+                    key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in mezzes[keep:]:
+        for f in (old, old.with_suffix(".mp4.done"),
+                  cache_dir / (old.name.rsplit(".", 1)[0] + ".lock")):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
+def _fetch_mezz_cached(mezz_uri: str, mezz_local: Path) -> bool:
+    """Fetch the mezzanine, cached PER WORKER so N chunks on one box download it
+    once instead of once per chunk. Keyed by the mezz URI (unique per job, so it
+    hits across that job's chunks) and symlinked into the per-activity work dir
+    (zero-copy). A file lock makes concurrent chunks on the same box share one
+    download. MEZZ_CACHE_DIR unset → plain per-chunk download (the AWS Batch path,
+    where each chunk is its own ephemeral container anyway)."""
+    cache_dir = os.environ.get("MEZZ_CACHE_DIR")
+    if not cache_dir:
+        return _download_if_complete(mezz_uri, mezz_local)
+    import fcntl
+    import hashlib
+    os.makedirs(cache_dir, exist_ok=True)
+    key = hashlib.sha256(mezz_uri.encode()).hexdigest()[:16]
+    cached = Path(cache_dir) / f"mezz-{key}.mp4"
+    cached_done = cached.with_suffix(".mp4.done")
+    with open(Path(cache_dir) / f"mezz-{key}.lock", "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        if cached.is_file() and cached_done.is_file():
+            print("[phase variant] mezzanine served from worker cache", flush=True)
+        else:
+            print("[phase variant] caching mezzanine (first chunk on this box)", flush=True)
+            if not _download_if_complete(mezz_uri, cached):
+                return False
+            _prune_mezz_cache(Path(cache_dir))
+    try:
+        if mezz_local.is_symlink() or mezz_local.exists():
+            mezz_local.unlink()
+        mezz_local.symlink_to(cached)
+    except OSError:
+        shutil.copy(cached, mezz_local)
+    return True
 
 
 def _prepare_work_dir() -> Path:
@@ -409,8 +474,8 @@ def phase_variant(args: argparse.Namespace) -> int:
 
     mezz_uri = args.s3_mezz.rstrip("/") + "/mezzanine.mp4"
     mezz_local = work / "mezzanine.mp4"
-    print(f"[phase variant] downloading {mezz_uri}", flush=True)
-    if not _download_if_complete(mezz_uri, mezz_local):
+    print(f"[phase variant] fetching {mezz_uri}", flush=True)
+    if not _fetch_mezz_cached(mezz_uri, mezz_local):
         print("error: mezzanine.done missing or size mismatch", file=sys.stderr)
         return 1
     timer.mark("fetch")
@@ -451,6 +516,14 @@ def phase_variant(args: argparse.Namespace) -> int:
     if args.chunk_index is not None:
         chunks = plan_chunks(info.duration_s, _chunk_duration_s(),
                              _SEGMENT_DURATION_S)
+        # Distributed-local sets COALESCE_RUNT_TAIL: fold a sub-frame final
+        # chunk (clip a hair over an exact chunk multiple) into its
+        # predecessor so 2-pass x265 doesn't choke on an empty stats file.
+        # The orchestrator dispatches the same coalesced count, and package-all
+        # globs whatever chunks land, so the three stay consistent. Cloud never
+        # sets the flag, so its Go-computed chunk_count contract is unchanged.
+        if _env_flag("COALESCE_RUNT_TAIL"):
+            chunks = _coalesce_runt_tail(chunks)
         if args.chunk_index >= len(chunks):
             print(f"error: chunk-index {args.chunk_index} out of range "
                   f"(clip has {len(chunks)} chunk(s))", file=sys.stderr)
@@ -465,7 +538,13 @@ def phase_variant(args: argparse.Namespace) -> int:
     # the vCPU we pay for is crunching video vs sitting idle-reserved.
     ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
     _enc_t0 = time.monotonic()
-    out_path = encode_variant(ctx, args.codec, rung, chunk=chunk)
+    # ENCODE_THREADS pins ffmpeg's thread count independent of the node: under a
+    # scheduler (Nomad) the CPU reservation is for bin-packing, not a hard core
+    # cap, so we can't rely on cgroup detection to size the encode. When unset
+    # (0), fall back to the cgroup quota (the AWS Batch path, where vCPU == cap).
+    _threads_env = int(os.environ.get("ENCODE_THREADS", "0") or "0")
+    out_path = encode_variant(ctx, args.codec, rung, chunk=chunk,
+                              threads=_threads_env or None)
     encode_wall_s = time.monotonic() - _enc_t0
     ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu_s = (ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime)
@@ -496,13 +575,19 @@ def phase_variant(args: argparse.Namespace) -> int:
                cpu_s=f"{cpu_s:.2f}", mem_mib=f"{peak_mib:.0f}")
 
     # Feed the control plane's learned-speed model (drives the dynamic chunk
-    # selector): content-seconds encoded vs encode wall-seconds for this
-    # (codec, height, pass). The Go server's Manager.learnSpeed consumes it.
+    # selector, cost, and ETA): content-seconds encoded vs encode wall-seconds,
+    # keyed by every dimension that moves encode time. machine = this worker's
+    # label (mac/ubuntu/macmini for local-dist, unset on cloud batch → its
+    # workers are all Graviton, so "graviton"); preset + fps because encode time
+    # scales with both. The Go server's Manager.learnSpeed consumes it.
     content_s = (chunk.end_s - chunk.start_s) if chunk is not None else info.duration_s
     two_pass = 1 if (args.codec == "hevc" and ctx.hevc_two_pass) else 0
+    machine = os.environ.get("WORKER_LABEL") or "graviton"
+    fps_i = max(1, round(float(info.fps)))
     if encode_wall_s > 0 and content_s > 0:
-        print(f"[[ENCODER-SPEED codec={args.codec} height={rung.height} "
-              f"two_pass={two_pass} content_s={content_s:.1f} "
+        print(f"[[ENCODER-SPEED machine={machine} codec={args.codec} "
+              f"height={rung.height} two_pass={two_pass} preset={args.preset} "
+              f"fps={fps_i} content_s={content_s:.1f} "
               f"encode_s={encode_wall_s:.1f}]]", flush=True)
     return 0
 
@@ -667,6 +752,8 @@ def phase_byteranges(args: argparse.Namespace) -> int:
 
     emit_stage(f"fragments:{args.codec}", "running", 0.0)
     generate_byteranges_sidecars(pkg_dir)
+    # Self-contained DASH: expand fragment byte-ranges into manifest_fragmented.mpd
+    write_fragmented_mpd(pkg_dir)
     emit_stage(f"fragments:{args.codec}", "done", 100.0)
 
     _upload_dir(pkg_dir, args.s3_out.rstrip("/") + f"/{stem}")
@@ -792,6 +879,8 @@ def phase_package_all(args: argparse.Namespace) -> int:
     # Byteranges BEFORE HLS — the playlists embed the fragment byte ranges.
     emit_stage(f"fragments:{args.codec}", "running", 0.0)
     generate_byteranges_sidecars(pkg_dir)
+    # Self-contained DASH: expand fragment byte-ranges into manifest_fragmented.mpd
+    write_fragmented_mpd(pkg_dir)
     emit_stage(f"fragments:{args.codec}", "done", 100.0)
 
     emit_stage(f"hls:{args.codec}", "running", 0.0)

@@ -76,6 +76,9 @@ func main() {
 		"force-terminate stale instances (false = warn-only)")
 	flag.Parse()
 
+	// Buffered so a job start/finalize never blocks on nudging the keep-warm
+	// loop; a pending nudge coalesces with any already queued.
+	warmTrigger := make(chan struct{}, 1)
 	mgr := encode.NewManager(encode.ManagerConfig{
 		SourceDir:       *sourceDir,
 		OutputDir:       *outputDir,
@@ -89,6 +92,12 @@ func main() {
 		EncoderImage:    *encoderImage,
 		StateMachineArn: *stateMachineArn,
 		MaxConcurrent:   *maxConcurrent,
+		WarmReconcile: func() {
+			select {
+			case warmTrigger <- struct{}{}:
+			default:
+			}
+		},
 	})
 	mgr.Reconcile()
 
@@ -122,6 +131,8 @@ func main() {
 		// Hold the warm floor across the whole app job queue, not just while one
 		// job's AWS resources are live — so it drops only when the queue is empty.
 		ActiveJobs: mgr.ActiveCloudJobs,
+		// React immediately to a job start/finalize instead of on the next tick.
+		Trigger: warmTrigger,
 	})
 
 	srv := api.NewServer(mgr)

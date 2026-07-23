@@ -3,12 +3,14 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/jonathaneoliver/encoder/internal/encode"
 	"github.com/jonathaneoliver/encoder/internal/imageinfo"
@@ -26,6 +28,13 @@ type Server struct {
 	CloudImage string
 
 	imageInfo *imageinfo.Client
+
+	// distMu guards distDisabled — the set of distributed-local worker machines
+	// the user has toggled off from the UI (drained). A disabled machine's
+	// worker container is stopped; the flag gives the pill immediate off-state
+	// feedback without waiting for the Temporal poller list to expire.
+	distMu       sync.Mutex
+	distDisabled map[string]bool
 }
 
 func NewServer(mgr *encode.Manager) *Server {
@@ -36,11 +45,15 @@ func NewServer(mgr *encode.Manager) *Server {
 			os.Getenv("GHCR_USERNAME"),
 			os.Getenv("GHCR_PAT"),
 		),
+		distDisabled: map[string]bool{},
 	}
 	s.Mux.HandleFunc("GET /api/version", s.getVersion)
+	s.Mux.HandleFunc("GET /api/dist/workers", s.distWorkers)
+	s.Mux.HandleFunc("POST /api/dist/workers/{machine}", s.toggleDistWorker)
 	s.Mux.HandleFunc("GET /api/settings", s.getSettings)
 	s.Mux.HandleFunc("POST /api/settings", s.putSettings)
 	s.Mux.HandleFunc("GET /api/sources", s.listSources)
+	s.Mux.HandleFunc("POST /api/sources/upload", s.uploadSource)
 	s.Mux.HandleFunc("GET /api/ladders", s.getLadders)
 	s.Mux.HandleFunc("POST /api/ladders", s.putLadder)
 	s.Mux.HandleFunc("DELETE /api/ladders/{name}", s.deleteLadder)
@@ -57,6 +70,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/jobs/stream", s.streamJobs)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/cancel", s.cancelJob)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/retry", s.retryJob)
+	s.Mux.HandleFunc("POST /api/jobs/{id}/redo", s.redoJob)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/simulate-interrupt", s.simulateInterrupt)
 	s.Mux.HandleFunc("GET /api/jobs/{id}/workdir", s.jobWorkdir)
 	// AWS inventory + cleanup (issue #5)
@@ -114,6 +128,65 @@ type sourceFile struct {
 	ModTime int64  `json:"mod_time"`
 }
 
+// uploadSource streams dropped video file(s) straight to SOURCE_DIR. Uses the
+// streaming MultipartReader (never ParseMultipartForm — sources are multi-GB and
+// must not buffer in memory), writes to <name>.uploading, then renames on
+// completion so the watcher never picks up a partial file. Rejects non-video and
+// path-traversal names.
+func (s *Server) uploadSource(w http.ResponseWriter, r *http.Request) {
+	mr, err := r.MultipartReader()
+	if err != nil {
+		http.Error(w, "expected a multipart upload: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	var saved []string
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			http.Error(w, "read part: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if part.FormName() != "file" {
+			part.Close()
+			continue
+		}
+		name := filepath.Base(part.FileName()) // strip any client path components
+		if name == "" || name == "." || strings.ContainsAny(name, `/\`) {
+			http.Error(w, "invalid filename", http.StatusBadRequest)
+			return
+		}
+		if !isVideo(strings.ToLower(filepath.Ext(name))) {
+			http.Error(w, "not a video file: "+name, http.StatusBadRequest)
+			return
+		}
+		dst := filepath.Join(s.Manager.SourceDir, name)
+		tmp := dst + ".uploading"
+		f, cerr := os.Create(tmp)
+		if cerr != nil {
+			http.Error(w, "create: "+cerr.Error(), http.StatusInternalServerError)
+			return
+		}
+		_, werr := io.Copy(f, part)
+		f.Close()
+		part.Close()
+		if werr != nil {
+			os.Remove(tmp)
+			http.Error(w, "write: "+werr.Error(), http.StatusInternalServerError)
+			return
+		}
+		if rerr := os.Rename(tmp, dst); rerr != nil {
+			os.Remove(tmp)
+			http.Error(w, "finalize: "+rerr.Error(), http.StatusInternalServerError)
+			return
+		}
+		saved = append(saved, name)
+	}
+	writeJSON(w, map[string]any{"saved": saved})
+}
+
 func (s *Server) listSources(w http.ResponseWriter, r *http.Request) {
 	entries, err := os.ReadDir(s.Manager.SourceDir)
 	if err != nil {
@@ -149,7 +222,7 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cfg.Target == "" {
-		cfg.Target = encode.TargetLocal
+		cfg.Target = encode.TargetLocalDist
 	}
 	if cfg.Codec == "" {
 		cfg.Codec = "both"
@@ -373,6 +446,31 @@ func (s *Server) retryJob(w http.ResponseWriter, r *http.Request) {
 	// lives at TMPDIR/encode_<stem>/ on the host filesystem, so
 	// variants + mezzanine from a prior partial run are still there
 	// when the new worker starts. No config plumbing needed.
+	job := s.Manager.Submit(cfg)
+	writeJSON(w, job)
+}
+
+// redoJob submits a new job with the same config as `id` but re-encodes the WHOLE
+// thing from scratch — no reuse. Unlike Retry (which resumes from prior staging
+// and keeps already-completed variants), Redo sets ForceReencode and clears any
+// resume pointer, so every rendition is produced again. Works on any terminal
+// job (done, failed, or cancelled) — "do it all over."
+func (s *Server) redoJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	orig := s.Manager.GetJob(id)
+	if orig == nil {
+		http.Error(w, "job not found", 404)
+		return
+	}
+	switch orig.Status {
+	case encode.StatusDone, encode.StatusFailed, encode.StatusCancelled:
+	default:
+		http.Error(w, "job is still active — cancel it before redoing", 400)
+		return
+	}
+	cfg := orig.Config
+	cfg.ForceReencode = true // re-encode every rendition, ignore existing outputs
+	cfg.ResumeFromJobID = "" // no prior staging — start fresh
 	job := s.Manager.Submit(cfg)
 	writeJSON(w, job)
 }

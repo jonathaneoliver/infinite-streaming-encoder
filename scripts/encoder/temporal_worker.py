@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""Temporal activity worker for distributed-local encoding.
+
+Runs inside the encoder image on every box (Mac + ubuntu). Registers the encode
+activities and polls the shared task queue; Temporal (durable server on the Mac)
+routes activities here and reschedules them elsewhere if this worker vanishes —
+that's the "adapt if a box goes away mid-encode" guarantee, for free.
+
+Each activity shells out to the unchanged `cli_phase` (which does its own MinIO
+I/O), so the queue only carries pointers (S3 URIs + params), never video. The
+activity heartbeats each output line so a dead worker is detected quickly and
+its in-flight chunk is retried on another worker.
+
+Env: TEMPORAL_ADDRESS (host:7233), TEMPORAL_TASK_QUEUE (default "encode"),
+ENCODE_SLOTS (max concurrent activities here ≈ cores/2), plus the MinIO creds
+the activities pass through to cli_phase.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+
+from temporalio import activity, workflow
+from temporalio.client import Client
+from temporalio.common import RetryPolicy
+from temporalio.worker import Worker
+
+TASK_QUEUE = os.environ.get("TEMPORAL_TASK_QUEUE", "encode")
+
+# Pulls the live % out of an ENCODER-STAGE marker so it can ride the heartbeat.
+_STAGE_PCT_RE = re.compile(r"percent=([0-9.]+)\]\]")
+
+
+def _terminate(proc: subprocess.Popen) -> None:
+    """Best-effort stop a phase subprocess: SIGTERM, then SIGKILL after a grace.
+    No-op if it already exited."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --- fleet CPU reporting -----------------------------------------------------
+# This box's identity + perf-core target, set in main(). Each activity stamps
+# them onto its heartbeat so the orchestrator can surface a per-machine CPU
+# sparkline, normalized to the perf-core target (100% = the box's 4/4/8-core
+# target fully busy; >100% = SMT/E-core spill).
+_MACHINE = ""
+_PERF_CORES = 0
+_CPU_LOCK = threading.Lock()
+_CPU_PREV = {"t": 0.0, "total": 0, "idle": 0, "busy": 0.0}
+
+
+def _busy_cores() -> float:
+    """Logical CPUs currently busy, from /proc/stat deltas. Throttled to ~2s and
+    cached between samples (heartbeats fire far more often). 0 if unavailable."""
+    now = time.monotonic()
+    with _CPU_LOCK:
+        try:
+            with open("/proc/stat") as f:
+                v = [int(x) for x in f.readline().split()[1:]]
+            total, idle = sum(v), v[3] + (v[4] if len(v) > 4 else 0)
+        except (OSError, ValueError, IndexError):
+            return 0.0
+        prev_t = _CPU_PREV["t"]
+        if prev_t and now - prev_t < 2.0:
+            return _CPU_PREV["busy"]
+        dt, di = total - _CPU_PREV["total"], idle - _CPU_PREV["idle"]
+        _CPU_PREV.update(t=now, total=total, idle=idle)
+        if not prev_t or dt <= 0:
+            return _CPU_PREV["busy"]
+        busy = max(0.0, (1.0 - di / dt) * (os.cpu_count() or 1))
+        _CPU_PREV["busy"] = busy
+        return busy
+
+
+@activity.defn(name="EncodePhase")
+def encode_phase(spec: dict) -> None:
+    """Run one `cli_phase` phase. spec = {"args": [...], "env": {...}}.
+
+    Sync activity (runs in the worker's thread pool). Streams cli_phase output,
+    heartbeating each line; raises on non-zero exit so Temporal retries. ENCODER
+    markers are echoed to stdout so they show in the worker/Temporal logs.
+    """
+    env = dict(os.environ)
+    env.update({k: str(v) for k, v in (spec.get("env") or {}).items()})
+    # Isolate the work dir PER activity: a Temporal worker runs many activities
+    # concurrently in ONE container, but cli_phase's _prepare_work_dir() rmtree's
+    # ENCODER_WORK_DIR at the start of every run — so a shared dir means they nuke
+    # each other's mezzanine/chunk files. Each phase exchanges everything via
+    # MinIO, so a private scratch dir is correct; clean it up after.
+    work_dir = f"/tmp/act-{uuid.uuid4().hex}"
+    env["ENCODER_WORK_DIR"] = work_dir
+    # Shared (per-worker, NOT per-activity) mezzanine cache, so all this box's
+    # chunks download the mezzanine once instead of once each. cli_phase symlinks
+    # it into each activity's work dir zero-copy.
+    env.setdefault("MEZZ_CACHE_DIR", "/tmp/mezz-cache")
+    cmd = ["python3", "-m", "encoder.cli_phase", *spec["args"]]
+    proc = subprocess.Popen(cmd, text=True, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    assert proc.stdout is not None
+    last = ""
+    progress = 0.0
+    try:
+        for line in proc.stdout:
+            last = line.rstrip("\n")
+            if last.startswith("[[ENCODER"):
+                print(last, flush=True)
+                # cli_phase's run_ffmpeg_with_progress emits ENCODER-STAGE with the
+                # live out_time/duration %. Capture it so the orchestrator can show
+                # real per-chunk progress instead of a binary 0→100 on completion.
+                mp = _STAGE_PCT_RE.search(last)
+                if mp:
+                    try:
+                        progress = float(mp.group(1))
+                    except ValueError:
+                        pass
+            activity.heartbeat(last[:180], {
+                "machine": _MACHINE, "busy": round(_busy_cores(), 2),
+                "perf": _PERF_CORES, "progress": round(progress, 1)})
+            # Cancellation (from a workflow cancel when the user cancels the job)
+            # rides in on the heartbeat response. Kill ffmpeg now so a cancelled
+            # chunk stops immediately instead of running to completion on this
+            # remote worker.
+            if activity.is_cancelled():
+                print("[temporal-worker] activity cancelled — killing encode",
+                      flush=True)
+                _terminate(proc)
+                raise asyncio.CancelledError
+        rc = proc.wait()
+    finally:
+        _terminate(proc)  # guards the readline-EOF path; no-op if already exited
+        shutil.rmtree(work_dir, ignore_errors=True)
+    if rc != 0:
+        raise RuntimeError(f"cli_phase {spec['args'][:2]} exit {rc}: {last[:200]}")
+
+
+# Minimal workflow to validate the Python side end-to-end (one activity).
+@workflow.defn(name="TestChunkWorkflow")
+class TestChunkWorkflow:
+    @workflow.run
+    async def run(self, spec: dict) -> str:
+        await workflow.execute_activity(
+            "EncodePhase", spec,
+            start_to_close_timeout=timedelta(minutes=30),
+            heartbeat_timeout=timedelta(seconds=60),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+        return "ok"
+
+
+_RETRY = RetryPolicy(maximum_attempts=4)
+
+
+@workflow.defn(name="EncodeWorkflow")
+class EncodeWorkflow:
+    """The distributed-local encode DAG, as durable code.
+
+    Input `plan` (computed by the caller — Go control plane or cli_local_dist):
+      bucket, job_prefix, src_key, has_audio, chunk_duration_s, n_chunks,
+      codecs = {codec: {"two_pass": bool, "rungs": [{label,width,height,bitrate}]}}
+
+    mezzanine + audio run first (sequential); then every (codec, rung, chunk) is
+    fanned out with asyncio.gather so Temporal spreads them across all workers;
+    then package/fragments/hls per codec. Temporal persists this history, so a
+    worker (or the whole box) dying mid-run resumes exactly — a lost activity is
+    retried on another worker. cli_phase skips a chunk whose output already
+    exists (idempotent), so retries are cheap.
+    """
+    @workflow.run
+    async def run(self, plan: dict) -> str:
+        b = plan["bucket"]
+        pfx = plan["job_prefix"].strip("/")
+        s3_work = f"s3://{b}/{pfx}/work"
+        s3_out = f"s3://{b}/{pfx}/out"
+
+        await self._phase(["mezzanine", "--s3-in", f"s3://{b}/{plan['src_key']}",
+                           "--s3-out", s3_work], {}, "mezzanine")
+        if plan.get("has_audio"):
+            await self._phase(["audio", "--s3-mezz", s3_work, "--s3-out", s3_work],
+                              {}, "audio")
+
+        cd = plan["chunk_duration_s"]
+        n = plan["n_chunks"]
+        # Dispatch HIGHEST-COST chunks first (LPT scheduling): a chunk's expected
+        # cost ~ height² × codec-factor × pass-factor, so the slow 4K HEVC 2-pass
+        # work starts immediately and the tail is cheap chunks — better makespan
+        # (no giant chunk finishing last) and the expensive work is visibly
+        # underway from the start. Deterministic (pure plan math) → Temporal-safe.
+        codec_cost = {"h264": 1.0, "hevc": 3.5, "av1": 8.0}
+        specs = []
+        for codec, ci in plan["codecs"].items():
+            tp = ci["two_pass"]
+            for r in ci["rungs"]:
+                w = (r["height"] * r["height"] * codec_cost.get(codec, 1.0)
+                     * (1.8 if tp else 1.0))
+                for i in range(n):
+                    specs.append((w, codec, r, tp, i))
+        specs.sort(key=lambda s: s[0], reverse=True)  # most expensive first
+        chunk_acts = []
+        for _w, codec, r, tp, i in specs:
+            args = ["variant", "--codec", codec, "--label", r["label"],
+                    "--width", str(r["width"]), "--height", str(r["height"]),
+                    "--bitrate", str(r["bitrate"]), "--chunk-index", str(i),
+                    "--s3-mezz", s3_work, "--s3-out", s3_work]
+            if tp:
+                args.append("--two-pass")
+            env = {"CHUNK_DURATION_S": str(cd), "COALESCE_RUNT_TAIL": "1",
+                   "TWO_PASS": "1" if tp else "0", "ENCODE_THREADS": "2"}
+            chunk_acts.append(self._phase(
+                args, env, f"enc-{codec}-{r['label']}-c{i}"))
+        await asyncio.gather(*chunk_acts)
+
+        for codec in plan["codecs"]:
+            await self._phase(["package-all", "--codec", codec, "--s3-variants",
+                              s3_work, "--s3-audio", s3_work, "--s3-out", s3_out],
+                              {}, f"pkg-{codec}")
+            for ph in ("byteranges", "hls"):
+                await self._phase([ph, "--codec", codec, "--s3-package", s3_out,
+                                  "--s3-out", s3_out], {}, f"{ph}-{codec}")
+        return "done"
+
+    async def _phase(self, args, env, act_id):
+        return await workflow.execute_activity(
+            "EncodePhase", {"args": args, "env": env},
+            start_to_close_timeout=timedelta(hours=1),
+            heartbeat_timeout=timedelta(seconds=90),
+            retry_policy=_RETRY, activity_id=act_id)
+
+
+_GB = 1024 ** 3
+# A 2-pass 4K (2160p) x265 encode peaks at a few GB; too many at once OOM-kills
+# the container (ffmpeg exit -9). Cap concurrency so each concurrent encode has
+# ~this much RAM headroom. Conservative — a big-RAM box still packs by cores.
+_MEM_PER_ENCODE_BYTES = 3 * _GB
+
+
+def _container_mem_bytes() -> int:
+    """RAM available to this worker — the cgroup limit if set, else /proc/meminfo.
+    0 if unknown."""
+    for path in ("/sys/fs/cgroup/memory.max",                    # cgroup v2
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"):  # cgroup v1
+        try:
+            v = open(path).read().strip()
+            if v not in ("max", ""):
+                n = int(v)
+                if 0 < n < (1 << 62):  # v1 sentinel for "unlimited" is huge
+                    return n
+        except (OSError, ValueError):
+            pass
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _physical_cores() -> int:
+    """Physical cores, NOT logical — so SMT siblings aren't counted as capacity
+    (a 2nd HEVC encode on a core's SMT sibling adds ~25%, not 100%). Linux reads
+    /sys topology; elsewhere (a Docker-Desktop VM that hides P/E cores) it falls
+    back to the logical count — those boxes should set ENCODE_SLOTS explicitly."""
+    try:
+        import glob
+        cores = set()
+        for f in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/core_id"):
+            pkg = f.replace("core_id", "physical_package_id")
+            pid = open(pkg).read().strip() if os.path.exists(pkg) else "0"
+            cores.add((pid, open(f).read().strip()))
+        if cores:
+            return len(cores)
+    except OSError:
+        pass
+    return os.cpu_count() or 4
+
+
+def _default_slots() -> int:
+    """Concurrent encodes when ENCODE_SLOTS is unset: physical-cores/2 (with the
+    workflow's 2 threads each this fills the physical cores and skips SMT),
+    capped by RAM/3GB so a small VM doesn't OOM on 4K. A box that can't reveal
+    its performance cores (a Mac's Docker VM hides P/E) should set ENCODE_SLOTS."""
+    by_cores = max(1, _physical_cores() // 2)
+    mem = _container_mem_bytes()
+    if mem <= 0:
+        return by_cores
+    return min(by_cores, max(1, int(mem // _MEM_PER_ENCODE_BYTES)))
+
+
+async def main() -> None:
+    import socket
+    address = os.environ.get("TEMPORAL_ADDRESS", "127.0.0.1:7233")
+    slots = int(os.environ.get("ENCODE_SLOTS", "0")) or _default_slots()
+    # Friendly, stable worker identity (WORKER_LABEL, e.g. "mac"/"ubuntu"): it
+    # rides on every ActivityTaskStarted event, so the orchestrator can tell
+    # which box ran each chunk and colour the UI plot by machine. Defaults to
+    # the hostname.
+    identity = os.environ.get("WORKER_LABEL") or socket.gethostname()
+    global _MACHINE, _PERF_CORES
+    _MACHINE, _PERF_CORES = identity, slots * 2
+    client = await Client.connect(address, identity=identity)
+    print(f"[temporal-worker] connected {address} queue={TASK_QUEUE} "
+          f"slots={slots} identity={identity}", flush=True)
+    with ThreadPoolExecutor(max_workers=slots) as pool:
+        worker = Worker(
+            client, task_queue=TASK_QUEUE,
+            activities=[encode_phase],
+            workflows=[TestChunkWorkflow, EncodeWorkflow],
+            activity_executor=pool, max_concurrent_activities=slots,
+        )
+        await worker.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

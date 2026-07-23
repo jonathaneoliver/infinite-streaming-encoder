@@ -29,11 +29,15 @@ from fractions import Fraction
 from pathlib import Path
 
 from encoder.audio import AudioSpec, create_audio
-from encoder.encode_variants import EncodeContext, encode_all, variant_stage_key
+from encoder.chunking import plan_chunks
+from encoder.encode_variants import (
+    EncodeContext, _coalesce_runt_tail, encode_all, variant_stage_key,
+)
 from encoder.ffprobe import ProbeError, probe
 from encoder.hls import (
     TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls, generate_ts_hls,
 )
+from encoder.manifests import write_fragmented_mpd
 from encoder.ladder import (
     Rung, get_ladder, label_height, ladder_bufsize_multiplier,
     ladder_maxrate_percent, parse_bitrate_override, select_rungs,
@@ -67,6 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume-package-from", type=Path, dest="resume_package_from")
     p.add_argument("--output", default=None,
                    help="base name for output dirs (stem + partial/pad suffixes)")
+    p.add_argument("--output-tag", default="", dest="output_tag",
+                   help="profile suffix appended AFTER the codec (e.g. 'xs')")
     p.add_argument("--output-dir", type=Path, required=True, dest="output_dir")
 
     # A single codec, a comma-separated subset (the UI's codec checkboxes,
@@ -117,6 +123,27 @@ def build_parser() -> argparse.ArgumentParser:
                    help="encode HEVC single-pass instead of the default "
                         "two-pass (faster, less accurate average — for "
                         "comparison; H264/AV1 are single-pass regardless)")
+    p.add_argument("--force-reencode", action="store_true", dest="force_reencode",
+                   help="ignore variants/chunks left in the per-clip work dir "
+                        "from a PRIOR encode of this file and re-encode them "
+                        "(the mezzanine is still reused — it's deterministic). "
+                        "Without this, a re-encode reuses the old complete "
+                        "variants because the work dir is keyed by filename.")
+
+    # Local parallelism: fill a multi-core box by running encodes concurrently
+    # (a single x265 encode only ~half-fills a machine). With a chunk duration,
+    # each variant is split into chunks encoded in parallel then concatenated —
+    # so even one HEVC variant saturates the cores (the same unit the cloud
+    # fans out to Batch). Threads-per-encode pins each concurrent ffmpeg to its
+    # slice (locally there's no cgroup to size them).
+    p.add_argument("--encode-concurrency", type=int, default=0,
+                   help="max concurrent variant/chunk encodes (0 = cores/threads)")
+    p.add_argument("--encode-threads", type=int, default=0,
+                   help="ffmpeg threads per concurrent encode (0 = auto, ~2)")
+    p.add_argument("--local-chunk-duration", type=float, default=0.0,
+                   dest="local_chunk_duration",
+                   help="split each variant into ~N-second chunks encoded in "
+                        "parallel then concatenated (0 = whole variant)")
 
     p.add_argument("--vmaf-lookup-csv", default=None, dest="vmaf_lookup_csv",
                    help="unused for now; reserved for burn-in VMAF labels")
@@ -140,13 +167,13 @@ def _output_stem(input_path: Path, explicit: str | None) -> str:
     return input_path.stem
 
 
-def _codec_package_dir(output_dir: Path, stem: str, codec: str) -> Path:
-    return output_dir / f"{stem}_{codec}"
+def _codec_package_dir(output_dir: Path, stem: str, codec: str, tag: str = "") -> Path:
+    return output_dir / (f"{stem}_{codec}" + (f"_{tag}" if tag else ""))
 
 
-def _ts_package_dir(output_dir: Path, stem: str, codec: str) -> Path:
+def _ts_package_dir(output_dir: Path, stem: str, codec: str, tag: str = "") -> Path:
     # Matches bash's OUTPUT_DIR_HEVC_TS="${stem}_hevc_ts"
-    return output_dir / f"{stem}_{codec}_ts"
+    return output_dir / (f"{stem}_{codec}_ts" + (f"_{tag}" if tag else ""))
 
 
 def _codec_list(selection: str) -> list[str]:
@@ -166,15 +193,26 @@ def _emit_plan(
     has_audio: bool,
     want_fmp4: bool,
     want_ts: bool,
+    n_chunks: int = 1,
 ) -> None:
-    """Announce every stage the pipeline will visit, in display order."""
+    """Announce every stage the pipeline will visit, in display order. When the
+    variants are chunked (n_chunks > 1), declare every chunk cell up front so the
+    UI lays out the full-width grid immediately instead of the variant row
+    growing as chunks start — matching the per-chunk keys encode_all emits."""
     stages: list[Stage] = [Stage(key="mezzanine", label="mezzanine")]
     for codec, rungs in rungs_by_codec.items():
         for rung in rungs:
-            stages.append(Stage(
-                key=variant_stage_key(codec, rung.label),
-                label=f"encode {codec} {rung.label}",
-            ))
+            if n_chunks > 1:
+                for i in range(n_chunks):
+                    stages.append(Stage(
+                        key=variant_stage_key(codec, rung.label, i),
+                        label=f"encode {codec} {rung.label} chunk{i}",
+                    ))
+            else:
+                stages.append(Stage(
+                    key=variant_stage_key(codec, rung.label),
+                    label=f"encode {codec} {rung.label}",
+                ))
     if has_audio:
         stages.append(Stage(key="audio", label="audio"))
     for codec in rungs_by_codec:
@@ -255,9 +293,21 @@ def run_full(args: argparse.Namespace) -> int:
     want_fmp4 = args.hls_format in ("fmp4", "both")
     want_ts = args.hls_format in ("ts", "both")
 
+    # Chunk count for the plan grid (all variants share it — same content
+    # duration). Computed from the source duration (capped by --time) + the same
+    # coalesce encode_all applies; the mezzanine reprobe may shift it by <2s,
+    # which coalesce absorbs, so the up-front grid matches what actually runs.
+    n_chunks = 1
+    if args.local_chunk_duration and args.local_chunk_duration > 0 and info.duration_s > 0:
+        eff = info.duration_s
+        if args.time_limit_s and args.time_limit_s > 0:
+            eff = min(eff, args.time_limit_s)
+        n_chunks = len(_coalesce_runt_tail(
+            plan_chunks(eff, args.local_chunk_duration, args.segment_duration_s)))
+
     _emit_plan(
         rungs_by_codec=rungs_by_codec, has_audio=info.has_audio,
-        want_fmp4=want_fmp4, want_ts=want_ts,
+        want_fmp4=want_fmp4, want_ts=want_ts, n_chunks=n_chunks,
     )
 
     # Per-clip persistent work dir. Lives under $ENCODER_TMP_ROOT /
@@ -273,6 +323,8 @@ def run_full(args: argparse.Namespace) -> int:
     # whose .done size disagrees with the file) is partial — keeping
     # it around wastes disk and can confuse the next ffmpeg pass.
     _sweep_partials(work_dir)
+    if args.force_reencode:
+        _sweep_reusable(work_dir)
     try:
         mezz_path = work_dir / "mezzanine.mp4"
 
@@ -341,7 +393,13 @@ def run_full(args: argparse.Namespace) -> int:
         print(f"[phase 3] encoding variants: codec={args.codec} "
               f"ladder={args.ladder}", flush=True)
         t0 = time.monotonic()
-        encode_all(encode_ctx, rungs_by_codec)
+        encode_all(
+            encode_ctx, rungs_by_codec,
+            concurrency=args.encode_concurrency or None,
+            threads_per_encode=args.encode_threads or None,
+            chunk_duration_s=args.local_chunk_duration,
+            segment_duration_s=args.segment_duration_s,
+        )
         print(f"[phase 3] done in {time.monotonic() - t0:.1f}s", flush=True)
 
         if info.has_audio:
@@ -364,7 +422,7 @@ def run_full(args: argparse.Namespace) -> int:
 
         for codec, rungs in rungs_by_codec.items():
             labels = tuple(r.label for r in rungs)
-            pkg_dir = _codec_package_dir(args.output_dir, stem, codec)
+            pkg_dir = _codec_package_dir(args.output_dir, stem, codec, args.output_tag)
             print(f"[phase 5] packaging {codec} → {pkg_dir.name}", flush=True)
             emit_stage(f"package:{codec}", "running", 0.0)
             package(PackageSpec(
@@ -382,6 +440,7 @@ def run_full(args: argparse.Namespace) -> int:
                 print(f"[phase 6] fragment sidecars for {codec}...", flush=True)
                 emit_stage(f"fragments:{codec}", "running", 0.0)
                 count = generate_byteranges_sidecars(pkg_dir)
+                write_fragmented_mpd(pkg_dir)
                 emit_stage(f"fragments:{codec}", "done", 100.0)
                 print(f"[phase 6] wrote {count} byteranges sidecars", flush=True)
 
@@ -391,7 +450,7 @@ def run_full(args: argparse.Namespace) -> int:
                 emit_stage(f"hls:{codec}", "done", 100.0)
 
             if want_ts:
-                ts_dir = _ts_package_dir(args.output_dir, stem, codec)
+                ts_dir = _ts_package_dir(args.output_dir, stem, codec, args.output_tag)
                 print(f"[phase 7b] TS HLS for {codec} → {ts_dir.name}",
                       flush=True)
                 emit_stage(f"hls-ts:{codec}", "running", 0.0)
@@ -429,6 +488,30 @@ def run_full(args: argparse.Namespace) -> int:
 
     print("[done]", flush=True)
     return 0
+
+
+def _sweep_reusable(work_dir: Path) -> None:
+    """Force re-encode: drop every complete variant/chunk/audio output from the
+    per-clip work dir so encode_all redoes them. The work dir is keyed by
+    filename (encode_<stem>), so without this a re-encode of the same file
+    reuses the PRIOR run's complete variants (encode_all skips _is_complete
+    files). The mezzanine is kept — it's a deterministic stream copy, always
+    correct to reuse, and re-doing it just re-uploads/re-copies a large file."""
+    removed = []
+    for mp4 in work_dir.glob("*.mp4"):
+        if mp4.name == "mezzanine.mp4":
+            continue
+        marker = mp4.with_suffix(mp4.suffix + ".done")
+        try:
+            mp4.unlink()
+            if marker.is_file():
+                marker.unlink()
+            removed.append(mp4.name)
+        except OSError:
+            pass
+    if removed:
+        print(f"[force] re-encoding: cleared {len(removed)} reusable output(s) "
+              f"from prior run", flush=True)
 
 
 def _sweep_partials(work_dir: Path) -> None:
@@ -530,7 +613,7 @@ def run_resume(args: argparse.Namespace) -> int:
         labels = _labels_for(codec)
         if not labels:
             continue
-        pkg_dir = _codec_package_dir(args.output_dir, stem, codec)
+        pkg_dir = _codec_package_dir(args.output_dir, stem, codec, args.output_tag)
         print(f"[resume] packaging {codec} → {pkg_dir.name} "
               f"({len(labels)} rungs)", flush=True)
         package(PackageSpec(
@@ -543,10 +626,12 @@ def run_resume(args: argparse.Namespace) -> int:
 
         if want_fmp4:
             generate_byteranges_sidecars(pkg_dir)
+            # Self-contained DASH: expand fragment byte-ranges into manifest_fragmented.mpd
+            write_fragmented_mpd(pkg_dir)
             generate_fmp4_hls(pkg_dir)
 
         if want_ts:
-            ts_dir = _ts_package_dir(args.output_dir, stem, codec)
+            ts_dir = _ts_package_dir(args.output_dir, stem, codec, args.output_tag)
             generate_ts_hls(TsHlsSpec(
                 tmp_dir=resume_dir, ts_output_dir=ts_dir, codec=codec,
                 labels=tuple(labels),

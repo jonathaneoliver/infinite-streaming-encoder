@@ -7,13 +7,15 @@ requirement for LL-HLS playback downstream.
 """
 from __future__ import annotations
 
+import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
 from encoder.burnin import BurninContext, build_filter, rate_label
-from encoder.chunking import Chunk
+from encoder.chunking import Chunk, plan_chunks
 from encoder.gop import keyint
 from encoder.ladder import (
     BUFSIZE_MULTIPLIER,
@@ -136,14 +138,16 @@ def _codec_specific_args(
     preset: str,
     pass_num: int | None = None,
     stats_path: Path | None = None,
+    threads_override: int | None = None,
 ) -> list[str]:
     maxrate_k = target_kbps  # placeholder — real value is set in build_ffmpeg_cmd
-    # Size the encoder's threads to the container's CPU quota. Batch cgroup-caps
-    # each job to its allocated vCPUs, but `pools=*` / `-threads 0` would size to
-    # ALL host cores — so two co-located jobs each spin up a host-wide pool and
-    # thrash (16 threads throttled into 8 cores). Matching the quota keeps each
-    # encode inside its slice. None (local, no cgroup) keeps the all-cores default.
-    n = _cgroup_cpu_quota()
+    # Size the encoder's threads. On Batch, the cgroup quota caps each job to its
+    # allocated vCPUs (co-located jobs mustn't each spin up a host-wide pool and
+    # thrash). Locally there's no cgroup, so `threads_override` is how the parallel
+    # chunk pool pins each concurrent encode to its slice (cores ÷ concurrency) —
+    # otherwise every concurrent ffmpeg would grab all cores. None + no cgroup
+    # keeps the all-cores default (a single sequential local encode).
+    n = threads_override or _cgroup_cpu_quota()
     threads = str(n) if n else "0"
     pools = str(n) if n else "*"
     if codec == "hevc":
@@ -203,6 +207,7 @@ def build_ffmpeg_cmd(
     rung: Rung,
     pass_num: int | None = None,
     chunk: Chunk | None = None,
+    threads: int | None = None,
 ) -> list[str]:
     """Return the ffmpeg argv for a single variant encode.
 
@@ -256,7 +261,8 @@ def build_ffmpeg_cmd(
         "-vf", filter_str,
     ]
     cmd += _codec_specific_args(codec, target_kbps, k, rung.preset,
-                                pass_num=pass_num, stats_path=stats_path)
+                                pass_num=pass_num, stats_path=stats_path,
+                                threads_override=threads)
     # VBV-capped ABR: target average + peak cap + buffer. SVT-AV1 is the
     # exception — its ffmpeg wrapper rejects -maxrate outside CRF mode
     # ("Max Bitrate only supported with CRF mode"), so av1 runs plain VBR to the
@@ -287,6 +293,7 @@ def encode_variant(
     codec: str,
     rung: Rung,
     chunk: Chunk | None = None,
+    threads: int | None = None,
 ) -> Path:
     """Encode one (codec, rung) combination. Returns the output path.
 
@@ -327,20 +334,20 @@ def encode_variant(
             # reads as lost work). Pass 1's stats ARE used by pass 2; nothing is
             # discarded except the pass-1 muxed output.
             run_ffmpeg_with_progress(
-                build_ffmpeg_cmd(ctx, codec, rung, pass_num=1, chunk=chunk),
+                build_ffmpeg_cmd(ctx, codec, rung, pass_num=1, chunk=chunk, threads=threads),
                 duration_s=total_duration_s,
                 stage_key=stage_key,
                 pct_lo=0.0, pct_hi=50.0, terminal=False,
             )
             run_ffmpeg_with_progress(
-                build_ffmpeg_cmd(ctx, codec, rung, pass_num=2, chunk=chunk),
+                build_ffmpeg_cmd(ctx, codec, rung, pass_num=2, chunk=chunk, threads=threads),
                 duration_s=total_duration_s,
                 stage_key=stage_key,
                 pct_lo=50.0, pct_hi=100.0,
             )
         else:
             run_ffmpeg_with_progress(
-                build_ffmpeg_cmd(ctx, codec, rung, chunk=chunk),
+                build_ffmpeg_cmd(ctx, codec, rung, chunk=chunk, threads=threads),
                 duration_s=total_duration_s,
                 stage_key=stage_key,
             )
@@ -447,43 +454,116 @@ def codec_list(selection: str) -> list[str]:
     raise EncodeError(f"unknown codec selection: {selection}")
 
 
+# A final chunk shorter than this can't seed a reliable 2-pass x265 stats file
+# ("empty stats file" → ffmpeg abort). plan_chunks tiles by chunk COUNT (a
+# contract shared with the Go/SFN control plane, so we can't change it there),
+# and when the clip is a hair over an exact chunk multiple the remainder chunk
+# is a sub-frame sliver. Locally we fold such a runt tail into its predecessor.
+_MIN_TAIL_CHUNK_S = 2.0
+
+
+def _coalesce_runt_tail(chunks: list[Chunk], min_tail_s: float = _MIN_TAIL_CHUNK_S) -> list[Chunk]:
+    """Merge a too-short final chunk into the one before it.
+
+    Only the last chunk is ever short (plan_chunks clips only the tail), so a
+    single merge suffices. Indices stay contiguous 0..n-1 (we drop the final
+    index and extend its predecessor), which concat_chunks relies on.
+    """
+    if len(chunks) < 2 or chunks[-1].duration_s >= min_tail_s:
+        return chunks
+    tail = chunks[-1]
+    prev = chunks[-2]
+    merged = Chunk(index=prev.index, start_s=prev.start_s,
+                   duration_s=prev.duration_s + tail.duration_s)
+    return chunks[:-2] + [merged]
+
+
 def encode_all(
     ctx: EncodeContext,
     rungs_by_codec: dict[str, list[Rung]],
+    *,
+    concurrency: int | None = None,
+    threads_per_encode: int | None = None,
+    chunk_duration_s: float = 0.0,
+    segment_duration_s: float = 6.0,
 ) -> list[Path]:
-    """Encode every (codec, rung) pair and return the output paths.
+    """Encode every (codec, rung) pair and return the whole-variant output paths.
 
     `rungs_by_codec` maps each selected codec to its ladder rungs (already
-    filtered by source/max-res and with any bitrate override baked in — see
-    ladder.select_rungs). Per-codec rung lists let a ladder give H264 and
-    HEVC different resolutions/rung counts (the Apple ladders do).
+    filtered by source/max-res and with any bitrate override baked in).
 
-    Runs sequentially — parallelism happens at the Go-server level (one
-    worker container per file; multiple jobs can run concurrently via
-    MAX_CONCURRENT), not inside a single variant loop.
+    Runs the encodes CONCURRENTLY across a bounded pool so a multi-core machine
+    fills its cores — a single x265 encode only ~half-fills a box, so one at a
+    time wasted most of the machine on HEVC. With `chunk_duration_s > 0` each
+    variant is split into chunks (`plan_chunks`) that run as independent units
+    and are `concat`'d afterward — so even ONE HEVC variant fills the cores (the
+    same chunk unit the cloud fans out to Batch). Each concurrent encode is
+    pinned to `threads_per_encode` threads (no cgroup locally, so we size the
+    packing ourselves — mirrors the cloud's per-job vCPU cap).
+
+    Defaults are core-aware: ~2 threads/encode (matches the cloud's HEVC vCPU),
+    concurrency ≈ cores ÷ threads. The Go server passes explicit values.
     """
+    cores = os.cpu_count() or 4
+    if not threads_per_encode or threads_per_encode < 1:
+        threads_per_encode = 2
+    if not concurrency or concurrency < 1:
+        concurrency = max(1, cores // threads_per_encode)
+
+    # Build the flat work-list of (codec, rung, chunk|None), skipping units that
+    # are already complete (resume). A chunked variant contributes N chunk units
+    # + a concat afterward; an un-chunked variant is one whole-variant unit.
+    units: list[tuple[str, Rung, Chunk | None]] = []
+    to_concat: list[tuple[str, str, int]] = []   # (codec, label, n_chunks)
     outputs: list[Path] = []
-    # Encode rung-major (all codecs of a rung together) to mirror the old
-    # tier-major order — mostly cosmetic for progress display.
     for codec, rungs in rungs_by_codec.items():
         for rung in rungs:
-            out = _variant_path(ctx.output_dir, codec, rung.label)
-            # Skip variants that are already fully encoded — the .done
-            # sidecar's size must match the MP4's current size, so a
-            # file rsynced mid-write (common after spot interrupt)
-            # doesn't trigger a false skip.
-            if _is_complete(out):
-                print(f"[resume] skipping {codec} {rung.label} "
-                      f"— already complete ({out.name})", flush=True)
-                # Emit "skipped" so the UI flips this variant's bar to
-                # the distinct reused-style (gray hash pattern + "reused"
-                # label) rather than the green done-style it'd get from
-                # a fresh encode. Makes it obvious at a glance which
-                # stages were picked up from the prior run.
+            whole = _variant_path(ctx.output_dir, codec, rung.label)
+            outputs.append(whole)
+            if _is_complete(whole):
                 emit_stage(variant_stage_key(codec, rung.label), "skipped", 100.0)
-                outputs.append(out)
                 continue
-            outputs.append(encode_variant(ctx, codec, rung))
+            chunks = None
+            if chunk_duration_s and chunk_duration_s > 0 and ctx.content_duration_s > 0:
+                total = ctx.content_duration_s + ctx.padding_duration_s
+                chunks = _coalesce_runt_tail(
+                    plan_chunks(total, chunk_duration_s, segment_duration_s))
+            if chunks and len(chunks) > 1:
+                to_concat.append((codec, rung.label, len(chunks)))
+                for ch in chunks:
+                    if not _is_complete(_chunk_path(ctx.output_dir, codec, rung.label, ch.index)):
+                        units.append((codec, rung, ch))
+            else:
+                units.append((codec, rung, None))
+
+    print(f"[phase 3] {len(units)} encode unit(s) across {concurrency} workers "
+          f"× {threads_per_encode} threads (cores={cores}"
+          f"{f', chunk={chunk_duration_s:g}s' if chunk_duration_s else ', whole-variant'})",
+          flush=True)
+
+    # Run the pool. First exception is re-raised after in-flight encodes settle
+    # (the Go server marks the job failed on any non-zero).
+    if units:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {
+                pool.submit(encode_variant, ctx, codec, rung,
+                            chunk=chunk, threads=threads_per_encode): (codec, rung, chunk)
+                for (codec, rung, chunk) in units
+            }
+            first_error: Exception | None = None
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as e:  # noqa: BLE001 — surface the first, keep draining
+                    if first_error is None:
+                        first_error = e
+            if first_error is not None:
+                raise first_error
+
+    # Join each chunked variant into its whole-variant mp4 (stream-copy concat).
+    for codec, label, n in to_concat:
+        concat_chunks(ctx.output_dir, codec, label, n)
+
     return outputs
 
 

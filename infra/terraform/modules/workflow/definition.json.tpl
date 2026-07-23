@@ -103,6 +103,9 @@
                 "chunk_duration.$": "$$.Map.Item.Value.chunk_duration",
                 "maxrate_percent.$": "$.maxrate_percent",
                 "bufsize_multiplier.$": "$.bufsize_multiplier",
+                "segment_duration.$": "$.segment_duration",
+                "partial_duration.$": "$.partial_duration",
+                "gop_duration.$": "$.gop_duration",
                 "chunked.$": "$$.Map.Item.Value.chunked"
               },
               "ItemProcessor": {
@@ -141,7 +144,9 @@
                           { "Name": "TWO_PASS", "Value.$": "$.two_pass" },
                           { "Name": "CHUNK_DURATION_S", "Value.$": "$.chunk_duration" },
                           { "Name": "MAXRATE_PERCENT", "Value.$": "$.maxrate_percent" },
-                          { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" }
+                          { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" },
+                          { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
+                          { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" }
                         ],
                         "ResourceRequirements": [
                           { "Type": "VCPU", "Value.$": "$.vcpu" },
@@ -172,7 +177,9 @@
                       "chunk_index.$": "$$.Map.Item.Value",
                       "chunk_duration.$": "$.chunk_duration",
                       "maxrate_percent.$": "$.maxrate_percent",
-                      "bufsize_multiplier.$": "$.bufsize_multiplier"
+                      "bufsize_multiplier.$": "$.bufsize_multiplier",
+                      "segment_duration.$": "$.segment_duration",
+                      "gop_duration.$": "$.gop_duration"
                     },
                     "ItemProcessor": {
                       "StartAt": "EncodeChunk",
@@ -202,7 +209,9 @@
                                 { "Name": "TWO_PASS", "Value.$": "$.two_pass" },
                                 { "Name": "CHUNK_DURATION_S", "Value.$": "$.chunk_duration" },
                                 { "Name": "MAXRATE_PERCENT", "Value.$": "$.maxrate_percent" },
-                                { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" }
+                                { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" },
+                                { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
+                                { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" }
                               ],
                               "ResourceRequirements": [
                                 { "Type": "VCPU", "Value.$": "$.vcpu" },
@@ -261,6 +270,12 @@
                   "s3_variants.$": "$.s3_prefix",
                   "s3_audio.$": "$.s3_prefix",
                   "s3_out.$": "$.s3_prefix"
+                },
+                "ContainerOverrides": {
+                  "Environment": [
+                    { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
+                    { "Name": "PARTIAL_DURATION", "Value.$": "$.partial_duration" }
+                  ]
                 }
               },
               "End": true
@@ -295,6 +310,12 @@
                   "s3_variants.$": "$.s3_prefix",
                   "s3_audio.$": "$.s3_prefix",
                   "s3_out.$": "$.s3_prefix"
+                },
+                "ContainerOverrides": {
+                  "Environment": [
+                    { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
+                    { "Name": "PARTIAL_DURATION", "Value.$": "$.partial_duration" }
+                  ]
                 }
               },
               "End": true
@@ -329,6 +350,12 @@
                   "s3_variants.$": "$.s3_prefix",
                   "s3_audio.$": "$.s3_prefix",
                   "s3_out.$": "$.s3_prefix"
+                },
+                "ContainerOverrides": {
+                  "Environment": [
+                    { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
+                    { "Name": "PARTIAL_DURATION", "Value.$": "$.partial_duration" }
+                  ]
                 }
               },
               "End": true

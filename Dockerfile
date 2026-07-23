@@ -22,14 +22,33 @@ LABEL org.opencontainers.image.version="${VERSION}"
 LABEL org.opencontainers.image.revision="${GIT_SHA}"
 LABEL org.opencontainers.image.source="https://github.com/jonathaneoliver/Encoder"
 
-# OS packages: encoding toolchain + CA certs + fonts for drawtext burn-ins.
+# OS packages: CA certs + fonts for drawtext burn-ins (+ xz to unpack the static
+# ffmpeg below). ffmpeg itself is NOT from apt — see the static build next.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash curl ca-certificates gettext-base \
-        ffmpeg \
         fonts-dejavu-core \
-        unzip \
+        unzip xz-utils \
         rsync openssh-client \
     && rm -rf /var/lib/apt/lists/*
+
+# ffmpeg + ffprobe: PINNED static GPL build (BtbN), which ships a much newer
+# libx265 than Debian's apt package — measurably faster HEVC (see
+# infra/local-cluster/PERFORMANCE.md). Multi-arch; self-contained binaries.
+# Pinned (tag + build) for reproducible images; bump both to update.
+ARG FFMPEG_TAG=autobuild-2026-07-22-13-36
+ARG FFMPEG_BUILD=ffmpeg-N-125716-g1b1f602699
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) farch="linux64" ;; \
+        arm64) farch="linuxarm64" ;; \
+        *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_TAG}/${FFMPEG_BUILD}-${farch}-gpl.tar.xz" -o /tmp/ffmpeg.tar.xz; \
+    tar -xJf /tmp/ffmpeg.tar.xz -C /tmp; \
+    mv /tmp/${FFMPEG_BUILD}-${farch}-gpl/bin/ffmpeg \
+       /tmp/${FFMPEG_BUILD}-${farch}-gpl/bin/ffprobe /usr/local/bin/; \
+    rm -rf /tmp/ffmpeg*; \
+    ffmpeg -version | head -1
 
 # AWS CLI v2 (multi-arch; official installer).
 RUN set -eux; \
@@ -79,6 +98,10 @@ RUN chmod +x /app/scripts/*.sh 2>/dev/null || true; \
 # PYTHONPATH lets `python3 -m encoder.foo` and `from encoder.foo import bar`
 # resolve regardless of the worker container's CWD.
 ENV PYTHONPATH=/app/scripts
+# Unbuffered stdout/stderr: our progress markers use flush=True, but this makes
+# EVERY print (incl. plain log lines + subprocess output) reach the Go log scanner
+# immediately instead of block-buffering when stdout is a pipe (it always is).
+ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 EXPOSE 8080

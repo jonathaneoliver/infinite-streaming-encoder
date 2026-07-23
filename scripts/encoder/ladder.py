@@ -216,6 +216,48 @@ SEED_LADDERS: dict[str, dict] = {
         "seed": True,
         "maxrate_percent": 110,
         "bufsize_multiplier": 0.10,
+        # No pinned segment_duration: the flexible base (tight VBV is safe to
+        # repackage into 1s/2s/6s); partial/gop are its LL-HLS live settings.
+        "partial_duration": "0.2",
+        "gop_duration": "1.0",
+        "codecs": {
+            "h264": _SEED_APPLE_H264_UNIQ,
+            "hevc": _SEED_APPLE_HEVC_UNIQ,
+            "av1":  _SEED_APPLE_HEVC_UNIQ,
+        },
+    },
+    "apple-uniq-live-6s": {
+        "description": "apple-uniq LL-HLS for 6s segments ONLY. The tight "
+                       "110%/0.10x VBV on apple-uniq-live kept the delivered "
+                       "per-segment peak reasonable even at 1s (peak ~= maxrate "
+                       "+ bufsize/T); fixed at 6s the bufsize/T term is 6x "
+                       "smaller, so relax to 150%/1.0x for better quality while "
+                       "the delivered peak stays ~1.67x avg. Keeps 0.2s parts + "
+                       "1s GOP. Outputs tagged _6s so go-live only makes 6s.",
+        "seed": True,
+        "maxrate_percent": 150,
+        "bufsize_multiplier": 1.0,
+        "segment_duration": "6",
+        "partial_duration": "0.2",
+        "gop_duration": "1.0",
+        "codecs": {
+            "h264": _SEED_APPLE_H264_UNIQ,
+            "hevc": _SEED_APPLE_HEVC_UNIQ,
+            "av1":  _SEED_APPLE_HEVC_UNIQ,
+        },
+    },
+    "apple-uniq-vod": {
+        "description": "apple-uniq bitrates tuned for VOD: 6s segments, NO "
+                       "LL-HLS parts, long 6s GOP (fewer keyframes -> better "
+                       "efficiency), relaxed VBV (peak <= 2x avg per Apple's "
+                       "VOD guidance, 2.0x buffer). Bits redistribute toward "
+                       "complex scenes; average bitrate + size unchanged.",
+        "seed": True,
+        "maxrate_percent": 200,
+        "bufsize_multiplier": 2.0,
+        "segment_duration": "6",
+        "partial_duration": "0",
+        "gop_duration": "6",
         "codecs": {
             "h264": _SEED_APPLE_H264_UNIQ,
             "hevc": _SEED_APPLE_HEVC_UNIQ,
