@@ -2,10 +2,12 @@ package api
 
 import (
 	"bufio"
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -84,36 +86,93 @@ func (s *Server) ladder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse the master to pull BANDWIDTH per rendition. Fall back to
+	// Parse the master to pull BANDWIDTH + width per rendition. Fall back to
 	// zero if the master is missing or malformed; the UI handles it.
-	actualByRes := readMasterBandwidth(dirPath)
+	actualByRes, widthByRes := readMasterBandwidth(dirPath)
+	// Targets: prefer the profile's own rungs recorded in encode.json (handles
+	// ANY resolution, incl. apple-uniq's unique heights); fall back to the
+	// standard-tier table for older outputs without it.
+	jsonTargets := readEncodeJSONTargets(dirPath)
 
+	// Enumerate the ACTUAL resolution dirs (<N>p) rather than a fixed standard
+	// list, so unique-resolution ladders (432p/468p/504p/684p …) show every rung.
+	resDirRe := regexp.MustCompile(`^(\d+)p$`)
+	entries, _ := os.ReadDir(dirPath)
 	var tiers []ladderTier
-	for _, t := range ladderSpec {
-		resDir := filepath.Join(dirPath, t.name)
-		info, err := os.Stat(resDir)
-		if err != nil || !info.IsDir() {
+	for _, e := range entries {
+		if !e.IsDir() {
 			continue
 		}
-		size, _ := dirStats(resDir)
+		mm := resDirRe.FindStringSubmatch(e.Name())
+		if mm == nil {
+			continue // skips "audio" and any non-rung dir
+		}
+		h, _ := strconv.Atoi(mm[1])
+		target := jsonTargets[h]
+		if target == 0 {
+			target = standardTargetByHeight(h, meta.codec) // legacy fallback
+		}
+		width := widthByRes[e.Name()]
+		if width == 0 {
+			width = h * 16 / 9 // 16:9 derive (apple-uniq rungs are 16:9)
+		}
+		size, _ := dirStats(filepath.Join(dirPath, e.Name()))
 		tiers = append(tiers, ladderTier{
-			Res:        t.name,
-			Width:      t.width,
-			Height:     t.height,
-			TargetKbps: tierTargetKbps(t, meta.codec),
-			ActualKbps: actualByRes[t.name],
+			Res:        e.Name(),
+			Width:      width,
+			Height:     h,
+			TargetKbps: target,
+			ActualKbps: actualByRes[e.Name()],
 			SizeBytes:  size,
 		})
 	}
+	sort.Slice(tiers, func(i, j int) bool { return tiers[i].Height < tiers[j].Height })
 
 	writeJSON(w, ladderDoc{Codec: meta.codec, Tiers: tiers})
+}
+
+// readEncodeJSONTargets reads the per-rung target bitrates from encode.json
+// (height → kbps). Empty when the file is absent (older outputs).
+func readEncodeJSONTargets(dirPath string) map[int]int {
+	out := map[int]int{}
+	data, err := os.ReadFile(filepath.Join(dirPath, "encode.json"))
+	if err != nil {
+		return out
+	}
+	var m struct {
+		Rungs []struct {
+			Height      int `json:"height"`
+			BitrateKbps int `json:"bitrate_kbps"`
+		} `json:"rungs"`
+	}
+	if json.Unmarshal(data, &m) == nil {
+		for _, r := range m.Rungs {
+			if r.Height > 0 {
+				out[r.Height] = r.BitrateKbps
+			}
+		}
+	}
+	return out
+}
+
+// standardTargetByHeight is the legacy fallback: the standard-tier target for an
+// exact standard height, else 0 (unique heights show "—" until re-encoded with
+// encode.json).
+func standardTargetByHeight(h int, codec string) int {
+	for _, t := range ladderSpec {
+		if t.height == h {
+			return tierTargetKbps(t, codec)
+		}
+	}
+	return 0
 }
 
 // readMasterBandwidth returns a map of "<res>p" → kbps from the dir's
 // master.m3u8. Finds a RESOLUTION=WxH alongside BANDWIDTH= on each
 // EXT-X-STREAM-INF line and maps Y (height) back to the tier name.
-func readMasterBandwidth(dirPath string) map[string]int {
+func readMasterBandwidth(dirPath string) (map[string]int, map[string]int) {
 	out := map[string]int{}
+	widths := map[string]int{}
 	// Masters can live at the dir root as master.m3u8 or master_ts.m3u8.
 	candidates := []string{"master.m3u8", "master_ts.m3u8"}
 	var path string
@@ -125,11 +184,11 @@ func readMasterBandwidth(dirPath string) map[string]int {
 		}
 	}
 	if path == "" {
-		return out
+		return out, widths
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return out
+		return out, widths
 	}
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
@@ -144,16 +203,21 @@ func readMasterBandwidth(dirPath string) map[string]int {
 			continue
 		}
 		bw, _ := strconv.Atoi(bwMatch[1])
+		wdt, _ := strconv.Atoi(resMatch[1])
 		h, _ := strconv.Atoi(resMatch[2])
-		out[heightToRes(h)] = bw / 1000 // bps → kbps
+		res := heightToRes(h)
+		out[res] = bw / 1000 // bps → kbps
+		widths[res] = wdt
 	}
-	return out
+	return out, widths
 }
 
+// heightToRes names a rendition by its height ("<N>p") — for ANY height, so
+// apple-uniq's unique resolutions (432p/468p/504p/684p) map correctly, not just
+// the standard tiers.
 func heightToRes(h int) string {
-	switch h {
-	case 360, 540, 720, 1080, 1440, 2160:
-		return strconv.Itoa(h) + "p"
+	if h <= 0 {
+		return ""
 	}
-	return ""
+	return strconv.Itoa(h) + "p"
 }
