@@ -582,18 +582,6 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <div class="aws-metric-value" id="aws-hourly">—</div>
             </div>
             <div class="aws-metric">
-                <div class="aws-metric-label" title="Self-tracked: burn rate integrated over the trailing 24h">Spent (last 24h)</div>
-                <div class="aws-metric-value" id="aws-spend-24h">—</div>
-            </div>
-            <div class="aws-metric">
-                <div class="aws-metric-label" title="Accumulated (on-demand − spot) cost across all finished cloud-batch jobs — what running on spot has saved you">Saved by spot (total)</div>
-                <div class="aws-metric-value ok" id="aws-saved">—</div>
-            </div>
-            <div class="aws-metric">
-                <div class="aws-metric-label" title="Trailing 24h: encode-minutes thrown away by spot reclaims ÷ total encode-minutes. High = reclaims are eating your spot savings.">Reclaim waste (24h)</div>
-                <div class="aws-metric-value" id="aws-reclaim-pct">—</div>
-            </div>
-            <div class="aws-metric">
                 <div class="aws-metric-label" title="Distributed-local encoder machines currently available (workers polling Temporal). One encode's chunks spread across these boxes; hover the value for names.">Local machines</div>
                 <div class="aws-metric-value" id="aws-dist-machines">—</div>
             </div>
@@ -2542,13 +2530,6 @@ function renderAws(data) {
     const hourlyEl = document.getElementById('aws-hourly');
     hourlyEl.textContent = '$' + hourly.toFixed(2);
     hourlyEl.className = 'aws-metric-value' + (hourly > 0 ? ' warn' : ' ok');
-    document.getElementById('aws-spend-24h').textContent = '$' + (s.spend_24h_usd || 0).toFixed(2);
-    document.getElementById('aws-saved').textContent = '$' + (s.saved_total_usd || 0).toFixed(2);
-    const rpct = s.reclaim_24h_pct || 0;
-    const rEl = document.getElementById('aws-reclaim-pct');
-    rEl.textContent = rpct.toFixed(1) + '%';
-    rEl.className = 'aws-metric-value' + (rpct >= 10 ? ' warn' : rpct > 0 ? '' : ' ok');
-    rEl.title = (s.reclaim_24h_lost_min || 0).toFixed(1) + ' min of encoding lost to reclaims in the last 24h';
     const warm = s.min_vcpus || 0;
     const warmEl = document.getElementById('aws-warm');
     warmEl.textContent = warm + ' vCPU';
@@ -2843,7 +2824,7 @@ function renderFleet(fleet, instances) {
           </div>
           <div style="font-size:13px;color:#ccc"><b>${used}</b> / ${total} vCPU busy (${pct}%) · <span style="color:#888">${idle} idle</span></div>
         </div>
-        <div style="color:#888;font-size:12px;margin-bottom:12px">${fleet.instance_count || running.length} instances · ${fleet.running_jobs || 0} running / ${fleet.queued_jobs || 0} queued jobs · $${(fleet.estimated_hourly_usd || 0).toFixed(2)}/hr · $${(fleet.spend_24h_usd || 0).toFixed(2)} last 24h</div>`;
+        <div style="color:#888;font-size:12px;margin-bottom:12px">${fleet.instance_count || running.length} instances · ${fleet.running_jobs || 0} running / ${fleet.queued_jobs || 0} queued jobs · $${(fleet.estimated_hourly_usd || 0).toFixed(2)}/hr</div>`;
         // If jobs couldn't be mapped to instances (missing ecs perm), say so.
         const mapped = running.some(i => (i.jobs || []).length);
         const note = (used > 0 && !mapped)
