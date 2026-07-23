@@ -451,7 +451,7 @@ dist-ps:              ## cluster + worker containers
 # MASTER_IP: the master box's LAN IP that workers dial for Temporal + MinIO.
 DIST_WORKERS ?=
 MASTER_IP ?= 192.168.0.110
-.PHONY: dist-deploy-workers dist-deploy
+.PHONY: dist-deploy-workers dist-deploy dist-deploy-ghcr
 
 dist-deploy-workers:  ## rsync code + rebuild image + (re)start worker on each DIST_WORKERS box
 	@if [ -z "$(DIST_WORKERS)" ]; then echo "set DIST_WORKERS=label=ssh_target [..] (in .env)"; exit 1; fi
@@ -464,3 +464,17 @@ dist-deploy-workers:  ## rsync code + rebuild image + (re)start worker on each D
 
 dist-deploy: build dist-worker dist-deploy-workers  ## deploy distributed-local to the master + all remote boxes
 	@echo ">>> distributed-local deployed: master worker + $(words $(DIST_WORKERS)) remote box(es)."
+
+# Like dist-deploy-workers, but every box PULLS the published image from GHCR
+# (no 900MB image transfer, no per-box build, any arch). Needs GHCR_PAT only if
+# the package is private. Pair with `make run-remote` on the master for a fully
+# no-local-build bring-up.
+dist-deploy-ghcr:     ## GHCR-pull workers on each DIST_WORKERS box (no build/transfer)
+	@if [ -z "$(DIST_WORKERS)" ]; then echo "set DIST_WORKERS=label=ssh_target [..] (in .env)"; exit 1; fi
+	@for w in $(DIST_WORKERS); do \
+	  label=$${w%%=*}; host=$${w#*=}; \
+	  MASTER_IP=$(MASTER_IP) IMAGE=$(REMOTE_IMAGE) GHCR_PAT=$(GHCR_PAT) GHCR_USERNAME=$(GHCR_USERNAME) \
+	    MINIO_ROOT_USER=$(MINIO_ACCESS_KEY) MINIO_ROOT_PASSWORD=$(MINIO_SECRET_KEY) \
+	    bash infra/local-cluster/deploy-worker-ghcr.sh "$$host" "$$label" || exit 1; \
+	done
+	@echo ">>> GHCR-pull workers deployed to $(words $(DIST_WORKERS)) box(es)."
