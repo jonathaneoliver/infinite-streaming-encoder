@@ -464,9 +464,10 @@ dist-deploy-workers:  ## rsync code + rebuild image + (re)start worker on each D
 	@for w in $(DIST_WORKERS); do \
 	  label=$${w%%=*}; host=$${w#*=}; \
 	  MASTER_IP=$(MASTER_IP) MINIO_ROOT_USER=$(MINIO_ROOT_USER) MINIO_ROOT_PASSWORD=$(MINIO_ROOT_PASSWORD) \
+	  DEV_BUILD=$(DEV_BUILD) FORCE_IMAGE=$(FORCE_IMAGE) \
 	    bash infra/local-cluster/deploy-worker.sh "$$host" "$$label" || exit 1; \
 	done
-	@echo ">>> remote workers deployed."
+	@echo ">>> remote workers deployed (DEV_BUILD=1 native-builds uncommitted deps on cross-arch boxes)."
 
 dist-deploy: build dist-worker dist-deploy-workers  ## deploy distributed-local to the master + all remote boxes
 	@echo ">>> distributed-local deployed: master worker + $(words $(DIST_WORKERS)) remote box(es)."
