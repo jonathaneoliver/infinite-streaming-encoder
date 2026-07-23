@@ -69,9 +69,22 @@ except ImportError:  # pragma: no cover — boto3 is in requirements.txt for the
 # their own ephemeral filesystem; no need for per-phase isolation.
 _WORK_DIR = Path(os.environ.get("ENCODER_WORK_DIR", "/tmp/work"))
 
-_SEGMENT_DURATION_S = 6.0
-_PARTIAL_DURATION_S = 0.2
-_GOP_DURATION_S = 1.0
+# Profile timing (segment / LL-HLS partial / GOP), read from env so the ladder's
+# values — injected by the Step Functions containerOverrides (SEGMENT_DURATION /
+# PARTIAL_DURATION / GOP_DURATION) — drive the cloud encode too. Previously
+# hardcoded, so cloud ignored the job's/ladder's timing. Falls back to the live
+# defaults. PARTIAL_DURATION=0 turns LL-HLS parts off (VOD).
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name, "")
+        return float(v) if v != "" else default
+    except ValueError:
+        return default
+
+
+_SEGMENT_DURATION_S = _env_float("SEGMENT_DURATION", 6.0)
+_PARTIAL_DURATION_S = _env_float("PARTIAL_DURATION", 0.2)
+_GOP_DURATION_S = _env_float("GOP_DURATION", 1.0)
 
 
 # ---------------------------------------------------------------------------

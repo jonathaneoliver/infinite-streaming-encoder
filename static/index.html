@@ -409,8 +409,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 </div>
             </div>
             <div class="control-group">
-                <label title="Bitrate ladder (resolutions + target bitrates). Manage ladders in the Ladders tab.">Ladder</label>
-                <select id="ladder">
+                <label title="Bitrate ladder (resolutions + target bitrates) AND its output timing (segment / partial / GOP). Manage ladders in the Ladders tab.">Ladder / Profile</label>
+                <select id="ladder" onchange="applyLadderTiming()">
                     <option value="apple-uniq-live">apple-uniq-live</option>
                 </select>
             </div>
@@ -867,6 +867,25 @@ async function loadLadders() {
             `<option value="${n}">${n}${laddersCache[n].seed ? '' : ' (custom)'}</option>`).join('');
         sel.value = names.includes(cur) ? cur : (names.includes(DEFAULT) ? DEFAULT : names[0] || '');
     }
+    applyLadderTiming(); // fill segment/partial/GOP from the selected profile
+}
+
+// The selected ladder/profile drives the segment/partial/GOP timing (the ladder
+// owns it now). Prefill the form fields from the profile's values (global default
+// where the profile doesn't specify); the user can still override per-encode.
+// Sending these explicit values is fine — the server's precedence is job > ladder
+// > default, and here job == the profile's value.
+function applyLadderTiming() {
+    const sel = document.getElementById('ladder');
+    if (!sel) return;
+    const d = laddersCache[sel.value] || {};
+    const set = (id, v, def) => {
+        const el = document.getElementById(id);
+        if (el) el.value = (v !== undefined && v !== null && v !== '') ? v : def;
+    };
+    set('segment-duration', d.segment_duration, '6');
+    set('partial-duration', d.partial_duration, '0.2');
+    set('gop-duration', d.gop_duration, '1.0');
 }
 
 // One table per ladder: rows are resolutions (highest first), columns are

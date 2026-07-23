@@ -759,6 +759,10 @@ type JobConfig struct {
 	// localChunkSeconds) — "dynamic"/"" default to 2×segment there.
 	ChunkDuration string `json:"chunk_duration,omitempty"`
 	GopDuration   string `json:"gop_duration"`
+	// OutputTag is appended to the output dir name ("<stem>_<tag>_<codec>"). Not a
+	// user field — filled from the selected ladder's output_tag by resolveTimings,
+	// so a profile like apple-uniq-live-6s marks its outputs ("_6s") for go-live.
+	OutputTag     string `json:"output_tag,omitempty"`
 	HlsFormat     string `json:"hls_format"`
 	Padding       string `json:"padding"`
 	KeepMezzanine bool   `json:"keep_mezzanine"`
@@ -1901,6 +1905,11 @@ func (cfg *JobConfig) OutputStem(filename string) string {
 	case "pink":
 		stem += "_padpink"
 	}
+	// Profile output tag (e.g. "6s") marks the dir for go-live; the encode script
+	// then appends "_<codec>", giving "<stem>_p200_6s_h264".
+	if cfg.OutputTag != "" {
+		stem += "_" + cfg.OutputTag
+	}
 	return stem
 }
 
@@ -2052,6 +2061,35 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	return args
 }
 
+// effectiveTiming resolves one profile timing value with precedence
+// job > ladder > global default. "" means "unset" at both the job and ladder
+// level; "0" is an explicit value (e.g. partial="0" turns LL-HLS parts off).
+func effectiveTiming(jobVal, ladderVal, globalDefault string) string {
+	if jobVal != "" {
+		return jobVal
+	}
+	if ladderVal != "" {
+		return ladderVal
+	}
+	return globalDefault
+}
+
+// resolveTimings fills a config's segment/partial/GOP from the selected ladder
+// (then the global default) wherever the job didn't set them, so the ladder
+// defines the profile's output timing. Mutates the passed (copied) cfg.
+func (m *Manager) resolveTimings(cfg *JobConfig) {
+	var def LadderDef
+	if m.Ladders != nil {
+		def, _ = m.Ladders.Get(cfg.Ladder)
+	}
+	cfg.SegmentDuration = effectiveTiming(cfg.SegmentDuration, def.SegmentDuration, "6")
+	cfg.PartialDuration = effectiveTiming(cfg.PartialDuration, def.PartialDuration, "0.2")
+	cfg.GopDuration = effectiveTiming(cfg.GopDuration, def.GopDuration, "1.0")
+	if cfg.OutputTag == "" { // no global default — empty means "no tag"
+		cfg.OutputTag = def.OutputTag
+	}
+}
+
 func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int) error {
 	// Project the cost comparison up front from the first source file's probe +
 	// the learned-speed model: AWS Batch (Graviton) compute cost AND predicted
@@ -2059,6 +2097,12 @@ func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int)
 	// on our cloud fleet?" and "how long on my own hardware?" apply to any run)
 	// and idempotent on reattach; refreshed live below as speeds are learned.
 	m.projectAndSetCosts(job)
+
+	// Resolve profile timing + output tag from the selected ladder into the job's
+	// effective config ONCE (job value wins, else ladder, else global default), so
+	// both the encode args AND the skip/output naming (resolveCodec, OutputStem)
+	// see the same values. Idempotent on reattach.
+	m.resolveTimings(&job.Config)
 
 	// cloud-batch fans the whole job onto AWS Batch via Step Functions; local-dist
 	// runs one worker container per file below.
@@ -2088,7 +2132,7 @@ func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int)
 		job.startFile(f, i+1, total)
 		m.notify(job)
 
-		fileCfg := job.Config
+		fileCfg := job.Config // already timing-resolved above
 		fileCfg.Codec = codec
 		var args []string
 		if job.Config.Target == TargetLocalDist {
@@ -2298,7 +2342,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// Source fps: keys the speed model (encode time ∝ frame count), so chunk
 		// sizes/priorities match the graviton keys learned at the same rate.
 		srcFps := probeSourceFps(localSrc)
-		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, srcWidth, srcFps, durationS, job.Config.ChunkDuration, m.jobPriorityBase(job), job.AppendLog)
+		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, srcWidth, srcFps, durationS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), job.AppendLog)
 		expectedEncodes = expEnc
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
@@ -2563,7 +2607,7 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached bool, sourceWidth, sourceFps int, clipDurationS float64, chunkCfg string, priorityBase int, logf func(string)) (string, int) {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached bool, sourceWidth, sourceFps int, clipDurationS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, logf func(string)) (string, int) {
 	if ladderName == "" {
 		ladderName = "apple-uniq-live"
 	}
@@ -2591,6 +2635,12 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	if bufMult <= 0 {
 		bufMult = 0.25
 	}
+	// Profile timing: job value wins, else the ladder's, else the global default.
+	// So a VOD ladder (0 partial, 6s GOP) drives the cloud encode the same way it
+	// drives local — cli_phase reads these off env (previously hardcoded).
+	segDur = effectiveTiming(segDur, ladderDef.SegmentDuration, "6")
+	partDur = effectiveTiming(partDur, ladderDef.PartialDuration, "0.2")
+	gopDur = effectiveTiming(gopDur, ladderDef.GopDuration, "1.0")
 	codecs := parseCodecSel(codecSel)
 	// Build the per-codec rung list from the ladder store. resolveLadderRungs
 	// caps each codec at the source width (no upscale) and --max-res, and
@@ -2705,6 +2755,11 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		// so a custom ladder's VBV is honored in the cloud, not just locally.
 		"maxrate_percent":    strconv.Itoa(maxratePct),
 		"bufsize_multiplier": strconv.FormatFloat(bufMult, 'f', -1, 64),
+		// Profile timing (ladder-resolved) → containerOverrides env → cli_phase.
+		// Same for every variant/package job of a run (like the VBV knobs above).
+		"segment_duration": segDur,
+		"partial_duration": partDur,
+		"gop_duration":     gopDur,
 		// Banded priorities for the fixed phases (chunks carry their own banded
 		// priority per variant). Keeps a job's whole pipeline in one band so an
 		// earlier job's package isn't starved by a later job's chunks.
