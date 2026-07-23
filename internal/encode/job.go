@@ -2908,6 +2908,11 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 	runArgs := []string{
 		"run", "-dt",
 		"--name", name,
+		// Resolve host.docker.internal on plain Linux too — Docker Desktop
+		// provides it automatically, but Docker Engine needs host-gateway. Lets
+		// the spawned orchestrator reach Temporal/MinIO published on the host
+		// when the master runs on Linux (a Linux box, or a CI runner).
+		"--add-host", "host.docker.internal:host-gateway",
 		"--label", "encoder.job_id=" + job.ID,
 		"--label", "encoder.role=encode-worker",
 		"--label", fmt.Sprintf("encoder.target=%s", job.Config.Target),

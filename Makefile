@@ -89,6 +89,7 @@ define ENCODER_DOCKER_RUN
 docker run --rm -d \
 	--name $(CONTAINER_NAME) \
 	-p $(PORT):8080 \
+	--add-host host.docker.internal:host-gateway \
 	-v $(SOURCE_DIR):/media/originals \
 	-v $(OUTPUT_DIR):/media/dynamic_content \
 	-v $(TMP_DIR):/media/tmp \

@@ -1,0 +1,44 @@
+name: smoke
+
+# Cold out-of-box test on a fresh GitHub-hosted Linux VM (empty image cache,
+# no Docker Desktop) — the truest OOBE. Runs the single-device local-dist smoke
+# encode end to end. This is what surfaces "works on my Mac" bugs like the
+# host.docker.internal gap and the fresh-MinIO bucket.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    # x86_64 Linux. To also test arm64, add `ubuntu-24.04-arm` to a matrix —
+    # note it bills minutes on a private repo.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host tools (netcat for the readiness wait)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq netcat-openbsd
+
+      - name: Minimal .env (fresh dirs; no AWS)
+        run: |
+          mkdir -p "$RUNNER_TEMP/src" "$RUNNER_TEMP/out" "$RUNNER_TEMP/tmp"
+          {
+            echo "SOURCE_DIR=$RUNNER_TEMP/src"
+            echo "OUTPUT_DIR=$RUNNER_TEMP/out"
+            echo "TMP_DIR=$RUNNER_TEMP/tmp"
+          } > .env
+
+      - name: make smoke (cold Linux, single-device local-dist)
+        # Skip the browser open; blank the AWS/tofu-resolved vars so the
+        # Makefile's parse-time `$(shell aws/tofu ...)` don't run in CI.
+        run: make smoke SMOKE_OPEN=0 ECR_REPO= ECR_PUSHED_TAG= WORKER_AMI=
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "=== containers ==="; docker ps -a || true
+          echo "=== server log ==="; docker logs encoder 2>&1 | tail -80 || true
+          echo "=== worker log ==="; docker logs encode-worker 2>&1 | tail -80 || true
