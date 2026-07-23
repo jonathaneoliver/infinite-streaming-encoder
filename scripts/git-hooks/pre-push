@@ -1,0 +1,24 @@
+#!/bin/sh
+# Block direct pushes to protected branches — changes must go through a PR.
+# Shared, committed hook. Activate it in a clone with:  make setup-hooks
+# (which sets core.hooksPath to this directory). This repo can't use server-side
+# branch protection on the GitHub Free plan, so this enforces the habit locally.
+# Bypass in a genuine emergency with:  git push --no-verify
+#
+# stdin lines: <local_ref> <local_sha> <remote_ref> <remote_sha>
+
+protected="main master"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    for b in $protected; do
+        if [ "$remote_ref" = "refs/heads/$b" ]; then
+            echo "✋ Direct push to '$b' is blocked."
+            echo "   Open a PR from a feature branch instead:"
+            echo "     git switch -c my-change && git push -u origin my-change && gh pr create"
+            echo "   (emergency bypass: git push --no-verify)"
+            exit 1
+        fi
+    done
+done
+
+exit 0
