@@ -999,13 +999,13 @@ function _stepColor(r) { return r < 1.25 ? '#d06666' : (r > 2.4 ? '#d0a24a' : '#
 // limit (≤ 2×), red = over VOD.
 function _peakColor(m) { return m <= 1.25 ? '#6ab04c' : (m <= 2.0 ? '#d0a24a' : '#d06666'); }
 
-// The output-name suffix for a ladder: explicit output_tag if set, else derived
-// from the segment — "<N>s" for a fixed-segment profile, "xs" for the flexible
-// base (no pinned segment, repackaged to 1/2/6s). Mirrors the Go deriveOutputTag.
+// The output-name suffix for a ladder: explicit output_tag if set, else "xs" for
+// the flexible base (no pinned segment — the master go-live repackages into
+// 1/2/6s), or "" for a fixed-segment profile (served as-is). Mirrors Go's
+// deriveOutputTag.
 function _ladderSuffix(d) {
     if (d.output_tag) return d.output_tag;
-    const seg = parseFloat(d.segment_duration);
-    return (seg && seg > 0) ? (Number.isInteger(seg) ? seg : seg) + 's' : 'xs';
+    return (parseFloat(d.segment_duration) > 0) ? '' : 'xs';
 }
 
 function renderLaddersTab() {
@@ -1023,7 +1023,7 @@ function renderLaddersTab() {
             (fixed && fixed > 0) ? `segment ${d.segment_duration}s (fixed)` : `segment 1/2/6s`,
             partOff ? `no parts` : `partial ${d.partial_duration || '0.2'}s`,
             `gop ${d.gop_duration || '1.0'}s`,
-            `suffix _${_ladderSuffix(d)}`,
+            _ladderSuffix(d) ? `suffix _${_ladderSuffix(d)} (go-live → 1/2/6s)` : `no suffix (served as-is)`,
         ];
         const actions = d.seed
             ? `<span class="job-ami-badge" title="Built-in, read-only">built-in</span>`
@@ -1195,8 +1195,8 @@ function _renderLadderEditor() {
           <input type="text" value="${_escAttr(e.partial_duration)}" placeholder="0.2" style="width:80px" oninput="_edSet('partial_duration',this.value)"></div>
         <div class="control-group"><label title="GOP / keyframe interval (s). VOD can use a long GOP (=segment) for efficiency; live keeps ~1s. Blank inherits 1.0.">GOP (s)</label>
           <input type="text" value="${_escAttr(e.gop_duration)}" placeholder="1.0" style="width:80px" oninput="_edSet('gop_duration',this.value)"></div>
-        <div class="control-group"><label title="Suffix appended to the output dir name (e.g. myclip_p200_6s_h264) so go-live can tell profiles apart. Blank = auto: a pinned segment → '<N>s', the flexible base → 'xs'.">Output suffix</label>
-          <input type="text" value="${_escAttr(e.output_tag)}" placeholder="auto: ${_ladderSuffix({ segment_duration: e.segment_duration })}" style="width:110px" oninput="_edSet('output_tag',this.value)"></div>
+        <div class="control-group"><label title="Suffix appended to the output dir name. '_xs' tells go-live to generate 1s/2s/6s segments from this master; anything else (no suffix) is served as-is. Blank = auto: the flexible base (no pinned segment) → 'xs', a fixed-segment profile → none.">Output suffix</label>
+          <input type="text" value="${_escAttr(e.output_tag)}" placeholder="auto: ${_ladderSuffix({ segment_duration: e.segment_duration }) || 'none'}" style="width:110px" oninput="_edSet('output_tag',this.value)"></div>
       </div>
       <div class="control-group" style="margin-top:8px"><label>Description</label>
         <input value="${_escAttr(e.description)}" placeholder="what this ladder is for" oninput="_edSet('description',this.value)" style="width:100%;max-width:600px"></div>
@@ -3210,7 +3210,6 @@ function renderJobsMetrics(s) {
     const running = s.running_instances || 0;
     const orphans = s.orphan_volumes || 0;
     const hourly = s.estimated_hourly_usd || 0;
-    const rpct = s.reclaim_24h_pct || 0;
     const live = s.max_vcpus || 0;
     const cls = (v, warnAbove) => 'aws-metric-value' + (v > (warnAbove || 0) ? ' warn' : ' ok');
     const tile = (label, valueHtml, title) =>
@@ -3228,9 +3227,6 @@ function renderJobsMetrics(s) {
         tile('Orphan volumes', `<div class="${cls(orphans)}">${orphans}</div>`),
         tile('S3 staged', `<div class="aws-metric-value">${formatBytes(s.total_s3_bytes || 0)}</div>`),
         tile('Est. hourly spend', `<div class="${cls(hourly)}">$${hourly.toFixed(2)}</div>`),
-        tile('Spent (last 24h)', `<div class="aws-metric-value">$${(s.spend_24h_usd || 0).toFixed(2)}</div>`, 'Self-tracked: burn rate integrated over the trailing 24h'),
-        tile('Saved by spot (total)', `<div class="aws-metric-value ok">$${(s.saved_total_usd || 0).toFixed(2)}</div>`, 'Accumulated (on-demand − spot) cost across all finished cloud-batch jobs'),
-        tile('Reclaim waste (24h)', `<div class="aws-metric-value${rpct >= 10 ? ' warn' : rpct > 0 ? '' : ' ok'}">${rpct.toFixed(1)}%</div>`, (s.reclaim_24h_lost_min || 0).toFixed(1) + ' min of encoding lost to reclaims in the last 24h'),
         tile('Keep warm', `<div class="aws-metric-value${(s.min_vcpus || 0) > 0 ? ' ok' : ''}">${s.min_vcpus || 0} vCPU</div>`, 'Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box (0 when idle).'),
         tile('Max vCPUs', vcpuHtml, 'Batch compute-env max vCPUs. 2× runs ~twice as many machines → roughly half the wall-clock for ~the same total cost.'),
     ].join('');

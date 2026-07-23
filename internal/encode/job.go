@@ -2085,10 +2085,10 @@ func (m *Manager) resolveTimings(cfg *JobConfig) {
 	cfg.SegmentDuration = effectiveTiming(cfg.SegmentDuration, def.SegmentDuration, "6")
 	cfg.PartialDuration = effectiveTiming(cfg.PartialDuration, def.PartialDuration, "0.2")
 	cfg.GopDuration = effectiveTiming(cfg.GopDuration, def.GopDuration, "1.0")
-	// Output suffix: explicit (job or ladder output_tag) wins; otherwise derive
-	// from the ladder — a fixed-segment profile gets "<N>s" (e.g. "6s"), the
-	// flexible base (no pinned segment) gets "xs" (repackaged to 1/2/6s). So every
-	// output carries a segment suffix go-live can key off.
+	// Output suffix: explicit (job or ladder output_tag) wins; otherwise only the
+	// FLEXIBLE base (no pinned segment) is tagged "xs" — that's the master go-live
+	// repackages into 1s/2s/6s. A fixed-segment profile is served as-is, so it
+	// gets NO suffix (go-live doesn't repackage it or need its segment length).
 	tag := cfg.OutputTag
 	if tag == "" {
 		tag = def.OutputTag
@@ -2096,9 +2096,9 @@ func (m *Manager) resolveTimings(cfg *JobConfig) {
 	cfg.OutputTag = deriveOutputTag(tag, def.SegmentDuration)
 }
 
-// deriveOutputTag returns the explicit tag if set, else a segment suffix: the
-// ladder's pinned segment as "<N>s" (whole seconds trimmed), or "xs" when the
-// ladder pins no segment (the flexible, repackaged-to-many base).
+// deriveOutputTag returns the explicit tag if set; else "xs" for the flexible
+// base (no pinned segment — the repackage-into-1/2/6s master go-live treats
+// specially), or "" for a fixed-segment profile (served as-is, no marker needed).
 func deriveOutputTag(explicit, ladderSegment string) string {
 	if explicit != "" {
 		return explicit
@@ -2106,10 +2106,7 @@ func deriveOutputTag(explicit, ladderSegment string) string {
 	if ladderSegment == "" {
 		return "xs"
 	}
-	if f, err := strconv.ParseFloat(ladderSegment, 64); err == nil && f == math.Trunc(f) {
-		return strconv.Itoa(int(f)) + "s"
-	}
-	return ladderSegment + "s"
+	return ""
 }
 
 func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int) error {
