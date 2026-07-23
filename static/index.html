@@ -410,7 +410,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             </div>
             <div class="control-group">
                 <label title="Bitrate ladder (resolutions + target bitrates) AND its output timing (segment / partial / GOP). Manage ladders in the Ladders tab.">Ladder / Profile</label>
-                <select id="ladder" onchange="applyLadderTiming()">
+                <select id="ladder">
                     <option value="apple-uniq-live">apple-uniq-live</option>
                 </select>
             </div>
@@ -428,18 +428,6 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group">
                 <label>Duration (s)</label>
                 <input type="text" id="time-limit" placeholder="full clip">
-            </div>
-            <div class="control-group">
-                <label>Segment (s)</label>
-                <input type="text" id="segment-duration" placeholder="6" value="6">
-            </div>
-            <div class="control-group">
-                <label>Partial (s)</label>
-                <input type="text" id="partial-duration" placeholder="0.2" value="0.2">
-            </div>
-            <div class="control-group">
-                <label>GOP (s)</label>
-                <input type="text" id="gop-duration" placeholder="1.0" value="1.0">
             </div>
             <div class="control-group">
                 <label>HLS Format</label>
@@ -867,25 +855,6 @@ async function loadLadders() {
             `<option value="${n}">${n}${laddersCache[n].seed ? '' : ' (custom)'}</option>`).join('');
         sel.value = names.includes(cur) ? cur : (names.includes(DEFAULT) ? DEFAULT : names[0] || '');
     }
-    applyLadderTiming(); // fill segment/partial/GOP from the selected profile
-}
-
-// The selected ladder/profile drives the segment/partial/GOP timing (the ladder
-// owns it now). Prefill the form fields from the profile's values (global default
-// where the profile doesn't specify); the user can still override per-encode.
-// Sending these explicit values is fine — the server's precedence is job > ladder
-// > default, and here job == the profile's value.
-function applyLadderTiming() {
-    const sel = document.getElementById('ladder');
-    if (!sel) return;
-    const d = laddersCache[sel.value] || {};
-    const set = (id, v, def) => {
-        const el = document.getElementById(id);
-        if (el) el.value = (v !== undefined && v !== null && v !== '') ? v : def;
-    };
-    set('segment-duration', d.segment_duration, '6');
-    set('partial-duration', d.partial_duration, '0.2');
-    set('gop-duration', d.gop_duration, '1.0');
 }
 
 // One table per ladder: rows are resolutions (highest first), columns are
@@ -994,19 +963,23 @@ function _ladderBandsSVG(d, T, dHi) {
     return `<svg width="${W}" height="${H}" style="font-family:inherit">${grid}${cols}</svg>`;
 }
 
-// Three side-by-side charts (1s / 2s / 6s segments) sharing one Y scale, so the
-// bands visibly grow as segments shorten — and a tight bufsize keeps that
-// growth small.
+// Bitrate-band charts. A ladder that PINS a segment_duration is used only at that
+// length, so it gets a SINGLE chart; the flexible base (no pinned segment) shows
+// 1s/2s/6s side-by-side so you can see the bands grow as segments shorten (and a
+// tight bufsize keeps that growth small). They share one Y scale.
 function _ladderBandsCharts(d) {
     const pct = (d.maxrate_percent || 124) / 100;
     const bufMult = d.bufsize_multiplier || 0.25;
     let maxAvg = 0;
     _CODEC_ORDER.forEach(c => (d.codecs && d.codecs[c] || []).forEach(r => { maxAvg = Math.max(maxAvg, r[2]); }));
     if (!maxAvg) return '';
-    // Biggest peak is at the shortest segment (1s); pad 4% for headroom.
-    const sharedDHi = maxAvg * (pct + bufMult / 1) * 1.04;
+    const fixedSeg = parseFloat(d.segment_duration);
+    const segs = (fixedSeg && fixedSeg > 0) ? [fixedSeg] : [1, 2, 6];
+    // Biggest peak is at the shortest segment; pad 4% for headroom.
+    const shortestT = Math.min(...segs);
+    const sharedDHi = maxAvg * (pct + bufMult / shortestT) * 1.04;
     // peak/avg = maxrate% + bufsize×/T, the SAME for every rung in a chart.
-    return [1, 2, 6].map(T => {
+    return segs.map(T => {
         const mult = pct + bufMult / T;
         return `<div>
         <div style="text-align:center;color:#ccc;font-size:12px;font-weight:600;margin-bottom:2px">${T}s segments
@@ -1033,9 +1006,15 @@ function renderLaddersTab() {
     if (!names.length) { el.innerHTML = '<div class="no-files">No ladders</div>'; return; }
     el.innerHTML = names.map(name => {
         const d = laddersCache[name] || {};
+        const fixed = parseFloat(d.segment_duration);
+        const partOff = d.partial_duration === '0' || parseFloat(d.partial_duration) === 0;
         const vbv = [
             `maxrate ${d.maxrate_percent || 124}%`,
             `bufsize ${d.bufsize_multiplier || 0.25}×`,
+            (fixed && fixed > 0) ? `segment ${d.segment_duration}s (fixed)` : `segment 1/2/6s`,
+            partOff ? `no parts` : `partial ${d.partial_duration || '0.2'}s`,
+            `gop ${d.gop_duration || '1.0'}s`,
+            ...(d.output_tag ? [`tag _${d.output_tag}`] : []),
         ];
         const actions = d.seed
             ? `<span class="job-ami-badge" title="Built-in, read-only">built-in</span>`
@@ -1082,6 +1061,13 @@ function _edFromDef(name, def, isNew) {
         description: def.description || '',
         maxrate_percent: def.maxrate_percent || 124,
         bufsize_multiplier: def.bufsize_multiplier || 0.25,
+        // Profile timing (strings; "" = inherit the global default). A pinned
+        // segment_duration marks a fixed-segment profile (one chart, output tag);
+        // partial_duration "0" turns LL-HLS parts off (VOD).
+        segment_duration: def.segment_duration || '',
+        partial_duration: def.partial_duration || '',
+        gop_duration: def.gop_duration || '',
+        output_tag: def.output_tag || '',
         codecs,
     };
 }
@@ -1139,7 +1125,7 @@ function _hideCloneMenu() { const m = document.getElementById('ctx-clone'); if (
 // input keeps focus. Structural edits (add/remove/clone) re-render the editor.
 function _edSet(field, val, kind) {
     _ed[field] = kind === 'int' ? (parseInt(val, 10) || 0) : kind === 'float' ? (parseFloat(val) || 0) : val;
-    if (field === 'maxrate_percent' || field === 'bufsize_multiplier') _edPreview();
+    if (['maxrate_percent', 'bufsize_multiplier', 'segment_duration', 'partial_duration', 'gop_duration'].includes(field)) _edPreview();
 }
 function _edRung(c, i, field, val) { _ed.codecs[c][i][field] = parseInt(val, 10) || 0; _edPreview(); }
 function _edDelRung(c, i) { _ed.codecs[c].splice(i, 1); if (!_ed.codecs[c].length) delete _ed.codecs[c]; _renderLadderEditor(); }
@@ -1192,6 +1178,17 @@ function _renderLadderEditor() {
         <div class="control-group"><label title="VBV buffer = target × this. Smaller = more constant bitrate; 0.10× keeps 1s peaks ≤~1.20×.">Bufsize ×</label>
           <input type="number" step="0.05" value="${e.bufsize_multiplier}" style="width:88px" oninput="_edSet('bufsize_multiplier',this.value,'float')"></div>
       </div>
+      <div style="color:#888;font-size:12px;margin:12px 0 4px">output timing (blank = inherit default). A pinned segment marks a fixed-segment profile (one chart); partial 0 = no LL-HLS parts (VOD).</div>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
+        <div class="control-group"><label title="HLS segment length (s). Pin it to make this a fixed-segment profile — the ladder page then shows one chart instead of 1/2/6s. Blank inherits 6.">Segment (s)</label>
+          <input type="text" value="${_escAttr(e.segment_duration)}" placeholder="6" style="width:80px" oninput="_edSet('segment_duration',this.value)"></div>
+        <div class="control-group"><label title="LL-HLS partial (part) length (s). 0 turns parts OFF (plain VOD). Blank inherits 0.2.">Partial (s)</label>
+          <input type="text" value="${_escAttr(e.partial_duration)}" placeholder="0.2" style="width:80px" oninput="_edSet('partial_duration',this.value)"></div>
+        <div class="control-group"><label title="GOP / keyframe interval (s). VOD can use a long GOP (=segment) for efficiency; live keeps ~1s. Blank inherits 1.0.">GOP (s)</label>
+          <input type="text" value="${_escAttr(e.gop_duration)}" placeholder="1.0" style="width:80px" oninput="_edSet('gop_duration',this.value)"></div>
+        <div class="control-group"><label title="Appended to the output dir name (e.g. '6s' → myclip_6s_h264) so go-live can tell a repackage-once profile apart. Blank = no tag.">Output tag</label>
+          <input type="text" value="${_escAttr(e.output_tag)}" placeholder="none" style="width:96px" oninput="_edSet('output_tag',this.value)"></div>
+      </div>
       <div class="control-group" style="margin-top:8px"><label>Description</label>
         <input value="${_escAttr(e.description)}" placeholder="what this ladder is for" oninput="_edSet('description',this.value)" style="width:100%;max-width:600px"></div>
       <div style="color:#888;font-size:12px;margin:12px 0 4px">rungs per codec — edit the bitrate (kbps), width or height; add/remove rungs. Burn-in is derived from height.</div>
@@ -1214,6 +1211,8 @@ async function saveLadder() {
         body: JSON.stringify({
             name, description: _ed.description,
             maxrate_percent: _ed.maxrate_percent, bufsize_multiplier: _ed.bufsize_multiplier,
+            segment_duration: _ed.segment_duration, partial_duration: _ed.partial_duration,
+            gop_duration: _ed.gop_duration, output_tag: _ed.output_tag,
             codecs: _ed.codecs,
         })
     });
@@ -1449,9 +1448,6 @@ async function startEncode(force = false) {
         codec: codecValue(),
         max_res: document.getElementById('max-res').value,
         time: document.getElementById('time-limit').value,
-        segment_duration: document.getElementById('segment-duration').value,
-        partial_duration: document.getElementById('partial-duration').value,
-        gop_duration: document.getElementById('gop-duration').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
         hevc_single_pass: document.getElementById('hevc-pass').value === '1',
@@ -3484,9 +3480,6 @@ async function forceReencode(fileName) {
         codec: codecValue(),
         max_res: document.getElementById('max-res').value,
         time: document.getElementById('time-limit').value,
-        segment_duration: document.getElementById('segment-duration').value,
-        partial_duration: document.getElementById('partial-duration').value,
-        gop_duration: document.getElementById('gop-duration').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
         hevc_single_pass: document.getElementById('hevc-pass').value === '1',

@@ -95,9 +95,11 @@ func defaultSeedLadders() map[string]LadderDef {
 			Seed:              true,
 			MaxratePercent:    110,
 			BufsizeMultiplier: 0.10,
-			SegmentDuration:   "6",
-			PartialDuration:   "0.2",
-			GopDuration:       "1.0",
+			// No pinned segment_duration: this is the FLEXIBLE base — the tight VBV
+			// is safe to repackage into 1s/2s/6s, so the ladder page shows all three
+			// segment charts. partial/gop are its LL-HLS live settings.
+			PartialDuration: "0.2",
+			GopDuration:     "1.0",
 			Codecs: map[string][][]int{
 				"h264": appleUniqH264,
 				"hevc": appleUniqHEVC,

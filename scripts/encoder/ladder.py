@@ -216,7 +216,8 @@ SEED_LADDERS: dict[str, dict] = {
         "seed": True,
         "maxrate_percent": 110,
         "bufsize_multiplier": 0.10,
-        "segment_duration": "6",
+        # No pinned segment_duration: the flexible base (tight VBV is safe to
+        # repackage into 1s/2s/6s); partial/gop are its LL-HLS live settings.
         "partial_duration": "0.2",
         "gop_duration": "1.0",
         "codecs": {
