@@ -34,7 +34,9 @@ services:
       POSTGRES_PWD: temporal
       POSTGRES_SEEDS: postgresql
     ports:
-      - "7233:7233"   # frontend — workers on both boxes dial this (LAN IP)
+      # Host port is parameterized so an isolated stack (make oobe) can run a
+      # second cluster alongside the real one. Container port stays 7233.
+      - "${TEMPORAL_PORT:-7233}:7233"   # frontend — workers dial this (LAN IP)
 
   temporal-ui:
     image: temporalio/ui:latest
@@ -44,7 +46,7 @@ services:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_CORS_ORIGINS: http://localhost:8233
     ports:
-      - "8233:8080"   # web dashboard
+      - "${TEMPORAL_UI_PORT:-8233}:8080"   # web dashboard
 
   minio:
     image: minio/minio
@@ -54,8 +56,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-encoder}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-encoder-secret}
     ports:
-      - "9000:9000"   # S3 API — workers on both boxes read/write here
-      - "9001:9001"   # MinIO console
+      - "${MINIO_API_PORT:-9000}:9000"       # S3 API — workers read/write here
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"   # MinIO console
     volumes:
       - minio_data:/data
 

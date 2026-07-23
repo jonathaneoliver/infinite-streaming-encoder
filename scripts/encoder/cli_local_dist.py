@@ -195,6 +195,28 @@ def _s3():
     )
 
 
+def _ensure_bucket(bucket: str) -> None:
+    """Create the staging bucket if it doesn't exist. On a fresh MinIO — a first
+    run on a new machine, or a wiped cluster — the bucket won't exist yet and the
+    first put_object fails with NoSuchBucket. Idempotent: HEAD first, create only
+    when missing, and tolerate a create race. (local-dist always targets MinIO via
+    S3_ENDPOINT_URL, so a region-less create_bucket is correct here.)"""
+    s3 = _s3()
+    try:
+        s3.head_bucket(Bucket=bucket)
+        return
+    except Exception:
+        pass
+    try:
+        s3.create_bucket(Bucket=bucket)
+        print(f"[dist] created staging bucket s3://{bucket}", flush=True)
+    except Exception as exc:
+        try:
+            s3.head_bucket(Bucket=bucket)  # someone else won the race — fine
+        except Exception:
+            raise exc
+
+
 def _progress_cb(stage_key: str, total_bytes: int):
     """A boto3 transfer Callback that emits throttled ENCODER-STAGE progress
     (every ~2%) for a byte transfer — so the UI shows a moving bar for the
@@ -214,6 +236,7 @@ def _progress_cb(stage_key: str, total_bytes: int):
 
 
 def _upload_source(local: Path, bucket: str, key: str) -> None:
+    _ensure_bucket(bucket)
     total = local.stat().st_size
     print(f"[dist] uploading source ({total / 1e6:.0f} MB) -> s3://{bucket}/{key}",
           flush=True)
