@@ -69,11 +69,24 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .job-prog-bar { flex: 1; max-width: 420px; height: 7px; background: #20252f; border-radius: 4px; overflow: hidden; }
 .job-prog-bar > div { height: 100%; background: #4a90d9; transition: width .4s ease; }
 .job-prog-sub { font-size: 0.72rem; color: #8a94a2; white-space: nowrap; }
+/* Per-job foldable details (the stages table + stats). Finished jobs fold by
+   default; a click remembers your choice for the session. */
+.details-toggle { cursor: pointer; user-select: none; display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 0.75rem; color: #8a94a2; }
+.details-toggle:hover { color: #cfd8e3; }
+.job.details-collapsed .job-details { display: none; }
+.job.details-collapsed .details-toggle .fold-chevron { transform: rotate(-90deg); }
 /* Jobs-tab overview strip + per-target group headers. */
 .jobs-overview { padding: 10px 16px; margin-bottom: 12px; background: #151a24; border: 1px solid #232a36; border-radius: 8px; font-size: 0.9rem; color: #aeb7c2; }
 .jobs-overview b { color: #e6edf3; }
 .jobs-group-hdr { margin: 14px 0 6px; padding-bottom: 4px; border-bottom: 1px solid #232a36; font-size: 0.82rem; letter-spacing: .02em; color: #8a94a2; text-transform: none; }
 .jobs-group-hdr:first-child { margin-top: 0; }
+/* Foldable fleet panels: click the header to collapse the body; a compact
+   summary stays in the header so it's still at-a-glance when folded. */
+.fleet-h2 { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 8px; }
+.fold-chevron { display: inline-block; font-size: 0.7em; color: #8a94a2; transition: transform .15s ease; }
+.fleet-panel.collapsed .fold-chevron { transform: rotate(-90deg); }
+.fleet-panel.collapsed .fleet-body { display: none; }
+.fleet-summary { font-size: 0.75rem; font-weight: 400; color: #8a94a2; margin-left: auto; }
 
 .status-queued { color: #888; }
 .status-running { color: #4cc9f0; }
@@ -503,15 +516,19 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 <!-- JOBS TAB -->
 <div id="tab-jobs" class="tab-content">
     <div class="jobs-overview" id="jobs-overview" style="display:none"></div>
-    <div class="panel" id="jobs-cloud-fleet-panel" style="display:none">
-        <h2>Cloud Fleet</h2>
-        <div class="aws-summary" id="jobs-cloud-metrics"></div>
-        <div id="jobs-fleet-full" title="Live cloud fleet — per-instance packing, utilization, and lifecycle (from the AWS inventory)"></div>
+    <div class="panel fleet-panel" id="jobs-cloud-fleet-panel" style="display:none">
+        <h2 class="fleet-h2" onclick="toggleFleet('cloud')"><span class="fold-chevron">▾</span>Cloud Fleet<span class="fleet-summary" id="cloud-fleet-summary"></span></h2>
+        <div class="fleet-body">
+            <div class="aws-summary" id="jobs-cloud-metrics"></div>
+            <div id="jobs-fleet-full" title="Live cloud fleet — per-instance packing, utilization, and lifecycle (from the AWS inventory)"></div>
+        </div>
     </div>
-    <div class="panel" id="jobs-local-fleet-panel" style="display:none">
-        <h2>Local Fleet</h2>
-        <div class="aws-summary" id="jobs-local-metrics"></div>
-        <div id="jobs-local-fleet" title="Live local cluster — per-machine CPU, packing, and the chunks running on each box"></div>
+    <div class="panel fleet-panel" id="jobs-local-fleet-panel" style="display:none">
+        <h2 class="fleet-h2" onclick="toggleFleet('local')"><span class="fold-chevron">▾</span>Local Fleet<span class="fleet-summary" id="local-fleet-summary"></span></h2>
+        <div class="fleet-body">
+            <div class="aws-summary" id="jobs-local-metrics"></div>
+            <div id="jobs-local-fleet" title="Live local cluster — per-machine CPU, packing, and the chunks running on each box"></div>
+        </div>
     </div>
     <div class="panel">
         <h2>Jobs</h2>
@@ -1759,9 +1776,12 @@ function jobRowHtml(j) {
             <div class="job-prog" style="display:none"></div>
             <div class="job-progress"></div>
             <div class="job-error" style="color:#ef476f;font-size:0.8rem;margin-top:4px;display:none"></div>
-            <div class="current-file" style="display:none;font-size:0.85rem;color:#8cf;margin-top:8px;font-weight:600"></div>
-            <table class="stages-table" style="display:none"><tbody></tbody></table>
-            <div class="job-stats" style="display:none"></div>
+            <div class="details-toggle" style="display:none" onclick="toggleDetails('${j.id}')"><span class="fold-chevron">▾</span><span class="details-toggle-label">details</span></div>
+            <div class="job-details">
+                <div class="current-file" style="display:none;font-size:0.85rem;color:#8cf;margin-top:8px;font-weight:600"></div>
+                <table class="stages-table" style="display:none"><tbody></tbody></table>
+                <div class="job-stats" style="display:none"></div>
+            </div>
             <div class="job-actions">
                 <span class="log-toggle" onclick="toggleLog('${j.id}')">Show log</span>
             </div>
@@ -2024,6 +2044,18 @@ function updateJobRow(row, j) {
         }
     }
 
+    // Foldable details: show the toggle only once there are stages to show, label
+    // it with the count, and apply the collapse state (finished jobs fold by
+    // default; an explicit user choice sticks).
+    const dt = row.querySelector('.details-toggle');
+    if (dt) {
+        const nStages = (j.stages || []).length;
+        dt.style.display = nStages ? '' : 'none';
+        const lbl = dt.querySelector('.details-toggle-label');
+        if (lbl) lbl.textContent = nStages ? `details (${nStages} stages)` : 'details';
+    }
+    row.classList.toggle('details-collapsed', _detailsCollapsed(j));
+
     // Pre-baked AMI badge — set once the worker reports its boot AMI and the
     // server confirms it matches the baked worker AMI (image already resident).
     const amiEl = row.querySelector('.job-ami-badge');
@@ -2179,6 +2211,23 @@ function _jobRunning(j) {
     return /running|encoding|starting|pending|queued/i.test(j.status || '');
 }
 
+// Per-job details fold. Default: finished jobs fold (compact history), active
+// jobs stay open. A click records an explicit choice for the session, which then
+// overrides the default on every re-render.
+const jobDetailsPref = {}; // id -> 'open' | 'closed'
+function _detailsCollapsed(j) {
+    const p = jobDetailsPref[j.id];
+    if (p) return p === 'closed';
+    return !_jobRunning(j); // finished/queued-terminal → folded by default
+}
+function toggleDetails(id) {
+    const row = document.getElementById('job-' + id);
+    if (!row) return;
+    const nowCollapsed = !row.classList.contains('details-collapsed');
+    jobDetailsPref[id] = nowCollapsed ? 'closed' : 'open';
+    row.classList.toggle('details-collapsed', nowCollapsed);
+}
+
 // Overview strip: how many encodes are live, split by fleet. Hidden when idle.
 function renderJobsOverview(all) {
     const el = document.getElementById('jobs-overview');
@@ -2206,6 +2255,21 @@ function syncFleetPanels() {
     const cp = document.getElementById('jobs-cloud-fleet-panel');
     if (cp) cp.style.display = _cloudActive() ? '' : 'none';
 }
+
+// Foldable fleet panels — collapse state persists per fleet in localStorage, so
+// the fleets stay out of the way when you don't need them but keep a one-line
+// summary in the header. The panel show/hide (based on activity) is separate.
+function toggleFleet(key) {
+    const collapsed = localStorage.getItem('fleet-collapsed-' + key) === '1';
+    localStorage.setItem('fleet-collapsed-' + key, collapsed ? '0' : '1');
+    applyFleetCollapse(key);
+}
+function applyFleetCollapse(key) {
+    const panel = document.getElementById('jobs-' + key + '-fleet-panel');
+    if (panel) panel.classList.toggle('collapsed', localStorage.getItem('fleet-collapsed-' + key) === '1');
+}
+applyFleetCollapse('cloud');
+applyFleetCollapse('local');
 
 function renderJobs() {
     const list = document.getElementById('jobs-list');
@@ -3026,6 +3090,8 @@ function renderLocalFleet() {
     const rows = insts.map(i => _localFleetRow(i, maxCores)).join('');
     panel.style.display = '';
     el.innerHTML = bar + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
+    const ls = document.getElementById('local-fleet-summary');
+    if (ls) ls.textContent = `${usedCores}/${totalCores} cores · ${totalChunks} chunk${totalChunks !== 1 ? 's' : ''} · ${insts.length} machine${insts.length > 1 ? 's' : ''}`;
     // Local metrics tiles live in THIS panel (not the cloud one). Their own
     // cloud-stats poll is slow, but pollDistWorkers/SSE call us every few seconds.
     const mrow = document.getElementById('jobs-local-metrics');
@@ -3144,6 +3210,8 @@ function renderJobsMetrics(s) {
         tile('Keep warm', `<div class="aws-metric-value${(s.min_vcpus || 0) > 0 ? ' ok' : ''}">${s.min_vcpus || 0} vCPU</div>`, 'Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box (0 when idle).'),
         tile('Max vCPUs', vcpuHtml, 'Batch compute-env max vCPUs. 2× runs ~twice as many machines → roughly half the wall-clock for ~the same total cost.'),
     ].join('');
+    const cs = document.getElementById('cloud-fleet-summary');
+    if (cs) cs.textContent = `${running} inst · ${execs} exec · $${hourly.toFixed(2)}/hr`;
     syncFleetPanels(); // show/hide the Cloud Fleet panel on the AWS-poll cadence too
 }
 
