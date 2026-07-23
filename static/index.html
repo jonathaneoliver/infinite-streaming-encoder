@@ -3768,6 +3768,29 @@ async function loadVersion() {
         const local = j.local || {};
         const cloud = j.cloud || {};
 
+        // Gate the cloud-batch target: if this host has no cloud config
+        // (STATE_MACHINE_ARN), disable the option and explain via hover, so the
+        // user isn't offered a target that fails at submit time.
+        const cbOpt = document.querySelector('#target option[value="cloud-batch"]');
+        if (cbOpt) {
+            const sel = document.getElementById('target');
+            if (j.cloud_configured) {
+                cbOpt.disabled = false;
+                cbOpt.textContent = 'Cloud (AWS Batch)';
+                cbOpt.title = '';
+            } else {
+                cbOpt.disabled = true;
+                cbOpt.textContent = 'Cloud (AWS Batch) — not configured';
+                cbOpt.title = 'Cloud encoding is not configured on this host. In your .env set '
+                    + 'STATE_MACHINE_ARN (and AWS_REGION, S3_BUCKET), with AWS credentials in '
+                    + '~/.aws — or run `make infra-setup`.';
+                if (sel && sel.value === 'cloud-batch') {
+                    sel.value = 'local-dist';
+                    if (typeof onTargetChange === 'function') onTargetChange();
+                }
+            }
+        }
+
         document.getElementById('about-local-version').textContent = local.version || 'dev';
         document.getElementById('about-local-sha').textContent = local.revision || 'unknown';
 
