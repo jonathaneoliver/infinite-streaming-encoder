@@ -47,7 +47,15 @@ GHCR_IMAGE ?= ghcr.io/jonathaneoliver/encoder
 GHCR_USERNAME ?= jonathaneoliver
 PLATFORMS ?= linux/amd64,linux/arm64
 
-.PHONY: require-paths build run stop restart logs shell status clean push push-setup cloud-push version setup-hooks
+# Which image `run` / `run-remote` launch. RUN_IMAGE feeds BOTH the server
+# container and the worker containers (ENCODER_IMAGE), so the two targets
+# differ only in this one value:
+#   run        -> the locally-built $(IMAGE_NAME)
+#   run-remote -> the published $(REMOTE_IMAGE), pulled from GHCR (no build)
+RUN_IMAGE ?= $(IMAGE_NAME)
+REMOTE_IMAGE ?= $(GHCR_IMAGE):latest
+
+.PHONY: require-paths build run run-remote stop restart logs shell status clean push push-setup cloud-push version setup-hooks
 
 # Point git at the committed hooks (scripts/git-hooks/) so the pre-push guard
 # that blocks direct pushes to main is active in this clone. Run once per clone.
@@ -69,56 +77,75 @@ build:
 version:
 	@echo $(VERSION) $(GIT_SHA)
 
+# Shared server-launch recipe used by both `run` and `run-remote`. $(RUN_IMAGE)
+# selects the image for the server AND the worker containers it spawns, so the
+# two targets share every mount/env and differ only in that one value.
+define ENCODER_DOCKER_RUN
+docker run --rm -d \
+	--name $(CONTAINER_NAME) \
+	-p $(PORT):8080 \
+	-v $(SOURCE_DIR):/media/originals \
+	-v $(OUTPUT_DIR):/media/dynamic_content \
+	-v $(TMP_DIR):/media/tmp \
+	-v /var/run/docker.sock:/var/run/docker.sock \
+	-v $(HOME)/.aws:/root/.aws:ro \
+	-v $(HOME)/.ssh:/root/.ssh:ro \
+	$(PROMOTE_MOUNT) \
+	$(PROMOTE_ADDHOST) \
+	$(PROMOTE_SSH_AGENT) \
+	-e 'PROMOTE_DESTS=$(PROMOTE_DESTS)' \
+	-e SOURCE_DIR=/media/originals \
+	-e OUTPUT_DIR=/media/dynamic_content \
+	-e TMP_DIR=/media/tmp \
+	-e SCRIPTS_DIR=/app/scripts \
+	-e HOST_SOURCE_DIR=$(SOURCE_DIR) \
+	-e HOST_OUTPUT_DIR=$(OUTPUT_DIR) \
+	-e HOST_TMP_DIR=$(TMP_DIR) \
+	-e HOST_AWS_DIR=$(HOME)/.aws \
+	-e ENCODER_IMAGE=$(RUN_IMAGE) \
+	-e AUTO_WATCH=$(AUTO_WATCH) \
+	-e DEFAULT_TARGET=$(DEFAULT_TARGET) \
+	-e DEFAULT_CODEC=$(DEFAULT_CODEC) \
+	-e DEFAULT_MAX_RES=$(DEFAULT_MAX_RES) \
+	-e MAX_CONCURRENT=$(MAX_CONCURRENT) \
+	-e WARM_MIN_VCPUS=$(WARM_MIN_VCPUS) \
+	-e DOCKER_IMAGE=$(DOCKER_IMAGE) \
+	-e WORKER_AMI_ID=$(WORKER_AMI) \
+	-e AWS_REGION=$(AWS_REGION) \
+	-e S3_BUCKET=$(S3_BUCKET) \
+	-e SUBNET_ID=$(SUBNET_ID) \
+	-e SECURITY_GROUP_ID=$(SECURITY_GROUP_ID) \
+	-e INSTANCE_PROFILE=$(INSTANCE_PROFILE) \
+	-e INSTANCE_TYPE=$(INSTANCE_TYPE) \
+	-e GHCR_PAT=$(GHCR_PAT) \
+	-e STATE_MACHINE_ARN=$(STATE_MACHINE_ARN) \
+	-e TEMPORAL_UI_ADDR=$(TEMPORAL_UI_ADDR) \
+	-e TEMPORAL_ADDRESS=$(TEMPORAL_ADDRESS) \
+	-e MINIO_ENDPOINT=$(MINIO_ENDPOINT) \
+	-e MINIO_ACCESS_KEY=$(MINIO_ACCESS_KEY) \
+	-e MINIO_SECRET_KEY=$(MINIO_SECRET_KEY) \
+	-e DIST_S3_BUCKET=$(DIST_S3_BUCKET) \
+	-e 'DIST_WORKERS=$(DIST_WORKERS)' \
+	-e LOCAL_WORKER_LABEL=$(LOCAL_WORKER_LABEL) \
+	-e DIST_WORKER_CONTAINER=$(DIST_WORKER_CONTAINER) \
+	$(RUN_IMAGE)
+@echo "Encoder running at http://localhost:$(PORT)"
+endef
+
 run: require-paths build
-	docker run --rm -d \
-		--name $(CONTAINER_NAME) \
-		-p $(PORT):8080 \
-		-v $(SOURCE_DIR):/media/originals \
-		-v $(OUTPUT_DIR):/media/dynamic_content \
-		-v $(TMP_DIR):/media/tmp \
-		-v /var/run/docker.sock:/var/run/docker.sock \
-		-v $(HOME)/.aws:/root/.aws:ro \
-		-v $(HOME)/.ssh:/root/.ssh:ro \
-		$(PROMOTE_MOUNT) \
-		$(PROMOTE_ADDHOST) \
-		$(PROMOTE_SSH_AGENT) \
-		-e 'PROMOTE_DESTS=$(PROMOTE_DESTS)' \
-		-e SOURCE_DIR=/media/originals \
-		-e OUTPUT_DIR=/media/dynamic_content \
-		-e TMP_DIR=/media/tmp \
-		-e SCRIPTS_DIR=/app/scripts \
-		-e HOST_SOURCE_DIR=$(SOURCE_DIR) \
-		-e HOST_OUTPUT_DIR=$(OUTPUT_DIR) \
-		-e HOST_TMP_DIR=$(TMP_DIR) \
-		-e HOST_AWS_DIR=$(HOME)/.aws \
-		-e ENCODER_IMAGE=$(IMAGE_NAME) \
-		-e AUTO_WATCH=$(AUTO_WATCH) \
-		-e DEFAULT_TARGET=$(DEFAULT_TARGET) \
-		-e DEFAULT_CODEC=$(DEFAULT_CODEC) \
-		-e DEFAULT_MAX_RES=$(DEFAULT_MAX_RES) \
-		-e MAX_CONCURRENT=$(MAX_CONCURRENT) \
-		-e WARM_MIN_VCPUS=$(WARM_MIN_VCPUS) \
-		-e DOCKER_IMAGE=$(DOCKER_IMAGE) \
-		-e WORKER_AMI_ID=$(WORKER_AMI) \
-		-e AWS_REGION=$(AWS_REGION) \
-		-e S3_BUCKET=$(S3_BUCKET) \
-		-e SUBNET_ID=$(SUBNET_ID) \
-		-e SECURITY_GROUP_ID=$(SECURITY_GROUP_ID) \
-		-e INSTANCE_PROFILE=$(INSTANCE_PROFILE) \
-		-e INSTANCE_TYPE=$(INSTANCE_TYPE) \
-		-e GHCR_PAT=$(GHCR_PAT) \
-		-e STATE_MACHINE_ARN=$(STATE_MACHINE_ARN) \
-		-e TEMPORAL_UI_ADDR=$(TEMPORAL_UI_ADDR) \
-		-e TEMPORAL_ADDRESS=$(TEMPORAL_ADDRESS) \
-		-e MINIO_ENDPOINT=$(MINIO_ENDPOINT) \
-		-e MINIO_ACCESS_KEY=$(MINIO_ACCESS_KEY) \
-		-e MINIO_SECRET_KEY=$(MINIO_SECRET_KEY) \
-		-e DIST_S3_BUCKET=$(DIST_S3_BUCKET) \
-		-e 'DIST_WORKERS=$(DIST_WORKERS)' \
-		-e LOCAL_WORKER_LABEL=$(LOCAL_WORKER_LABEL) \
-		-e DIST_WORKER_CONTAINER=$(DIST_WORKER_CONTAINER) \
-		$(IMAGE_NAME)
-	@echo "Encoder running at http://localhost:$(PORT)"
+	$(ENCODER_DOCKER_RUN)
+
+# Fire up from the published GHCR image instead of a local build — for a fresh
+# machine that just wants to run it. Pulls $(REMOTE_IMAGE) (which also becomes
+# ENCODER_IMAGE for the worker containers); logs into GHCR first only if
+# GHCR_PAT is set, which is needed when the package is private.
+run-remote: RUN_IMAGE = $(REMOTE_IMAGE)
+run-remote: require-paths
+	@if [ -n "$$GHCR_PAT" ]; then \
+		echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin; \
+	fi
+	docker pull $(REMOTE_IMAGE)
+	$(ENCODER_DOCKER_RUN)
 
 stop:
 	docker stop $(CONTAINER_NAME) 2>/dev/null || true
