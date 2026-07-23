@@ -161,6 +161,29 @@ func (s *Server) ladder(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The manifest's BANDWIDTH/AVERAGE-BANDWIDTH bundle the audio group, but the
+	// ladder Target and the measured Actual are video-only — so subtract the audio
+	// bitrate from Peak/Avg to keep all four columns comparable (video-only).
+	audioKbps := 0
+	audioDir := filepath.Join(dirPath, "audio")
+	if fi, err := os.Stat(audioDir); err == nil && fi.IsDir() {
+		if sz, _ := dirStats(audioDir); sz > 0 {
+			dur := rungDurationS(audioDir)
+			if dur <= 0 { // audio playlist may lack EXTINF — borrow a video rung's
+				dur = firstRungDuration(dirPath)
+			}
+			if dur > 0 {
+				audioKbps = int(float64(sz) * 8 / dur / 1000)
+			}
+		}
+	}
+	deAudio := func(v int) int {
+		if v > audioKbps {
+			return v - audioKbps
+		}
+		return v
+	}
+
 	// Enumerate the ACTUAL resolution dirs (<N>p) rather than a fixed standard
 	// list, so unique-resolution ladders (432p/468p/504p/684p …) show every rung.
 	resDirRe := regexp.MustCompile(`^(\d+)p$`)
@@ -193,8 +216,8 @@ func (s *Server) ladder(w http.ResponseWriter, r *http.Request) {
 		}
 		tiers = append(tiers, ladderTier{
 			Res: res, Width: width, Height: h, TargetKbps: target,
-			PeakKbps: peakByRes[res], AvgKbps: avgByRes[res], ActualKbps: actual,
-			SizeBytes: size, Vmaf: jsonVmaf[h],
+			PeakKbps: deAudio(peakByRes[res]), AvgKbps: deAudio(avgByRes[res]),
+			ActualKbps: actual, SizeBytes: size, Vmaf: jsonVmaf[h],
 		})
 	}
 	sort.Slice(tiers, func(i, j int) bool { return tiers[i].Height < tiers[j].Height })
@@ -276,6 +299,21 @@ func readMasterBandwidth(dirPath string) (peak, avg, widths map[string]int) {
 		}
 	}
 	return peak, avg, widths
+}
+
+// firstRungDuration returns the content duration from the first <N>p rung found
+// (they share one timeline) — a fallback when the audio playlist has no EXTINF.
+func firstRungDuration(dirPath string) float64 {
+	entries, _ := os.ReadDir(dirPath)
+	rre := regexp.MustCompile(`^\d+p$`)
+	for _, e := range entries {
+		if e.IsDir() && rre.MatchString(e.Name()) {
+			if d := rungDurationS(filepath.Join(dirPath, e.Name())); d > 0 {
+				return d
+			}
+		}
+	}
+	return 0
 }
 
 // rungDurationS sums the #EXTINF segment durations in a rung's playlist to get

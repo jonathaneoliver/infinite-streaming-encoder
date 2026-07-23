@@ -185,13 +185,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .ladder-title { font-size: 0.9rem; color: #8cf; font-weight: 600; margin-bottom: 8px; }
 .ladder-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
 .ladder-table th { text-align: left; color: #aac; font-weight: 600; padding: 6px 10px 6px 0; border-bottom: 1px solid #2a2a3a; }
+.ladder-table th.num { text-align: right; }
 .ladder-table td { padding: 6px 10px 6px 0; vertical-align: middle; color: #eee; border-bottom: 1px solid #1f1f2e; }
 .ladder-table tbody tr:last-child td { border-bottom: none; }
 .ladder-res { font-weight: 600; color: #8cf; }
 .ladder-dim { color: #888; font-variant-numeric: tabular-nums; }
 .ladder-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.ladder-bar-cell { width: 30%; }
-.ladder-bar-track { display: inline-block; vertical-align: middle; position: relative; width: calc(100% - 50px); height: 10px; background: #2a2a3a; border-radius: 3px; overflow: visible; }
+.ladder-bar-cell { width: 200px; white-space: nowrap; }
+.ladder-bar-track { display: inline-block; vertical-align: middle; position: relative; width: 130px; height: 10px; background: #2a2a3a; border-radius: 3px; overflow: visible; }
 .ladder-bar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px 0 0 3px; }
 .ladder-bar-overshoot { position: absolute; left: 100%; top: -1px; bottom: -1px; background: repeating-linear-gradient(45deg, #ef476f, #ef476f 4px, #b83450 4px, #b83450 8px); border-radius: 0 3px 3px 0; opacity: 0.85; }
 .ladder-bar-good { background: #3aa76d; }
@@ -1705,22 +1706,24 @@ function renderLadderTable(ladder) {
         <div class="ladder-panel">
             <div class="ladder-title">ABR ladder — ${ladder.codec.toUpperCase()}</div>
             ${profileLine}
+            <div style="overflow-x:auto">
             <table class="ladder-table">
                 <thead>
                     <tr>
                         <th>Tier</th>
                         <th>Dim</th>
-                        <th>Target</th>
-                        <th title="peak segment bitrate (manifest BANDWIDTH)">Peak</th>
-                        <th title="declared average (manifest AVERAGE-BANDWIDTH)">Avg</th>
-                        <th title="measured average = size × 8 ÷ duration">Actual</th>
-                        <th title="VMAF (— until the VMAF audit runs)">VMAF</th>
+                        <th class="num">Target</th>
+                        <th class="num" title="peak segment bitrate (manifest BANDWIDTH), video-only">Peak</th>
+                        <th class="num" title="declared average (manifest AVERAGE-BANDWIDTH), video-only">Avg</th>
+                        <th class="num" title="measured average = size × 8 ÷ duration">Actual</th>
+                        <th class="num" title="VMAF (— until the VMAF audit runs)">VMAF</th>
                         <th>Budget (actual/target)</th>
-                        <th>Size</th>
+                        <th class="num">Size</th>
                     </tr>
                 </thead>
                 <tbody>${rows}</tbody>
             </table>
+            </div>
         </div>
     `;
 }
