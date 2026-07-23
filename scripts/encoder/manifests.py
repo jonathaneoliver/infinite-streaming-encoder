@@ -30,6 +30,26 @@ _DASH_NS = "urn:mpeg:dash:schema:mpd:2011"
 _NS = {"mpd": _DASH_NS}
 
 
+def _strip_leading_junk(path: Path) -> bool:
+    """Remove any stray bytes before the XML declaration in an .mpd and rewrite.
+    A stray log line can leak into the file (we've seen "Make manifest.mpd"
+    prepended), which makes it invalid XML — every ET.parse of a manifest goes
+    through this first so a corrupt prefix self-heals instead of breaking
+    packaging/serving. No-op (returns False) when the file is already clean or
+    missing. Returns True if it healed the file."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return False
+    idx = data.find(b"<?xml")
+    if idx < 0:
+        idx = data.find(b"<MPD")  # no declaration but starts at the root element
+    if idx > 0:
+        path.write_bytes(data[idx:])
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Fragment byte-ranges → mpd (self-contained, no sidecar at serve time)
 # ---------------------------------------------------------------------------
@@ -54,6 +74,7 @@ def write_fragmented_mpd(package_dir: Path) -> int:
 
     ET.register_namespace("", _DASH_NS)
     ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
+    _strip_leading_junk(src)
     tree = ET.parse(src)
     root = tree.getroot()
 
@@ -148,6 +169,7 @@ def convert_segmentlist(manifest_path: Path, backup: bool = True) -> None:
     ET.register_namespace("", _DASH_NS)
     ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
 
+    _strip_leading_junk(manifest_path)
     try:
         tree = ET.parse(manifest_path)
     except ET.ParseError as e:
@@ -280,6 +302,7 @@ def hls_from_dash(package_dir: Path) -> bool:
 
 def _parse_dash(mpd_path: Path) -> dict[str, Any]:
     ET.register_namespace("", _DASH_NS)
+    _strip_leading_junk(mpd_path)
     root = ET.parse(mpd_path).getroot()
 
     duration_attr = root.get("mediaPresentationDuration") or ""
