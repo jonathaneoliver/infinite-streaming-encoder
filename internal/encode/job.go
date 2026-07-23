@@ -2925,7 +2925,12 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 		// file is written by the control plane; cloud variant jobs don't need
 		// it (they get concrete rungs from the SFN).
 		"-e", "LADDER_STORE=" + filepath.Join(m.TmpDir, "ladders.json"),
-		"--entrypoint", script,
+		// Run the orchestrator via python3 rather than exec'ing the script
+		// directly, so it works whether the script is baked into the image (+x)
+		// or bind-mounted from the host working tree (HOST_SCRIPTS_DIR, where the
+		// file keeps the host's non-executable mode). The script path is passed
+		// as the first argument below, after the image.
+		"--entrypoint", "python3",
 	}
 	// Dev: overlay the host's working-tree encoder package onto the image's, so
 	// a spawned orchestrator (local-dist) runs current code without a rebuild.
@@ -2960,6 +2965,7 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 		)
 	}
 	runArgs = append(runArgs, m.EncoderImage)
+	runArgs = append(runArgs, script)
 	runArgs = append(runArgs, scriptArgs...)
 	return runArgs
 }
