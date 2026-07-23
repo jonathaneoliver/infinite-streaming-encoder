@@ -999,6 +999,15 @@ function _stepColor(r) { return r < 1.25 ? '#d06666' : (r > 2.4 ? '#d0a24a' : '#
 // limit (≤ 2×), red = over VOD.
 function _peakColor(m) { return m <= 1.25 ? '#6ab04c' : (m <= 2.0 ? '#d0a24a' : '#d06666'); }
 
+// The output-name suffix for a ladder: explicit output_tag if set, else derived
+// from the segment — "<N>s" for a fixed-segment profile, "xs" for the flexible
+// base (no pinned segment, repackaged to 1/2/6s). Mirrors the Go deriveOutputTag.
+function _ladderSuffix(d) {
+    if (d.output_tag) return d.output_tag;
+    const seg = parseFloat(d.segment_duration);
+    return (seg && seg > 0) ? (Number.isInteger(seg) ? seg : seg) + 's' : 'xs';
+}
+
 function renderLaddersTab() {
     const el = document.getElementById('ladders-list');
     if (!el) return;
@@ -1014,7 +1023,7 @@ function renderLaddersTab() {
             (fixed && fixed > 0) ? `segment ${d.segment_duration}s (fixed)` : `segment 1/2/6s`,
             partOff ? `no parts` : `partial ${d.partial_duration || '0.2'}s`,
             `gop ${d.gop_duration || '1.0'}s`,
-            ...(d.output_tag ? [`tag _${d.output_tag}`] : []),
+            `suffix _${_ladderSuffix(d)}`,
         ];
         const actions = d.seed
             ? `<span class="job-ami-badge" title="Built-in, read-only">built-in</span>`
@@ -1186,8 +1195,8 @@ function _renderLadderEditor() {
           <input type="text" value="${_escAttr(e.partial_duration)}" placeholder="0.2" style="width:80px" oninput="_edSet('partial_duration',this.value)"></div>
         <div class="control-group"><label title="GOP / keyframe interval (s). VOD can use a long GOP (=segment) for efficiency; live keeps ~1s. Blank inherits 1.0.">GOP (s)</label>
           <input type="text" value="${_escAttr(e.gop_duration)}" placeholder="1.0" style="width:80px" oninput="_edSet('gop_duration',this.value)"></div>
-        <div class="control-group"><label title="Appended to the output dir name (e.g. '6s' → myclip_6s_h264) so go-live can tell a repackage-once profile apart. Blank = no tag.">Output tag</label>
-          <input type="text" value="${_escAttr(e.output_tag)}" placeholder="none" style="width:96px" oninput="_edSet('output_tag',this.value)"></div>
+        <div class="control-group"><label title="Suffix appended to the output dir name (e.g. myclip_p200_6s_h264) so go-live can tell profiles apart. Blank = auto: a pinned segment → '<N>s', the flexible base → 'xs'.">Output suffix</label>
+          <input type="text" value="${_escAttr(e.output_tag)}" placeholder="auto: ${_ladderSuffix({ segment_duration: e.segment_duration })}" style="width:110px" oninput="_edSet('output_tag',this.value)"></div>
       </div>
       <div class="control-group" style="margin-top:8px"><label>Description</label>
         <input value="${_escAttr(e.description)}" placeholder="what this ladder is for" oninput="_edSet('description',this.value)" style="width:100%;max-width:600px"></div>

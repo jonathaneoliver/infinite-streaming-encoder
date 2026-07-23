@@ -240,7 +240,6 @@ SEED_LADDERS: dict[str, dict] = {
         "segment_duration": "6",
         "partial_duration": "0.2",
         "gop_duration": "1.0",
-        "output_tag": "6s",
         "codecs": {
             "h264": _SEED_APPLE_H264_UNIQ,
             "hevc": _SEED_APPLE_HEVC_UNIQ,

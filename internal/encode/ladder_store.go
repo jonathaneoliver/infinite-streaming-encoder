@@ -111,10 +111,9 @@ func defaultSeedLadders() map[string]LadderDef {
 			Seed:              true,
 			MaxratePercent:    150,
 			BufsizeMultiplier: 1.0,
-			SegmentDuration:   "6",
+			SegmentDuration:   "6", // fixed → suffix auto-derives to "_6s"
 			PartialDuration:   "0.2",
 			GopDuration:       "1.0",
-			OutputTag:         "6s", // → "<stem>_6s_<codec>" so go-live only makes 6s
 			Codecs: map[string][][]int{
 				"h264": appleUniqH264,
 				"hevc": appleUniqHEVC,

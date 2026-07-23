@@ -2085,9 +2085,31 @@ func (m *Manager) resolveTimings(cfg *JobConfig) {
 	cfg.SegmentDuration = effectiveTiming(cfg.SegmentDuration, def.SegmentDuration, "6")
 	cfg.PartialDuration = effectiveTiming(cfg.PartialDuration, def.PartialDuration, "0.2")
 	cfg.GopDuration = effectiveTiming(cfg.GopDuration, def.GopDuration, "1.0")
-	if cfg.OutputTag == "" { // no global default — empty means "no tag"
-		cfg.OutputTag = def.OutputTag
+	// Output suffix: explicit (job or ladder output_tag) wins; otherwise derive
+	// from the ladder — a fixed-segment profile gets "<N>s" (e.g. "6s"), the
+	// flexible base (no pinned segment) gets "xs" (repackaged to 1/2/6s). So every
+	// output carries a segment suffix go-live can key off.
+	tag := cfg.OutputTag
+	if tag == "" {
+		tag = def.OutputTag
 	}
+	cfg.OutputTag = deriveOutputTag(tag, def.SegmentDuration)
+}
+
+// deriveOutputTag returns the explicit tag if set, else a segment suffix: the
+// ladder's pinned segment as "<N>s" (whole seconds trimmed), or "xs" when the
+// ladder pins no segment (the flexible, repackaged-to-many base).
+func deriveOutputTag(explicit, ladderSegment string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if ladderSegment == "" {
+		return "xs"
+	}
+	if f, err := strconv.ParseFloat(ladderSegment, 64); err == nil && f == math.Trunc(f) {
+		return strconv.Itoa(int(f)) + "s"
+	}
+	return ladderSegment + "s"
 }
 
 func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int) error {
