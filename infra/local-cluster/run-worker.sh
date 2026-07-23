@@ -44,6 +44,7 @@ label_args=(-e "WORKER_LABEL=${WORKER_LABEL:-$WORKER_NAME}")
 
 docker rm -f "$WORKER_NAME" >/dev/null 2>&1 || true
 docker run -d --name "$WORKER_NAME" --restart unless-stopped \
+  --add-host host.docker.internal:host-gateway \
   -e "TEMPORAL_ADDRESS=${TEMPORAL_ADDRESS}" \
   -e "S3_ENDPOINT_URL=${S3_ENDPOINT_URL}" \
   -e "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" \
