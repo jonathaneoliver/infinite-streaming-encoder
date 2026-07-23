@@ -47,7 +47,13 @@ GHCR_IMAGE ?= ghcr.io/jonathaneoliver/encoder
 GHCR_USERNAME ?= jonathaneoliver
 PLATFORMS ?= linux/amd64,linux/arm64
 
-.PHONY: require-paths build run stop restart logs shell status clean push push-setup cloud-push version
+.PHONY: require-paths build run stop restart logs shell status clean push push-setup cloud-push version setup-hooks
+
+# Point git at the committed hooks (scripts/git-hooks/) so the pre-push guard
+# that blocks direct pushes to main is active in this clone. Run once per clone.
+setup-hooks:
+	git config core.hooksPath scripts/git-hooks
+	@echo "git hooks active (scripts/git-hooks). Direct pushes to main are now blocked — use a PR."
 
 require-paths:
 	@: $${SOURCE_DIR:?SOURCE_DIR is not set — create a .env (see .env.example)}
