@@ -759,16 +759,19 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
             _report_task_failure(ev.get("taskFailedEventDetails", {}))
 
 
-def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "") -> int:
+def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "",
+                      output_tag: str = "") -> int:
     """Mirror s3://.../<prefix>/output_<codec>/ into local_dir.
 
     The state machine writes each codec's packaged dir as output_<codec>/. When
     output_stem is given, each is downloaded to a per-codec top-level directory
-    named <output_stem>_<codec>/ (e.g. myclip_p200_hevc/master.m3u8) — matching
-    the local pipeline's naming contract (OutputStem + codec suffix). That lets
-    moveTmpToOutput move each codec independently, so codecs of the same clip
-    COEXIST in OUTPUT_DIR instead of one replacing the other's <stem> wrapper.
+    named <output_stem>_<codec>[_<output_tag>]/ (e.g. myclip_p200_hevc_xs/) —
+    matching the local pipeline's naming contract (OutputStem + codec + profile
+    tag appended LAST so the _p200_<codec> shape smashing keys off stays intact).
+    That lets moveTmpToOutput move each codec independently, so codecs of the same
+    clip COEXIST in OUTPUT_DIR instead of one replacing the other's <stem> wrapper.
     Without output_stem (legacy), the raw output_<codec>/ layout is preserved."""
+    tag_suffix = f"_{output_tag}" if output_tag else ""
     if not s3_prefix.startswith("s3://"):
         return 0
     rest = s3_prefix[len("s3://"):].rstrip("/")
@@ -784,7 +787,7 @@ def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "") ->
         if not tail or not head.startswith("output_"):
             return None  # dir marker or unexpected key — skip
         codec = head[len("output_"):]
-        return local_dir / f"{output_stem}_{codec}" / tail
+        return local_dir / f"{output_stem}_{codec}{tag_suffix}" / tail
 
     # List everything first so the sync-back can drive a real progress bar
     # (weighted by bytes — segment counts vary wildly in size). This runs in the
@@ -1009,7 +1012,8 @@ def cmd_poll(args: argparse.Namespace) -> int:
                             _emit_stage(f"{k}:{codec}", "done", 100.0)
                 print(f"    downloading outputs from {args.s3_prefix}", flush=True)
                 n = _download_outputs(args.s3_prefix, Path(args.local_dir),
-                                      getattr(args, "output_stem", ""))
+                                      getattr(args, "output_stem", ""),
+                                      getattr(args, "output_tag", ""))
                 print(f"    downloaded {n} files", flush=True)
                 try:
                     _emit_cost_summary(exec_name, log_state)  # cost + host sweep
@@ -1047,6 +1051,8 @@ def main(argv: list[str] | None = None) -> int:
     # Base output name (OutputStem, no codec). When set, each codec's outputs
     # land in <output-stem>_<codec>/ so codecs coexist in OUTPUT_DIR.
     pp.add_argument("--output-stem", dest="output_stem", default="")
+    pp.add_argument("--output-tag", dest="output_tag", default="",
+                    help="profile suffix appended AFTER the codec (e.g. 'xs')")
     pp.set_defaults(fn=cmd_poll)
 
     args = p.parse_args(argv)

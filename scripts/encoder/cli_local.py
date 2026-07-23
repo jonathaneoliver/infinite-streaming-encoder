@@ -71,6 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume-package-from", type=Path, dest="resume_package_from")
     p.add_argument("--output", default=None,
                    help="base name for output dirs (stem + partial/pad suffixes)")
+    p.add_argument("--output-tag", default="", dest="output_tag",
+                   help="profile suffix appended AFTER the codec (e.g. 'xs')")
     p.add_argument("--output-dir", type=Path, required=True, dest="output_dir")
 
     # A single codec, a comma-separated subset (the UI's codec checkboxes,
@@ -165,13 +167,13 @@ def _output_stem(input_path: Path, explicit: str | None) -> str:
     return input_path.stem
 
 
-def _codec_package_dir(output_dir: Path, stem: str, codec: str) -> Path:
-    return output_dir / f"{stem}_{codec}"
+def _codec_package_dir(output_dir: Path, stem: str, codec: str, tag: str = "") -> Path:
+    return output_dir / (f"{stem}_{codec}" + (f"_{tag}" if tag else ""))
 
 
-def _ts_package_dir(output_dir: Path, stem: str, codec: str) -> Path:
+def _ts_package_dir(output_dir: Path, stem: str, codec: str, tag: str = "") -> Path:
     # Matches bash's OUTPUT_DIR_HEVC_TS="${stem}_hevc_ts"
-    return output_dir / f"{stem}_{codec}_ts"
+    return output_dir / (f"{stem}_{codec}_ts" + (f"_{tag}" if tag else ""))
 
 
 def _codec_list(selection: str) -> list[str]:
@@ -420,7 +422,7 @@ def run_full(args: argparse.Namespace) -> int:
 
         for codec, rungs in rungs_by_codec.items():
             labels = tuple(r.label for r in rungs)
-            pkg_dir = _codec_package_dir(args.output_dir, stem, codec)
+            pkg_dir = _codec_package_dir(args.output_dir, stem, codec, args.output_tag)
             print(f"[phase 5] packaging {codec} → {pkg_dir.name}", flush=True)
             emit_stage(f"package:{codec}", "running", 0.0)
             package(PackageSpec(
@@ -448,7 +450,7 @@ def run_full(args: argparse.Namespace) -> int:
                 emit_stage(f"hls:{codec}", "done", 100.0)
 
             if want_ts:
-                ts_dir = _ts_package_dir(args.output_dir, stem, codec)
+                ts_dir = _ts_package_dir(args.output_dir, stem, codec, args.output_tag)
                 print(f"[phase 7b] TS HLS for {codec} → {ts_dir.name}",
                       flush=True)
                 emit_stage(f"hls-ts:{codec}", "running", 0.0)
@@ -611,7 +613,7 @@ def run_resume(args: argparse.Namespace) -> int:
         labels = _labels_for(codec)
         if not labels:
             continue
-        pkg_dir = _codec_package_dir(args.output_dir, stem, codec)
+        pkg_dir = _codec_package_dir(args.output_dir, stem, codec, args.output_tag)
         print(f"[resume] packaging {codec} → {pkg_dir.name} "
               f"({len(labels)} rungs)", flush=True)
         package(PackageSpec(
@@ -629,7 +631,7 @@ def run_resume(args: argparse.Namespace) -> int:
             generate_fmp4_hls(pkg_dir)
 
         if want_ts:
-            ts_dir = _ts_package_dir(args.output_dir, stem, codec)
+            ts_dir = _ts_package_dir(args.output_dir, stem, codec, args.output_tag)
             generate_ts_hls(TsHlsSpec(
                 tmp_dir=resume_dir, ts_output_dir=ts_dir, codec=codec,
                 labels=tuple(labels),

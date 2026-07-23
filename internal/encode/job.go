@@ -1905,12 +1905,22 @@ func (cfg *JobConfig) OutputStem(filename string) string {
 	case "pink":
 		stem += "_padpink"
 	}
-	// Profile output tag (e.g. "6s") marks the dir for go-live; the encode script
-	// then appends "_<codec>", giving "<stem>_p200_6s_h264".
-	if cfg.OutputTag != "" {
-		stem += "_" + cfg.OutputTag
-	}
+	// NOTE: the profile output tag (e.g. "xs") is NOT part of the stem — the
+	// encode script appends it AFTER the codec ("<stem>_p200_<codec>_xs"), so the
+	// "_p200_<codec>" shape smashing/go-live keys off stays intact (its clip-ID
+	// regex is _p200_(codec)(_|$), which needs the codec right after _p200).
 	return stem
+}
+
+// outputCodecDir is the final output directory name for one codec: the stem +
+// "_<codec>" + the profile suffix appended LAST ("<stem>_p200_h264_xs"). The
+// encode scripts build the same name; Go uses it for skip/matching.
+func (cfg *JobConfig) outputCodecDir(filename, codec string) string {
+	name := cfg.OutputStem(filename) + "_" + codec
+	if cfg.OutputTag != "" {
+		name += "_" + cfg.OutputTag
+	}
+	return name
 }
 
 // localChunkSeconds resolves the fixed chunk size for a LOCAL encode, driving
@@ -1969,6 +1979,9 @@ func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) [
 	}
 	if cfg.GopDuration != "" {
 		args = append(args, "--gop-duration", cfg.GopDuration)
+	}
+	if cfg.OutputTag != "" {
+		args = append(args, "--output-tag", cfg.OutputTag)
 	}
 	if cfg.HlsFormat != "" {
 		args = append(args, "--hls-format", cfg.HlsFormat)
@@ -2054,6 +2067,9 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	if chunk := cfg.localChunkSeconds(); chunk > 0 {
 		args = append(args, "--chunk-duration",
 			strconv.FormatFloat(chunk, 'f', -1, 64))
+	}
+	if cfg.OutputTag != "" {
+		args = append(args, "--output-tag", cfg.OutputTag)
 	}
 	if cfg.HevcSinglePass {
 		args = append(args, "--hevc-single-pass")
@@ -2405,11 +2421,15 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	// <stem>/output_<codec>/ wrapper), so moveTmpToOutput moves each codec
 	// independently and codecs of the same clip COEXIST in OUTPUT_DIR — matching
 	// the local pipeline + the OutputStem/resolveCodec/watcher naming contract.
-	poll := exec.Command("python3", "-m", "encoder.cli_batch", "poll",
+	pollArgs := []string{"poll",
 		"--execution-arn", execArn,
 		"--s3-prefix", s3Prefix,
 		"--local-dir", tmpDir,
-		"--output-stem", job.Config.OutputStem(filename))
+		"--output-stem", job.Config.OutputStem(filename)}
+	if job.Config.OutputTag != "" {
+		pollArgs = append(pollArgs, "--output-tag", job.Config.OutputTag)
+	}
+	poll := exec.Command("python3", append([]string{"-m", "encoder.cli_batch"}, pollArgs...)...)
 	poll.Env = os.Environ()
 	stdout, err := poll.StdoutPipe()
 	if err != nil {
@@ -2806,7 +2826,6 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 // resolveCodec checks which codecs are already encoded in OutputDir and returns
 // the codec flag that covers only the missing ones. Returns "" if all exist.
 func (m *Manager) resolveCodec(cfg JobConfig, filename string) string {
-	stem := cfg.OutputStem(filename)
 	want := map[string]bool{}
 	for _, c := range parseCodecSel(cfg.Codec) { // handles "", both, all, comma-list, single
 		want[c] = true
@@ -2814,7 +2833,7 @@ func (m *Manager) resolveCodec(cfg JobConfig, filename string) string {
 	// The still-missing codecs, in canonical order.
 	var missing []string
 	for _, c := range []string{"h264", "hevc", "av1"} {
-		if want[c] && !dirExistsWithFiles(filepath.Join(m.OutputDir, stem+"_"+c)) {
+		if want[c] && !dirExistsWithFiles(filepath.Join(m.OutputDir, cfg.outputCodecDir(filename, c))) {
 			missing = append(missing, c)
 		}
 	}

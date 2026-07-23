@@ -605,7 +605,8 @@ def run(args: argparse.Namespace) -> int:
     # 5. download output_<codec>/ -> <output-dir>/<stem>_<codec>/
     out_dir = Path(args.output_dir)
     for codec in rungs_by_codec:
-        dest = out_dir / f"{args.output}_{codec}"
+        dest = out_dir / (f"{args.output}_{codec}"
+                          + (f"_{args.output_tag}" if args.output_tag else ""))
         n = _download_prefix(bucket, f"{out_prefix}/output_{codec}/", dest)
         print(f"[dist] downloaded {n} file(s) -> {dest}", flush=True)
 
@@ -857,7 +858,8 @@ def run_temporal(args: argparse.Namespace) -> int:
 
     out_dir = Path(args.output_dir)
     for codec in rungs_by_codec:
-        dest = out_dir / f"{args.output}_{codec}"
+        dest = out_dir / (f"{args.output}_{codec}"
+                          + (f"_{args.output_tag}" if args.output_tag else ""))
         n = _download_prefix(bucket, f"{prefix}/out/output_{codec}/", dest)
         print(f"[dist] downloaded {n} file(s) -> {dest}", flush=True)
     print("[dist] done", flush=True)
@@ -868,6 +870,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cli_local_dist")
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True, help="output stem")
+    p.add_argument("--output-tag", default="", dest="output_tag",
+                   help="suffix appended AFTER the codec (e.g. 'xs' -> "
+                        "<stem>_<codec>_xs); blank = none")
     p.add_argument("--output-dir", required=True, dest="output_dir")
     p.add_argument("--codec", default="hevc")
     p.add_argument("--ladder", default="apple-uniq-live")
