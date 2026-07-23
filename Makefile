@@ -572,3 +572,75 @@ smoke: require-paths build   ## end-to-end single-device smoke: tiny clip -> loc
 	 if [ -n "$$d" ] && ls "$$d"/*.m3u8 >/dev/null 2>&1; then \
 	   echo ">>> SMOKE PASS: $$d (has playlists)"; \
 	 else echo ">>> SMOKE FAIL: no smoke output dir with playlists in $(OUTPUT_DIR)"; exit 1; fi
+
+# ---- OOBE (out-of-box experience) test ---------------------------------------
+# Runs a fully ISOLATED instance — its own dirs, ports, container names, and a
+# second Temporal/MinIO cluster — so the first-run-from-nothing path is exercised
+# WITHOUT touching your live farm, then tears itself down. Good for catching the
+# config/dir/port/wiring problems your warm setup hides.
+# LIMIT: the Docker image cache is shared, so this does NOT test cold image pulls
+# (ffmpeg/Shaka/base images) or missing host tools — for those, use a fresh box.
+OOBE_DIR ?= $(HOME)/encoder-oobe
+OOBE_PORT ?= 8090
+OOBE_TEMPORAL_PORT ?= 7333
+OOBE_TEMPORAL_UI_PORT ?= 8333
+OOBE_MINIO_PORT ?= 9100
+OOBE_MINIO_CONSOLE_PORT ?= 9101
+OOBE_PROJECT ?= encoder-oobe
+OOBE_SERVER ?= encoder-oobe
+OOBE_WORKER ?= encode-worker-oobe
+# OOBE_KEEP=1 leaves the isolated instance up on finish (pass OR fail) so you can
+# inspect logs at :$(OOBE_PORT); otherwise it always tears down.
+OOBE_KEEP ?=
+OOBE_CLUSTER_ENV = TEMPORAL_PORT=$(OOBE_TEMPORAL_PORT) TEMPORAL_UI_PORT=$(OOBE_TEMPORAL_UI_PORT) \
+	MINIO_API_PORT=$(OOBE_MINIO_PORT) MINIO_CONSOLE_PORT=$(OOBE_MINIO_CONSOLE_PORT)
+
+.PHONY: oobe oobe-down
+oobe: build   ## isolated first-run test: own dirs/ports/cluster -> encode -> assert -> tear down
+	@echo ">>> [oobe] fresh dirs under $(OOBE_DIR)"
+	@rm -rf $(OOBE_DIR); mkdir -p $(OOBE_DIR)/source $(OOBE_DIR)/output $(OOBE_DIR)/tmp
+	@echo ">>> [oobe] isolated cluster '$(OOBE_PROJECT)' on ports $(OOBE_TEMPORAL_PORT)/$(OOBE_TEMPORAL_UI_PORT)/$(OOBE_MINIO_PORT)/$(OOBE_MINIO_CONSOLE_PORT)..."
+	@$(OOBE_CLUSTER_ENV) docker compose -p $(OOBE_PROJECT) -f $(DIST_COMPOSE) up -d
+	@echo ">>> [oobe] waiting for the isolated Temporal (:$(OOBE_TEMPORAL_PORT))..."
+	@for i in $$(seq 1 60); do nc -z localhost $(OOBE_TEMPORAL_PORT) 2>/dev/null && break; sleep 1; done; sleep 5
+	@echo ">>> [oobe] generating a tiny clip in the isolated source dir..."
+	@docker run --rm -v "$(OOBE_DIR)/source:/src" --entrypoint ffmpeg $(IMAGE_NAME) \
+	  -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 \
+	  -t 20 -pix_fmt yuv420p -c:v libx264 -c:a aac -shortest -y /src/smoke.mp4
+	@echo ">>> [oobe] isolated worker '$(OOBE_WORKER)'..."
+	@ENCODER_IMAGE=$(IMAGE_NAME) WORKER_NAME=$(OOBE_WORKER) WORKER_LABEL=oobe \
+	  TEMPORAL_ADDRESS=host.docker.internal:$(OOBE_TEMPORAL_PORT) \
+	  S3_ENDPOINT_URL=http://host.docker.internal:$(OOBE_MINIO_PORT) \
+	  AWS_ACCESS_KEY_ID=$(MINIO_ACCESS_KEY) AWS_SECRET_ACCESS_KEY=$(MINIO_SECRET_KEY) \
+	  CODE_MOUNT=$(CURDIR)/scripts/encoder \
+	  bash infra/local-cluster/run-worker.sh
+	@echo ">>> [oobe] isolated server '$(OOBE_SERVER)' on :$(OOBE_PORT)..."
+	@docker rm -f $(OOBE_SERVER) >/dev/null 2>&1 || true
+	$(MAKE) run CONTAINER_NAME=$(OOBE_SERVER) PORT=$(OOBE_PORT) \
+	  SOURCE_DIR=$(OOBE_DIR)/source OUTPUT_DIR=$(OOBE_DIR)/output TMP_DIR=$(OOBE_DIR)/tmp \
+	  TEMPORAL_ADDRESS=host.docker.internal:$(OOBE_TEMPORAL_PORT) \
+	  MINIO_ENDPOINT=http://host.docker.internal:$(OOBE_MINIO_PORT) \
+	  DIST_WORKER_CONTAINER=$(OOBE_WORKER) HOST_SCRIPTS_DIR=$(CURDIR)/scripts/encoder
+	@echo ">>> [oobe] waiting for the isolated server (:$(OOBE_PORT))..."
+	@for i in $$(seq 1 30); do curl -sf http://localhost:$(OOBE_PORT)/api/jobs >/dev/null 2>&1 && break; sleep 1; done
+	@echo ">>> [oobe] submitting encode + waiting (timeout ~300s)..."
+	@id=$$(curl -sf -X POST http://localhost:$(OOBE_PORT)/api/encode -H 'Content-Type: application/json' \
+	    -d '{"files":["smoke.mp4"],"target":"local-dist","codec":"h264","max_res":"720p","chunk_duration":"12"}' \
+	    | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["id"])'); \
+	  echo "    job $$id"; st=pending; \
+	  for i in $$(seq 1 60); do \
+	    st=$$(curl -sf http://localhost:$(OOBE_PORT)/api/jobs | python3 -c "import sys,json; j=[x for x in json.load(sys.stdin) if x['id']=='$$id']; print(j[0]['status'] if j else 'gone')"); \
+	    echo "    status=$$st"; \
+	    case "$$st" in done) break;; failed|gone) break;; esac; sleep 5; \
+	  done; \
+	  d=$$(ls -d $(OOBE_DIR)/output/smoke_p200*h264* 2>/dev/null | head -1); \
+	  if [ "$$st" = done ] && [ -n "$$d" ] && ls "$$d"/*.m3u8 >/dev/null 2>&1; then res="OOBE PASS: $$d (has playlists)"; else res="OOBE FAIL (status=$$st)"; fi; \
+	  if [ "$(OOBE_KEEP)" = "1" ]; then echo ">>> [oobe] OOBE_KEEP=1 — leaving instance up (logs at http://localhost:$(OOBE_PORT); 'make oobe-down' to clean)"; \
+	  else echo ">>> [oobe] tearing down..."; $(MAKE) oobe-down >/dev/null 2>&1 || true; fi; \
+	  echo ">>> $$res"; case "$$res" in OOBE\ PASS*) exit 0;; *) exit 1;; esac
+
+oobe-down:            ## tear down the isolated OOBE instance (server, worker, cluster + volumes, dirs)
+	-docker rm -f $(OOBE_SERVER) $(OOBE_WORKER) 2>/dev/null
+	-$(OOBE_CLUSTER_ENV) docker compose -p $(OOBE_PROJECT) -f $(DIST_COMPOSE) down -v 2>/dev/null
+	-rm -rf $(OOBE_DIR)
+	@echo ">>> [oobe] torn down."
