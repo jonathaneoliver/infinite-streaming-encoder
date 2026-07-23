@@ -1649,27 +1649,31 @@ async function loadOutputDetail(name) {
     }
 }
 
-// Ladder matrix: one row per tier with target vs actual bitrate + size.
-// The delta bar visualizes actual/target — >100% means the encoder
-// overshot its budget (x265 commonly does at low targets). Keeps the
-// view compact: 4 columns fit inside the outputs list width.
+// Ladder matrix: one row per rung with target vs peak/avg/ACTUAL bitrate,
+// VMAF (when measured), budget, and size — plus the profile + extra config the
+// output was made with (from encode.json). Budget = ACTUAL average ÷ target.
 function renderLadderTable(ladder) {
     if (!ladder || !ladder.tiers || ladder.tiers.length === 0) return '';
+    const kb = v => v > 0 ? v.toLocaleString() + ' k' : '—';
     const rows = ladder.tiers.map(t => {
-        const ratio = t.target_kbps > 0 ? (t.actual_kbps / t.target_kbps) : 0;
+        // Budget compares the TRUE average (actual) to target; fall back to peak
+        // if we couldn't measure the average.
+        const measured = t.actual_kbps > 0 ? t.actual_kbps : t.peak_kbps;
+        const ratio = t.target_kbps > 0 ? (measured / t.target_kbps) : 0;
         const pct = Math.min(150, Math.round(ratio * 100));
-        // Bar colour: green ≤110%, amber 110-125%, red >125%
         const cls = ratio === 0 ? 'ladder-bar-empty'
                   : ratio <= 1.10 ? 'ladder-bar-good'
                   : ratio <= 1.25 ? 'ladder-bar-warn'
                   : 'ladder-bar-bad';
-        const actualDisp = t.actual_kbps > 0 ? t.actual_kbps.toLocaleString() : '—';
         return `
             <tr>
                 <td class="ladder-res">${t.res}</td>
                 <td class="ladder-dim">${t.width}×${t.height}</td>
-                <td class="ladder-num">${t.target_kbps.toLocaleString()} k</td>
-                <td class="ladder-num">${actualDisp} k</td>
+                <td class="ladder-num">${kb(t.target_kbps)}</td>
+                <td class="ladder-num" title="peak segment bitrate (manifest BANDWIDTH)">${kb(t.peak_kbps)}</td>
+                <td class="ladder-num" title="declared average (manifest AVERAGE-BANDWIDTH)">${kb(t.avg_kbps)}</td>
+                <td class="ladder-num" title="measured average = size × 8 ÷ duration">${kb(t.actual_kbps)}</td>
+                <td class="ladder-num" title="VMAF (measured post-encode; — until the VMAF audit runs)">${t.vmaf > 0 ? t.vmaf.toFixed(1) : '—'}</td>
                 <td class="ladder-bar-cell">
                     <div class="ladder-bar-track">
                         <div class="ladder-bar-fill ${cls}" style="width:${Math.min(100, pct)}%"></div>
@@ -1681,17 +1685,37 @@ function renderLadderTable(ladder) {
             </tr>
         `;
     }).join('');
+    const p = ladder.profile;
+    const chip = (label, on) => on ? `<span style="color:#8cf"> · ${label}</span>` : '';
+    const profileLine = p
+        ? `<div style="font-size:12px;color:#aab;margin:2px 0 8px">
+             profile <b style="color:#cfe6f5">${escapeHtml(p.name || '—')}</b>
+             · maxrate ${p.maxrate_percent}% · bufsize ${p.bufsize_multiplier}×
+             · seg ${p.segment_s}s · partial ${p.partial_s}s · gop ${p.gop_s}s
+             ${p.output_tag ? ` · suffix _${escapeHtml(p.output_tag)}` : ''}
+             ${p.max_res ? ` · max-res ${escapeHtml(p.max_res)}` : ''}
+             ${chip('hevc single-pass', p.hevc_single_pass)}
+             ${p.padding && p.padding !== 'off' ? ` · padding ${escapeHtml(p.padding)}` : ''}
+             ${p.chunk_duration ? ` · chunk ${escapeHtml(p.chunk_duration)}` : ''}
+             ${chip('force re-encode', p.force_reencode)}
+             ${p.encoded_at ? `<span style="color:#889"> · ${new Date(p.encoded_at).toLocaleString()}</span>` : ''}
+           </div>`
+        : `<div style="font-size:12px;color:#889;margin:2px 0 8px">no encode.json (encoded before profile metadata) — targets/config best-effort</div>`;
     return `
         <div class="ladder-panel">
             <div class="ladder-title">ABR ladder — ${ladder.codec.toUpperCase()}</div>
+            ${profileLine}
             <table class="ladder-table">
                 <thead>
                     <tr>
                         <th>Tier</th>
                         <th>Dim</th>
                         <th>Target</th>
-                        <th>Actual</th>
-                        <th>Budget usage</th>
+                        <th title="peak segment bitrate (manifest BANDWIDTH)">Peak</th>
+                        <th title="declared average (manifest AVERAGE-BANDWIDTH)">Avg</th>
+                        <th title="measured average = size × 8 ÷ duration">Actual</th>
+                        <th title="VMAF (— until the VMAF audit runs)">VMAF</th>
+                        <th>Budget (actual/target)</th>
                         <th>Size</th>
                     </tr>
                 </thead>

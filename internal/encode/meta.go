@@ -21,14 +21,22 @@ type encodeMeta struct {
 	PartialS          string     `json:"partial_s"`
 	GopS              string     `json:"gop_s"`
 	OutputTag         string     `json:"output_tag,omitempty"`
-	Source            string     `json:"source,omitempty"`
-	EncodedAt         string     `json:"encoded_at"`
-	Rungs             []metaRung `json:"rungs,omitempty"`
+	// Extra job config used to make this output.
+	MaxRes         string `json:"max_res,omitempty"`
+	HevcSinglePass bool   `json:"hevc_single_pass,omitempty"`
+	Padding        string `json:"padding,omitempty"`
+	ChunkDuration  string `json:"chunk_duration,omitempty"`
+	ForceReencode  bool   `json:"force_reencode,omitempty"`
+	Source         string `json:"source,omitempty"`
+	EncodedAt      string `json:"encoded_at"`
+	Rungs          []metaRung `json:"rungs,omitempty"`
 }
 
 type metaRung struct {
 	Height      int `json:"height"`
 	BitrateKbps int `json:"bitrate_kbps"`
+	// Vmaf is populated later by the VMAF audit (#24); 0/absent = not measured.
+	Vmaf float64 `json:"vmaf,omitempty"`
 }
 
 // writeEncodeMetaForDirs writes encode.json + a one-line manifest comment into
@@ -85,6 +93,11 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig) {
 		PartialS:          defaultVal(cfg.PartialDuration, "0.2"),
 		GopS:              defaultVal(cfg.GopDuration, "1.0"),
 		OutputTag:         cfg.OutputTag,
+		MaxRes:            cfg.MaxRes,
+		HevcSinglePass:    cfg.HevcSinglePass,
+		Padding:           cfg.Padding,
+		ChunkDuration:     cfg.ChunkDuration,
+		ForceReencode:     cfg.ForceReencode,
 		Source:            strings.Join(cfg.Files, ", "),
 		EncodedAt:         time.Now().UTC().Format(time.RFC3339),
 		Rungs:             rungs,
