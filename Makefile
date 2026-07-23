@@ -55,6 +55,11 @@ PLATFORMS ?= linux/amd64,linux/arm64
 RUN_IMAGE ?= $(IMAGE_NAME)
 REMOTE_IMAGE ?= $(GHCR_IMAGE):latest
 
+# Dev only: host path overlaid onto a spawned orchestrator's /app/scripts/encoder
+# so it runs current working-tree code without a rebuild. Set by `make farm-dev`;
+# empty in normal runs (the orchestrator then uses the image's baked scripts).
+HOST_SCRIPTS_DIR ?=
+
 .PHONY: require-paths build run run-remote stop restart logs shell status clean push push-setup cloud-push version setup-hooks
 
 # Point git at the committed hooks (scripts/git-hooks/) so the pre-push guard
@@ -128,6 +133,7 @@ docker run --rm -d \
 	-e 'DIST_WORKERS=$(DIST_WORKERS)' \
 	-e LOCAL_WORKER_LABEL=$(LOCAL_WORKER_LABEL) \
 	-e DIST_WORKER_CONTAINER=$(DIST_WORKER_CONTAINER) \
+	-e HOST_SCRIPTS_DIR=$(HOST_SCRIPTS_DIR) \
 	$(RUN_IMAGE)
 @echo "Encoder running at http://localhost:$(PORT)"
 endef
@@ -530,8 +536,12 @@ farm-dev: require-paths   ## dev farm: bind-mount local scripts/encoder into eve
 	      bash infra/local-cluster/deploy-worker-ghcr.sh "$$host" "$$label" || exit 1; \
 	  done; \
 	else echo "    (no DIST_WORKERS — master-only)"; fi
-	@echo ">>> [farm-dev] 4/4 ensure server + UI is up (left running if already up)..."
-	@if docker ps --filter name=$(CONTAINER_NAME) --filter status=running -q | grep -q .; then \
-	  echo "    server already running — left as-is"; \
-	else $(MAKE) run-remote; fi
-	@echo ">>> farm-dev up. Edit scripts/encoder, then re-run 'make farm-dev' to propagate (rsync diffs + restart)."
+	@echo ">>> [farm-dev] 4/4 ensure the server is up WITH the dev code mount (orchestrator runs current code)..."
+	@if docker inspect $(CONTAINER_NAME) --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep -qxF 'HOST_SCRIPTS_DIR=$(CURDIR)/scripts/encoder'; then \
+	  echo "    server already running with the dev code mount — left as-is"; \
+	else \
+	  echo "    (re)starting server with HOST_SCRIPTS_DIR=$(CURDIR)/scripts/encoder"; \
+	  $(MAKE) stop; \
+	  HOST_SCRIPTS_DIR=$(CURDIR)/scripts/encoder $(MAKE) run-remote; \
+	fi
+	@echo ">>> farm-dev up. Edit scripts/encoder, then re-run 'make farm-dev' — workers rsync+restart; the orchestrator picks up changes live (server stays up)."
