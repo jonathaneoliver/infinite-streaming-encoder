@@ -1813,10 +1813,10 @@ function jobRowHtml(j) {
             </div>
             ${_jobConfigHtml(j.config)}
             <div class="job-prog" style="display:none"></div>
-            <div class="job-progress"></div>
             <div class="job-error" style="color:#ef476f;font-size:0.8rem;margin-top:4px;display:none"></div>
             <div class="details-toggle" style="display:none" onclick="toggleDetails('${j.id}')"><span class="fold-chevron">▾</span><span class="details-toggle-label">details</span></div>
             <div class="job-details">
+                <div class="job-progress"></div>
                 <div class="current-file" style="display:none;font-size:0.85rem;color:#8cf;margin-top:8px;font-weight:600"></div>
                 <table class="stages-table" style="display:none"><tbody></tbody></table>
             </div>
