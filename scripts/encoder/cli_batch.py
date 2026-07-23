@@ -162,6 +162,56 @@ def _short_label(jobname: str) -> str:
             }.get(jobname.split("-", 1)[0], jobname.split("-", 1)[0])
 
 
+def _tag_hosts_for_jobs(described_jobs: list, log_state: dict) -> None:
+    """Emit ENCODER-HOST for each described Batch job's stage keys, so the UI
+    colours those rows/cells by the EC2 instance the job ran on. Deduped per
+    (stage key, instance) via log_state, so a job is only announced once. Shared
+    by the live RUNNING poll, the SUCCEEDED backfill, and the end-of-run sweep."""
+    for j in described_jobs:
+        keys = _host_stage_keys(j.get("jobName", ""))
+        ci_arn = j.get("container", {}).get("containerInstanceArn")
+        if not (keys and ci_arn):
+            continue
+        inst = _ec2_for_container_instance(ci_arn)
+        if not inst:
+            continue
+        for key in keys:
+            seen_key = "_host:" + key
+            if log_state.get(seen_key) != inst:
+                log_state[seen_key] = inst
+                _emit_host(key, inst)
+
+
+def _backfill_completed_hosts(exec_name: str, log_state: dict) -> None:
+    """Colour chunks that completed BETWEEN polls. A short chunk (small H.264
+    rung) can start and finish inside one poll interval, so it's never observed
+    RUNNING and never tagged — its cell falls back to the default (blue). A
+    SUCCEEDED job keeps its containerInstanceArn, so describe the ones whose stage
+    keys aren't coloured yet and emit their host. Bounded: only untagged jobs are
+    described (via the name, no API call), so each is described at most once."""
+    batch = _batch()
+    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    try:
+        done = batch.list_jobs(jobQueue=queue, jobStatus="SUCCEEDED"
+                               ).get("jobSummaryList", [])
+    except ClientError:
+        return
+    ids = []
+    for j in done:
+        name = j.get("jobName", "")
+        if exec_name not in name:
+            continue
+        keys = _host_stage_keys(name)
+        if keys and any(log_state.get("_host:" + k) is None for k in keys):
+            ids.append(j["jobId"])
+    for i in range(0, len(ids), 100):
+        try:
+            jobs = batch.describe_jobs(jobs=ids[i:i + 100]).get("jobs", [])
+        except ClientError:
+            continue
+        _tag_hosts_for_jobs(jobs, log_state)
+
+
 def _forward_running_logs(exec_name: str, log_state: dict) -> None:
     """Tail the CloudWatch streams of currently-RUNNING jobs and forward their
     [progress]/[phase] lines into the app log — so long phases (mezzanine,
@@ -181,23 +231,12 @@ def _forward_running_logs(exec_name: str, log_state: dict) -> None:
         except ClientError:
             continue
         for j in jobs:
-            container = j.get("container", {})
-            stream = container.get("logStreamName")
+            stream = j.get("container", {}).get("logStreamName")
             if stream:
                 _tail_progress(stream, _short_label(j.get("jobName", "")), log_state)
-            # Report which machine each running job landed on, once per stage
-            # key, so the UI can colour EVERY row (encode chunks + mezzanine /
-            # audio / package / fragments / hls) by instance. Best-effort.
-            keys = _host_stage_keys(j.get("jobName", ""))
-            ci_arn = container.get("containerInstanceArn")
-            if keys and ci_arn:
-                inst = _ec2_for_container_instance(ci_arn)
-                if inst:
-                    for key in keys:
-                        seen_key = "_host:" + key
-                        if log_state.get(seen_key) != inst:
-                            log_state[seen_key] = inst
-                            _emit_host(key, inst)
+        # Colour every running job's rows (encode chunks + mezzanine / audio /
+        # package / fragments / hls) by the instance it landed on. Best-effort.
+        _tag_hosts_for_jobs(jobs, log_state)
 
 
 def _tail_progress(stream: str, label: str, log_state: dict) -> None:
@@ -836,13 +875,17 @@ def _collect_exec_jobs(exec_name: str) -> list:
     return jobs
 
 
-def _emit_cost_summary(exec_name: str) -> None:
+def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
     """At job end, sum the execution's Batch compute and emit two markers the
     control plane consumes: ENCODER-COST (spot-vs-on-demand savings, accumulated
     into 'saved by using spot') and ENCODER-STATS (run efficiency: encode wall,
     vCPU-hours, the slowest single chunk = makespan floor, job count, max vCPUs).
     exec= keeps both idempotent across a reattach."""
     jobs = _collect_exec_jobs(exec_name)
+    # Definitive host sweep: every job is fully described here (with its
+    # containerInstanceArn), so colour any chunk the live poll missed — nothing
+    # is left the default blue by the time the run finishes.
+    _tag_hosts_for_jobs(jobs, log_state if log_state is not None else {})
     vcpu_s = 0.0
     mn = mx = None
     longest_s = 0.0
@@ -945,6 +988,12 @@ def cmd_poll(args: argparse.Namespace) -> int:
             _forward_running_logs(exec_name, log_state)
         except Exception:  # noqa: BLE001 — live tailing is cosmetic
             pass
+        # Backfill instance colour for chunks that finished between polls (short
+        # rungs never seen RUNNING), so their cells aren't left the default blue.
+        try:
+            _backfill_completed_hosts(exec_name, log_state)
+        except Exception:  # noqa: BLE001 — host colouring is cosmetic
+            pass
 
         desc = sfn.describe_execution(executionArn=args.execution_arn)
         status = desc["status"]
@@ -963,7 +1012,7 @@ def cmd_poll(args: argparse.Namespace) -> int:
                                       getattr(args, "output_stem", ""))
                 print(f"    downloaded {n} files", flush=True)
                 try:
-                    _emit_cost_summary(exec_name)  # spot-vs-on-demand savings
+                    _emit_cost_summary(exec_name, log_state)  # cost + host sweep
                 except Exception:  # noqa: BLE001 — cost summary is best-effort
                     pass
                 return 0
