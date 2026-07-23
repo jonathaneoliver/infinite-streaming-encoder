@@ -478,3 +478,60 @@ dist-deploy-ghcr:     ## GHCR-pull workers on each DIST_WORKERS box (no build/tr
 	    bash infra/local-cluster/deploy-worker-ghcr.sh "$$host" "$$label" || exit 1; \
 	done
 	@echo ">>> GHCR-pull workers deployed to $(words $(DIST_WORKERS)) box(es)."
+
+# ---- One-command farm --------------------------------------------------------
+# `make farm` brings the whole distributed-local setup up from THIS machine as
+# master, pulling every image from GHCR (no local build). The master always runs
+# a worker; extra boxes come from DIST_WORKERS in .env. Run `make push` first so
+# GHCR has your current code.
+# `make farm-dev` is the developer loop: it bind-mounts your local scripts/encoder
+# into every worker, so re-running it just rsyncs the diffs and restarts workers
+# (no rebuild, no re-pull) — the fastest way to get local changes onto all boxes.
+.PHONY: farm farm-dev
+
+# host.docker.internal reaches the master's own cluster from its worker container.
+_MASTER_WORKER_ENV = TEMPORAL_ADDRESS=host.docker.internal:7233 \
+	S3_ENDPOINT_URL=http://host.docker.internal:9000 \
+	AWS_ACCESS_KEY_ID=$(MINIO_ACCESS_KEY) AWS_SECRET_ACCESS_KEY=$(MINIO_SECRET_KEY) \
+	WORKER_LABEL=$(LOCAL_WORKER_LABEL)
+
+farm: require-paths   ## bring the whole farm up from GHCR (cluster + this box's worker + DIST_WORKERS + UI)
+	@echo ">>> [farm] 1/5 cluster (temporal + minio)..."
+	$(MAKE) dist-up
+	@echo ">>> [farm] 2/5 waiting for Temporal (:7233)..."
+	@for i in $$(seq 1 60); do nc -z localhost 7233 2>/dev/null && break; sleep 1; done; sleep 5
+	@echo ">>> [farm] 3/5 pull $(REMOTE_IMAGE) + start a worker on THIS machine..."
+	@if [ -n "$(GHCR_PAT)" ]; then echo "$(GHCR_PAT)" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin; fi
+	docker pull $(REMOTE_IMAGE)
+	@ENCODER_IMAGE=$(REMOTE_IMAGE) $(_MASTER_WORKER_ENV) bash infra/local-cluster/run-worker.sh
+	@echo ">>> [farm] 4/5 remote workers (from GHCR)..."
+	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-ghcr; else echo "    (no DIST_WORKERS — master-only farm)"; fi
+	@echo ">>> [farm] 5/5 server + UI from GHCR..."
+	@$(MAKE) stop
+	$(MAKE) run-remote
+	@echo ">>> farm up:  UI http://localhost:$(PORT)   Temporal UI http://localhost:8233"
+
+farm-dev: require-paths   ## dev farm: bind-mount local scripts/encoder into every worker; re-run to fast-sync changes
+	@echo ">>> [farm-dev] 1/4 cluster..."
+	$(MAKE) dist-up
+	@for i in $$(seq 1 60); do nc -z localhost 7233 2>/dev/null && break; sleep 1; done; sleep 5
+	@echo ">>> [farm-dev] 2/4 worker on THIS machine with a LIVE local code mount..."
+	@docker image inspect $(REMOTE_IMAGE) >/dev/null 2>&1 || { \
+	  if [ -n "$(GHCR_PAT)" ]; then echo "$(GHCR_PAT)" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin; fi; \
+	  docker pull $(REMOTE_IMAGE); }
+	@ENCODER_IMAGE=$(REMOTE_IMAGE) CODE_MOUNT=$(CURDIR)/scripts/encoder $(_MASTER_WORKER_ENV) \
+	  bash infra/local-cluster/run-worker.sh
+	@echo ">>> [farm-dev] 3/4 rsync code + restart workers on DIST_WORKERS boxes..."
+	@if [ -n "$(DIST_WORKERS)" ]; then \
+	  for w in $(DIST_WORKERS); do \
+	    label=$${w%%=*}; host=$${w#*=}; \
+	    DEV=1 MASTER_IP=$(MASTER_IP) IMAGE=$(REMOTE_IMAGE) GHCR_PAT=$(GHCR_PAT) GHCR_USERNAME=$(GHCR_USERNAME) \
+	      MINIO_ROOT_USER=$(MINIO_ACCESS_KEY) MINIO_ROOT_PASSWORD=$(MINIO_SECRET_KEY) \
+	      bash infra/local-cluster/deploy-worker-ghcr.sh "$$host" "$$label" || exit 1; \
+	  done; \
+	else echo "    (no DIST_WORKERS — master-only)"; fi
+	@echo ">>> [farm-dev] 4/4 ensure server + UI is up (left running if already up)..."
+	@if docker ps --filter name=$(CONTAINER_NAME) --filter status=running -q | grep -q .; then \
+	  echo "    server already running — left as-is"; \
+	else $(MAKE) run-remote; fi
+	@echo ">>> farm-dev up. Edit scripts/encoder, then re-run 'make farm-dev' to propagate (rsync diffs + restart)."
