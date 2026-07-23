@@ -533,3 +533,38 @@ farm-dev: require-paths   ## dev farm from your WORKING TREE (uncommitted): loca
 	@$(MAKE) stop
 	HOST_SCRIPTS_DIR=$(CURDIR)/scripts/encoder $(MAKE) run
 	@echo ">>> farm-dev up (working tree — nothing committed/pushed). Re-run 'make farm-dev' after edits."
+
+# ---- Smoke test --------------------------------------------------------------
+# End-to-end single-device check (docs/TESTING.md, test 1): generate a tiny clip,
+# bring up a 1-box farm from the working tree, encode it, assert the output.
+# The multi-box and cloud topologies are manual (hardware / cost).
+.PHONY: smoke
+SMOKE_SRC ?= $(SOURCE_DIR)/smoke.mp4
+
+smoke: require-paths build   ## end-to-end single-device smoke: tiny clip -> local-dist encode -> assert output
+	@echo ">>> [smoke] generating $(SMOKE_SRC) (if missing)..."
+	@[ -f "$(SMOKE_SRC)" ] || docker run --rm -v "$(SOURCE_DIR):/src" --entrypoint ffmpeg $(IMAGE_NAME) \
+	  -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 \
+	  -t 20 -pix_fmt yuv420p -c:v libx264 -c:a aac -shortest -y /src/smoke.mp4
+	@echo ">>> [smoke] clearing any prior smoke output..."
+	@rm -rf $(OUTPUT_DIR)/smoke_p200* 2>/dev/null || true
+	@echo ">>> [smoke] bringing up a single-device farm from the working tree..."
+	$(MAKE) farm-dev DIST_WORKERS=
+	@echo ">>> [smoke] waiting for the server (:$(PORT))..."
+	@for i in $$(seq 1 30); do curl -sf http://localhost:$(PORT)/api/jobs >/dev/null 2>&1 && break; sleep 1; done
+	@echo ">>> [smoke] submitting encode (h264, 720p, 12s chunks) + waiting (timeout ~300s)..."
+	@id=$$(curl -sf -X POST http://localhost:$(PORT)/api/encode -H 'Content-Type: application/json' \
+	    -d '{"files":["smoke.mp4"],"target":"local-dist","codec":"h264","max_res":"720p","chunk_duration":"12"}' \
+	    | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["id"])'); \
+	  echo "    job $$id"; st=pending; \
+	  for i in $$(seq 1 60); do \
+	    st=$$(curl -sf http://localhost:$(PORT)/api/jobs | python3 -c "import sys,json; j=[x for x in json.load(sys.stdin) if x['id']=='$$id']; print(j[0]['status'] if j else 'gone')"); \
+	    echo "    status=$$st"; \
+	    case "$$st" in done) break;; failed|gone) echo '>>> SMOKE FAIL: job '"$$st"; exit 1;; esac; \
+	    sleep 5; \
+	  done; \
+	  [ "$$st" = done ] || { echo '>>> SMOKE FAIL: timed out'; exit 1; }
+	@d=$$(ls -d $(OUTPUT_DIR)/smoke_p200*h264* 2>/dev/null | head -1); \
+	 if [ -n "$$d" ] && ls "$$d"/*.m3u8 >/dev/null 2>&1; then \
+	   echo ">>> SMOKE PASS: $$d (has playlists)"; \
+	 else echo ">>> SMOKE FAIL: no smoke output dir with playlists in $(OUTPUT_DIR)"; exit 1; fi
