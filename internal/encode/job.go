@@ -1452,6 +1452,10 @@ func (m *Manager) run(job *Job, startIdx int) {
 		} else {
 			job.Status = StatusDone
 			job.Progress = "complete"
+			// Write the profile metadata (encode.json + a one-line manifest
+			// comment) into each output dir BEFORE promote, so a promoted copy
+			// carries it too.
+			m.writeEncodeMetaForDirs(job, moved)
 			if job.Config.PromoteAfter {
 				m.autoPromote(job, moved)
 			}
