@@ -115,10 +115,118 @@ func (m *Manager) projectLocalWallSeconds(cfg JobConfig, sourceWidth, fps int, d
 	return math.Max(coreSeconds/cores, floor)
 }
 
-// ensureSourceProbe probes the job's first source file once (duration/width/fps)
-// and caches the result on the Job, so live re-prediction — called on every
-// encode-speed sample — needn't re-invoke ffprobe. Returns false when the clip
-// can't be sized (no files / ffprobe failure / zero duration).
+// --- SaaS baseline pricing (per OUTPUT minute). Ported from commercial_cloud.py
+//     so BOTH targets compute the commercial + MediaConvert baselines the same
+//     way, server-side (they're a pure function of the ladder + probe, need no
+//     learned data). Previously only the local orchestrator emitted these, so
+//     cloud-batch jobs showed $0. ---
+
+var _commercialTiers = []struct {
+	maxH int
+	rate map[string]float64
+}{
+	{719, map[string]float64{"h264": 0.005, "hevc": 0.008, "av1": 0.010}},  // SD (<720)
+	{1080, map[string]float64{"h264": 0.010, "hevc": 0.015, "av1": 0.020}}, // HD
+	{1440, map[string]float64{"h264": 0.025, "hevc": 0.038, "av1": 0.050}}, // 1440p
+	{1 << 30, map[string]float64{"h264": 0.045, "hevc": 0.068, "av1": 0.090}}, // 4K+
+}
+
+const (
+	_commercialRepackPerMin = 0.003 // package each rendition to HLS/DASH
+	_commercialAudioPerMin  = 0.001 // one audio track when the source has audio
+)
+
+func _commercialRate(height int, codec string) float64 {
+	for _, t := range _commercialTiers {
+		if height <= t.maxH {
+			if r, ok := t.rate[codec]; ok {
+				return r
+			}
+			return t.rate["h264"]
+		}
+	}
+	return _commercialTiers[len(_commercialTiers)-1].rate["h264"]
+}
+
+// _fpsMult = ceil(fps/30): +100% per additional 30fps (30→1, 60→2).
+func _fpsMult(fps int) int {
+	if fps <= 0 {
+		fps = 30
+	}
+	m := (fps + 29) / 30
+	if m < 1 {
+		m = 1
+	}
+	return m
+}
+
+// _bitrateMult = +25% per 50 Mbps of source bitrate over 50.
+func _bitrateMult(srcMbps float64) float64 {
+	if srcMbps <= 50 {
+		return 1.0
+	}
+	return 1.0 + 0.25*math.Ceil((srcMbps-50)/50)
+}
+
+// MediaConvert: Basic tier for h264, Professional for hevc/av1; ×2 above 30fps.
+var (
+	_mcBasic = []struct {
+		maxH int
+		rate float64
+	}{{719, 0.0075}, {1080, 0.0150}, {1 << 30, 0.0300}}
+	_mcPro = []struct {
+		maxH int
+		rate float64
+	}{{719, 0.0170}, {1080, 0.0340}, {1 << 30, 0.0680}}
+)
+
+func _mcRate(height int, codec string) float64 {
+	t := _mcPro
+	if codec == "h264" {
+		t = _mcBasic
+	}
+	for _, e := range t {
+		if height <= e.maxH {
+			return e.rate
+		}
+	}
+	return t[len(t)-1].rate
+}
+
+// projectSaaSCosts returns what this ladder would cost on a hosted transcoder —
+// commercial cloud (per-output-minute tiers + repack + audio, × fps × bitrate)
+// and AWS MediaConvert (Basic/Pro tiers × 2 over 30fps). Target-independent.
+func (m *Manager) projectSaaSCosts(cfg JobConfig, sourceWidth, fps int, durationS float64, hasAudio bool, srcMbps float64) (commercial, mediaconvert float64) {
+	if m.Ladders == nil || durationS <= 0 {
+		return 0, 0
+	}
+	ladderName := cfg.Ladder
+	if ladderName == "" {
+		ladderName = "apple-uniq-live"
+	}
+	minutes := durationS / 60.0
+	cMult := float64(_fpsMult(fps)) * _bitrateMult(srcMbps)
+	mcMult := 1.0
+	if fps > 30 {
+		mcMult = 2.0
+	}
+	for _, c := range parseCodecSel(cfg.Codec) {
+		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, sourceWidth) {
+			commercial += minutes*_commercialRate(r.Height, c)*cMult + minutes*_commercialRepackPerMin
+			mediaconvert += minutes * _mcRate(r.Height, c) * mcMult
+		}
+	}
+	if hasAudio {
+		commercial += minutes * _commercialAudioPerMin
+	}
+	return commercial, mediaconvert
+}
+
+// ensureSourceProbe probes the job's first source file once (duration/width/fps
+// + audio presence + bitrate) and caches the result on the Job, so live re-
+// prediction — called on every encode-speed sample — needn't re-invoke ffprobe.
+// Returns false when the clip can't be sized (no files / ffprobe failure / zero
+// duration).
 func (m *Manager) ensureSourceProbe(job *Job) bool {
 	job.mu.Lock()
 	if job.probeDone {
@@ -134,13 +242,18 @@ func (m *Manager) ensureSourceProbe(job *Job) bool {
 	src := filepath.Join(m.SourceDir, job.Config.Files[0])
 	dur, err := probeDurationSeconds(src)
 	width, fps := 0, 0
+	hasAudio := false
+	var mbps float64
 	if err == nil && dur > 0 {
 		width = probeSourceWidth(src)
 		fps = probeSourceFps(src)
+		hasAudio = probeHasAudio(src)
+		mbps = probeSourceMbps(src)
 	}
 	job.mu.Lock()
 	job.probeDone = true
 	job.probeDuration, job.probeWidth, job.probeFps = dur, width, fps
+	job.probeHasAudio, job.probeSrcMbps = hasAudio, mbps
 	ok := dur > 0
 	job.mu.Unlock()
 	return ok
@@ -161,17 +274,31 @@ func (m *Manager) projectAndSetCosts(job *Job) {
 	}
 	job.mu.Lock()
 	dur, width, fps := job.probeDuration, job.probeWidth, job.probeFps
+	hasAudio, srcMbps := job.probeHasAudio, job.probeSrcMbps
 	job.mu.Unlock()
 
 	spot, ondemand := m.projectCloudCost(job.Config, width, fps, dur)
 	localWall := m.projectLocalWallSeconds(job.Config, width, fps, dur)
+	commercial, mediaconvert := m.projectSaaSCosts(job.Config, width, fps, dur, hasAudio, srcMbps)
 
 	job.mu.Lock()
+	if commercial > 0 {
+		job.CommercialUSD = commercial
+	}
+	if mediaconvert > 0 {
+		job.MediaConvertUSD = mediaconvert
+	}
 	if spot > 0 {
 		job.AwsSpotUSD, job.AwsOndemandUSD = spot, ondemand
 	}
 	if localWall > 0 {
-		job.LocalWallSeconds = localWall
+		// Don't overwrite the MEASURED local wall (elapsed+ETA) that computeProgress
+		// keeps for a running local-dist job — the model is only the pre-progress /
+		// cloud "what-if" estimate.
+		measured := job.Config.Target == TargetLocalDist && job.ETASeconds > 0
+		if !measured {
+			job.LocalWallSeconds = localWall
+		}
 	}
 	job.mu.Unlock()
 	m.notify(job)

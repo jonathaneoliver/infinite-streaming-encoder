@@ -25,7 +25,8 @@ type ladderRung struct {
 // sfnVariant is one entry in the SFN input's "variants" list. All the
 // worker-facing fields are strings because Batch job Parameters (Ref::x) are
 // string substitutions; Priority stays an int (SchedulingPriorityOverride
-// wants a number) and is the predicted encode wall time — see predictedPriority.
+// wants a number) and is a banded, rank-of-predicted-wall priority — assigned in
+// buildSFNInput so the heaviest variant strictly outranks the merely-heavy.
 type sfnVariant struct {
 	Codec    string `json:"codec"`
 	Label    string `json:"label"`

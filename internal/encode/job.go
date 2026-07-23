@@ -102,6 +102,33 @@ func probeSourceFps(path string) int {
 	return 0
 }
 
+// probeHasAudio reports whether the source has at least one audio stream, for
+// the commercial cost model's per-track audio add-on.
+func probeHasAudio(path string) bool {
+	cmd := exec.Command("ffprobe", "-v", "error",
+		"-select_streams", "a", "-show_entries", "stream=index",
+		"-of", "csv=p=0", path)
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
+}
+
+// probeSourceMbps reads the source's overall bitrate in Mbit/s (0 on failure),
+// for the commercial model's high-bitrate multiplier (+25% per 50 Mbps > 50).
+func probeSourceMbps(path string) float64 {
+	cmd := exec.Command("ffprobe", "-v", "error",
+		"-show_entries", "format=bit_rate",
+		"-of", "default=noprint_wrappers=1:nokey=1", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	bps, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil || bps <= 0 {
+		return 0
+	}
+	return bps / 1e6
+}
+
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\[\?[0-9;]*[a-zA-Z]|\x1b[()][0-9A-B]|\x1b\][^\x07]*\x07|\r`)
 
 func stripANSI(s string) string {
@@ -282,6 +309,15 @@ func (m *Manager) computeProgress(job *Job) {
 	job.OverallProgress = prog
 	if prog > 1 && prog < 99.5 && !job.StartedAt.IsZero() {
 		job.ETASeconds = time.Since(job.StartedAt).Seconds() * (100 - prog) / prog
+		// For a running LOCAL-DIST job, the local-hardware "cost" (predicted
+		// end−start wall clock) is best given by the MEASURED total: elapsed +
+		// ETA. Keep it consistent with the per-job ETA rather than the seed
+		// makespan model (projectLocalWallSeconds), which over-predicts until
+		// local speeds are learned. The model still covers the cloud "what-if"
+		// and the pre-progress estimate.
+		if job.Config.Target == TargetLocalDist {
+			job.LocalWallSeconds = time.Since(job.StartedAt).Seconds() + job.ETASeconds
+		}
 	} else {
 		job.ETASeconds = 0
 	}
@@ -469,17 +505,10 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Unlock()
 		return true
 	}
-	if m := commercialMarkerRe.FindStringSubmatch(line); m != nil {
-		// Only the SaaS baselines come from Python now (per-output-minute pricing
-		// needs no learned data). The AWS spot/on-demand numbers are computed
-		// server-side from the learned graviton speed model (projectCloudCost),
-		// so the marker's aws/aws_od fields (m[3]/m[4]) are intentionally ignored.
-		commercial, _ := strconv.ParseFloat(m[1], 64)
-		mediaconvert, _ := strconv.ParseFloat(m[2], 64)
-		j.mu.Lock()
-		j.CommercialUSD = commercial
-		j.MediaConvertUSD = mediaconvert
-		j.mu.Unlock()
+	if commercialMarkerRe.MatchString(line) {
+		// ALL cost baselines are now computed server-side from the ladder + probe
+		// (Manager.projectAndSetCosts) so cloud-batch and local-dist agree — the
+		// old local-only ENCODER-COMMERCIAL marker is just swallowed (not logged).
 		return true
 	}
 	if m := fileMarkerRe.FindStringSubmatch(line); m != nil {
@@ -853,6 +882,8 @@ type Job struct {
 	probeDuration float64
 	probeWidth    int
 	probeFps      int
+	probeHasAudio bool
+	probeSrcMbps  float64
 
 	// Run efficiency stats (from ENCODER-STATS, computed by the driver from Batch
 	// at job end). EncodeWallS = the Batch encode span (denominator for
@@ -2433,27 +2464,6 @@ func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, co
 	}
 }
 
-// predictedPriority ranks a variant by its predicted encode WALL time
-// (content ÷ learned-or-seeded speed) so the slowest variant gets the highest
-// Batch SchedulingPriorityOverride and enters the fleet first. Reuses the same
-// speed model as the dynamic chunk selector, so ordering sharpens as speeds are
-// learned. Clamped to Batch's [1, 9999] priority range. When the clip duration
-// is unknown (0), content falls back to 1 so variants still rank by 1/speed.
-func predictedPriority(speeds *EncodeSpeedStore, codec string, height int, twoPass bool, preset string, fps int, clipS float64) int {
-	content := clipS
-	if content <= 0 {
-		content = 1
-	}
-	p := int(math.Round(content / speeds.Speed("graviton", codec, height, twoPass, preset, fps)))
-	if p < 1 {
-		p = 1
-	}
-	if p > 9999 {
-		p = 9999
-	}
-	return p
-}
-
 // chunkPlanLine explains one variant's chunk-size decision for the job log:
 // how many chunks, the per-chunk length, and — for the dynamic selector — the
 // speed (learned or seeded) and target that produced it. This is what makes a
@@ -2587,6 +2597,7 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	// assigns ordinal labels for repeated resolutions — identical to
 	// ladder.select_rungs, so cloud and local agree on {codec}_{label}.
 	var variants []sfnVariant
+	var scores []float64 // predicted encode wall per variant, aligned with variants (for rank-based priority)
 	doH264, doHevc, doAV1 := false, false, false
 	for _, c := range codecs {
 		rungs := store.resolveRungs(ladderName, c, maxRes, sourceWidth)
@@ -2608,18 +2619,17 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			// two-passes by default unless the user asked for a single-pass
 			// comparison run (hevcSinglePass).
 			twoPass := c == "hevc" && !hevcSinglePass
-			// Priority = predicted encode WALL time (content ÷ learned speed):
-			// the slowest variant enters the fleet first. Subsumes the old
-			// resolution-tier + HEVC-bump heuristic — pixels, codec, and pass
-			// all fold into the speed model, so 1080p sorts ahead of 1044p and
-			// 4K HEVC 2-pass far ahead of any H.264, self-correcting as learned.
-			prio := predictedPriority(speeds, c, r.Height, twoPass, r.Preset, sourceFps, clipDurationS)
-			// Compress the within-job priority to 0-999 (order preserved; very slow
-			// variants tie at the top) and lift it into this job's band.
-			if prio > 999 {
-				prio = 999
+			// Ranking score = predicted encode WALL (content ÷ graviton speed). The
+			// banded SchedulingPriority is assigned by RANK of this score AFTER the
+			// loop (not by clamping the raw score), so the heaviest variant strictly
+			// outranks the merely-heavy — pixels, codec, and pass all fold into the
+			// speed model, self-correcting as speeds are learned.
+			score := clipDurationS
+			if score <= 0 {
+				score = 1
 			}
-			prio = clampPrio(priorityBase + prio)
+			score /= speeds.Speed("graviton", c, r.Height, twoPass, r.Preset, sourceFps)
+			scores = append(scores, score)
 			// Per-variant chunking: size this variant's chunks (dynamic by
 			// complexity, or the job's fixed/whole config), then enumerate them.
 			cs := variantChunkSeconds(chunkCfg, clipDurationS, speeds, c, r.Height, twoPass, r.Preset, sourceFps)
@@ -2640,7 +2650,7 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 				Preset:        r.Preset,
 				VCPU:          vcpu,
 				Memory:        mem,
-				Priority:      prio,
+				Priority:      0, // assigned by rank below
 				TwoPass:       strconv.FormatBool(twoPass),
 				ChunkIndices:  idx,
 				ChunkDuration: strconv.FormatFloat(cs, 'f', -1, 64),
@@ -2648,9 +2658,26 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			})
 		}
 	}
-	// Submit slowest-first (high resolution, then HEVC before H.264) so the
-	// long poles enter the queue early; schedulingPriority enforces it, but a
-	// good submission order helps too.
+	// Assign the banded SchedulingPriority by RANK of predicted encode wall: the
+	// heaviest variant gets 999 within this job's band, the next 998, and so on —
+	// strictly decreasing. Ranking (rather than clamping the raw score to 999) is
+	// what stops 4K H.264 and 4K HEVC 2-pass — both far past the old 999 cap —
+	// from tying at 999 and letting Batch start the cheaper H.264 first. A ladder
+	// has ≤ ~40 variants, so ranks never collide within the 999-wide band.
+	order := make([]int, len(variants))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return scores[order[a]] > scores[order[b]] })
+	for rank, vi := range order {
+		within := 999 - rank
+		if within < 1 {
+			within = 1
+		}
+		variants[vi].Priority = clampPrio(priorityBase + within)
+	}
+	// Submit slowest-first too (Priority desc) so submission order reinforces the
+	// scheduler's priority — the long poles enter the queue first.
 	sortRungsSlowestFirst(variants)
 	// chunk_indices / chunk_duration / chunked are PER-VARIANT now (on each
 	// sfnVariant above): each variant sizes its own chunks by complexity, so the
