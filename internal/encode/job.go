@@ -2927,6 +2927,13 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 		"-e", "LADDER_STORE=" + filepath.Join(m.TmpDir, "ladders.json"),
 		"--entrypoint", script,
 	}
+	// Dev: overlay the host's working-tree encoder package onto the image's, so
+	// a spawned orchestrator (local-dist) runs current code without a rebuild.
+	// Opt-in via HOST_SCRIPTS_DIR (set by `make farm-dev`); empty in normal runs,
+	// where the container uses the image's baked scripts.
+	if dir := os.Getenv("HOST_SCRIPTS_DIR"); dir != "" {
+		runArgs = append(runArgs, "-v", dir+":"+filepath.Join(m.ScriptsDir, "encoder")+":ro")
+	}
 	// Cloud jobs drive AWS from inside the worker; pass the credentials
 	// directory and the AWS / GHCR env vars the wrapper expects.
 	if job.Config.Target == TargetCloud {

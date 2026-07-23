@@ -9,13 +9,18 @@
 #       (docker save | ssh docker load) — no GHCR auth, no cross-arch emulation.
 #       Great for extra Apple-Silicon boxes (Mac Mini). Transferred once; later
 #       deploys skip it (set FORCE_IMAGE=1 to re-send after a base/deps rebuild).
-#   different arch           -> BUILD encoder-temporal:cur from the GHCR base
-#       (needs the box logged into GHCR). This is the Linux/amd64 path (ubuntu).
+#   different arch           -> BUILD from the GHCR base (fast; just adds
+#       temporalio). This is the Linux/amd64 path (ubuntu). With DEV_BUILD=1 it
+#       instead builds the WORKING-TREE Dockerfile NATIVELY on the box — slower
+#       first time, but bakes your uncommitted deps for that arch (no QEMU, no
+#       push). Use it when you've changed requirements.txt / the Dockerfile.
 # Either way current code is rsync'd and bind-mounted, so routine code deploys
 # only move the small scripts/encoder dir, never the whole image.
 #
 # Env: MASTER_IP (LAN IP of the master, default 192.168.0.110),
-#      MINIO_ROOT_USER / MINIO_ROOT_PASSWORD, FORCE_IMAGE=1 to force a re-transfer.
+#      MINIO_ROOT_USER / MINIO_ROOT_PASSWORD, FORCE_IMAGE=1 to re-transfer a
+#      same-arch image (e.g. after a dep change), DEV_BUILD=1 to native-build on
+#      a cross-arch box.
 set -euo pipefail
 SSH_TARGET="${1:?usage: deploy-worker.sh <ssh_target> <label> [remote_code_dir]}"
 LABEL="${2:?label (e.g. macmini) required}"
@@ -36,8 +41,17 @@ if [ -n "$master_arch" ] && [ "$master_arch" = "$remote_arch" ]; then
     else
         echo ">>> [$LABEL] $SSH_TARGET — same arch ($remote_arch): $image already present (FORCE_IMAGE=1 to re-send)"
     fi
+elif [ "${DEV_BUILD:-}" = "1" ]; then
+    echo ">>> [$LABEL] $SSH_TARGET — arch $remote_arch vs master $master_arch: DEV_BUILD — building the working-tree image natively on the box"
+    image="encoder-dev:cur"
+    ssh -o BatchMode=yes "$SSH_TARGET" "mkdir -p /tmp/encoder-build"
+    # Ship just the Dockerfile build context (mirrors the Dockerfile's COPY set),
+    # then build natively on the box — bakes uncommitted deps for its arch.
+    rsync -a --delete Dockerfile requirements.txt go.mod cmd internal scripts static \
+        "$SSH_TARGET:/tmp/encoder-build/"
+    ssh -o BatchMode=yes "$SSH_TARGET" "cd /tmp/encoder-build && docker build -q -t $image . >/dev/null"
 else
-    echo ">>> [$LABEL] $SSH_TARGET — arch $remote_arch vs master $master_arch: build from GHCR base"
+    echo ">>> [$LABEL] $SSH_TARGET — arch $remote_arch vs master $master_arch: build from GHCR base (DEV_BUILD=1 to native-build uncommitted deps)"
     image="encoder-temporal:cur"
     ssh -o BatchMode=yes "$SSH_TARGET" "
         docker pull -q $BASE_IMAGE >/dev/null 2>&1 || true
