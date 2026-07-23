@@ -270,16 +270,21 @@ ecr-login:
 	aws ecr get-login-password --region $(AWS_REGION) | \
 	  docker login --username AWS --password-stdin $(ECR_REGISTRY)
 
-ecr-push: ecr-login   ## build arm64 (Graviton) + push the worker image to ECR
-	# The default buildx "docker" driver already caches layers in the local
-	# daemon across builds, so an incremental (script-only) build reuses the
-	# heavy ffmpeg/Shaka layers. External registry cache (--cache-to) needs a
-	# docker-container buildx builder; not worth it on one host, adopt only if
-	# builds move to multiple machines/CI.
-	docker buildx build --platform linux/arm64 \
+ecr-push: ecr-login   ## build ONCE (amd64+arm64) + push to BOTH ECR and GHCR, in sync
+	# Single multi-arch build pushed to BOTH registries with the SAME tags, so the
+	# cloud-batch image (ECR, Graviton pulls arm64) and the local + local-dist
+	# image (GHCR; Macs arm64, ubuntu amd64) can never drift out of sync. Requires
+	# GHCR_PAT (write:packages) + a docker-container buildx builder for multi-arch.
+	@: $${GHCR_PAT:?GHCR_PAT is not set — required so deploy keeps ECR + GHCR in sync (classic PAT, write:packages)}
+	@echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin
+	@docker buildx inspect encoder-builder >/dev/null 2>&1 || \
+		docker buildx create --name encoder-builder --driver docker-container >/dev/null
+	docker buildx build --builder encoder-builder --platform linux/amd64,linux/arm64 \
 		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(IMAGE_TAG) \
-		--tag $(ECR_REPO):latest --tag $(ECR_REPO):$(IMAGE_TAG) --push .
-	@echo "Pushed $(ECR_REPO):latest :$(IMAGE_TAG) (linux/arm64)"
+		--tag $(ECR_REPO):latest   --tag $(ECR_REPO):$(IMAGE_TAG) \
+		--tag $(GHCR_IMAGE):latest --tag $(GHCR_IMAGE):$(IMAGE_TAG) \
+		--push .
+	@echo "Pushed :latest :$(IMAGE_TAG) → ECR ($(ECR_REPO)) + GHCR ($(GHCR_IMAGE)) [amd64+arm64, in sync]"
 
 infra-init:           ## tofu init (local backend override, if present)
 	cd $(TF_DIR) && tofu init
