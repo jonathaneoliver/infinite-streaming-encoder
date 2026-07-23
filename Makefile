@@ -540,6 +540,8 @@ farm-dev: require-paths   ## dev farm from your WORKING TREE (uncommitted): loca
 # The multi-box and cloud topologies are manual (hardware / cost).
 .PHONY: smoke
 SMOKE_SRC ?= $(SOURCE_DIR)/smoke.mp4
+# Open the jobs page in a browser during the run; set SMOKE_OPEN=0 to skip.
+SMOKE_OPEN ?= 1
 
 smoke: require-paths build   ## end-to-end single-device smoke: tiny clip -> local-dist encode -> assert output
 	@echo ">>> [smoke] generating $(SMOKE_SRC) (if missing)..."
@@ -552,6 +554,8 @@ smoke: require-paths build   ## end-to-end single-device smoke: tiny clip -> loc
 	$(MAKE) farm-dev DIST_WORKERS=
 	@echo ">>> [smoke] waiting for the server (:$(PORT))..."
 	@for i in $$(seq 1 30); do curl -sf http://localhost:$(PORT)/api/jobs >/dev/null 2>&1 && break; sleep 1; done
+	@echo ">>> [smoke] opening the jobs page (set SMOKE_OPEN=0 to skip)..."
+	@[ "$(SMOKE_OPEN)" = "0" ] || ( open http://localhost:$(PORT)/ 2>/dev/null || xdg-open http://localhost:$(PORT)/ 2>/dev/null ) || echo "    watch it at http://localhost:$(PORT)/"
 	@echo ">>> [smoke] submitting encode (h264, 720p, 12s chunks) + waiting (timeout ~300s)..."
 	@id=$$(curl -sf -X POST http://localhost:$(PORT)/api/encode -H 'Content-Type: application/json' \
 	    -d '{"files":["smoke.mp4"],"target":"local-dist","codec":"h264","max_res":"720p","chunk_duration":"12"}' \
