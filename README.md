@@ -1,4 +1,4 @@
-# Encoder
+# infinite-streaming-encoder
 
 A Go HTTP server + single-page UI that drives adaptive-bitrate (ABR) video
 encoding. The Go code is a thin **control plane**; the actual encoding —

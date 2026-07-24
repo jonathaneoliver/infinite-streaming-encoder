@@ -9,3 +9,8 @@ __pycache__/
 
 # Playwright MCP browser-automation console logs — local only, not source.
 .playwright-mcp/
+
+# transient Claude worktrees
+.claude/worktrees/
+# untracked comparison doc — never commit
+ENCODER_COMPARISON.md

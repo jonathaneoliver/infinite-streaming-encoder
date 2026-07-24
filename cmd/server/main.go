@@ -9,10 +9,10 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/jonathaneoliver/encoder/internal/api"
-	"github.com/jonathaneoliver/encoder/internal/awswatch"
-	"github.com/jonathaneoliver/encoder/internal/encode"
-	"github.com/jonathaneoliver/encoder/internal/watcher"
+	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/api"
+	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/awswatch"
+	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/encode"
+	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/watcher"
 )
 
 // Version + gitSha are stamped at build time via

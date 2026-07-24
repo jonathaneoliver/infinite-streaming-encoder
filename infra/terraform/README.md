@@ -1,6 +1,6 @@
 # AWS Batch infrastructure for encoder
 
-Terraform that provisions the Batch + Step Functions pipeline described in [issue #14](https://github.com/jonathaneoliver/Encoder/issues/14).
+Terraform that provisions the Batch + Step Functions pipeline described in [issue #14](https://github.com/jonathaneoliver/infinite-streaming-encoder/issues/14).
 
 ## First-run checklist
 

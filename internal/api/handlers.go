@@ -12,8 +12,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/jonathaneoliver/encoder/internal/encode"
-	"github.com/jonathaneoliver/encoder/internal/imageinfo"
+	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/encode"
+	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/imageinfo"
 )
 
 type Server struct {
