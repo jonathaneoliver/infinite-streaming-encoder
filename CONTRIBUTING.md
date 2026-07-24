@@ -86,7 +86,10 @@ reload the page.
 orchestration, packaging, the cloud path, or the farm scripts, run the relevant topologies:
 
 - **`make smoke`** — automated single-box local farm encode, end to end (generates a tiny
-  clip, encodes it, asserts the `.m3u8` output). This is also what CI runs on every PR.
+  clip, encodes it, asserts the `.m3u8` output). The same job exists as the `smoke` GitHub
+  workflow, but it's **manual-only** (too slow to gate every PR) — run it from the Actions
+  tab or `gh workflow run smoke.yml` before merging pipeline-affecting changes. The per-PR
+  gate is the fast `ci` workflow (`gofmt` / `go vet` / `go build` + `tofu fmt`).
 - **Two-box / cross-arch / cloud** — the manual tests 2–4 in `docs/TESTING.md` (they need your
   hardware or cost a few cents on AWS).
 

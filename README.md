@@ -1,7 +1,6 @@
 # infinite-streaming-encoder
 
 [![CI](https://img.shields.io/github/actions/workflow/status/jonathaneoliver/infinite-streaming-encoder/ci.yml?branch=main&label=ci)](https://github.com/jonathaneoliver/infinite-streaming-encoder/actions/workflows/ci.yml)
-[![Smoke](https://img.shields.io/github/actions/workflow/status/jonathaneoliver/infinite-streaming-encoder/smoke.yml?branch=main&label=smoke)](https://github.com/jonathaneoliver/infinite-streaming-encoder/actions/workflows/smoke.yml)
 [![Release](https://img.shields.io/github/v/release/jonathaneoliver/infinite-streaming-encoder?label=release&color=blue)](https://github.com/jonathaneoliver/infinite-streaming-encoder/releases/latest)
 [![License](https://img.shields.io/badge/license-InfiniteStream-lightgrey)](LICENSE)
 [![GHCR](https://img.shields.io/badge/ghcr.io-infinite--streaming--encoder-2496ED?logo=docker&logoColor=white)](https://github.com/jonathaneoliver/infinite-streaming-encoder/pkgs/container/infinite-streaming-encoder)

@@ -22,6 +22,11 @@ permissions:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
+    # Code scanning (SARIF upload) is only available on public repos (or with
+    # GitHub Advanced Security). While this repo is private the analysis runs
+    # but the upload fails, so skip the job until the repo is public — at which
+    # point it activates automatically with no further changes.
+    if: github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
