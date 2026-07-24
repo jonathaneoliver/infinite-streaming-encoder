@@ -401,6 +401,23 @@ def ladder_bufsize_multiplier(ladder_def: dict) -> float:
     return float(ladder_def.get("bufsize_multiplier") or BUFSIZE_MULTIPLIER)
 
 
+def ladder_extra_args(ladder_def: dict, codec: str) -> str:
+    """Raw per-codec ffmpeg extra args for a codec on this ladder ("" when
+    unset — the default). Mirrors LadderDef.extraArgsFor on the Go side."""
+    return str((ladder_def.get("extra_args") or {}).get(codec, "") or "")
+
+
+def ladder_passes(ladder_def: dict, codec: str) -> int:
+    """Encode pass count for a codec on this ladder, falling back to the
+    codec-intrinsic default (hevc:2, everything else:1) when unset. Mirrors
+    LadderDef.passesFor on the Go side — the single source of truth for the
+    two-pass decision now that it lives in the profile."""
+    n = (ladder_def.get("passes") or {}).get(codec)
+    if isinstance(n, int) and n > 0:
+        return n
+    return 2 if codec == "hevc" else 1
+
+
 def _normalize_rung_row(row) -> tuple[int, int, int, str]:
     """Accept a [w,h,b] / [w,h,b,preset] list or a rung dict; return
     (width, height, bitrate, preset)."""

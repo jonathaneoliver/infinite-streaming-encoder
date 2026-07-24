@@ -38,6 +38,11 @@ type sfnVariant struct {
 	Memory   string `json:"memory"`
 	Priority int    `json:"priority"`
 	TwoPass  string `json:"two_pass"`
+	// ExtraArgs is the ladder profile's per-codec raw ffmpeg args for THIS
+	// variant's codec (resolved from LadderDef.ExtraArgs[codec]; "" = none).
+	// Travels to the worker as the EXTRA_ARGS container env, alongside TWO_PASS.
+	// (#59's per-codec pass count needs no new field — it's folded into TwoPass.)
+	ExtraArgs string `json:"extra_args"`
 	// Per-variant chunking (dynamic chunk selector): each variant sizes its own
 	// chunks by complexity, so a slow 4K HEVC gets many 30s chunks while a cheap
 	// H264 runs whole. ChunkIndices is [0..n-1]; ChunkDuration is the chunk size

@@ -40,7 +40,8 @@ from infinite_streaming_encoder.hls import (
 from infinite_streaming_encoder.manifests import write_fragmented_mpd
 from infinite_streaming_encoder.ladder import (
     Rung, get_ladder, label_height, ladder_bufsize_multiplier,
-    ladder_maxrate_percent, parse_bitrate_override, select_rungs,
+    ladder_extra_args, ladder_maxrate_percent, ladder_passes,
+    parse_bitrate_override, select_rungs,
 )
 from infinite_streaming_encoder.mezzanine import MezzanineSpec, create_mezzanine
 from infinite_streaming_encoder.packager import PackageSpec, package
@@ -387,7 +388,10 @@ def run_full(args: argparse.Namespace) -> int:
             padding_duration_s=video_pad_s,
             maxrate_percent=ladder_maxrate_percent(ladder_def),
             bufsize_multiplier=ladder_bufsize_multiplier(ladder_def),
-            hevc_two_pass=not args.hevc_single_pass,
+            # Pass count + extra_args from the ladder profile; hevc_single_pass
+            # stays a per-encode override forcing HEVC single-pass.
+            hevc_two_pass=ladder_passes(ladder_def, "hevc") == 2 and not args.hevc_single_pass,
+            extra_args={c: ladder_extra_args(ladder_def, c) for c in ("h264", "hevc", "av1")},
         )
 
         print(f"[phase 3] encoding variants: codec={args.codec} "

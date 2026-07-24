@@ -506,6 +506,11 @@ def phase_variant(args: argparse.Namespace) -> int:
         # codec-correct decision; feeding it hevc_two_pass is a no-op for a
         # non-HEVC job (encode_variants gates on codec == "hevc").
         hevc_two_pass=args.two_pass or _env_flag("TWO_PASS"),
+        # Per-codec profile extra_args: the --extra-args flag (local dist path)
+        # or the EXTRA_ARGS container env (cloud SFN). This worker encodes a
+        # single codec, so map the value under its own codec for
+        # build_ffmpeg_cmd's ctx.extra_args[codec] lookup.
+        extra_args={args.codec: (getattr(args, "extra_args", "") or os.environ.get("EXTRA_ARGS", ""))},
     )
 
     # Chunked mode: encode only chunk `--chunk-index` of the variant. The
@@ -951,6 +956,10 @@ def _build_parser() -> argparse.ArgumentParser:
     v.add_argument("--s3-out", required=True, dest="s3_out")
     v.add_argument("--two-pass", action="store_true", dest="two_pass",
                    help="two-pass software encode (also honors TWO_PASS env)")
+    v.add_argument("--extra-args", default="", dest="extra_args",
+                   help="raw per-codec ffmpeg args from the ladder profile, "
+                        "appended after rate control (also honors EXTRA_ARGS "
+                        "env); shlex-split to argv, never shell-eval'd")
     v.add_argument("--chunk-index", type=int, default=None, dest="chunk_index",
                    help="encode only this 0-based chunk of the variant "
                         "(Batch array index); omit for a whole-clip encode")

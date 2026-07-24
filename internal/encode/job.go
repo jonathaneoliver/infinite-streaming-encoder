@@ -2638,11 +2638,15 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		}
 		for _, r := range rungs {
 			vcpu, mem := variantResourcesFor(c, r.Height)
-			// Two-pass is HEVC-only and automatic: H264's single-pass VBV
-			// already hits target average, so it never two-passes; HEVC
-			// two-passes by default unless the user asked for a single-pass
-			// comparison run (hevcSinglePass).
-			twoPass := c == "hevc" && !hevcSinglePass
+			// Two-pass is now owned by the ladder profile's per-codec pass count
+			// (LadderDef.Passes → passesFor: hevc defaults to 2, h264/av1 to 1;
+			// h264:2/av1:2 are rejected at save time). The per-encode
+			// hevcSinglePass flag is kept as an OVERRIDE to force a single-pass
+			// HEVC comparison run without cloning the ladder.
+			twoPass := ladderDef.passesFor(c) == 2
+			if hevcSinglePass && c == "hevc" {
+				twoPass = false
+			}
 			// Ranking score = predicted encode WALL (content ÷ graviton speed). The
 			// banded SchedulingPriority is assigned by RANK of this score AFTER the
 			// loop (not by clamping the raw score), so the heaviest variant strictly
@@ -2676,6 +2680,7 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 				Memory:        mem,
 				Priority:      0, // assigned by rank below
 				TwoPass:       strconv.FormatBool(twoPass),
+				ExtraArgs:     ladderDef.extraArgsFor(c),
 				ChunkIndices:  idx,
 				ChunkDuration: strconv.FormatFloat(cs, 'f', -1, 64),
 				Chunked:       strconv.FormatBool(nc > 1),

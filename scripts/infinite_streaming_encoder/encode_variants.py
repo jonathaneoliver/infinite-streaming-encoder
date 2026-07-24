@@ -8,6 +8,7 @@ requirement for LL-HLS playback downstream.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -72,10 +73,19 @@ class EncodeContext:
     # via the null muxer), pass 2 distributes bits to hit the average
     # accurately while the SAME maxrate/bufsize VBV keeps peaks flat.
     #
-    # hevc_two_pass defaults True (the correct behaviour). Set False only
-    # to run HEVC single-pass for a side-by-side bitrate comparison — see
-    # the "HEVC pass" selector in the UI, which maps here.
+    # hevc_two_pass defaults True (the correct behaviour). Its value now comes
+    # from the ladder profile's per-codec `passes` (passes.hevc == 1 → False);
+    # the control moved off the per-encode form into the profile. Only HEVC
+    # varies (h264 is always 1-pass, av1 has no 2-pass path), so a single bool
+    # still captures the whole degree of freedom.
     hevc_two_pass: bool = True
+    # extra_args maps a codec to raw ffmpeg tokens appended after the rung's
+    # rate-control block and before the output — the ladder profile's per-codec
+    # `extra_args`. Absent/"" for a codec = none. Split with shlex (never
+    # shell-eval'd). A per-codec map (not a single string) because a local run
+    # reuses one context across all codecs; a cloud variant job carries just its
+    # own codec's entry.
+    extra_args: dict[str, str] | None = None
 
 
 class EncodeError(RuntimeError):
@@ -273,6 +283,14 @@ def build_ffmpeg_cmd(
             "-maxrate", f"{maxrate_k}k",
             "-bufsize", f"{bufsize_k}k",
         ]
+    # Per-codec profile extra_args, appended AFTER rate control so a user can
+    # add options and (where ffmpeg allows) override a preceding one, at their
+    # own risk. shlex → argv, never shell-eval'd. Applied to both passes of a
+    # two-pass encode (build_ffmpeg_cmd runs per pass), matching how the rest of
+    # the codec args are shared across passes.
+    extra = (ctx.extra_args or {}).get(codec, "")
+    if extra:
+        cmd += shlex.split(extra)
     if pass_num == 1:
         # Analysis pass: discard the muxed output, keep only the stats.
         cmd += ["-an", "-f", "null", "-"]
