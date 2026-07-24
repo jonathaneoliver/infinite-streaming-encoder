@@ -2245,10 +2245,15 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 			m.notify(job)
 			upload := exec.Command("aws", "s3", "cp", localSrc, s3Input) // no --only-show-errors: we want the progress lines
 			upload.Env = os.Environ()
-			stderr, pipeErr := upload.StderrPipe()
+			// aws s3 cp writes its "Completed X/Y" progress to STDOUT (errors go
+			// to stderr). Scan stdout for the progress bar; buffer stderr for the
+			// failure message.
+			stdoutPipe, pipeErr := upload.StdoutPipe()
 			if pipeErr != nil {
-				return fmt.Errorf("aws s3 cp stderr pipe: %w", pipeErr)
+				return fmt.Errorf("aws s3 cp stdout pipe: %w", pipeErr)
 			}
+			var stderrBuf bytes.Buffer
+			upload.Stderr = &stderrBuf
 			if err := upload.Start(); err != nil {
 				job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
 				m.notify(job)
@@ -2256,7 +2261,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 			}
 			// aws s3 cp updates its progress in place with '\r'; split on both \r and \n
 			// so intermediate updates are seen, not just the final \n-terminated line.
-			upScanner := bufio.NewScanner(stderr)
+			upScanner := bufio.NewScanner(stdoutPipe)
 			upScanner.Buffer(make([]byte, 64*1024), 1<<20)
 			upScanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
 				if atEOF && len(data) == 0 {
@@ -2270,20 +2275,17 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 				}
 				return 0, nil, nil
 			})
-			var lastErr string
 			for upScanner.Scan() {
 				line := strings.TrimSpace(upScanner.Text())
 				if pct, ok := parseAwsCpProgress(line); ok {
 					job.upsertStage("upload:inputs", "upload inputs", "running", pct)
 					m.notify(job)
-				} else if line != "" && !strings.HasPrefix(line, "Completed") {
-					lastErr = line // keep the tail of any non-progress (error) output
 				}
 			}
 			if err := upload.Wait(); err != nil {
 				job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
 				m.notify(job)
-				return fmt.Errorf("aws s3 cp: %w: %s", err, lastErr)
+				return fmt.Errorf("aws s3 cp: %w: %s", err, strings.TrimSpace(stderrBuf.String()))
 			}
 			job.upsertStage("upload:inputs", "upload inputs", "done", 100)
 			m.notify(job)
