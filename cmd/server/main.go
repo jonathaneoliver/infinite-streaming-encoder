@@ -61,7 +61,7 @@ func main() {
 	stateMachineArn := flag.String("state-machine-arn", env("STATE_MACHINE_ARN", ""), "Step Functions state machine ARN for the cloud-batch target (empty disables that target)")
 	autoWatch := flag.Bool("auto-watch", env("AUTO_WATCH", "true") == "true", "auto-encode new files in source dir")
 	watchInterval := flag.Duration("watch-interval", 30*time.Second, "filesystem watch polling interval")
-	defaultTarget := flag.String("default-target", env("DEFAULT_TARGET", "local"), "default encode target: cloud or local")
+	defaultTarget := flag.String("default-target", env("DEFAULT_TARGET", "local-dist"), "default encode target: local-dist or cloud-batch")
 	defaultCodec := flag.String("default-codec", env("DEFAULT_CODEC", "both"), "default codec: h264, hevc, both")
 	defaultLadder := flag.String("default-ladder", env("DEFAULT_LADDER", "apple-uniq-live"), "default encoding ladder profile")
 	defaultMaxRes := flag.String("default-max-res", env("DEFAULT_MAX_RES", ""), "default max resolution (empty = no limit)")

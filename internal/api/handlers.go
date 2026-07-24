@@ -227,6 +227,15 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 	if cfg.Codec == "" {
 		cfg.Codec = "both"
 	}
+	// Reject unknown/retired targets up front with a clear message, rather than
+	// letting a bad target string (e.g. the retired "local"/"cloud") fail
+	// cryptically deep in the encode path.
+	switch cfg.Target {
+	case encode.TargetLocalDist, encode.TargetCloudBatch:
+	default:
+		http.Error(w, fmt.Sprintf("unknown target %q — use local-dist or cloud-batch", cfg.Target), http.StatusBadRequest)
+		return
+	}
 	// One job per file: each selected file becomes its own independent job, so
 	// they run concurrently (up to MAX_CONCURRENT), each with its own log,
 	// history, cancel and retry — instead of a single batched job that processes
