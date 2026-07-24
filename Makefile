@@ -82,7 +82,7 @@ COMPOSE_DEV  := $(COMPOSE_BASE) -f docker-compose.dev.yml
 # compose as ENCODE_SLOTS (empty string is safe: compose ${ENCODE_SLOTS:-0}).
 FARM_ENCODE_SLOTS := $(shell P=$$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null); if [ -n "$$P" ] && [ "$$P" -gt 1 ]; then echo $$((P/2)); fi)
 
-.PHONY: require-paths build run run-remote down stop restart logs shell status clean push push-setup cloud-push version setup-hooks
+.PHONY: require-paths build run run-remote down stop restart logs shell status clean publish version setup-hooks
 
 # Point git at the committed hooks (scripts/git-hooks/) so the pre-push guard
 # that blocks direct pushes to main is active in this clone. Run once per clone.
@@ -154,47 +154,25 @@ status:
 clean: stop
 	docker rmi $(IMAGE_NAME) 2>/dev/null || true
 
-# One-time setup for multi-arch push. Requires GHCR_PAT in the
-# environment (or .env) with write:packages scope.
-push-setup:
+# Build multi-arch + publish the farm image to GHCR (:latest :VERSION :GIT_SHA).
+# Self-contained: logs into GHCR and ensures the docker-container buildx builder
+# exists, so it works on a fresh machine. Run before `make farm-up` so every box
+# pulls the same published image. (The cloud path publishes to ECR+GHCR via a
+# separate target, ecr-publish, invoked by cloud-up/deploy — see below.)
+publish:              ## build multi-arch + publish the farm image to GHCR (:latest :VERSION :GIT_SHA)
 	@: $${GHCR_PAT:?GHCR_PAT is not set — create a classic PAT with write:packages scope}
 	@echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin
 	@docker buildx inspect encoder-builder >/dev/null 2>&1 || \
-		docker buildx create --name encoder-builder --driver docker-container --use
-	@docker buildx use encoder-builder
-	@docker buildx inspect --bootstrap
-
-# Full multi-arch release push. Use when cutting a release (bumping
-# VERSION) or when you've touched something Graviton-specific.
-# Publishes three tags: latest, $(VERSION), and $(GIT_SHA).
-push:
-	docker buildx build \
+		docker buildx create --name encoder-builder --driver docker-container >/dev/null
+	docker buildx build --builder encoder-builder \
 		--platform $(PLATFORMS) \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_SHA=$(GIT_SHA) \
 		--tag $(GHCR_IMAGE):latest \
 		--tag $(GHCR_IMAGE):$(VERSION) \
 		--tag $(GHCR_IMAGE):$(GIT_SHA) \
-		--push \
-		.
+		--push .
 	@echo "Published $(GHCR_IMAGE):latest :$(VERSION) :$(GIT_SHA) for $(PLATFORMS)"
-
-# Fast iterative push for cloud-feature work. Single-arch (linux/amd64,
-# matches the default c7i instance family), so no 5-10 minute ARM QEMU
-# build. Useful when you're debugging the cloud pipeline and want the
-# next EC2 launch to pick up your changes. Publishes :latest + commit
-# SHA tags; skips the :$(VERSION) tag so release tags stay multi-arch.
-# If you need Graviton after iterating, finish with `make push`.
-cloud-push:
-	docker buildx build \
-		--platform linux/amd64 \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg GIT_SHA=$(GIT_SHA) \
-		--tag $(GHCR_IMAGE):latest \
-		--tag $(GHCR_IMAGE):$(GIT_SHA) \
-		--push \
-		.
-	@echo "Published $(GHCR_IMAGE):latest :$(GIT_SHA) (linux/amd64 only)"
 
 # ---------------------------------------------------------------------------
 # Cloud-batch deploy (AWS Batch + Step Functions). Replaces the manual
@@ -246,7 +224,7 @@ STATE_MACHINE_ARN ?= $(shell cd $(TF_DIR) && tofu output -no-color -raw state_ma
 # (~$1.50/mo until cloud-clear/cloud-down). Default off: cold ECR pull (~60s).
 USE_AMI ?=
 
-.PHONY: ecr-login ecr-push infra-init infra-plan infra-apply deploy deploy-review timing cpu-report cloud-up cloud-clear cloud-down cloud-check ami-up ami-down
+.PHONY: ecr-login ecr-publish infra-init infra-plan infra-apply deploy deploy-review timing cpu-report cloud-up cloud-clear cloud-down cloud-check ami-up ami-down
 
 # Resolve the pre-baked worker AMI for the CURRENT image tag, if one exists.
 # Empty when nothing is baked -> Batch pulls the image on boot. This is what
@@ -262,7 +240,7 @@ ecr-login:
 	aws ecr get-login-password --region $(AWS_REGION) | \
 	  docker login --username AWS --password-stdin $(ECR_REGISTRY)
 
-ecr-push: ecr-login   ## build ONCE (amd64+arm64) + push to BOTH ECR and GHCR, in sync
+ecr-publish: ecr-login   ## build ONCE (amd64+arm64) + push to BOTH ECR and GHCR, in sync
 	# Single multi-arch build pushed to BOTH registries with the SAME tags, so the
 	# cloud-batch image (ECR, Graviton pulls arm64) and the local + local-dist
 	# image (GHCR; Macs arm64, ubuntu amd64) can never drift out of sync. Requires
@@ -301,7 +279,7 @@ cloud-down:           ## FULL teardown -> $0/mo (no prompt): tofu destroy -auto-
 # re-resolves ECR_REPO / WORKER_AMI from CURRENT state. Order matters:
 #   1. init + apply   — create/reconcile ECR, Batch, VPC, SFN, IAM (image pulls
 #                       on boot unless an AMI is wired in below).
-#   2. ecr-push       — push :IMAGE_TAG so the image exists to run (+ bake).
+#   2. ecr-publish       — push :IMAGE_TAG so the image exists to run (+ bake).
 #   3. USE_AMI=1 only — ami-up (bake), wait for it, then a second plan+apply wires
 #                       the AMI into the launch template. Off by default (~60s
 #                       cold ECR pull is cheaper than the standing ~$1.50/mo).
@@ -310,7 +288,7 @@ cloud-up:             ## provision/reconcile the cloud stack to current code + v
 	$(MAKE) infra-init
 	$(MAKE) infra-plan
 	$(MAKE) infra-apply
-	$(MAKE) ecr-push
+	$(MAKE) ecr-publish
 	@if [ "$(USE_AMI)" = 1 ]; then \
 	  $(MAKE) ami-up; \
 	  echo ">>> waiting for the baked AMI to be queryable (EC2 is eventually consistent)..."; \
@@ -340,7 +318,7 @@ cloud-check:          ## live cloud readiness: AWS creds + state machine + S3 bu
 deploy:               ## push image + restart + plan + APPLY infra (one shot)
 	@start=$$(date +%s); \
 	echo ">>> deploy started $$(date '+%H:%M:%S')  worker=$(IMAGE_TAG)"; \
-	if $(MAKE) ecr-push && $(MAKE) restart && $(MAKE) infra-plan && $(MAKE) infra-apply; then \
+	if $(MAKE) ecr-publish && $(MAKE) restart && $(MAKE) infra-plan && $(MAKE) infra-apply; then \
 		el=$$(( $$(date +%s) - start )); \
 		printf '\a\n\033[1;32m==================================================\n'; \
 		printf '  DEPLOY COMPLETE  %dm %02ds   worker=%s\n' $$((el/60)) $$((el%60)) "$(IMAGE_TAG)"; \
@@ -353,7 +331,7 @@ deploy:               ## push image + restart + plan + APPLY infra (one shot)
 	fi
 
 deploy-review:        ## like deploy but stop at the plan (review before infra-apply)
-	$(MAKE) ecr-push
+	$(MAKE) ecr-publish
 	$(MAKE) restart
 	$(MAKE) infra-plan
 	@echo ">>> Review the plan above. To apply it:  make infra-apply"

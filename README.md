@@ -59,6 +59,27 @@ tree** instead, use `make farm-dev-up` (below). `make run` / `make run-remote` b
 up **just the server** (against an already-running cluster), which is what
 `make restart` / `make deploy` use to bounce it after an image change.
 
+### From a clean checkout → running: three scenarios
+
+Everything reduces to three, chosen by *where the workers run* and *whose code*:
+
+| Goal | Commands |
+| --- | --- |
+| **Local farm, your working-tree code** (the dev loop) | `make farm-dev-up` |
+| **Local farm, the published image** (multi-box, identical everywhere) | `make publish` → `make farm-up` |
+| **Cloud (AWS Batch)** | `make cloud-up` → submit a `cloud` job → `make cloud-clear` |
+
+- **`farm-dev-up`** builds from your working tree and needs no GHCR push; for any
+  `DIST_WORKERS` boxes it rsyncs/builds your code to them too.
+- **`publish` → `farm-up`** publishes one multi-arch image to GHCR, then every box
+  (master + `DIST_WORKERS`) pulls that identical image.
+- **`cloud-up`** provisions the AWS stack and pushes the image to ECR (it runs
+  `ecr-publish` for you); **`cloud-clear`** zeroes idle cost between sessions.
+  Nothing runs on AWS until you submit a `cloud`-target job.
+
+The sections below break each scenario down; teardown is `make farm-down` (local)
+and `make cloud-clear` / `make cloud-down` (cloud).
+
 ### A single-machine distributed encode (`local`)
 
 `make farm-up` already gives you this on one box — cluster + server + one worker.
@@ -75,7 +96,7 @@ Submit with target **Local (all machines)**; watch the Temporal UI at `:8233`.
 
 `make farm-up` brings this box up as master (cluster + server + worker) in one
 compose command, then deploys a worker to each `DIST_WORKERS` box over SSH (run
-`make push` first so GHCR has your code):
+`make publish` first so GHCR has your code):
 
 ```bash
 # .env: MASTER_IP=<this box's LAN IP>
@@ -151,8 +172,8 @@ One `Dockerfile`, published/used four ways:
 | Built by | Where | For |
 | --- | --- | --- |
 | `make build` | local daemon (`infinite-streaming-encoder`) | server + local/same-arch workers |
-| `make push` | GHCR (multi-arch) | cross-arch workers + version display + `make run-remote` |
-| `make ecr-push` | ECR (arm64) | AWS Batch workers |
+| `make publish` | GHCR (multi-arch) | cross-arch workers + version display + `make run-remote` |
+| `make ecr-publish` | ECR (arm64) | AWS Batch workers |
 | `make ami-up` | AWS AMI | pre-pull the ECR image onto spot boxes |
 
 ## Repository layout
