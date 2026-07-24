@@ -5,7 +5,7 @@
 # Pro-gated, so this harness drives the phase containers by hand in DAG
 # order (see smoke_test.sh) rather than through a state machine. That
 # still exercises the real code path each Batch job runs:
-#   python3 -m encoder.cli_local phase <name> --s3-... (+ --two-pass)
+#   python3 -m infinite_streaming_encoder.cli_local phase <name> --s3-... (+ --two-pass)
 # plus the S3 download/upload + .done sidecar logic end to end.
 #
 #   docker compose -f infra/localstack/docker-compose.yml up -d

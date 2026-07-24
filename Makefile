@@ -2,8 +2,8 @@
 -include .env
 export
 
-IMAGE_NAME ?= encoder
-CONTAINER_NAME ?= encoder
+IMAGE_NAME ?= infinite-streaming-encoder
+CONTAINER_NAME ?= infinite-streaming-encoder
 PORT ?= 8080
 # Temporal UI address the server queries for available distributed-local workers.
 TEMPORAL_UI_ADDR ?= http://host.docker.internal:8233
@@ -43,7 +43,7 @@ PROMOTE_ADDHOST := $(if $(PROMOTE_SSH_IP),--add-host $(PROMOTE_SSH_HOST):$(PROMO
 PROMOTE_SSH_AGENT := $(if $(PROMOTE_SSH_HOST),-v /run/host-services/ssh-auth.sock:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent,)
 
 # GHCR publishing
-GHCR_IMAGE ?= ghcr.io/jonathaneoliver/encoder
+GHCR_IMAGE ?= ghcr.io/jonathaneoliver/infinite-streaming-encoder
 GHCR_USERNAME ?= jonathaneoliver
 PLATFORMS ?= linux/amd64,linux/arm64
 
@@ -55,7 +55,7 @@ PLATFORMS ?= linux/amd64,linux/arm64
 RUN_IMAGE ?= $(IMAGE_NAME)
 REMOTE_IMAGE ?= $(GHCR_IMAGE):latest
 
-# Dev only: host path overlaid onto a spawned orchestrator's /app/scripts/encoder
+# Dev only: host path overlaid onto a spawned orchestrator's /app/scripts/infinite_streaming_encoder
 # so it runs current working-tree code without a rebuild. Set by `make farm-dev`;
 # empty in normal runs (the orchestrator then uses the image's baked scripts).
 HOST_SCRIPTS_DIR ?=
@@ -364,11 +364,11 @@ deploy-review:        ## like deploy but stop at the plan (review before infra-a
 
 timing:               ## where-did-the-time-go for an execution: make timing EXEC=<arn>
 	@: $${EXEC:?set EXEC=<execution-arn>}
-	docker exec $(CONTAINER_NAME) python3 -m encoder.cloud.timing --execution-arn $(EXEC)
+	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.cloud.timing --execution-arn $(EXEC)
 
 cpu-report:           ## per-tier encode CPU utilization vs reserved vCPU: make cpu-report EXEC=<arn>
 	@: $${EXEC:?set EXEC=<execution-arn>}
-	docker exec $(CONTAINER_NAME) python3 -m encoder.cloud.cpu_report --execution-arn $(EXEC)
+	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.cloud.cpu_report --execution-arn $(EXEC)
 
 # ---- Worker-AMI cache (opt-in, one at a time) --------------------------------
 # The AMI is a pre-warmed cache: a cold spot instance boots with the encoder
@@ -429,7 +429,7 @@ unbake-ami:           ## clear the compute-env AMI pointer, THEN delete the AMIs
 
 clear-costs:          ## kill every idle AWS cost: sweep tagged instances/volumes/spot/S3 + remove worker AMI
 	@echo ">>> sweeping Application=encoder-app runtime resources (instances, volumes, spot, S3)..."
-	docker exec $(CONTAINER_NAME) python3 -m encoder.cloud.cleanup --sweep-all
+	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.cloud.cleanup --sweep-all
 	@echo ">>> removing worker AMI(s)..."
 	$(MAKE) unbake-ami
 	@echo ">>> Idle cost generators cleared (AMI pointer self-cleared to pull-on-boot)."
@@ -501,7 +501,7 @@ dist-deploy-ghcr:     ## GHCR-pull workers on each DIST_WORKERS box (no build/tr
 # master, pulling every image from GHCR (no local build). The master always runs
 # a worker; extra boxes come from DIST_WORKERS in .env. Run `make push` first so
 # GHCR has your current code.
-# `make farm-dev` is the developer loop: it bind-mounts your local scripts/encoder
+# `make farm-dev` is the developer loop: it bind-mounts your local scripts/infinite_streaming_encoder
 # into every worker, so re-running it just rsyncs the diffs and restarts workers
 # (no rebuild, no re-pull) — the fastest way to get local changes onto all boxes.
 .PHONY: farm farm-dev
@@ -535,13 +535,13 @@ farm-dev: require-paths   ## dev farm from your WORKING TREE (uncommitted): loca
 	$(MAKE) dist-up
 	@for i in $$(seq 1 60); do nc -z localhost 7233 2>/dev/null && break; sleep 1; done; sleep 5
 	@echo ">>> [farm-dev] 3/5 worker on THIS machine (local image + LIVE working-tree code mount)..."
-	@ENCODER_IMAGE=$(IMAGE_NAME) CODE_MOUNT=$(CURDIR)/scripts/encoder $(_MASTER_WORKER_ENV) \
+	@ENCODER_IMAGE=$(IMAGE_NAME) CODE_MOUNT=$(CURDIR)/scripts/infinite_streaming_encoder $(_MASTER_WORKER_ENV) \
 	  bash infra/local-cluster/run-worker.sh
 	@echo ">>> [farm-dev] 4/5 sync code + image to DIST_WORKERS boxes (transfer same-arch / build cross-arch; code bind-mounted)..."
 	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-workers; else echo "    (no DIST_WORKERS — master-only)"; fi
 	@echo ">>> [farm-dev] 5/5 server + UI from the LOCAL build; orchestrator runs your working-tree code..."
 	@$(MAKE) stop
-	HOST_SCRIPTS_DIR=$(CURDIR)/scripts/encoder $(MAKE) run
+	HOST_SCRIPTS_DIR=$(CURDIR)/scripts/infinite_streaming_encoder $(MAKE) run
 	@echo ">>> farm-dev up (working tree — nothing committed/pushed). Re-run 'make farm-dev' after edits."
 
 # ---- Smoke test --------------------------------------------------------------
@@ -622,7 +622,7 @@ oobe: build   ## isolated first-run test: own dirs/ports/cluster -> encode -> as
 	  TEMPORAL_ADDRESS=host.docker.internal:$(OOBE_TEMPORAL_PORT) \
 	  S3_ENDPOINT_URL=http://host.docker.internal:$(OOBE_MINIO_PORT) \
 	  AWS_ACCESS_KEY_ID=$(MINIO_ACCESS_KEY) AWS_SECRET_ACCESS_KEY=$(MINIO_SECRET_KEY) \
-	  CODE_MOUNT=$(CURDIR)/scripts/encoder \
+	  CODE_MOUNT=$(CURDIR)/scripts/infinite_streaming_encoder \
 	  bash infra/local-cluster/run-worker.sh
 	@echo ">>> [oobe] isolated server '$(OOBE_SERVER)' on :$(OOBE_PORT)..."
 	@docker rm -f $(OOBE_SERVER) >/dev/null 2>&1 || true
@@ -630,7 +630,7 @@ oobe: build   ## isolated first-run test: own dirs/ports/cluster -> encode -> as
 	  SOURCE_DIR=$(OOBE_DIR)/source OUTPUT_DIR=$(OOBE_DIR)/output TMP_DIR=$(OOBE_DIR)/tmp \
 	  TEMPORAL_ADDRESS=host.docker.internal:$(OOBE_TEMPORAL_PORT) \
 	  MINIO_ENDPOINT=http://host.docker.internal:$(OOBE_MINIO_PORT) \
-	  DIST_WORKER_CONTAINER=$(OOBE_WORKER) HOST_SCRIPTS_DIR=$(CURDIR)/scripts/encoder
+	  DIST_WORKER_CONTAINER=$(OOBE_WORKER) HOST_SCRIPTS_DIR=$(CURDIR)/scripts/infinite_streaming_encoder
 	@echo ">>> [oobe] waiting for the isolated server (:$(OOBE_PORT))..."
 	@for i in $$(seq 1 30); do curl -sf http://localhost:$(OOBE_PORT)/api/jobs >/dev/null 2>&1 && break; sleep 1; done
 	@echo ">>> [oobe] submitting encode + waiting (timeout ~300s)..."

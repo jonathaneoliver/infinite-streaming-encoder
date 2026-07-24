@@ -2,11 +2,11 @@
 machine. Invoked by the Go server's `cloud-batch` target the same way
 it invokes cli_cloud.py for the legacy spot target:
 
-  python -m encoder.cli_batch submit \\
+  python -m infinite_streaming_encoder.cli_batch submit \\
     --state-machine-arn ARN --input-json FILE
   # prints the execution ARN on stdout
 
-  python -m encoder.cli_batch poll \\
+  python -m infinite_streaming_encoder.cli_batch poll \\
     --execution-arn ARN --s3-prefix URI --local-dir PATH
   # blocks until terminal state; emits ENCODER-STAGE markers as
   # per-step events land in GetExecutionHistory
@@ -911,7 +911,7 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
     spot, ondemand = vh * _SPOT_VCPU_HR, vh * _ONDEMAND_VCPU_HR
     saved = ondemand - spot
     try:
-        from encoder.cloud.compute_env import get_vcpus
+        from infinite_streaming_encoder.cloud.compute_env import get_vcpus
         max_vcpus = int(get_vcpus().get("max_vcpus") or 0)
     except Exception:  # noqa: BLE001 — best-effort
         max_vcpus = 0
@@ -1036,7 +1036,7 @@ def cmd_poll(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="encoder.cli_batch")
+    p = argparse.ArgumentParser(prog="infinite_streaming_encoder.cli_batch")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     ps = sub.add_parser("submit")

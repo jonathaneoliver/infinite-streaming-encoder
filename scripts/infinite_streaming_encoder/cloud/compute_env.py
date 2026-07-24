@@ -12,7 +12,7 @@ import json
 import os
 import sys
 
-from encoder.cloud.aws import batch_client
+from infinite_streaming_encoder.cloud.aws import batch_client
 
 
 def _encoder_ce() -> str | None:
@@ -60,7 +60,7 @@ def get_vcpus() -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="encoder.cloud.compute_env")
+    p = argparse.ArgumentParser(prog="infinite_streaming_encoder.cloud.compute_env")
     p.add_argument("--set-min-vcpus", type=int, help="new minvCpus floor")
     p.add_argument("--set-max-vcpus", type=int, help="new maxvCpus ceiling")
     p.add_argument("--get", action="store_true", help="print current min/max/desired")

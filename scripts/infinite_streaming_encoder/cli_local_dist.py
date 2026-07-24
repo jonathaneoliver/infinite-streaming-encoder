@@ -46,13 +46,13 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from encoder.chunking import plan_chunks
-from encoder.encode_variants import _coalesce_runt_tail, variant_stage_key
-from encoder.ffprobe import ProbeError, probe
-from encoder.ladder import (
+from infinite_streaming_encoder.chunking import plan_chunks
+from infinite_streaming_encoder.encode_variants import _coalesce_runt_tail, variant_stage_key
+from infinite_streaming_encoder.ffprobe import ProbeError, probe
+from infinite_streaming_encoder.ladder import (
     Rung, get_ladder, parse_bitrate_override, select_rungs,
 )
-from encoder.progress import Stage, emit_plan, emit_stage
+from infinite_streaming_encoder.progress import Stage, emit_plan, emit_stage
 
 _SEGMENT_DURATION_S = 6.0
 # Fold a final chunk shorter than this into its predecessor (mirrors
@@ -313,9 +313,9 @@ def run_phase(w: Worker, phase_args: list[str], *, env: dict[str, str],
     cmd = ["docker", *w.host_args, "run", "--rm", "--name", cname,
            *_phase_env(env)]
     if w.code_mount:
-        cmd += ["-v", f"{w.code_mount}:/app/scripts/encoder:ro"]
+        cmd += ["-v", f"{w.code_mount}:/app/scripts/infinite_streaming_encoder:ro"]
     cmd += ["--entrypoint", "python3", w.image,
-            "-m", "encoder.cli_phase", *phase_args]
+            "-m", "infinite_streaming_encoder.cli_phase", *phase_args]
     key = (tuple(w.host_args), cname)
     with _POOL_LOCK:
         _POOL_CONTAINERS.add(key)
@@ -508,7 +508,7 @@ def _emit_commercial_cost(rungs_by_codec, info, input_path,
     of SOURCE duration) and our own AWS Batch spot fleet (per ENCODING hour —
     compute-based, so it weights each variant's real work). Best-effort."""
     try:
-        from encoder.commercial_cloud import (
+        from infinite_streaming_encoder.commercial_cloud import (
             estimate_usd, mediaconvert_usd, aws_spot_usd, aws_ondemand_usd)
         try:
             src_mbps = input_path.stat().st_size * 8 / (info.duration_s or 1) / 1e6
@@ -915,10 +915,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--worker", action="append", default=None,
                    help="repeatable: 'local' or 'ssh://user@host'")
     p.add_argument("--image-local", default="encoder:latest", dest="image_local")
-    p.add_argument("--image-remote", default="ghcr.io/jonathaneoliver/encoder:latest",
+    p.add_argument("--image-remote", default="ghcr.io/jonathaneoliver/infinite-streaming-encoder:latest",
                    dest="image_remote")
     p.add_argument("--remote-code-mount", default=None, dest="remote_code_mount",
-                   help="host path to mount over /app/scripts/encoder on remote "
+                   help="host path to mount over /app/scripts/infinite_streaming_encoder on remote "
                         "workers (for a stale remote image)")
     # Backend: 'pool' = hand-rolled docker/ssh pool; 'temporal' = durable
     # EncodeWorkflow across Temporal workers.

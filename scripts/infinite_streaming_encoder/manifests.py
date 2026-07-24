@@ -544,7 +544,7 @@ def _write_master(dash_info: dict[str, Any], output_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="encoder.manifests", description=__doc__)
+    parser = argparse.ArgumentParser(prog="infinite_streaming_encoder.manifests", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_convert = sub.add_parser("convert-segmentlist",

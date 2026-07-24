@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-// Mirror of scripts/encoder/ladder.py's LADDER. Changing the kbps
+// Mirror of scripts/infinite_streaming_encoder/ladder.py's LADDER. Changing the kbps
 // values here is a visualization-only concern; the encoder's real
 // targets are the Python ones. Keeping them in sync is a manual step
 // — trivial but required when the Python ladder shifts.

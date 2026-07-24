@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fractions import Fraction
 
-from encoder.ladder import Rung
+from infinite_streaming_encoder.ladder import Rung
 
 
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"

@@ -6,9 +6,9 @@ batch:submitJob.sync jobs — they run to completion, orphaned — so cancel pas
 chunks stop now, and the compute environment can scale spot instances back to
 zero). The Go server shells out to these commands:
 
-    python3 -m encoder.cloud.batch_admin stop-execution --arn <arn> [--terminate-jobs]
-    python3 -m encoder.cloud.batch_admin terminate-job --id <jobId>
-    python3 -m encoder.cloud.batch_admin stop-all
+    python3 -m infinite_streaming_encoder.cloud.batch_admin stop-execution --arn <arn> [--terminate-jobs]
+    python3 -m infinite_streaming_encoder.cloud.batch_admin terminate-job --id <jobId>
+    python3 -m infinite_streaming_encoder.cloud.batch_admin stop-all
 
 Each prints a small JSON report to stdout.
 """
@@ -21,7 +21,7 @@ import sys
 
 from botocore.exceptions import ClientError
 
-from encoder.cloud.aws import batch_client, sfn_client
+from infinite_streaming_encoder.cloud.aws import batch_client, sfn_client
 
 _ACTIVE_BATCH_STATUSES = ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING")
 _REASON = "released from encoder AWS tab"
@@ -109,7 +109,7 @@ def _stop_all() -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="encoder.cloud.batch_admin")
+    p = argparse.ArgumentParser(prog="infinite_streaming_encoder.cloud.batch_admin")
     # Output is always JSON; accept --json as a no-op so the Go server's
     # runPythonCloud helper (which always appends it) works unchanged.
     p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)

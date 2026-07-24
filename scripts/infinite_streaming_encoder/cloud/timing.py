@@ -13,7 +13,7 @@ Jobs are grouped by the EC2 instance they ran on, and the first job on each
 instance is flagged "cold" (it paid the image pull) vs "warm" — so you can
 see how much of the wall-clock is machine bringup / image load vs real encode.
 
-  python3 -m encoder.cloud.timing --execution-arn <arn> [--json]
+  python3 -m infinite_streaming_encoder.cloud.timing --execution-arn <arn> [--json]
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ import sys
 
 from botocore.exceptions import ClientError
 
-from encoder.cloud.aws import batch_client, region
+from infinite_streaming_encoder.cloud.aws import batch_client, region
 
 try:
     import boto3
@@ -187,7 +187,7 @@ def _print_human(d: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="encoder.cloud.timing")
+    p = argparse.ArgumentParser(prog="infinite_streaming_encoder.cloud.timing")
     p.add_argument("--execution-arn", required=True, dest="execution_arn")
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)

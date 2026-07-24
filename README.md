@@ -96,7 +96,7 @@ or pushed**:
 
 - `make build` compiles your working-tree Go + deps into the local image (the
   server runs it).
-- Your working-tree `scripts/encoder` is bind-mounted into every worker and the
+- Your working-tree `scripts/infinite_streaming_encoder` is bind-mounted into every worker and the
   orchestrator, so uncommitted **Python** runs everywhere, any arch.
 - Remote boxes go through the arch-aware `deploy-worker.sh` (transfer to
   same-arch boxes, native build on cross-arch ones).
@@ -128,7 +128,7 @@ One `Dockerfile`, published/used four ways:
 
 | Built by | Where | For |
 | --- | --- | --- |
-| `make build` | local daemon (`encoder`) | server + local/same-arch workers |
+| `make build` | local daemon (`infinite-streaming-encoder`) | server + local/same-arch workers |
 | `make push` | GHCR (multi-arch) | cross-arch workers + version display + `make run-remote` |
 | `make ecr-push` | ECR (arm64) | AWS Batch workers |
 | `make bake-ami` | AWS AMI | pre-pull the ECR image onto spot boxes |
@@ -141,7 +141,7 @@ internal/encode/     control plane: Job/Manager, targets, scheduling, promote
 internal/api/        HTTP + SSE, dist worker toggle, static file servers
 internal/watcher/    source-directory auto-submit
 internal/awswatch/   cloud inventory watchdog + Batch keep-warm
-scripts/encoder/     the Python encoder package
+scripts/infinite_streaming_encoder/     the Python encoder package
   cli_local_dist.py    distributed-local orchestrator (Temporal backend)
   temporal_worker.py   the per-box worker (activities + workflow DAG)
   cli_batch.py         AWS Batch: Step Functions submit/poll

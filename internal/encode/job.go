@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// defaultChunkDurationSeconds mirrors scripts/encoder/chunking
+// defaultChunkDurationSeconds mirrors scripts/infinite_streaming_encoder/chunking
 // .DEFAULT_CHUNK_DURATION_S. The control plane computes chunk_count the same
 // way the Python phase does (from the same clip duration + chunk size) so the
 // two never disagree.
@@ -136,7 +136,7 @@ func stripANSI(s string) string {
 }
 
 // Markers the Python orchestrator emits for structured progress. See
-// scripts/encoder/progress.py for the producer side.
+// scripts/infinite_streaming_encoder/progress.py for the producer side.
 var (
 	planMarkerRe  = regexp.MustCompile(`^\[\[ENCODER-PLAN (.+)\]\]$`)
 	stageMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=([0-9.]+)\]\]$`)
@@ -874,7 +874,7 @@ type Job struct {
 	// cost on hosted transcoders (a generic commercial cloud encoder, and AWS
 	// MediaConvert) — comparison baselines against our own spot/local cost. Both
 	// are per-output-minute pricing, emitted once per job by the orchestrator
-	// (scripts/encoder/commercial_cloud.py). For local jobs (no SpotUSD) they're
+	// (scripts/infinite_streaming_encoder/commercial_cloud.py). For local jobs (no SpotUSD) they're
 	// "what you'd have paid a hosted transcoder for the same work".
 	CommercialUSD   float64 `json:"commercial_usd,omitempty"`
 	MediaConvertUSD float64 `json:"mediaconvert_usd,omitempty"`
@@ -1442,7 +1442,7 @@ func (m *Manager) run(job *Job, startIdx int) {
 	// branches to its SFN driver inside encodeFilesFrom. (Legacy single-box "local"
 	// and direct-EC2 "cloud" targets were retired — cli_local.py survives only as
 	// the phase entry point cloud-batch's Batch job-defs invoke.)
-	script := filepath.Join(m.ScriptsDir, "encoder", "cli_local_dist.py")
+	script := filepath.Join(m.ScriptsDir, "infinite_streaming_encoder", "cli_local_dist.py")
 
 	err := m.encodeFilesFrom(job, jobTmpDir, script, startIdx)
 
@@ -2161,7 +2161,7 @@ func (m *Manager) encodeCloudBatchSFN(job *Job, tmpDir string, startIdx int) err
 // just downloads the finished outputs). Terminal-failure / aborted / not-found
 // → false, so runOneCloudBatchSFN resubmits a fresh execution instead.
 func (m *Manager) cloudExecutionResumable(arn string) bool {
-	out, err := exec.Command("python3", "-m", "encoder.cloud.batch_admin",
+	out, err := exec.Command("python3", "-m", "infinite_streaming_encoder.cloud.batch_admin",
 		"execution-status", "--arn", arn).Output()
 	if err != nil {
 		return false
@@ -2335,7 +2335,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		}
 
 		// Submit.
-		submit := exec.Command("python3", "-m", "encoder.cli_batch", "submit",
+		submit := exec.Command("python3", "-m", "infinite_streaming_encoder.cli_batch", "submit",
 			"--state-machine-arn", m.StateMachineArn,
 			"--input-json", inputPath)
 		submit.Env = os.Environ()
@@ -2364,7 +2364,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 	if job.Config.OutputTag != "" {
 		pollArgs = append(pollArgs, "--output-tag", job.Config.OutputTag)
 	}
-	poll := exec.Command("python3", append([]string{"-m", "encoder.cli_batch"}, pollArgs...)...)
+	poll := exec.Command("python3", append([]string{"-m", "infinite_streaming_encoder.cli_batch"}, pollArgs...)...)
 	poll.Env = os.Environ()
 	stdout, err := poll.StdoutPipe()
 	if err != nil {
@@ -2398,7 +2398,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 					// in-flight submitJob.sync jobs running (orphaned) until they
 					// finish; terminate them so in-progress chunks stop now and
 					// the fleet frees up promptly.
-					stop := exec.Command("python3", "-m", "encoder.cloud.batch_admin",
+					stop := exec.Command("python3", "-m", "infinite_streaming_encoder.cloud.batch_admin",
 						"stop-execution", "--arn", execArn, "--terminate-jobs")
 					stop.Env = os.Environ()
 					if o, e := stop.CombinedOutput(); e != nil {
@@ -2873,7 +2873,7 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 	// Opt-in via HOST_SCRIPTS_DIR (set by `make farm-dev`); empty in normal runs,
 	// where the container uses the image's baked scripts.
 	if dir := os.Getenv("HOST_SCRIPTS_DIR"); dir != "" {
-		runArgs = append(runArgs, "-v", dir+":"+filepath.Join(m.ScriptsDir, "encoder")+":ro")
+		runArgs = append(runArgs, "-v", dir+":"+filepath.Join(m.ScriptsDir, "infinite_streaming_encoder")+":ro")
 	}
 	// TargetLocalDist: the orchestrator reaches Temporal + MinIO. These are the
 	// MinIO creds (as AWS_* for boto3) — kept under distinct MINIO_* server env

@@ -14,7 +14,7 @@ A tier well under 100% is over-reserved — it's holding vCPU (hard-reserved by
 Batch, so unusable by other jobs) that ffmpeg never uses. Drop that tier's
 allocation in variantResources (internal/encode/job.go) to pack more per box.
 
-  python3 -m encoder.cloud.cpu_report --execution-arn <arn> [--json]
+  python3 -m infinite_streaming_encoder.cloud.cpu_report --execution-arn <arn> [--json]
 """
 from __future__ import annotations
 
@@ -26,8 +26,8 @@ from collections import defaultdict
 
 from botocore.exceptions import ClientError
 
-from encoder.cloud.aws import region
-from encoder.cloud.timing import (
+from infinite_streaming_encoder.cloud.aws import region
+from infinite_streaming_encoder.cloud.timing import (
     _container_timing,
     _exec_name,
     _jobs_for_execution,
@@ -106,7 +106,7 @@ def _print_human(d: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="encoder.cloud.cpu_report")
+    p = argparse.ArgumentParser(prog="infinite_streaming_encoder.cloud.cpu_report")
     p.add_argument("--execution-arn", required=True, dest="execution_arn")
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)

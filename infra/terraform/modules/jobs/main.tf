@@ -105,7 +105,7 @@ resource "aws_batch_job_definition" "mezzanine" {
       { type = "MEMORY", value = "4096" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "mezzanine",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "mezzanine",
       "--s3-in", "Ref::s3_in",
       "--s3-out", "Ref::s3_out",
     ]
@@ -147,7 +147,7 @@ resource "aws_batch_job_definition" "variant" {
       { type = "MEMORY", value = "16384" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "variant",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "variant",
       "--codec", "Ref::codec",
       # Concrete rung resolved by the control plane from the ladder store —
       # the worker needs no ladder knowledge, so user-defined ladders work.
@@ -195,7 +195,7 @@ resource "aws_batch_job_definition" "audio" {
       { type = "MEMORY", value = "4096" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "audio",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "audio",
       "--s3-mezz", "Ref::s3_mezz",
       "--s3-out", "Ref::s3_out",
     ]
@@ -235,7 +235,7 @@ resource "aws_batch_job_definition" "package" {
       { type = "MEMORY", value = "4096" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "package",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "package",
       "--codec", "Ref::codec",
       "--s3-variants", "Ref::s3_variants",
       "--s3-audio", "Ref::s3_audio",
@@ -280,7 +280,7 @@ resource "aws_batch_job_definition" "package_all" {
       { type = "MEMORY", value = "4096" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "package-all",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "package-all",
       "--codec", "Ref::codec",
       "--s3-variants", "Ref::s3_variants",
       "--s3-audio", "Ref::s3_audio",
@@ -321,7 +321,7 @@ resource "aws_batch_job_definition" "hls" {
       { type = "MEMORY", value = "2048" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "hls",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "hls",
       "--codec", "Ref::codec",
       "--s3-package", "Ref::s3_package",
       "--s3-out", "Ref::s3_out",
@@ -362,7 +362,7 @@ resource "aws_batch_job_definition" "byteranges" {
       { type = "MEMORY", value = "2048" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "byteranges",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "byteranges",
       "--codec", "Ref::codec",
       "--s3-package", "Ref::s3_package",
       "--s3-out", "Ref::s3_out",

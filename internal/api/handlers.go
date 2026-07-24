@@ -896,10 +896,10 @@ func isVideo(ext string) bool {
 // or crash away from the main server goroutine.
 // ---------------------------------------------------------------------------
 
-// runPythonCloud invokes `python3 -m encoder.cloud.<module> <args>` and
+// runPythonCloud invokes `python3 -m infinite_streaming_encoder.cloud.<module> <args>` and
 // returns the captured stdout on exit-0, or an error containing stderr.
 func runPythonCloud(module string, args ...string) ([]byte, error) {
-	fullArgs := append([]string{"-m", "encoder.cloud." + module, "--json"}, args...)
+	fullArgs := append([]string{"-m", "infinite_streaming_encoder.cloud." + module, "--json"}, args...)
 	cmd := exec.Command("python3", fullArgs...)
 	// The Python modules read AWS_REGION, S3_BUCKET, etc. from the
 	// server process's environment — same vars the encoder has been
@@ -908,10 +908,10 @@ func runPythonCloud(module string, args ...string) ([]byte, error) {
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("python3 -m encoder.cloud.%s exited %d: %s",
+			return nil, fmt.Errorf("python3 -m infinite_streaming_encoder.cloud.%s exited %d: %s",
 				module, ee.ExitCode(), strings.TrimSpace(string(ee.Stderr)))
 		}
-		return nil, fmt.Errorf("python3 -m encoder.cloud.%s: %w", module, err)
+		return nil, fmt.Errorf("python3 -m infinite_streaming_encoder.cloud.%s: %w", module, err)
 	}
 	return out, nil
 }

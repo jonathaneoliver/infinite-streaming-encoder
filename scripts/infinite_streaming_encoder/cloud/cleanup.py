@@ -29,7 +29,7 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
-from encoder.cloud.aws import (
+from infinite_streaming_encoder.cloud.aws import (
     APP_TAG_KEY, APP_TAG_VALUE, app_tag_filter, ec2_client, s3_client,
 )
 
@@ -495,7 +495,7 @@ def delete_prefix(prefix: str) -> CleanupReport:
 
 def _main() -> int:
     import argparse
-    p = argparse.ArgumentParser(prog="encoder.cloud.cleanup")
+    p = argparse.ArgumentParser(prog="infinite_streaming_encoder.cloud.cleanup")
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--job-id", help="tear down one job's resources")
     group.add_argument("--delete-prefix", metavar="PREFIX",

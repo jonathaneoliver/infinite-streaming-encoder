@@ -23,7 +23,7 @@ inbound firewall/NAT setup and no Docker-Desktop networking pain. Temporal makes
 the whole encode **durable** — kill a worker (or its whole box) mid-run and its
 in-flight chunks are rescheduled onto another worker; the workflow finishes.
 The message queue only carries pointers (S3 URIs + params); MinIO carries the
-video. See `../../scripts/encoder/temporal_worker.py` (activities + the
+video. See `../../scripts/infinite_streaming_encoder/temporal_worker.py` (activities + the
 `EncodeWorkflow` DAG) and `cli_local_dist.py --backend temporal` (the trigger).
 
 ## Bring it up
@@ -37,7 +37,7 @@ make dist-worker    # start a worker on the master too (uses its cores)
 ```
 
 On **each other box** (needs Docker + a current encoder image, or a synced
-`scripts/encoder` checkout + `CODE_MOUNT`):
+`scripts/infinite_streaming_encoder` checkout + `CODE_MOUNT`):
 
 ```
 cp infra/local-cluster/worker.env.example worker.env   # edit master IP + slots
@@ -49,7 +49,7 @@ infra/local-cluster/run-worker.sh worker.env
 From anywhere that can reach the master (the Go control plane will do this):
 
 ```
-python3 -m encoder.cli_local_dist --backend temporal \
+python3 -m infinite_streaming_encoder.cli_local_dist --backend temporal \
   --temporal-address <master>:7233 \
   --input clip.mkv --output clip --output-dir ./out \
   --codec hevc --max-res 1080p --chunk-duration 12 \

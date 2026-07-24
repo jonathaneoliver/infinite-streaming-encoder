@@ -66,7 +66,7 @@ ladders still produce exactly one packaged dir per codec.
   contents — must handle multiple rungs per resolution.
 - The ladder-matrix UI (`internal/api/ladder.go`) — rows become rungs.
 
-## New data model (`scripts/encoder/ladder.py`)
+## New data model (`scripts/infinite_streaming_encoder/ladder.py`)
 
 ```python
 @dataclass(frozen=True)
@@ -112,12 +112,12 @@ smashing lines ~595–668 — port verbatim.)
 
 | Layer | File | Change |
 | --- | --- | --- |
-| Ladder data | `scripts/encoder/ladder.py` | `Rung` + `LADDERS` + `select_rungs` + label assignment |
-| Encode | `scripts/encoder/encode_variants.py` | `_variant_path`/`variant_stage_key` key on `label`; loop over rungs |
-| Local CLI | `scripts/encoder/cli_local.py` | `--ladder` flag → select codec rung lists |
-| Batch phase | `scripts/encoder/cli_phase.py` | `--tier` → `--rung`/`--label`; drop fixed `choices`; pass `--ladder` |
-| Resume | `scripts/encoder/resume.py` | discover by `{codec}_{label}.mp4`, not `{res}` |
-| Packaging | `scripts/encoder/packager.py`, `hls.py` | representations keyed by rung label |
+| Ladder data | `scripts/infinite_streaming_encoder/ladder.py` | `Rung` + `LADDERS` + `select_rungs` + label assignment |
+| Encode | `scripts/infinite_streaming_encoder/encode_variants.py` | `_variant_path`/`variant_stage_key` key on `label`; loop over rungs |
+| Local CLI | `scripts/infinite_streaming_encoder/cli_local.py` | `--ladder` flag → select codec rung lists |
+| Batch phase | `scripts/infinite_streaming_encoder/cli_phase.py` | `--tier` → `--rung`/`--label`; drop fixed `choices`; pass `--ladder` |
+| Resume | `scripts/infinite_streaming_encoder/resume.py` | discover by `{codec}_{label}.mp4`, not `{res}` |
+| Packaging | `scripts/infinite_streaming_encoder/packager.py`, `hls.py` | representations keyed by rung label |
 | Go config | `internal/encode/job.go` | `JobConfig.Ladder`; `buildSFNInput` emits per-codec rung lists (not `tier`×`codec` cross-product) |
 | Go UI mirror | `internal/api/ladder.go`, `handlers.go` | rung-aware ladder matrix + `parseOutputMeta` |
 | SFN template | `infra/terraform/modules/workflow/definition.json.tpl` | variant Map item = `{codec, label, width, height, bitrate}`; job def `--rung`/`--label` |

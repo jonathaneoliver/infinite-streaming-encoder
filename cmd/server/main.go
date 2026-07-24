@@ -49,7 +49,7 @@ func main() {
 	outputDir := flag.String("output-dir", env("OUTPUT_DIR", "/media/dynamic_content"), "encode output directory")
 	tmpDir := flag.String("tmp-dir", env("TMP_DIR", "/media/tmp"), "temporary directory for in-progress encodes")
 	scriptsDir := flag.String("scripts-dir", env("SCRIPTS_DIR", "/scripts"), "directory containing encode scripts")
-	dockerImage := flag.String("docker-image", env("DOCKER_IMAGE", "ghcr.io/jonathaneoliver/encoder:latest"), "Docker image used for remote (EC2) encodes")
+	dockerImage := flag.String("docker-image", env("DOCKER_IMAGE", "ghcr.io/jonathaneoliver/infinite-streaming-encoder:latest"), "Docker image used for remote (EC2) encodes")
 	// Host-side paths for bind-mounting into sibling worker containers.
 	// `docker run -v` from inside a container resolves paths against the
 	// host daemon, so the in-container paths above aren't usable there.
@@ -66,7 +66,7 @@ func main() {
 	defaultLadder := flag.String("default-ladder", env("DEFAULT_LADDER", "apple-uniq-live"), "default encoding ladder profile")
 	defaultMaxRes := flag.String("default-max-res", env("DEFAULT_MAX_RES", ""), "default max resolution (empty = no limit)")
 	maxConcurrent := flag.Int("max-concurrent", intEnv("MAX_CONCURRENT", 1), "max concurrent encode jobs")
-	// AWS watchdog (issue #5 phase 5). Polls `encoder.cloud.inventory` on
+	// AWS watchdog (issue #5 phase 5). Polls `infinite_streaming_encoder.cloud.inventory` on
 	// an interval; any instance older than the lifetime budget is flagged
 	// as a leak and, when AUTO_TERMINATE_STALE=true, force-terminated.
 	awsWatchInterval := flag.Duration("aws-watch-interval", 60*time.Second, "AWS inventory poll interval; 0 disables")
