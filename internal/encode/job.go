@@ -711,14 +711,29 @@ func splitLinesOrCR(data []byte, atEOF bool) (advance int, token []byte, err err
 type Target string
 
 const (
-	TargetCloud      Target = "cloud"
-	TargetLocal      Target = "local"
-	TargetCloudBatch Target = "cloud-batch"
-	// TargetLocalDist fans one encode's chunks across the local Temporal worker
-	// pool (Mac + any other boxes) via cli_local_dist --backend temporal, with
-	// MinIO as the shared store. Same output contract as TargetLocal.
-	TargetLocalDist Target = "local-dist"
+	// TargetLocalDist ("local") fans one encode's chunks across the local
+	// Temporal worker pool (Mac + any other boxes) via cli_local_dist
+	// --backend temporal, with MinIO as the shared store.
+	TargetLocalDist Target = "local"
+	// TargetCloudBatch ("cloud") fans chunks across AWS Batch spot via Step
+	// Functions. The retired single-box and one-box-EC2 targets are gone; the
+	// old "local-dist"/"cloud-batch" values are still accepted as input aliases
+	// (see NormalizeTarget).
+	TargetCloudBatch Target = "cloud"
 )
+
+// NormalizeTarget maps the previous target values onto the current ones so
+// existing .env (DEFAULT_TARGET), persisted job state, and old API callers keep
+// working after the local-dist/cloud-batch -> local/cloud rename.
+func NormalizeTarget(t Target) Target {
+	switch t {
+	case "local-dist":
+		return TargetLocalDist
+	case "cloud-batch":
+		return TargetCloudBatch
+	}
+	return t
+}
 
 // envOr returns the env var value or a fallback.
 func envOr(key, fallback string) string {
@@ -1185,7 +1200,7 @@ func (m *Manager) olderStillLaunching(job *Job) bool {
 		if j == job || j.ID >= job.ID { // IDs are ascending timestamps → older = smaller
 			continue
 		}
-		if j.Config.Target != TargetCloud && j.Config.Target != TargetCloudBatch {
+		if j.Config.Target != TargetCloudBatch {
 			continue
 		}
 		if (j.Status == StatusQueued || j.Status == StatusRunning) && !j.isLaunchComplete() {
@@ -1302,7 +1317,7 @@ func (m *Manager) ActiveCloudJobs() int {
 	n := 0
 	for _, j := range m.jobs {
 		if (j.Status == StatusQueued || j.Status == StatusRunning) &&
-			(j.Config.Target == TargetCloud || j.Config.Target == TargetCloudBatch) {
+			j.Config.Target == TargetCloudBatch {
 			n++
 		}
 	}
@@ -1350,7 +1365,7 @@ func (m *Manager) jobPriorityBase(job *Job) int {
 			continue
 		}
 		if (j.Status == StatusQueued || j.Status == StatusRunning) &&
-			(j.Config.Target == TargetCloud || j.Config.Target == TargetCloudBatch) &&
+			j.Config.Target == TargetCloudBatch &&
 			j.ID < job.ID {
 			older++
 		}
@@ -1610,9 +1625,6 @@ func (m *Manager) Cancel(id string) bool {
 	//   exactly the thing Cancel is trying to interrupt. SIGKILL to
 	//   PID 1 terminates the container and all children at once.
 	cancelMode := "stop"
-	if job.Config.Target == TargetLocal {
-		cancelMode = "kill"
-	}
 	go func() {
 		for _, name := range names {
 			if cancelMode == "kill" {
@@ -1957,89 +1969,6 @@ func (cfg *JobConfig) localChunkSeconds() float64 {
 	}
 }
 
-func (cfg *JobConfig) encodeArgsForFile(sourceDir, outputDir, filename string) []string {
-	args := []string{
-		"--input", sourceDir + "/" + filename,
-		"--output", cfg.OutputStem(filename),
-		"--output-dir", outputDir,
-	}
-	if cfg.Codec != "" {
-		args = append(args, "--codec", cfg.Codec)
-	}
-	if cfg.Ladder != "" {
-		args = append(args, "--ladder", cfg.Ladder)
-	}
-	if cfg.MaxRes != "" {
-		args = append(args, "--max-res", cfg.MaxRes)
-	}
-	if cfg.Time != "" {
-		args = append(args, "--time", cfg.Time)
-	}
-	if cfg.SegmentDuration != "" {
-		args = append(args, "--segment-duration", cfg.SegmentDuration)
-	}
-	if cfg.PartialDuration != "" {
-		args = append(args, "--partial-duration", cfg.PartialDuration)
-	}
-	if cfg.GopDuration != "" {
-		args = append(args, "--gop-duration", cfg.GopDuration)
-	}
-	if cfg.OutputTag != "" {
-		args = append(args, "--output-tag", cfg.OutputTag)
-	}
-	if cfg.HlsFormat != "" {
-		args = append(args, "--hls-format", cfg.HlsFormat)
-	}
-	switch cfg.Padding {
-	case "black":
-		args = append(args, "--padding")
-	case "pink":
-		args = append(args, "--padding-pink")
-	case "none":
-		args = append(args, "--no-padding")
-	}
-	if cfg.KeepMezzanine {
-		args = append(args, "--keep-mezzanine")
-	}
-	if cfg.HevcSinglePass {
-		args = append(args, "--hevc-single-pass")
-	}
-	// Local: chunk each variant so concurrent encodes fill the cores (the
-	// cloud gets this from Batch fan-out; locally cli_local runs a bounded
-	// pool over the chunks). Concurrency/threads are left to cli_local's
-	// core-aware auto-sizing so it adapts to whatever host runs the worker.
-	if cfg.Target == TargetLocal {
-		if chunk := cfg.localChunkSeconds(); chunk > 0 {
-			args = append(args, "--local-chunk-duration",
-				strconv.FormatFloat(chunk, 'f', -1, 64))
-		}
-		// The per-clip work dir is keyed by filename and persists across jobs,
-		// so a force re-encode must tell cli_local to drop the prior run's
-		// complete variants (else encode_all reuses them). resolveCodec is
-		// already bypassed for force upstream; this closes the worker-side reuse.
-		if cfg.ForceReencode {
-			args = append(args, "--force-reencode")
-		}
-	}
-	// CPU arch only makes sense for cloud encodes (local runs on the
-	// host's own architecture), and cli_local.py doesn't accept the
-	// flag. Gate by target so we don't hand an unknown arg to argparse.
-	if cfg.Target == TargetCloud && cfg.CpuArch != "" {
-		args = append(args, "--cpu-arch", cfg.CpuArch)
-	}
-	if cfg.Target == TargetCloud && cfg.UseSpot != nil && !*cfg.UseSpot {
-		args = append(args, "--no-spot")
-	}
-	if cfg.Target == TargetCloud && cfg.ResumeFromJobID != "" {
-		args = append(args, "--resume-from-job-id", cfg.ResumeFromJobID)
-	}
-	if cfg.Target == TargetCloud && cfg.SimulateInterruptAfterS > 0 {
-		args = append(args, "--simulate-interrupt-after",
-			strconv.Itoa(cfg.SimulateInterruptAfterS))
-	}
-	return args
-}
-
 // distArgsForFile builds the CLI for cli_local_dist.py (the TargetLocalDist
 // worker): plan + start the durable Temporal EncodeWorkflow, which fans the
 // file's chunks across the local worker pool and downloads output_<codec>/ to
@@ -2173,12 +2102,12 @@ func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int)
 
 		fileCfg := job.Config // already timing-resolved above
 		fileCfg.Codec = codec
-		var args []string
-		if job.Config.Target == TargetLocalDist {
-			args = fileCfg.distArgsForFile(m.SourceDir, tmpDir, f, job.ID)
-		} else {
-			args = fileCfg.encodeArgsForFile(m.SourceDir, tmpDir, f)
+		if job.Config.Target != TargetLocalDist {
+			// cloud-batch is handled earlier; anything else is an invalid or
+			// retired target that should have been rejected at submit.
+			return fmt.Errorf("unsupported target %q (use local or cloud)", job.Config.Target)
 		}
+		args := fileCfg.distArgsForFile(m.SourceDir, tmpDir, f, job.ID)
 		if err := m.runFileContainer(job, i, script, args); err != nil {
 			return fmt.Errorf("%s: %w", f, err)
 		}
@@ -2944,18 +2873,6 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 	if dir := os.Getenv("HOST_SCRIPTS_DIR"); dir != "" {
 		runArgs = append(runArgs, "-v", dir+":"+filepath.Join(m.ScriptsDir, "encoder")+":ro")
 	}
-	// Cloud jobs drive AWS from inside the worker; pass the credentials
-	// directory and the AWS / GHCR env vars the wrapper expects.
-	if job.Config.Target == TargetCloud {
-		if m.HostAWSDir != "" {
-			runArgs = append(runArgs, "-v", m.HostAWSDir+":/root/.aws:ro")
-		}
-		for _, key := range cloudEnvPassthrough {
-			if v := os.Getenv(key); v != "" {
-				runArgs = append(runArgs, "-e", key+"="+v)
-			}
-		}
-	}
 	// TargetLocalDist: the orchestrator reaches Temporal + MinIO. These are the
 	// MinIO creds (as AWS_* for boto3) — kept under distinct MINIO_* server env
 	// so they don't clobber the server's real AWS creds used by the cloud path.
@@ -3151,6 +3068,9 @@ func (m *Manager) loadPersistedStates() []persistedState {
 func (m *Manager) Reconcile() {
 	states := m.loadPersistedStates()
 	for _, s := range states {
+		// A job persisted before the local-dist/cloud-batch -> local/cloud rename
+		// carries the old target value; normalize so it dispatches correctly.
+		s.Config.Target = NormalizeTarget(s.Config.Target)
 		job := &Job{
 			ID:        s.ID,
 			Config:    s.Config,

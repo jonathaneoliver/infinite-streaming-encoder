@@ -32,7 +32,7 @@ Submit via the UI (target dropdown + these settings) or the API:
 
 ```bash
 curl -X POST http://localhost:8080/api/encode -H 'Content-Type: application/json' \
-  -d '{"files":["smoke.mp4"],"target":"local-dist","codec":"h264","max_res":"720p","chunk_duration":"12"}'
+  -d '{"files":["smoke.mp4"],"target":"local","codec":"h264","max_res":"720p","chunk_duration":"12"}'
 ```
 
 ## The four tests
@@ -64,7 +64,7 @@ Submit the clip. **Pass:** the **amd64 box actually runs chunks** (its colour
 appears in the grid); completes; plays back. This is the test that catches
 arch-handling regressions.
 
-### 4 — Cloud (`cloud-batch`)
+### 4 — Cloud (`cloud`)
 Infra must be up (`make infra-apply`). Submit with target **Cloud (AWS Batch)**,
 H.264, 720p, and **whole variant** chunking (one Batch job per tier — cheapest
 for a pipeline check; use small chunks only to test cloud fan-out).

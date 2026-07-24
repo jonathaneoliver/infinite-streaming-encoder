@@ -568,7 +568,7 @@ smoke: require-paths build   ## end-to-end single-device smoke: tiny clip -> loc
 	@[ "$(SMOKE_OPEN)" = "0" ] || ( open http://localhost:$(PORT)/ 2>/dev/null || xdg-open http://localhost:$(PORT)/ 2>/dev/null ) || echo "    watch it at http://localhost:$(PORT)/"
 	@echo ">>> [smoke] submitting encode (h264, 720p, 12s chunks) + waiting (timeout ~300s)..."
 	@id=$$(curl -sf -X POST http://localhost:$(PORT)/api/encode -H 'Content-Type: application/json' \
-	    -d '{"files":["smoke.mp4"],"target":"local-dist","codec":"h264","max_res":"720p","chunk_duration":"12"}' \
+	    -d '{"files":["smoke.mp4"],"target":"local","codec":"h264","max_res":"720p","chunk_duration":"12"}' \
 	    | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["id"])'); \
 	  echo "    job $$id"; st=pending; \
 	  for i in $$(seq 1 60); do \
@@ -635,7 +635,7 @@ oobe: build   ## isolated first-run test: own dirs/ports/cluster -> encode -> as
 	@for i in $$(seq 1 30); do curl -sf http://localhost:$(OOBE_PORT)/api/jobs >/dev/null 2>&1 && break; sleep 1; done
 	@echo ">>> [oobe] submitting encode + waiting (timeout ~300s)..."
 	@id=$$(curl -sf -X POST http://localhost:$(OOBE_PORT)/api/encode -H 'Content-Type: application/json' \
-	    -d '{"files":["smoke.mp4"],"target":"local-dist","codec":"h264","max_res":"720p","chunk_duration":"12"}' \
+	    -d '{"files":["smoke.mp4"],"target":"local","codec":"h264","max_res":"720p","chunk_duration":"12"}' \
 	    | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["id"])'); \
 	  echo "    job $$id"; st=pending; \
 	  for i in $$(seq 1 60); do \
