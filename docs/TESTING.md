@@ -41,14 +41,14 @@ curl -X POST http://localhost:8080/api/encode -H 'Content-Type: application/json
 ```bash
 make smoke        # generates the asset, brings up a 1-box farm, encodes, asserts output
 ```
-Or manually: `make farm-dev` with **no** `DIST_WORKERS`, then submit.
+Or manually: `make farm-dev-up` with **no** `DIST_WORKERS`, then submit.
 **Pass:** job reaches `done`; `OUTPUT_DIR/smoke_p200_h264*/` has `.m3u8` playlists;
 plays in the UI; the chunk grid is **one colour** (one machine).
 
 ### 2 — Two devices, same arch (e.g. Mac + Mac Mini, both arm64)
 ```bash
 # .env: MASTER_IP=<this box LAN IP>, DIST_WORKERS=mini=you@mini.local
-make farm-dev
+make farm-dev-up
 ```
 Submit the clip. **Pass:** the chunk grid shows **two colours** (work ran on both
 boxes); completes; plays back. `deploy-worker.sh` transfers the master's image to
@@ -57,8 +57,8 @@ the same-arch box.
 ### 3 — Two devices, different arch (Mac arm64 + Ubuntu amd64)
 ```bash
 # .env: DIST_WORKERS=ubuntu=you@ubuntu.local
-make farm-dev                 # cross-arch: builds from GHCR base + bind-mounts code
-make farm-dev DEV_BUILD=1     # if the commit changed requirements.txt / Dockerfile
+make farm-dev-up                 # cross-arch: builds from GHCR base + bind-mounts code
+make farm-dev-up DEV_BUILD=1     # if the commit changed requirements.txt / Dockerfile
 ```
 Submit the clip. **Pass:** the **amd64 box actually runs chunks** (its colour
 appears in the grid); completes; plays back. This is the test that catches

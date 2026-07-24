@@ -1,0 +1,14 @@
+# Optional promote overlay: rsync to a *.local remote over SSH.
+# Layered by the Makefile only when PROMOTE_SSH_HOST is set. The Makefile
+# resolves PROMOTE_SSH_IP via mDNS (dscacheutil) and exports it, since Docker
+# can't resolve .local names itself. Forwards the host ssh-agent (Docker Desktop
+# magic socket) so a keychain-protected key works in-container. compose merges
+# these onto the base server service (extra_hosts + volumes lists concatenate).
+services:
+  server:
+    extra_hosts:
+      - "${PROMOTE_SSH_HOST}:${PROMOTE_SSH_IP}"
+    volumes:
+      - /run/host-services/ssh-auth.sock:/ssh-agent
+    environment:
+      SSH_AUTH_SOCK: /ssh-agent

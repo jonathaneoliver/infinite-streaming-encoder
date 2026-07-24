@@ -19,12 +19,32 @@ go run ./cmd/server                   # reads env vars; flags override env
 Docker workflow (normal development — scripts need ffmpeg, Shaka Packager, docker-cli, aws-cli baked into the image):
 ```
 make build         # docker build
-make run           # build + run, mounts SOURCE_DIR / OUTPUT_DIR / TMP_DIR + ~/.aws + docker.sock
-make restart       # stop + run
+make run           # bring up JUST the server (compose, --no-deps); mounts SOURCE_DIR / OUTPUT_DIR / TMP_DIR + ~/.aws + ~/.ssh + docker.sock
+make restart       # stop + run (bounce the server, e.g. after an image push)
 make logs          # docker logs -f
 make shell         # exec into container
 make stop / clean
 ```
+
+Farm bring-up (distributed-local encoding — Temporal + MinIO, no AWS). The whole
+thing lives in the **unified root `docker-compose.yml`** with two profiles:
+```
+make farm-up          # master box: GHCR image -> cluster + server + one local worker (+ cloud configured)
+make farm-dev-up      # same, but build from your working tree + live-mount scripts/infinite_streaming_encoder
+docker compose --profile worker up -d   # an EXTRA box: worker only (dials master's LAN Temporal/MinIO)
+```
+`master` profile = postgres + temporal + temporal-ui + minio + server + worker;
+`worker` profile = worker only (MinIO/Temporal are **master-only**). The server,
+worker, cluster, and the old `run-worker.sh` are all folded into this one file;
+`make run`/`run-remote` target just the `server` service within it. The worker
+container is named `encode-worker` (the `internal/api/dist.go` start/stop toggle
+contract). **Networking contract:** every service keeps its host-published port
+and addresses the cluster via `TEMPORAL_ADDRESS` / `S3_ENDPOINT_URL`
+(`host.docker.internal` on the master, `MASTER_IP` on remote boxes) — because the
+server spawns short-lived per-job orchestrator containers that are *not* on the
+compose network and reach Temporal/MinIO through `host.docker.internal`. Don't
+rewrite services to compose-DNS names (`temporal:7233`). See
+`infra/local-cluster/README.md` and `scripts/infinite_streaming_encoder/temporal_worker.py`.
 
 `.env` at the repo root is auto-loaded by the Makefile and passed through. Key vars: `SOURCE_DIR`, `OUTPUT_DIR`, `TMP_DIR` (host paths), `AUTO_WATCH`, `DEFAULT_TARGET` (cloud|local), `DEFAULT_CODEC` (h264|hevc|both|all), `DEFAULT_MAX_RES`, `MAX_CONCURRENT`, plus AWS vars (`S3_BUCKET`, `SUBNET_ID`, `SECURITY_GROUP_ID`, `INSTANCE_PROFILE`, `INSTANCE_TYPE`, `GHCR_PAT`) for cloud encoding. The Makefile additionally exports `HOST_SOURCE_DIR` / `HOST_OUTPUT_DIR` / `HOST_TMP_DIR` / `HOST_AWS_DIR` / `ENCODER_IMAGE` into the server container — the server needs the host-side view of those paths to spawn worker containers (see "Worker containers" below).
 

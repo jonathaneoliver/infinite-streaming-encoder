@@ -1,0 +1,18 @@
+# Dev overlay for the working-tree ("farm-dev-up") loop. Layer it after the base:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+#     --profile master up -d --build
+#
+# It bind-mounts your live ./scripts/infinite_streaming_encoder over the image's
+# baked copy in BOTH the server and the worker, so uncommitted Python changes run
+# without a rebuild. The Makefile's `make farm-dev-up` also passes
+# HOST_SCRIPTS_DIR=$(CURDIR)/scripts/infinite_streaming_encoder so the server
+# overlays the same live code onto the short-lived orchestrator containers it
+# spawns. Re-run after edits to pick up changes (Go/deps still need --build).
+services:
+  server:
+    volumes:
+      - ./scripts/infinite_streaming_encoder:/app/scripts/infinite_streaming_encoder:ro
+  worker:
+    volumes:
+      - ./scripts/infinite_streaming_encoder:/app/scripts/infinite_streaming_encoder:ro

@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+# DEPRECATED for local use. The master's own worker (and the cluster + server)
+# now come up from the unified root docker-compose.yml:
+#     make farm            # GHCR image
+#     make farm-dev        # working-tree build
+#     make dist-worker     # just this box's worker
+#     docker compose --profile worker up -d   # a standalone worker box
+# This script survives ONLY because the SSH remote-deploy path still uses it
+# (infra/local-cluster/deploy-worker.sh / deploy-worker-ghcr.sh scp + run it).
+# Prefer `docker compose --profile worker up` on new worker boxes.
+#
 # Run a distributed-local encode worker on THIS box. The worker is a container
 # from the encoder image running `infinite_streaming_encoder.temporal_worker`; it polls the Temporal
 # server (outbound only) and runs cli_phase encodes against MinIO. --restart

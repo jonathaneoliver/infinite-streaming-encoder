@@ -84,7 +84,7 @@ Producing a full ABR ladder for a library of source videos is:
   durable Temporal workflow; MinIO is the shared chunk/blob store.
 - **D2 — Pull-based workers.** Each worker box makes outbound-only connections
   (no inbound firewall/NAT setup) and contributes its cores.
-- **D3 — One-command farm.** `make farm` brings up cluster + this box's worker +
+- **D3 — One-command farm.** `make farm-up` brings up cluster + this box's worker +
   every `DIST_WORKERS` box + server/UI. Machines can be toggled mid-run.
 - **D4 — Mixed architectures.** A farm of arm + x86 boxes works: code is
   bind-mounted (arch-independent), images are transferred (same-arch) or built
@@ -109,7 +109,7 @@ Producing a full ABR ladder for a library of source videos is:
   recompute it.
 
 ### 6.5 Developer ergonomics
-- **E1 — Commit-free testing.** `make farm-dev` runs the entire farm from the
+- **E1 — Commit-free testing.** `make farm-dev-up` runs the entire farm from the
   working tree: local build (uncommitted Go + deps) on the master, working-tree
   Python bind-mounted into every worker and the orchestrator.
 - **E2 — Fast propagation.** Re-running the dev loop rsyncs only diffs and
@@ -135,5 +135,5 @@ Producing a full ABR ladder for a library of source videos is:
 - Ladder expansion (`apple` / `apple-uniq`) — see
   [`apple-ladder-design.md`](apple-ladder-design.md).
 - Adaptive chunk sizing by source length / codec.
-- Whether to publish a public multi-arch GHCR image so `make farm` / `run-remote`
+- Whether to publish a public multi-arch GHCR image so `make farm-up` / `run-remote`
   onboarding needs no PAT.
