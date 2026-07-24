@@ -99,6 +99,7 @@
                 "s3_prefix.$": "$.s3_prefix",
                 "s3_mezz.$": "$.s3_mezz",
                 "two_pass.$": "$$.Map.Item.Value.two_pass",
+                "extra_args.$": "$$.Map.Item.Value.extra_args",
                 "chunk_indices.$": "$$.Map.Item.Value.chunk_indices",
                 "chunk_duration.$": "$$.Map.Item.Value.chunk_duration",
                 "maxrate_percent.$": "$.maxrate_percent",
@@ -142,6 +143,7 @@
                       "ContainerOverrides": {
                         "Environment": [
                           { "Name": "TWO_PASS", "Value.$": "$.two_pass" },
+                          { "Name": "EXTRA_ARGS", "Value.$": "$.extra_args" },
                           { "Name": "CHUNK_DURATION_S", "Value.$": "$.chunk_duration" },
                           { "Name": "MAXRATE_PERCENT", "Value.$": "$.maxrate_percent" },
                           { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" },
@@ -174,6 +176,7 @@
                       "s3_prefix.$": "$.s3_prefix",
                       "s3_mezz.$": "$.s3_mezz",
                       "two_pass.$": "$.two_pass",
+                      "extra_args.$": "$.extra_args",
                       "chunk_index.$": "$$.Map.Item.Value",
                       "chunk_duration.$": "$.chunk_duration",
                       "maxrate_percent.$": "$.maxrate_percent",
@@ -207,6 +210,7 @@
                             "ContainerOverrides": {
                               "Environment": [
                                 { "Name": "TWO_PASS", "Value.$": "$.two_pass" },
+                                { "Name": "EXTRA_ARGS", "Value.$": "$.extra_args" },
                                 { "Name": "CHUNK_DURATION_S", "Value.$": "$.chunk_duration" },
                                 { "Name": "MAXRATE_PERCENT", "Value.$": "$.maxrate_percent" },
                                 { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" },

@@ -204,22 +204,26 @@ class EncodeWorkflow:
         specs = []
         for codec, ci in plan["codecs"].items():
             tp = ci["two_pass"]
+            ea = ci.get("extra_args", "")  # per-codec ladder-profile ffmpeg args
             for r in ci["rungs"]:
                 w = (r["height"] * r["height"] * codec_cost.get(codec, 1.0)
                      * (1.8 if tp else 1.0))
                 for i in range(n):
-                    specs.append((w, codec, r, tp, i))
+                    specs.append((w, codec, r, tp, ea, i))
         specs.sort(key=lambda s: s[0], reverse=True)  # most expensive first
         chunk_acts = []
-        for _w, codec, r, tp, i in specs:
+        for _w, codec, r, tp, ea, i in specs:
             args = ["variant", "--codec", codec, "--label", r["label"],
                     "--width", str(r["width"]), "--height", str(r["height"]),
                     "--bitrate", str(r["bitrate"]), "--chunk-index", str(i),
                     "--s3-mezz", s3_work, "--s3-out", s3_work]
             if tp:
                 args.append("--two-pass")
+            if ea:
+                args += ["--extra-args", ea]
             env = {"CHUNK_DURATION_S": str(cd), "COALESCE_RUNT_TAIL": "1",
-                   "TWO_PASS": "1" if tp else "0", "ENCODE_THREADS": "2"}
+                   "TWO_PASS": "1" if tp else "0", "EXTRA_ARGS": ea,
+                   "ENCODE_THREADS": "2"}
             chunk_acts.append(self._phase(
                 args, env, f"enc-{codec}-{r['label']}-c{i}"))
         await asyncio.gather(*chunk_acts)

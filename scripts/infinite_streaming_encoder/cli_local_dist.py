@@ -50,7 +50,8 @@ from infinite_streaming_encoder.chunking import plan_chunks
 from infinite_streaming_encoder.encode_variants import _coalesce_runt_tail, variant_stage_key
 from infinite_streaming_encoder.ffprobe import ProbeError, probe
 from infinite_streaming_encoder.ladder import (
-    Rung, get_ladder, parse_bitrate_override, select_rungs,
+    Rung, get_ladder, ladder_extra_args, ladder_passes,
+    parse_bitrate_override, select_rungs,
 )
 from infinite_streaming_encoder.progress import Stage, emit_plan, emit_stage
 
@@ -353,6 +354,7 @@ class ChunkTask:
     rung: Rung
     index: int
     two_pass: bool
+    extra_args: str = ""
     attempts: int = 0
 
 
@@ -396,9 +398,12 @@ def _worker_loop(w: Worker, sh: _Shared, s3_mezz: str, s3_out: str) -> None:
                 "--s3-mezz", s3_mezz, "--s3-out", s3_out]
         if task.two_pass:
             args.append("--two-pass")
+        if task.extra_args:
+            args += ["--extra-args", task.extra_args]
         rc = run_phase(w, args,
                        env={"CHUNK_DURATION_S": f"{sh.chunk_duration_s:g}",
-                            "TWO_PASS": "1" if task.two_pass else "0"},
+                            "TWO_PASS": "1" if task.two_pass else "0",
+                            "EXTRA_ARGS": task.extra_args},
                        log_prefix=stage)
         if rc == 0 and _object_exists(sh.bucket, key):
             with sh.lock:
@@ -596,13 +601,19 @@ def run(args: argparse.Namespace) -> int:
                      env={}, log_prefix="audio"):
             return 1
 
-    # 3. chunk fan-out across the pool
-    two_pass_for = {"hevc": not args.hevc_single_pass, "h264": False, "av1": False}
+    # 3. chunk fan-out across the pool. Pass count + extra_args now come from
+    # the ladder profile (ladder_passes/ladder_extra_args); hevc_single_pass
+    # stays as a per-encode override forcing HEVC single-pass.
+    two_pass_for = {c: ladder_passes(ladder_def, c) == 2 for c in ("h264", "hevc", "av1")}
+    if args.hevc_single_pass:
+        two_pass_for["hevc"] = False
+    extra_args_for = {c: ladder_extra_args(ladder_def, c) for c in ("h264", "hevc", "av1")}
     tasks: list[ChunkTask] = []
     for codec, rungs in rungs_by_codec.items():
         for rung in rungs:
             for i in range(n_chunks):
-                tasks.append(ChunkTask(codec, rung, i, two_pass_for[codec]))
+                tasks.append(ChunkTask(codec, rung, i, two_pass_for[codec],
+                                       extra_args_for[codec]))
     print(f"[dist] === {len(tasks)} chunk task(s) across "
           f"{sum(w.slots for w in pool)} slot(s) ===", flush=True)
     sh = _Shared(q=queue.Queue(), bucket=bucket, work_prefix=work_prefix,
@@ -811,12 +822,18 @@ def run_temporal(args: argparse.Namespace) -> int:
                           hevc_two_pass=not args.hevc_single_pass)
     _upload_source(input_path, bucket, src_key)
 
-    two_pass = {"hevc": not args.hevc_single_pass, "h264": False, "av1": False}
+    # Pass count + extra_args come from the ladder profile now; hevc_single_pass
+    # remains a per-encode override forcing HEVC single-pass.
+    ladder_def = get_ladder(args.ladder)
+    two_pass = {c: ladder_passes(ladder_def, c) == 2 for c in ("h264", "hevc", "av1")}
+    if args.hevc_single_pass:
+        two_pass["hevc"] = False
     plan = {
         "bucket": bucket, "job_prefix": prefix, "src_key": src_key,
         "has_audio": info.has_audio, "chunk_duration_s": args.chunk_duration_s,
         "n_chunks": n_chunks,
         "codecs": {c: {"two_pass": two_pass[c],
+                       "extra_args": ladder_extra_args(ladder_def, c),
                        "rungs": [{"label": r.label, "width": r.width,
                                   "height": r.height, "bitrate": r.bitrate} for r in rr]}
                    for c, rr in rungs_by_codec.items()},

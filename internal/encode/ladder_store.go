@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -40,6 +41,19 @@ type LadderDef struct {
 	// Codecs maps a codec ("h264"/"hevc"/"av1") to its rungs, each a
 	// [width, height, bitrate_kbps] triple. Preset defaults to "medium".
 	Codecs map[string][][]int `json:"codecs"`
+	// ExtraArgs maps a codec to a raw ffmpeg args string appended AFTER the
+	// ladder's rate-control block and BEFORE the output — e.g. "hevc":
+	// "-x265-params aq-mode=3:psy-rd=2.0", "av1": "-svtav1-params film-grain=8".
+	// Empty/absent = none (the default; existing ladders are unchanged). The
+	// Python side shlex-splits it to argv (never shell-eval'd); shell
+	// metacharacters are rejected at save time (validateLadderDef).
+	ExtraArgs map[string]string `json:"extra_args,omitempty"`
+	// Passes maps a codec to its encode pass count (1 or 2). Absent/missing key
+	// = the codec-intrinsic default (h264:1, hevc:2, av1:1), so existing ladders
+	// are unchanged. Only HEVC is a real choice: h264 is always 1-pass and av1
+	// has no 2-pass path, so h264:2 / av1:2 are rejected at save time. This
+	// generalizes the old per-encode JobConfig.HevcSinglePass into the profile.
+	Passes map[string]int `json:"passes,omitempty"`
 }
 
 type ladderFile struct {
@@ -327,7 +341,61 @@ func validateLadderDef(def LadderDef) error {
 	if def.MaxratePercent < 0 || def.BufsizeMultiplier < 0 {
 		return fmt.Errorf("maxrate_percent / bufsize_multiplier must be >= 0")
 	}
+	// extra_args: known codec, and no shell metacharacters. The Python side
+	// shlex-splits to argv (never shell-eval'd), so this is a footgun guard, not
+	// an injection defense — but rejecting metacharacters keeps a bad flag from
+	// looking like it might shell-escape.
+	for codec, raw := range def.ExtraArgs {
+		if codec != "h264" && codec != "hevc" && codec != "av1" {
+			return fmt.Errorf("extra_args: unknown codec %q (want h264/hevc/av1)", codec)
+		}
+		if i := strings.IndexAny(raw, ";|&<>`\n\r"); i >= 0 {
+			return fmt.Errorf("extra_args[%s]: shell metacharacter %q is not allowed", codec, raw[i:i+1])
+		}
+		if strings.Contains(raw, "$(") || strings.Contains(raw, "${") {
+			return fmt.Errorf("extra_args[%s]: command/variable substitution is not allowed", codec)
+		}
+	}
+	// passes: 1 or 2, and only HEVC may be 2 (h264 is always 1-pass; av1 has no
+	// 2-pass path). Absent keys fall back to the codec-intrinsic default.
+	for codec, n := range def.Passes {
+		if codec != "h264" && codec != "hevc" && codec != "av1" {
+			return fmt.Errorf("passes: unknown codec %q (want h264/hevc/av1)", codec)
+		}
+		if n != 1 && n != 2 {
+			return fmt.Errorf("passes[%s]: must be 1 or 2", codec)
+		}
+		if n == 2 && codec != "hevc" {
+			return fmt.Errorf("passes[%s]: only HEVC supports 2-pass (h264 is always 1-pass, av1 has no 2-pass path)", codec)
+		}
+	}
 	return nil
+}
+
+// extraArgsFor returns the raw ffmpeg extra-args string for a codec on this
+// ladder ("" when unset — the default). av1 uses its own key (its param syntax
+// differs from hevc), unlike rung resolution where av1 reuses the hevc column.
+func (d LadderDef) extraArgsFor(codec string) string {
+	if d.ExtraArgs == nil {
+		return ""
+	}
+	return d.ExtraArgs[codec]
+}
+
+// passesFor returns the encode pass count for a codec on this ladder, falling
+// back to the codec-intrinsic default (hevc:2, everything else:1) when the
+// ladder doesn't pin it. This is the single source of truth for the two-pass
+// decision now that it lives in the profile (was JobConfig.HevcSinglePass).
+func (d LadderDef) passesFor(codec string) int {
+	if d.Passes != nil {
+		if n, ok := d.Passes[codec]; ok && n > 0 {
+			return n
+		}
+	}
+	if codec == "hevc" {
+		return 2
+	}
+	return 1
 }
 
 // resolveRungs returns the rungs to encode for a (ladder, codec), filtered to
