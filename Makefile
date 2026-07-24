@@ -652,5 +652,12 @@ oobe: build   ## isolated first-run test: own dirs/ports/cluster -> encode -> as
 oobe-down:            ## tear down the isolated OOBE instance (server, worker, cluster + volumes, dirs)
 	-docker rm -f $(OOBE_SERVER) $(OOBE_WORKER) 2>/dev/null
 	-$(OOBE_CLUSTER_ENV) docker compose -p $(OOBE_PROJECT) -f $(DIST_COMPOSE) down -v 2>/dev/null
-	-rm -rf $(OOBE_DIR)
-	@echo ">>> [oobe] torn down."
+	@# Workers run as root and (on Linux, no UID remap) leave root-owned files in
+	@# the bind-mounted dir, so a plain host rm can hit "Permission denied". Try
+	@# the host rm first, then fall back to removing it from inside a container.
+	-rm -rf $(OOBE_DIR) 2>/dev/null
+	@if [ -d "$(OOBE_DIR)" ]; then \
+	  echo "    removing root-owned leftovers via a throwaway container..."; \
+	  docker run --rm -v "$(dir $(OOBE_DIR)):/parent" alpine rm -rf "/parent/$(notdir $(OOBE_DIR))" 2>/dev/null || true; \
+	fi
+	@[ -d "$(OOBE_DIR)" ] && echo ">>> [oobe] WARNING: $(OOBE_DIR) could not be removed" || echo ">>> [oobe] torn down."
