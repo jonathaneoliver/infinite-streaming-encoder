@@ -93,10 +93,10 @@ resource "aws_batch_compute_environment" "spot_graviton" {
   # build the new env, move the queue to it, then delete the old. A
   # fixed name forces delete-first, which AWS refuses while the job
   # queue is still attached ("found existing JobQueue relationship").
-  compute_environment_name_prefix = "infinite-streaming-encoder-spot-graviton-"
-  type                            = "MANAGED"
-  state                           = "ENABLED"
-  service_role                    = aws_iam_service_linked_role.batch.arn
+  name_prefix  = "infinite-streaming-encoder-spot-graviton-"
+  type         = "MANAGED"
+  state        = "ENABLED"
+  service_role = aws_iam_service_linked_role.batch.arn
 
   compute_resources {
     type                = "SPOT"
