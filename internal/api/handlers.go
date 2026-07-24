@@ -19,12 +19,14 @@ import (
 type Server struct {
 	Manager *encode.Manager
 	Mux     *http.ServeMux
-	// Version + GitSha are stamped by cmd/server from -ldflags-injected
-	// main.version / main.gitSha. CloudImage is the DOCKER_IMAGE env var
-	// — what the EC2 worker user-data pulls on job start. The About tab
-	// pulls the image's OCI labels from GHCR to compare local vs cloud.
+	// Version, GitSha, ImageTag are stamped by cmd/server from -ldflags-injected
+	// main.version / main.gitSha / main.imageTag. GitSha is the real HEAD;
+	// ImageTag is the content hash the image was published under. CloudImage is
+	// the DOCKER_IMAGE env var — what the worker pulls on job start. The About
+	// tab pulls the image's OCI labels from GHCR to compare local vs cloud.
 	Version    string
 	GitSha     string
+	ImageTag   string
 	CloudImage string
 
 	imageInfo *imageinfo.Client
@@ -111,8 +113,9 @@ func noCache(h http.Handler) http.Handler {
 func (s *Server) getVersion(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{
 		"local": map[string]string{
-			"version":  s.Version,
-			"revision": s.GitSha,
+			"version":   s.Version,
+			"revision":  s.GitSha,
+			"image_tag": s.ImageTag,
 		},
 		"cloud_image": s.CloudImage,
 		// Whether the cloud-batch target is usable on this host. The UI disables

@@ -676,6 +676,8 @@ make clear-costs  # this button's sweep AND the AMI, in one command</code></pre>
             <dd id="about-local-version">—</dd>
             <dt>Commit</dt>
             <dd id="about-local-sha">—</dd>
+            <dt title="Content hash the image was published under (Dockerfile/requirements/scripts/static). The cloud job-defs pin this tag.">Image tag</dt>
+            <dd id="about-local-imagetag">—</dd>
         </dl>
 
         <h3 class="about-subhead" style="margin-top:18px">Cloud worker image</h3>
@@ -693,7 +695,7 @@ make clear-costs  # this button's sweep AND the AMI, in one command</code></pre>
         <h3 class="about-subhead" style="margin-top:18px">Source</h3>
         <dl class="about-list">
             <dt>Repository</dt>
-            <dd><a href="https://github.com/jonathaneoliver/Encoder" target="_blank" rel="noopener">github.com/jonathaneoliver/Encoder</a></dd>
+            <dd><a href="https://github.com/jonathaneoliver/infinite-streaming-encoder" target="_blank" rel="noopener">github.com/jonathaneoliver/infinite-streaming-encoder</a></dd>
         </dl>
     </div>
 </div>
@@ -3822,6 +3824,7 @@ async function loadVersion() {
 
         document.getElementById('about-local-version').textContent = local.version || 'dev';
         document.getElementById('about-local-sha').textContent = local.revision || 'unknown';
+        document.getElementById('about-local-imagetag').textContent = local.image_tag || '—';
 
         document.getElementById('about-cloud-image').textContent = j.cloud_image || '(not configured)';
         if (cloud.error) {

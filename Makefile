@@ -99,6 +99,7 @@ build:
 	docker build \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_SHA=$(GIT_SHA) \
+		--build-arg IMAGE_TAG=$(IMAGE_TAG) \
 		-t $(IMAGE_NAME) .
 
 version:

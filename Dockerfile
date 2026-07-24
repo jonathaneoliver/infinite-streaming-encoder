@@ -1,12 +1,18 @@
 FROM golang:1.26-alpine AS builder
 ARG VERSION=dev
 ARG GIT_SHA=unknown
+# IMAGE_TAG is the CONTENT hash (last commit touching Dockerfile/requirements/
+# scripts/static) — distinct from GIT_SHA (real HEAD). A published image bakes
+# both: GIT_SHA answers "which commit shipped", IMAGE_TAG answers "what content
+# is actually in this image" (they diverge when HEAD is ahead with e.g. doc-only
+# commits, and it's IMAGE_TAG the cloud job-defs pin).
+ARG IMAGE_TAG=unknown
 WORKDIR /build
 COPY go.mod .
 COPY cmd/ cmd/
 COPY internal/ internal/
 RUN CGO_ENABLED=0 go build \
-    -ldflags "-X main.version=${VERSION} -X main.gitSha=${GIT_SHA}" \
+    -ldflags "-X main.version=${VERSION} -X main.gitSha=${GIT_SHA} -X main.imageTag=${IMAGE_TAG}" \
     -o /encoder ./cmd/server
 
 FROM python:3.14-slim
@@ -14,13 +20,15 @@ FROM python:3.14-slim
 ARG TARGETARCH
 ARG VERSION=dev
 ARG GIT_SHA=unknown
+ARG IMAGE_TAG=unknown
 
 # OCI labels let the SPA's About tab query the registry (GHCR) and
-# report the cloud image's version + commit SHA alongside the local
-# binary's, so the user can see when the two have drifted.
+# report the cloud image's version + commit SHA + content tag alongside the
+# local binary's, so the user can see when the two have drifted.
 LABEL org.opencontainers.image.version="${VERSION}"
 LABEL org.opencontainers.image.revision="${GIT_SHA}"
-LABEL org.opencontainers.image.source="https://github.com/jonathaneoliver/Encoder"
+LABEL org.opencontainers.image.ref.name="${IMAGE_TAG}"
+LABEL org.opencontainers.image.source="https://github.com/jonathaneoliver/infinite-streaming-encoder"
 
 # OS packages: CA certs + fonts for drawtext burn-ins (+ xz to unpack the static
 # ffmpeg below). ffmpeg itself is NOT from apt — see the static build next.
