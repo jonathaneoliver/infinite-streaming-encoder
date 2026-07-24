@@ -115,6 +115,10 @@ func (s *Server) getVersion(w http.ResponseWriter, r *http.Request) {
 			"revision": s.GitSha,
 		},
 		"cloud_image": s.CloudImage,
+		// Whether the cloud-batch target is usable on this host. The UI disables
+		// the option when false — mirrors the submit-time guard in job.go so a
+		// local-only install doesn't offer a target that can't work.
+		"cloud_configured": s.Manager.StateMachineArn != "",
 	}
 	if s.CloudImage != "" {
 		out["cloud"] = s.imageInfo.Get(r.Context(), s.CloudImage)
