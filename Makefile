@@ -238,12 +238,20 @@ ECR_PUSHED_TAG := $(shell aws ecr describe-images --repository-name infinite-str
 # if ECR can't be reached. Override in .env to pin a specific tag.
 DOCKER_IMAGE ?= $(ECR_REPO):$(if $(ECR_PUSHED_TAG),$(ECR_PUSHED_TAG),$(IMAGE_TAG))
 
-.PHONY: ecr-login ecr-push infra-init infra-plan infra-apply infra-destroy infra-teardown infra-setup deploy timing cpu-report bake-ami unbake-ami clear-costs
+# Step Functions ARN — auto-resolved from Terraform state (like ECR_REPO) so a
+# fresh `cloud-up` needs nothing hand-copied into .env. A value in .env wins (?=).
+STATE_MACHINE_ARN ?= $(shell cd $(TF_DIR) && tofu output -no-color -raw state_machine_arn 2>/dev/null)
+
+# USE_AMI=1 pre-bakes the worker AMI during `cloud-up` for faster cold starts
+# (~$1.50/mo until cloud-clear/cloud-down). Default off: cold ECR pull (~60s).
+USE_AMI ?=
+
+.PHONY: ecr-login ecr-push infra-init infra-plan infra-apply deploy deploy-review timing cpu-report cloud-up cloud-clear cloud-down cloud-check ami-up ami-down
 
 # Resolve the pre-baked worker AMI for the CURRENT image tag, if one exists.
 # Empty when nothing is baked -> Batch pulls the image on boot. This is what
 # makes the AMI cache opt-in and self-correcting: bake before an encode
-# session, `make unbake-ami` after, and infra-plan/apply just pick up whatever
+# session, `make ami-down` after, and infra-plan/apply just pick up whatever
 # is (or isn't) there for this image tag.
 WORKER_AMI ?= $(shell aws ec2 describe-images --owners self --region $(AWS_REGION) \
 	--filters "Name=tag:image_tag,Values=$(IMAGE_TAG)" "Name=state,Values=available" \
@@ -283,40 +291,49 @@ infra-plan:           ## tofu plan -> tf.plan (review before infra-apply)
 infra-apply:          ## apply the saved tf.plan (run only after reviewing the plan)
 	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu apply tf.plan
 
-infra-destroy:        ## tear the whole stack down to $0 (also removes the worker AMI)
-	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu destroy
-	$(MAKE) unbake-ami   # AMI isn't tofu-managed; remove it too so nothing bills
+cloud-down:           ## FULL teardown -> $0/mo (no prompt): tofu destroy -auto-approve + remove AMI
+	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu destroy -auto-approve
+	$(MAKE) ami-down   # AMI isn't tofu-managed; remove it too so nothing bills
 
-infra-teardown: infra-destroy   ## alias for infra-destroy (mirror of infra-setup)
-
-# Stand the whole stack up from nothing in one shot — the inverse of
-# infra-destroy. Every step is a sub-make so it re-parses the Makefile and
-# re-resolves ECR_REPO / WORKER_AMI from CURRENT state (the top-level values
-# were empty when make started, before any of this existed). Order matters:
-#   1. init + first apply       — create ECR, Batch, VPC, SFN, IAM (no AMI yet;
-#                                  launch template pulls the image on boot).
-#   2. ecr-push                 — push :IMAGE_TAG so the image exists to bake+run.
-#   3. bake-ami                 — bake the worker AMI (needs the instance profile
-#                                  from step 1 AND the image from step 2).
-#   4. second plan + apply      — WORKER_AMI now resolves to the baked AMI, so
-#                                  this wires it into the launch template.
-# Job defs referencing a not-yet-pushed tag apply fine in step 1 — ECR isn't
-# checked at create; step 2 fills it in.
-infra-setup:          ## one-shot stand-up: init + apply + ecr-push + bake-ami + wire AMI
+# Bring the cloud stack up to match the CURRENT code — the everyday cloud action
+# (run it for a new account, or after a worker-image change). Idempotent: tofu
+# creates on first run and reconciles after; every step is a sub-make so it
+# re-resolves ECR_REPO / WORKER_AMI from CURRENT state. Order matters:
+#   1. init + apply   — create/reconcile ECR, Batch, VPC, SFN, IAM (image pulls
+#                       on boot unless an AMI is wired in below).
+#   2. ecr-push       — push :IMAGE_TAG so the image exists to run (+ bake).
+#   3. USE_AMI=1 only — ami-up (bake), wait for it, then a second plan+apply wires
+#                       the AMI into the launch template. Off by default (~60s
+#                       cold ECR pull is cheaper than the standing ~$1.50/mo).
+#   4. cloud-check    — verify creds + state machine + bucket are actually usable.
+cloud-up:             ## provision/reconcile the cloud stack to current code + verify (USE_AMI=1 bakes the AMI)
 	$(MAKE) infra-init
 	$(MAKE) infra-plan
 	$(MAKE) infra-apply
 	$(MAKE) ecr-push
-	$(MAKE) bake-ami
-	@echo ">>> waiting for the baked AMI to be queryable as available (EC2 is eventually consistent)..."
-	@until [ -n "$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
-	    --filters Name=tag:image_tag,Values=$(IMAGE_TAG) Name=state,Values=available \
-	    --query 'Images[0].ImageId' --output text 2>/dev/null | grep -v '^None$$')" ]; do \
-	  sleep 3; done
-	$(MAKE) infra-plan
-	$(MAKE) infra-apply
-	@echo ">>> Stack up, image pushed, AMI baked + wired. Cold starts skip the ECR pull."
-	@echo ">>> (The AMI costs ~\$$1.50/mo while it exists — 'make unbake-ami' when done.)"
+	@if [ "$(USE_AMI)" = 1 ]; then \
+	  $(MAKE) ami-up; \
+	  echo ">>> waiting for the baked AMI to be queryable (EC2 is eventually consistent)..."; \
+	  until [ -n "$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
+	      --filters Name=tag:image_tag,Values=$(IMAGE_TAG) Name=state,Values=available \
+	      --query 'Images[0].ImageId' --output text 2>/dev/null | grep -v '^None$$')" ]; do sleep 3; done; \
+	  $(MAKE) infra-plan; $(MAKE) infra-apply; \
+	  echo ">>> AMI baked + wired — cold starts skip the ECR pull (~\$$1.50/mo until cloud-clear)."; \
+	else echo ">>> skipping AMI bake (USE_AMI unset -> pull-on-boot). Set USE_AMI=1 for warm starts."; fi
+	@$(MAKE) cloud-check
+	@echo ">>> cloud-up complete."
+
+# Live readiness: proves a cloud job could actually run — creds valid, the state
+# machine exists, the staging bucket is reachable. Uses runtime creds; seconds,
+# not a tofu plan. Run standalone anytime to answer "is cloud usable right now?"
+cloud-check:          ## live cloud readiness: AWS creds + state machine + S3 bucket reachable
+	@aws sts get-caller-identity >/dev/null 2>&1 \
+	  && echo "  ok: AWS credentials valid" || { echo "  FAIL: AWS credentials (check ~/.aws)"; exit 1; }
+	@aws stepfunctions describe-state-machine --state-machine-arn "$(STATE_MACHINE_ARN)" \
+	    --region $(AWS_REGION) >/dev/null 2>&1 \
+	  && echo "  ok: state machine live" || { echo "  FAIL: STATE_MACHINE_ARN not reachable — run cloud-up"; exit 1; }
+	@aws s3api head-bucket --bucket "$(S3_BUCKET)" 2>/dev/null \
+	  && echo "  ok: S3 bucket $(S3_BUCKET) reachable" || { echo "  FAIL: S3_BUCKET '$(S3_BUCKET)' not reachable"; exit 1; }
 
 # Deploy stops at the plan on purpose — review it, then run `make infra-apply`.
 # (Keeping preview and apply as separate, deliberate steps for live IaC.)
@@ -353,10 +370,10 @@ cpu-report:           ## per-tier encode CPU utilization vs reserved vCPU: make 
 # The AMI is a pre-warmed cache: a cold spot instance boots with the encoder
 # image already resident, skipping the ~60s ECR pull. It's OPT-IN and costs
 # ~$1.50/mo in EBS-snapshot storage while it exists, so bake it before an
-# encode session and `make unbake-ami` after. Exactly one infinite-streaming-encoder-worker AMI
+# encode session and `make ami-down` after. Exactly one infinite-streaming-encoder-worker AMI
 # is ever kept: bake prunes every other one, unbake removes them all.
 
-bake-ami:             ## build a worker AMI with the current image pre-pulled (keeps only this one)
+ami-up:             ## build a worker AMI with the current image pre-pulled (keeps only this one)
 	@: $${ECR_REPO:?ECR_REPO empty — run `make infra-apply` first, or set it in .env}
 	cd infra/packer && packer init worker-ami.pkr.hcl && \
 	  packer build -var region=$(AWS_REGION) -var ecr_repo=$(ECR_REPO) \
@@ -374,11 +391,11 @@ bake-ami:             ## build a worker AMI with the current image pre-pulled (k
 	  done
 	@echo ">>> Baked infinite-streaming-encoder-worker-$(IMAGE_TAG) (1 AMI total). Now: make infra-apply  (wires it in)"
 
-unbake-ami:           ## clear the compute-env AMI pointer, THEN delete the AMIs (self-clearing, no dangling ref)
+ami-down:           ## clear the compute-env AMI pointer, THEN delete the AMIs (self-clearing, no dangling ref)
 	# Clear the compute env's image_id_override FIRST so we never delete an AMI
 	# the env still points at — no dangling pointer, no manual follow-up apply.
 	# Targeted to the compute env only (won't touch job defs). Guarded so it
-	# no-ops on an already-destroyed stack (infra-destroy calls this after
+	# no-ops on an already-destroyed stack (cloud-down calls this after
 	# teardown, when there's nothing left in state to apply).
 	@if cd $(TF_DIR) && tofu state list 2>/dev/null | grep -q 'aws_batch_compute_environment.spot_graviton'; then \
 	  echo ">>> clearing compute-env AMI pointer (-> pull-on-boot)..."; \
@@ -398,21 +415,21 @@ unbake-ami:           ## clear the compute-env AMI pointer, THEN delete the AMIs
 	@echo ">>> Removed. Compute env is on pull-on-boot; nothing dangling."
 
 # ---- Cost teardown -----------------------------------------------------------
-# clear-costs kills everything that bills while IDLE without destroying the
+# cloud-clear kills everything that bills while IDLE without destroying the
 # reusable stack (compute env, queue, SFN, VPC, IAM are all ~$0 at rest —
 # scale-to-zero spot, IGW/public subnets, free S3 gateway endpoint). It runs
 # the same tagged sweep as the app's Emergency Clear (instances / orphan
 # volumes / spot requests / S3 data tagged Application=infinite-streaming-encoder-app) and removes
 # the worker AMI + snapshot. For a TOTAL teardown (also drops ECR images, log
-# groups, VPC — next use needs a full re-deploy) use `make infra-destroy`.
+# groups, VPC — next use needs a full re-deploy) use `make cloud-down`.
 
-clear-costs:          ## kill every idle AWS cost: sweep tagged instances/volumes/spot/S3 + remove worker AMI
+cloud-clear:          ## kill every idle AWS cost: sweep tagged instances/volumes/spot/S3 + remove worker AMI
 	@echo ">>> sweeping Application=infinite-streaming-encoder-app runtime resources (instances, volumes, spot, S3)..."
 	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.cloud.cleanup --sweep-all
 	@echo ">>> removing worker AMI(s)..."
-	$(MAKE) unbake-ami
+	$(MAKE) ami-down
 	@echo ">>> Idle cost generators cleared (AMI pointer self-cleared to pull-on-boot)."
-	@echo ">>> The Batch stack stays (it's ~\$$0 at rest). Full teardown: make infra-destroy"
+	@echo ">>> The Batch stack stays (it's ~\$$0 at rest). Full teardown: make cloud-down"
 
 # ---- Distributed-local encoding (Temporal + MinIO, no AWS) --------------------
 # All-container control plane on this (master) box; workers run one-per-box and

@@ -73,9 +73,9 @@ syncs back and promotes → plays in the UI.
 
 **Cost & cautions:**
 - The dominant cost is the ~60–90 s spot boot + ECR pull, not the encode — one
-  tiny clip ≈ a few cents. A pre-baked AMI (`make bake-ami`) removes the pull.
+  tiny clip ≈ a few cents. A pre-baked AMI (`make ami-up`) removes the pull.
 - **After** the test: confirm the instance scales to zero (AWS tab); `make
-  clear-costs` sweeps anything idle.
+  cloud-clear` sweeps anything idle.
 - **Do not `make deploy` while a cloud job is running** — it deregisters job-def
   revisions and fails the in-flight execution.
 - A compute-env infra-apply pauses scale-down until it clears; run cloud tests

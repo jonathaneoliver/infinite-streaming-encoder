@@ -39,7 +39,7 @@ Every encode is split into chunks and fanned out. You choose where the workers r
 - For `local`: nothing else — `make farm-up` brings up the whole master profile
   (Temporal + MinIO + server + a worker) from one `docker-compose.yml`.
 - For `cloud`: an AWS account, an existing S3 bucket, and the Terraform
-  stack under `infra/terraform` applied (`make infra-setup`).
+  stack under `infra/terraform` applied (`make cloud-up`).
 
 The image bakes in ffmpeg, Shaka Packager, the Docker CLI, and the AWS CLI.
 
@@ -103,7 +103,8 @@ See [`docs/PRD.md`](docs/PRD.md) and
 ### Cloud encoding (`cloud`)
 
 ```bash
-make infra-setup          # one-time: tofu apply + ecr-push + bake-ami + wire
+make cloud-up          # new account / after an image change: provision + push + verify
+                       #   (USE_AMI=1 also bakes the warm-start AMI)
 ```
 Then submit with target **Cloud (AWS Batch)**.
 
@@ -152,7 +153,7 @@ One `Dockerfile`, published/used four ways:
 | `make build` | local daemon (`infinite-streaming-encoder`) | server + local/same-arch workers |
 | `make push` | GHCR (multi-arch) | cross-arch workers + version display + `make run-remote` |
 | `make ecr-push` | ECR (arm64) | AWS Batch workers |
-| `make bake-ami` | AWS AMI | pre-pull the ECR image onto spot boxes |
+| `make ami-up` | AWS AMI | pre-pull the ECR image onto spot boxes |
 
 ## Repository layout
 

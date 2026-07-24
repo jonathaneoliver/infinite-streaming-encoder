@@ -71,7 +71,7 @@ else
 fi
 
 section "Cloud (target cloud-batch)"
-[ -n "${STATE_MACHINE_ARN:-}" ] && ok "STATE_MACHINE_ARN set" || warn "STATE_MACHINE_ARN unset — cloud-batch is disabled (run 'make infra-setup' to configure AWS)"
+[ -n "${STATE_MACHINE_ARN:-}" ] && ok "STATE_MACHINE_ARN set" || warn "STATE_MACHINE_ARN unset — cloud-batch is disabled (run 'make cloud-up' to configure AWS)"
 [ -n "${S3_BUCKET:-}" ]         && ok "S3_BUCKET=$S3_BUCKET"   || warn "S3_BUCKET unset — required for cloud-batch staging"
 [ -n "${AWS_REGION:-}" ]        && ok "AWS_REGION=$AWS_REGION" || warn "AWS_REGION unset (defaults us-west-2)"
 if [ -d "$HOME/.aws" ] || [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then ok "AWS credentials present"; else warn "no ~/.aws and no AWS_ACCESS_KEY_ID — cloud-batch can't authenticate"; fi
