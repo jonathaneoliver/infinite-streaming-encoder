@@ -33,11 +33,11 @@ for v in SOURCE_DIR OUTPUT_DIR TMP_DIR; do
 done
 
 section "Server config"
-tgt="${DEFAULT_TARGET:-local-dist}"
+tgt="${DEFAULT_TARGET:-local}"
 case "$tgt" in
-  local-dist|cloud-batch) ok "DEFAULT_TARGET=$tgt" ;;
-  local|cloud)            bad "DEFAULT_TARGET=$tgt is retired — use local-dist or cloud-batch" ;;
-  *)                      bad "DEFAULT_TARGET=$tgt is not a valid target (local-dist | cloud-batch)" ;;
+  local|cloud)            ok "DEFAULT_TARGET=$tgt" ;;
+  local-dist|cloud-batch) ok "DEFAULT_TARGET=$tgt (accepted alias for ${tgt%%-*})" ;;
+  *)                      bad "DEFAULT_TARGET=$tgt is not a valid target (local | cloud)" ;;
 esac
 cod="${DEFAULT_CODEC:-both}"
 case "$cod" in

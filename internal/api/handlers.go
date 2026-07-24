@@ -228,16 +228,17 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 	if cfg.Target == "" {
 		cfg.Target = encode.TargetLocalDist
 	}
+	// Accept the old local-dist / cloud-batch values as aliases for local / cloud.
+	cfg.Target = encode.NormalizeTarget(cfg.Target)
 	if cfg.Codec == "" {
 		cfg.Codec = "both"
 	}
-	// Reject unknown/retired targets up front with a clear message, rather than
-	// letting a bad target string (e.g. the retired "local"/"cloud") fail
-	// cryptically deep in the encode path.
+	// Reject unknown targets up front with a clear message, rather than letting
+	// a bad target string fail cryptically deep in the encode path.
 	switch cfg.Target {
 	case encode.TargetLocalDist, encode.TargetCloudBatch:
 	default:
-		http.Error(w, fmt.Sprintf("unknown target %q — use local-dist or cloud-batch", cfg.Target), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("unknown target %q — use local or cloud", cfg.Target), http.StatusBadRequest)
 		return
 	}
 	// One job per file: each selected file becomes its own independent job, so
@@ -384,30 +385,7 @@ func (s *Server) simulateInterrupt(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "job is not running", 400)
 		return
 	}
-	if job.Config.Target == encode.TargetCloud {
-		bucket := os.Getenv("S3_BUCKET")
-		region := os.Getenv("AWS_REGION")
-		if bucket == "" {
-			http.Error(w, "S3_BUCKET not configured", 500)
-			return
-		}
-		cloudID := job.CloudJobID
-		if cloudID == "" {
-			http.Error(w, "cloud_job_id not yet known for this job", 409)
-			return
-		}
-		key := fmt.Sprintf("s3://%s/jobs/%s/_SIMULATE_INTERRUPT", bucket, cloudID)
-		cmd := exec.Command("aws", "s3", "cp", "-", key, "--region", region)
-		cmd.Stdin = strings.NewReader("")
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to write sentinel: %s", strings.TrimSpace(string(out))), 500)
-			return
-		}
-		w.WriteHeader(204)
-		return
-	}
-	// Local: find and SIGKILL the worker container(s) for this job.
+	// Find and SIGKILL the worker container(s) for this job.
 	out, err := exec.Command("docker", "ps",
 		"--filter", "label=encoder.job_id="+id,
 		"--format", "{{.Names}}").Output()
@@ -443,18 +421,6 @@ func (s *Server) retryJob(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := orig.Config
 	cfg.ForceReencode = true
-	if cfg.Target == encode.TargetCloud {
-		// The JobID used as the S3 prefix by cli_cloud.py isn't the
-		// Manager's internal ID — it's the timestamp-based one the
-		// Python tool computes itself. We stash that into Job.CloudJobID
-		// when the remote plan prints job_id:<X>; fall back to the
-		// manager ID (close enough for new-style jobs).
-		prior := orig.CloudJobID
-		if prior == "" {
-			prior = orig.ID
-		}
-		cfg.ResumeFromJobID = prior
-	}
 	// Local resume is automatic: cli_local.py's per-clip work dir
 	// lives at TMPDIR/encode_<stem>/ on the host filesystem, so
 	// variants + mezzanine from a prior partial run are still there

@@ -13,11 +13,11 @@ One Docker image plays three roles: the **server** (Go control plane, default
 
 Every encode is split into chunks and fanned out. You choose where the workers run:
 
-- **`local-dist` — "Local (all machines)."** Chunks fan out across one or more
+- **`local` — "Local (all machines)."** Chunks fan out across one or more
   machines on your LAN via **Temporal** (durable orchestration) + **MinIO**
   (shared chunk store). No AWS. A worker box only needs Docker and outbound
   reach to the master.
-- **`cloud-batch` — "Cloud (AWS Batch)."** Chunks fan out across **AWS Batch**
+- **`cloud` — "Cloud (AWS Batch)."** Chunks fan out across **AWS Batch**
   spot Graviton instances, driven by Step Functions, staged in S3.
 
 (The older single-box `local` and one-box EC2 `cloud` targets were retired.)
@@ -36,9 +36,9 @@ Every encode is split into chunks and fanned out. You choose where the workers r
 ## Requirements
 
 - Docker (with the daemon socket at `/var/run/docker.sock`).
-- For `local-dist`: nothing else — `make dist-up` brings up Temporal + MinIO in
+- For `local`: nothing else — `make dist-up` brings up Temporal + MinIO in
   containers on the master.
-- For `cloud-batch`: an AWS account, an existing S3 bucket, and the Terraform
+- For `cloud`: an AWS account, an existing S3 bucket, and the Terraform
   stack under `infra/terraform` applied (`make infra-setup`).
 
 The image bakes in ffmpeg, Shaka Packager, the Docker CLI, and the AWS CLI.
@@ -58,7 +58,7 @@ To run the server **without building** (pull the published image from GHCR):
 make run-remote
 ```
 
-### A single-machine distributed encode (`local-dist`)
+### A single-machine distributed encode (`local`)
 
 ```bash
 make dist-up              # Temporal + Temporal-UI + Postgres + MinIO (containers)
@@ -82,7 +82,7 @@ make farm
 server/UI. See [`docs/PRD.md`](docs/PRD.md) and
 [`infra/local-cluster/README.md`](infra/local-cluster/README.md).
 
-### Cloud encoding (`cloud-batch`)
+### Cloud encoding (`cloud`)
 
 ```bash
 make infra-setup          # one-time: tofu apply + ecr-push + bake-ami + wire
@@ -115,7 +115,7 @@ required; everything else has a working default. See
 [`.env.example`](.env.example). Key groups:
 
 - **Host paths (required):** `SOURCE_DIR`, `OUTPUT_DIR`, `TMP_DIR`.
-- **Server:** `AUTO_WATCH`, `DEFAULT_TARGET` (`local-dist` | `cloud-batch`),
+- **Server:** `AUTO_WATCH`, `DEFAULT_TARGET` (`local` | `cloud`),
   `DEFAULT_CODEC`, `DEFAULT_MAX_RES`, `MAX_CONCURRENT`.
 - **Distributed-local:** `MASTER_IP`, `DIST_WORKERS`, plus Temporal/MinIO vars
   (defaults match `make dist-up`).

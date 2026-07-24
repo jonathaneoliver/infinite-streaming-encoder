@@ -8,9 +8,9 @@ legacy single-box `local` and one-box EC2 `cloud` paths are retired)
 Encoder is a self-hosted control plane for producing adaptive-bitrate (ABR)
 streaming assets from source video. A single operator drops a master file in
 and gets back player-ready LL-HLS + DASH output. Every encode is **chunked and
-fanned out** — across the operator's own LAN machines (`local-dist`, via
+fanned out** — across the operator's own LAN machines (`local`, via
 Temporal + MinIO, no AWS) or across cheap AWS Batch spot capacity
-(`cloud-batch`). Neither a server restart nor a lost worker/spot reclaim loses
+(`cloud`). Neither a server restart nor a lost worker/spot reclaim loses
 meaningful work, and the operator can build and test changes across the whole
 fleet without committing or pushing anything.
 
@@ -72,14 +72,14 @@ Producing a full ABR ladder for a library of source videos is:
 - **F2 — Encode ladder.** Per selected codec (H.264 / HEVC / AV1) and tier,
   closed GOPs, burned-in overlays.
 - **F3 — Package.** LL-HLS (fMP4 + EXT-X-PART) and DASH per codec; optional TS-HLS.
-- **F4 — Targets.** Route a job to `local-dist` or `cloud-batch`.
+- **F4 — Targets.** Route a job to `local` or `cloud`.
 - **F5 — Skip / narrow.** Encode only the missing codec outputs; skip a
   complete file. Bypassed by force-reencode.
 - **F6 — Live progress.** Stream per-job, per-phase, per-chunk status over SSE,
   attributed to the executing machine.
 - **F7 — Playback.** Serve output for in-browser HLS/DASH.
 
-### 6.2 Distributed-local (`local-dist`)
+### 6.2 Distributed-local (`local`)
 - **D1 — LAN fan-out.** Chunks of one encode run across multiple machines via a
   durable Temporal workflow; MinIO is the shared chunk/blob store.
 - **D2 — Pull-based workers.** Each worker box makes outbound-only connections
@@ -93,7 +93,7 @@ Producing a full ABR ladder for a library of source videos is:
 ### 6.3 Reliability
 - **R1 — Server-restart resilience.** A running encode survives a restart of
   the server; state is persisted and reconciled.
-- **R2 — Worker / spot resilience.** A lost `local-dist` worker's chunks are
+- **R2 — Worker / spot resilience.** A lost `local` worker's chunks are
   rescheduled by Temporal; a reclaimed Batch chunk is retried. At most one
   ~30 s chunk of work is lost.
 - **R3 — Crash-consistent output.** Partial output never appears in
