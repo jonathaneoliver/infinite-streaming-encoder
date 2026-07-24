@@ -452,14 +452,21 @@ dist-deploy: build dist-worker dist-deploy-workers  ## deploy distributed-local 
 	@echo ">>> distributed-local deployed: master worker + $(words $(DIST_WORKERS)) remote box(es)."
 
 # Like dist-deploy-workers, but every box PULLS the published image from GHCR
-# (no 900MB image transfer, no per-box build, any arch). Needs GHCR_PAT only if
-# the package is private. Pair with `make run-remote` on the master for a fully
-# no-local-build bring-up.
-dist-deploy-ghcr:     ## GHCR-pull workers on each DIST_WORKERS box (no build/transfer)
+# (no 900MB image transfer, no per-box build, any arch). The published package
+# is PUBLIC, so workers pull with no auth — we blank GHCR_PAT for the worker
+# call so the deploy never attempts a `docker login`. Blanking (not just
+# omitting) is required because the Makefile `export`s .env, so GHCR_PAT would
+# otherwise reach the script via the environment. Why it matters: `docker login`
+# over SSH fails headlessly on a macOS box (Docker Desktop's keychain credsStore:
+# "-25308 User interaction is not allowed"), which is what used to force the
+# macmini onto the image-transfer path. Pair with `make run-remote` on the master
+# for a fully no-local-build bring-up. (Forked to a PRIVATE package? Log each
+# worker box into GHCR by hand first — not supported headlessly on macOS.)
+dist-deploy-ghcr:     ## GHCR-pull workers on each DIST_WORKERS box (no build/transfer, no auth)
 	@if [ -z "$(DIST_WORKERS)" ]; then echo "set DIST_WORKERS=label=ssh_target [..] (in .env)"; exit 1; fi
 	@for w in $(DIST_WORKERS); do \
 	  label=$${w%%=*}; host=$${w#*=}; \
-	  MASTER_IP=$(MASTER_IP) IMAGE=$(REMOTE_IMAGE) GHCR_PAT=$(GHCR_PAT) GHCR_USERNAME=$(GHCR_USERNAME) \
+	  GHCR_PAT= MASTER_IP=$(MASTER_IP) IMAGE=$(REMOTE_IMAGE) GHCR_USERNAME=$(GHCR_USERNAME) \
 	    MINIO_ROOT_USER=$(MINIO_ACCESS_KEY) MINIO_ROOT_PASSWORD=$(MINIO_SECRET_KEY) \
 	    bash infra/local-cluster/deploy-worker-ghcr.sh "$$host" "$$label" || exit 1; \
 	done
