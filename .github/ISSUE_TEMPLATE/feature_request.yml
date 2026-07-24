@@ -1,0 +1,49 @@
+name: Feature request
+description: Suggest a new capability or enhancement
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project is a control plane for chunked, spot-resumable ABR video encoding across a local farm or AWS Batch. Features that keep encodes parallel, resumable, and observable are in scope; general media-server / playback-origin features likely are not.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: The workflow or encoding scenario you're trying to support.
+      placeholder: e.g. "I want AV1 chunks to fall back to a slower preset automatically when a spot worker is reclaimed twice."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you change or add? UI? Go control plane? Python pipeline? Cloud path?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing settings / workarounds you've tried, and why they fall short.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Dashboard / UI
+        - Go control plane (jobs / scheduling)
+        - Encoding pipeline (ffmpeg / ladder / packaging)
+        - Chunking / resume
+        - Local farm (Temporal / MinIO / workers)
+        - Cloud (AWS Batch / Step Functions / Terraform)
+        - Watcher / auto-submit
+        - Build / release / images
+        - Documentation
+        - Other

@@ -13,22 +13,22 @@ import (
 // what ladder/profile and properties produced this rendition. Structured so
 // go-live / dashboards can read it; the natural home for VMAF scores later.
 type encodeMeta struct {
-	Profile           string     `json:"profile"`
-	Codec             string     `json:"codec"`
-	MaxratePercent    int        `json:"maxrate_percent"`
-	BufsizeMultiplier float64    `json:"bufsize_multiplier"`
-	SegmentS          string     `json:"segment_s"`
-	PartialS          string     `json:"partial_s"`
-	GopS              string     `json:"gop_s"`
-	OutputTag         string     `json:"output_tag,omitempty"`
+	Profile           string  `json:"profile"`
+	Codec             string  `json:"codec"`
+	MaxratePercent    int     `json:"maxrate_percent"`
+	BufsizeMultiplier float64 `json:"bufsize_multiplier"`
+	SegmentS          string  `json:"segment_s"`
+	PartialS          string  `json:"partial_s"`
+	GopS              string  `json:"gop_s"`
+	OutputTag         string  `json:"output_tag,omitempty"`
 	// Extra job config used to make this output.
-	MaxRes         string `json:"max_res,omitempty"`
-	HevcSinglePass bool   `json:"hevc_single_pass,omitempty"`
-	Padding        string `json:"padding,omitempty"`
-	ChunkDuration  string `json:"chunk_duration,omitempty"`
-	ForceReencode  bool   `json:"force_reencode,omitempty"`
-	Source         string `json:"source,omitempty"`
-	EncodedAt      string `json:"encoded_at"`
+	MaxRes         string     `json:"max_res,omitempty"`
+	HevcSinglePass bool       `json:"hevc_single_pass,omitempty"`
+	Padding        string     `json:"padding,omitempty"`
+	ChunkDuration  string     `json:"chunk_duration,omitempty"`
+	ForceReencode  bool       `json:"force_reencode,omitempty"`
+	Source         string     `json:"source,omitempty"`
+	EncodedAt      string     `json:"encoded_at"`
 	Rungs          []metaRung `json:"rungs,omitempty"`
 }
 

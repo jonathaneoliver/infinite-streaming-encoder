@@ -1,0 +1,52 @@
+version: 2
+
+# Dependabot config — opens PRs for security and version updates across every
+# ecosystem in this repo. Weekly cadence keeps PR volume low. All PRs land via
+# the same PR + merge workflow as everything else (direct pushes to main are
+# blocked). PRs target the default branch (main); development happens on
+# short-lived feature branches, so no target-branch override is needed.
+
+updates:
+
+  # GitHub Actions used by .github/workflows/*
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+
+  # Go control plane (single module at the repo root).
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Python encoder package (requirements.txt at the repo root — boto3 etc.).
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Terraform / OpenTofu — the AWS Batch + Step Functions + ECR stack.
+  - package-ecosystem: "terraform"
+    directory: "/infra/terraform"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Docker base images in the Dockerfile.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"
