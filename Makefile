@@ -16,8 +16,9 @@ MINIO_ENDPOINT ?= http://host.docker.internal:9000
 MINIO_ACCESS_KEY ?= encoder
 MINIO_SECRET_KEY ?= encoder-secret
 DIST_S3_BUCKET ?= encoder-local
-# Label for the master box's own worker + the container name workers run as
-# (run-worker.sh WORKER_NAME) — used by the server to toggle machines on/off.
+# Label for the master box's own worker + the container name the worker runs as
+# (the compose `worker` service's container_name) — used by the server to toggle
+# machines on/off (internal/api/dist.go docker start/stop).
 LOCAL_WORKER_LABEL ?= mac
 DIST_WORKER_CONTAINER ?= encode-worker
 
@@ -30,17 +31,15 @@ DIST_WORKER_CONTAINER ?= encode-worker
 VERSION := $(shell cat VERSION 2>/dev/null || echo dev)
 GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
-# Promote (staging -> live rsync). All optional; no-ops when unset.
+# Promote (staging -> live rsync). All optional; no-ops when unset. Wired into
+# the server via the docker-compose.promote-{local,ssh}.yml overlays, which the
+# COMPOSE_PROMOTE logic below layers in only when the matching var is set.
 #  - PROMOTE_LOCAL_DIR: host dir mounted at /media/promote-local (a local dest;
 #    reference /media/promote-local in PROMOTE_DESTS).
 #  - PROMOTE_SSH_HOST: a *.local remote resolved here via mDNS and --add-host'd
-#    into the container, since Docker can't resolve .local names itself.
-PROMOTE_MOUNT := $(if $(PROMOTE_LOCAL_DIR),-v $(PROMOTE_LOCAL_DIR):/media/promote-local,)
+#    into the container (via the ssh overlay), since Docker can't resolve .local
+#    names itself. PROMOTE_SSH_IP is exported for that overlay to interpolate.
 PROMOTE_SSH_IP := $(if $(PROMOTE_SSH_HOST),$(shell dscacheutil -q host -a name $(PROMOTE_SSH_HOST) 2>/dev/null | awk '/^ip_address:/{print $$2; exit}'),)
-PROMOTE_ADDHOST := $(if $(PROMOTE_SSH_IP),--add-host $(PROMOTE_SSH_HOST):$(PROMOTE_SSH_IP),)
-# Forward the host ssh-agent (Docker Desktop magic socket) so a passphrase-
-# protected key whose passphrase is in the macOS keychain works in-container.
-PROMOTE_SSH_AGENT := $(if $(PROMOTE_SSH_HOST),-v /run/host-services/ssh-auth.sock:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent,)
 
 # GHCR publishing
 GHCR_IMAGE ?= ghcr.io/jonathaneoliver/infinite-streaming-encoder
@@ -60,7 +59,30 @@ REMOTE_IMAGE ?= $(GHCR_IMAGE):latest
 # empty in normal runs (the orchestrator then uses the image's baked scripts).
 HOST_SCRIPTS_DIR ?=
 
-.PHONY: require-paths build run run-remote stop restart logs shell status clean push push-setup cloud-push version setup-hooks
+# ---- Compose bring-up --------------------------------------------------------
+# One unified docker-compose.yml drives the whole farm via profiles (master =
+# cluster + server + worker; worker = worker only). Optional promote overlays are
+# layered only when the matching .env vars are set. This replaces the old split:
+# infra/local-cluster compose (cluster) + run-worker.sh (worker) + the
+# ENCODER_DOCKER_RUN docker-run block (server).
+COMPOSE ?= docker compose
+COMPOSE_PROJECT ?= infinite-streaming-encoder
+COMPOSE_PROMOTE :=
+ifneq ($(strip $(PROMOTE_LOCAL_DIR)),)
+COMPOSE_PROMOTE += -f docker-compose.promote-local.yml
+endif
+ifneq ($(strip $(PROMOTE_SSH_HOST)),)
+COMPOSE_PROMOTE += -f docker-compose.promote-ssh.yml
+endif
+COMPOSE_BASE := $(COMPOSE) -p $(COMPOSE_PROJECT) -f docker-compose.yml $(COMPOSE_PROMOTE)
+COMPOSE_DEV  := $(COMPOSE_BASE) -f docker-compose.dev.yml
+# Mac master only: size worker concurrency from HOST performance cores (the
+# Docker VM hides P/E cores, so in-container detection over-counts). Empty on
+# Linux / non-Mac -> the worker detects physical cores in-container. Passed to
+# compose as ENCODE_SLOTS (empty string is safe: compose ${ENCODE_SLOTS:-0}).
+FARM_ENCODE_SLOTS := $(shell P=$$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null); if [ -n "$$P" ] && [ "$$P" -gt 1 ]; then echo $$((P/2)); fi)
+
+.PHONY: require-paths build run run-remote down stop restart logs shell status clean push push-setup cloud-push version setup-hooks
 
 # Point git at the committed hooks (scripts/git-hooks/) so the pre-push guard
 # that blocks direct pushes to main is active in this clone. Run once per clone.
@@ -86,80 +108,37 @@ version:
 doctor:               ## preflight: check .env / host tools / per-target config, report clearly
 	@bash scripts/doctor.sh
 
-# Shared server-launch recipe used by both `run` and `run-remote`. $(RUN_IMAGE)
-# selects the image for the server AND the worker containers it spawns, so the
-# two targets share every mount/env and differ only in that one value.
-define ENCODER_DOCKER_RUN
-docker run --rm -d \
-	--name $(CONTAINER_NAME) \
-	-p $(PORT):8080 \
-	--add-host host.docker.internal:host-gateway \
-	-v $(SOURCE_DIR):/media/originals \
-	-v $(OUTPUT_DIR):/media/dynamic_content \
-	-v $(TMP_DIR):/media/tmp \
-	-v /var/run/docker.sock:/var/run/docker.sock \
-	-v $(HOME)/.aws:/root/.aws:ro \
-	-v $(HOME)/.ssh:/root/.ssh:ro \
-	$(PROMOTE_MOUNT) \
-	$(PROMOTE_ADDHOST) \
-	$(PROMOTE_SSH_AGENT) \
-	-e 'PROMOTE_DESTS=$(PROMOTE_DESTS)' \
-	-e SOURCE_DIR=/media/originals \
-	-e OUTPUT_DIR=/media/dynamic_content \
-	-e TMP_DIR=/media/tmp \
-	-e SCRIPTS_DIR=/app/scripts \
-	-e HOST_SOURCE_DIR=$(SOURCE_DIR) \
-	-e HOST_OUTPUT_DIR=$(OUTPUT_DIR) \
-	-e HOST_TMP_DIR=$(TMP_DIR) \
-	-e HOST_AWS_DIR=$(HOME)/.aws \
-	-e ENCODER_IMAGE=$(RUN_IMAGE) \
-	-e AUTO_WATCH=$(AUTO_WATCH) \
-	-e DEFAULT_TARGET=$(DEFAULT_TARGET) \
-	-e DEFAULT_CODEC=$(DEFAULT_CODEC) \
-	-e DEFAULT_MAX_RES=$(DEFAULT_MAX_RES) \
-	-e MAX_CONCURRENT=$(MAX_CONCURRENT) \
-	-e WARM_MIN_VCPUS=$(WARM_MIN_VCPUS) \
-	-e DOCKER_IMAGE=$(DOCKER_IMAGE) \
-	-e WORKER_AMI_ID=$(WORKER_AMI) \
-	-e AWS_REGION=$(AWS_REGION) \
-	-e S3_BUCKET=$(S3_BUCKET) \
-	-e SUBNET_ID=$(SUBNET_ID) \
-	-e SECURITY_GROUP_ID=$(SECURITY_GROUP_ID) \
-	-e INSTANCE_PROFILE=$(INSTANCE_PROFILE) \
-	-e INSTANCE_TYPE=$(INSTANCE_TYPE) \
-	-e GHCR_PAT=$(GHCR_PAT) \
-	-e STATE_MACHINE_ARN=$(STATE_MACHINE_ARN) \
-	-e TEMPORAL_UI_ADDR=$(TEMPORAL_UI_ADDR) \
-	-e TEMPORAL_ADDRESS=$(TEMPORAL_ADDRESS) \
-	-e MINIO_ENDPOINT=$(MINIO_ENDPOINT) \
-	-e MINIO_ACCESS_KEY=$(MINIO_ACCESS_KEY) \
-	-e MINIO_SECRET_KEY=$(MINIO_SECRET_KEY) \
-	-e DIST_S3_BUCKET=$(DIST_S3_BUCKET) \
-	-e 'DIST_WORKERS=$(DIST_WORKERS)' \
-	-e LOCAL_WORKER_LABEL=$(LOCAL_WORKER_LABEL) \
-	-e DIST_WORKER_CONTAINER=$(DIST_WORKER_CONTAINER) \
-	-e HOST_SCRIPTS_DIR=$(HOST_SCRIPTS_DIR) \
-	$(RUN_IMAGE)
-@echo "Encoder running at http://localhost:$(PORT)"
-endef
+# Server-only lifecycle. `run` brings up JUST the encoder server (no cluster /
+# worker) via compose — this is what `restart`/`deploy` use to bounce the server
+# after an image push. `--no-deps` keeps it from dragging the cluster up; for the
+# whole master profile (cluster + server + worker) use `make farm` / `farm-dev`.
+# ENCODER_IMAGE feeds BOTH this service's image and the image it spawns workers
+# from, so `run` (local build) and `run-remote` (GHCR) differ only in that value.
+run: require-paths
+	ENCODER_IMAGE=$(RUN_IMAGE) $(COMPOSE_BASE) up -d --build --no-deps server
+	@echo "Encoder running at http://localhost:$(PORT)"
 
-run: require-paths build
-	$(ENCODER_DOCKER_RUN)
-
-# Fire up from the published GHCR image instead of a local build — for a fresh
-# machine that just wants to run it. Pulls $(REMOTE_IMAGE) (which also becomes
-# ENCODER_IMAGE for the worker containers); logs into GHCR first only if
-# GHCR_PAT is set, which is needed when the package is private.
+# Fire up the server from the published GHCR image instead of a local build.
+# Logs into GHCR first only if GHCR_PAT is set (needed when the package is
+# private). Pairs with `make farm` for a fully no-local-build bring-up.
 run-remote: RUN_IMAGE = $(REMOTE_IMAGE)
 run-remote: require-paths
 	@if [ -n "$$GHCR_PAT" ]; then \
 		echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin; \
 	fi
-	docker pull $(REMOTE_IMAGE)
-	$(ENCODER_DOCKER_RUN)
+	ENCODER_IMAGE=$(REMOTE_IMAGE) $(COMPOSE_BASE) pull server
+	ENCODER_IMAGE=$(REMOTE_IMAGE) $(COMPOSE_BASE) up -d --no-build --no-deps server
+	@echo "Encoder running at http://localhost:$(PORT)"
 
+# Bring the whole master stack down (cluster + server + worker). ARGS=-v wipes
+# the Temporal/MinIO volumes.
+down:
+	$(COMPOSE_BASE) --profile master down $(ARGS)
+
+# Stop just the server (leaves the cluster + worker running). `restart` bounces
+# it via `run` so a fresh image is picked up.
 stop:
-	docker stop $(CONTAINER_NAME) 2>/dev/null || true
+	$(COMPOSE_BASE) stop server 2>/dev/null || docker stop $(CONTAINER_NAME) 2>/dev/null || true
 
 restart: stop run
 
@@ -437,30 +416,25 @@ clear-costs:          ## kill every idle AWS cost: sweep tagged instances/volume
 
 # ---- Distributed-local encoding (Temporal + MinIO, no AWS) --------------------
 # All-container control plane on this (master) box; workers run one-per-box and
-# pull work. See infra/local-cluster/README.md.
-DIST_COMPOSE = infra/local-cluster/docker-compose.yml
+# pull work. All of this now lives in the unified docker-compose.yml (master /
+# worker profiles); these are convenience aliases for pieces of it.
 .PHONY: dist-up dist-down dist-worker dist-logs dist-ps
 
-dist-up:              ## bring up the local cluster (temporal + ui + postgres + minio)
-	docker compose -f $(DIST_COMPOSE) up -d
-	@echo ">>> Temporal UI: http://localhost:8233   MinIO console: http://localhost:9001"
+dist-up: require-paths   ## bring up ONLY the local cluster (temporal + ui + postgres + minio)
+	$(COMPOSE_BASE) up -d postgresql temporal temporal-ui minio
+	@echo ">>> Temporal UI: http://localhost:$${TEMPORAL_UI_PORT:-8233}   MinIO console: http://localhost:$${MINIO_CONSOLE_PORT:-9001}"
 
-dist-down:            ## stop the local cluster (volumes persist; add ARGS=-v to wipe)
-	docker compose -f $(DIST_COMPOSE) down $(ARGS)
+dist-down:            ## stop the whole master stack (cluster + server + worker; ARGS=-v wipes volumes)
+	$(COMPOSE_BASE) --profile master down $(ARGS)
 
-dist-worker: build    ## run an encode worker on THIS box (uses the freshly-built image)
-	ENCODER_IMAGE=$(ENCODER_IMAGE) TEMPORAL_ADDRESS=$${TEMPORAL_ADDRESS:-host.docker.internal:7233} \
-	S3_ENDPOINT_URL=$${S3_ENDPOINT_URL:-http://host.docker.internal:9000} \
-	AWS_ACCESS_KEY_ID=$${MINIO_ROOT_USER:-encoder} \
-	AWS_SECRET_ACCESS_KEY=$${MINIO_ROOT_PASSWORD:-encoder-secret} \
-	infra/local-cluster/run-worker.sh
+dist-worker:          ## (re)build + run the local worker on THIS box (no source dirs needed)
+	ENCODER_IMAGE=$(IMAGE_NAME) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) $(COMPOSE_BASE) up -d --build worker
 
 dist-logs:            ## follow the local worker log
-	docker logs -f $${WORKER_NAME:-encode-worker}
+	docker logs -f $${DIST_WORKER_CONTAINER:-encode-worker}
 
-dist-ps:              ## cluster + worker containers
-	docker compose -f $(DIST_COMPOSE) ps
-	@docker ps --filter name=encode-worker --format 'table {{.Names}}\t{{.Status}}'
+dist-ps:              ## cluster + worker + server containers
+	$(COMPOSE_BASE) --profile master ps
 
 # DIST_WORKERS: space-separated label=ssh_target pairs of remote worker boxes,
 # e.g. DIST_WORKERS = ubuntu=jonathanoliver@jonathanoliver-ubuntu.local
@@ -497,51 +471,31 @@ dist-deploy-ghcr:     ## GHCR-pull workers on each DIST_WORKERS box (no build/tr
 	@echo ">>> GHCR-pull workers deployed to $(words $(DIST_WORKERS)) box(es)."
 
 # ---- One-command farm --------------------------------------------------------
-# `make farm` brings the whole distributed-local setup up from THIS machine as
-# master, pulling every image from GHCR (no local build). The master always runs
-# a worker; extra boxes come from DIST_WORKERS in .env. Run `make push` first so
-# GHCR has your current code.
-# `make farm-dev` is the developer loop: it bind-mounts your local scripts/infinite_streaming_encoder
-# into every worker, so re-running it just rsyncs the diffs and restarts workers
-# (no rebuild, no re-pull) — the fastest way to get local changes onto all boxes.
+# `make farm` brings the whole master profile up in ONE compose command (cluster
+# + server + one local worker), pulling the image from GHCR (no local build).
+# Extra boxes come from DIST_WORKERS in .env. Run `make push` first so GHCR has
+# your current code.
+# `make farm-dev` is the developer loop: local build + the dev overlay that
+# bind-mounts your working-tree scripts/infinite_streaming_encoder live into the
+# server + worker — re-run after edits (Go/deps still need the --build it does).
 .PHONY: farm farm-dev
 
-# host.docker.internal reaches the master's own cluster from its worker container.
-_MASTER_WORKER_ENV = TEMPORAL_ADDRESS=host.docker.internal:7233 \
-	S3_ENDPOINT_URL=http://host.docker.internal:9000 \
-	AWS_ACCESS_KEY_ID=$(MINIO_ACCESS_KEY) AWS_SECRET_ACCESS_KEY=$(MINIO_SECRET_KEY) \
-	WORKER_LABEL=$(LOCAL_WORKER_LABEL)
-
-farm: require-paths   ## bring the whole farm up from GHCR (cluster + this box's worker + DIST_WORKERS + UI)
-	@echo ">>> [farm] 1/5 cluster (temporal + minio)..."
-	$(MAKE) dist-up
-	@echo ">>> [farm] 2/5 waiting for Temporal (:7233)..."
-	@for i in $$(seq 1 60); do nc -z localhost 7233 2>/dev/null && break; sleep 1; done; sleep 5
-	@echo ">>> [farm] 3/5 pull $(REMOTE_IMAGE) + start a worker on THIS machine..."
+farm: require-paths   ## bring the whole master farm up from GHCR (cluster + server + worker), + DIST_WORKERS
+	@echo ">>> [farm] pulling images + bringing up the master profile (cluster + server + worker) from GHCR..."
 	@if [ -n "$(GHCR_PAT)" ]; then echo "$(GHCR_PAT)" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin; fi
-	docker pull $(REMOTE_IMAGE)
-	@ENCODER_IMAGE=$(REMOTE_IMAGE) $(_MASTER_WORKER_ENV) bash infra/local-cluster/run-worker.sh
-	@echo ">>> [farm] 4/5 remote workers (from GHCR)..."
+	ENCODER_IMAGE=$(REMOTE_IMAGE) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) $(COMPOSE_BASE) --profile master pull
+	ENCODER_IMAGE=$(REMOTE_IMAGE) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) $(COMPOSE_BASE) --profile master up -d --no-build
+	@echo ">>> [farm] remote workers (from GHCR)..."
 	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-ghcr; else echo "    (no DIST_WORKERS — master-only farm)"; fi
-	@echo ">>> [farm] 5/5 server + UI from GHCR..."
-	@$(MAKE) stop
-	$(MAKE) run-remote
-	@echo ">>> farm up:  UI http://localhost:$(PORT)   Temporal UI http://localhost:8233"
+	@echo ">>> farm up:  UI http://localhost:$(PORT)   Temporal UI http://localhost:$${TEMPORAL_UI_PORT:-8233}"
 
-farm-dev: require-paths   ## dev farm from your WORKING TREE (uncommitted): local build + bind-mounted code on every box
-	@echo ">>> [farm-dev] 1/5 build the image from your working tree (uncommitted Go + deps)..."
-	$(MAKE) build
-	@echo ">>> [farm-dev] 2/5 cluster (temporal + minio)..."
-	$(MAKE) dist-up
-	@for i in $$(seq 1 60); do nc -z localhost 7233 2>/dev/null && break; sleep 1; done; sleep 5
-	@echo ">>> [farm-dev] 3/5 worker on THIS machine (local image + LIVE working-tree code mount)..."
-	@ENCODER_IMAGE=$(IMAGE_NAME) CODE_MOUNT=$(CURDIR)/scripts/infinite_streaming_encoder $(_MASTER_WORKER_ENV) \
-	  bash infra/local-cluster/run-worker.sh
-	@echo ">>> [farm-dev] 4/5 sync code + image to DIST_WORKERS boxes (transfer same-arch / build cross-arch; code bind-mounted)..."
+farm-dev: require-paths   ## dev farm from your WORKING TREE (uncommitted): local build + live-mounted code
+	@echo ">>> [farm-dev] building from working tree + bringing up the master profile with live code..."
+	ENCODER_IMAGE=$(IMAGE_NAME) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) \
+	  HOST_SCRIPTS_DIR=$(CURDIR)/scripts/infinite_streaming_encoder \
+	  $(COMPOSE_DEV) --profile master up -d --build
+	@echo ">>> [farm-dev] remote workers (rsync code + transfer/build image)..."
 	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-workers; else echo "    (no DIST_WORKERS — master-only)"; fi
-	@echo ">>> [farm-dev] 5/5 server + UI from the LOCAL build; orchestrator runs your working-tree code..."
-	@$(MAKE) stop
-	HOST_SCRIPTS_DIR=$(CURDIR)/scripts/infinite_streaming_encoder $(MAKE) run
 	@echo ">>> farm-dev up (working tree — nothing committed/pushed). Re-run 'make farm-dev' after edits."
 
 # ---- Smoke test --------------------------------------------------------------
@@ -602,35 +556,31 @@ OOBE_WORKER ?= encode-worker-oobe
 # OOBE_KEEP=1 leaves the isolated instance up on finish (pass OR fail) so you can
 # inspect logs at :$(OOBE_PORT); otherwise it always tears down.
 OOBE_KEEP ?=
-OOBE_CLUSTER_ENV = TEMPORAL_PORT=$(OOBE_TEMPORAL_PORT) TEMPORAL_UI_PORT=$(OOBE_TEMPORAL_UI_PORT) \
-	MINIO_API_PORT=$(OOBE_MINIO_PORT) MINIO_CONSOLE_PORT=$(OOBE_MINIO_CONSOLE_PORT)
+# All the env an isolated OOBE stack needs: its own container names, host ports,
+# dirs, and cluster addresses (server + worker reach the isolated cluster via
+# host.docker.internal at the OOBE ports). Fed to the same unified compose file
+# via its own project (-p), so it's fully isolated from the live farm.
+OOBE_ENV = CONTAINER_NAME=$(OOBE_SERVER) DIST_WORKER_CONTAINER=$(OOBE_WORKER) \
+	PORT=$(OOBE_PORT) TEMPORAL_PORT=$(OOBE_TEMPORAL_PORT) TEMPORAL_UI_PORT=$(OOBE_TEMPORAL_UI_PORT) \
+	MINIO_API_PORT=$(OOBE_MINIO_PORT) MINIO_CONSOLE_PORT=$(OOBE_MINIO_CONSOLE_PORT) \
+	SOURCE_DIR=$(OOBE_DIR)/source OUTPUT_DIR=$(OOBE_DIR)/output TMP_DIR=$(OOBE_DIR)/tmp \
+	TEMPORAL_ADDRESS=host.docker.internal:$(OOBE_TEMPORAL_PORT) \
+	MINIO_ENDPOINT=http://host.docker.internal:$(OOBE_MINIO_PORT) \
+	S3_ENDPOINT_URL=http://host.docker.internal:$(OOBE_MINIO_PORT) \
+	LOCAL_WORKER_LABEL=oobe ENCODER_IMAGE=$(IMAGE_NAME) \
+	HOST_SCRIPTS_DIR=$(CURDIR)/scripts/infinite_streaming_encoder
+OOBE_COMPOSE = docker compose -p $(OOBE_PROJECT) -f docker-compose.yml -f docker-compose.dev.yml
 
 .PHONY: oobe oobe-down
 oobe: build   ## isolated first-run test: own dirs/ports/cluster -> encode -> assert -> tear down
 	@echo ">>> [oobe] fresh dirs under $(OOBE_DIR)"
 	@rm -rf $(OOBE_DIR); mkdir -p $(OOBE_DIR)/source $(OOBE_DIR)/output $(OOBE_DIR)/tmp
-	@echo ">>> [oobe] isolated cluster '$(OOBE_PROJECT)' on ports $(OOBE_TEMPORAL_PORT)/$(OOBE_TEMPORAL_UI_PORT)/$(OOBE_MINIO_PORT)/$(OOBE_MINIO_CONSOLE_PORT)..."
-	@$(OOBE_CLUSTER_ENV) docker compose -p $(OOBE_PROJECT) -f $(DIST_COMPOSE) up -d
-	@echo ">>> [oobe] waiting for the isolated Temporal (:$(OOBE_TEMPORAL_PORT))..."
-	@for i in $$(seq 1 60); do nc -z localhost $(OOBE_TEMPORAL_PORT) 2>/dev/null && break; sleep 1; done; sleep 5
 	@echo ">>> [oobe] generating a tiny clip in the isolated source dir..."
 	@docker run --rm -v "$(OOBE_DIR)/source:/src" --entrypoint ffmpeg $(IMAGE_NAME) \
 	  -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 \
 	  -t 20 -pix_fmt yuv420p -c:v libx264 -c:a aac -shortest -y /src/smoke.mp4
-	@echo ">>> [oobe] isolated worker '$(OOBE_WORKER)'..."
-	@ENCODER_IMAGE=$(IMAGE_NAME) WORKER_NAME=$(OOBE_WORKER) WORKER_LABEL=oobe \
-	  TEMPORAL_ADDRESS=host.docker.internal:$(OOBE_TEMPORAL_PORT) \
-	  S3_ENDPOINT_URL=http://host.docker.internal:$(OOBE_MINIO_PORT) \
-	  AWS_ACCESS_KEY_ID=$(MINIO_ACCESS_KEY) AWS_SECRET_ACCESS_KEY=$(MINIO_SECRET_KEY) \
-	  CODE_MOUNT=$(CURDIR)/scripts/infinite_streaming_encoder \
-	  bash infra/local-cluster/run-worker.sh
-	@echo ">>> [oobe] isolated server '$(OOBE_SERVER)' on :$(OOBE_PORT)..."
-	@docker rm -f $(OOBE_SERVER) >/dev/null 2>&1 || true
-	$(MAKE) run CONTAINER_NAME=$(OOBE_SERVER) PORT=$(OOBE_PORT) \
-	  SOURCE_DIR=$(OOBE_DIR)/source OUTPUT_DIR=$(OOBE_DIR)/output TMP_DIR=$(OOBE_DIR)/tmp \
-	  TEMPORAL_ADDRESS=host.docker.internal:$(OOBE_TEMPORAL_PORT) \
-	  MINIO_ENDPOINT=http://host.docker.internal:$(OOBE_MINIO_PORT) \
-	  DIST_WORKER_CONTAINER=$(OOBE_WORKER) HOST_SCRIPTS_DIR=$(CURDIR)/scripts/infinite_streaming_encoder
+	@echo ">>> [oobe] bringing up isolated master stack '$(OOBE_PROJECT)' on ports $(OOBE_PORT)/$(OOBE_TEMPORAL_PORT)/$(OOBE_MINIO_PORT) (one compose up)..."
+	$(OOBE_ENV) $(OOBE_COMPOSE) --profile master up -d --build
 	@echo ">>> [oobe] waiting for the isolated server (:$(OOBE_PORT))..."
 	@for i in $$(seq 1 30); do curl -sf http://localhost:$(OOBE_PORT)/api/jobs >/dev/null 2>&1 && break; sleep 1; done
 	@echo ">>> [oobe] submitting encode + waiting (timeout ~300s)..."
@@ -650,8 +600,7 @@ oobe: build   ## isolated first-run test: own dirs/ports/cluster -> encode -> as
 	  echo ">>> $$res"; case "$$res" in OOBE\ PASS*) exit 0;; *) exit 1;; esac
 
 oobe-down:            ## tear down the isolated OOBE instance (server, worker, cluster + volumes, dirs)
-	-docker rm -f $(OOBE_SERVER) $(OOBE_WORKER) 2>/dev/null
-	-$(OOBE_CLUSTER_ENV) docker compose -p $(OOBE_PROJECT) -f $(DIST_COMPOSE) down -v 2>/dev/null
+	-$(OOBE_ENV) $(OOBE_COMPOSE) --profile master down -v 2>/dev/null
 	@# Workers run as root and (on Linux, no UID remap) leave root-owned files in
 	@# the bind-mounted dir, so a plain host rm can hit "Permission denied". Try
 	@# the host rm first, then fall back to removing it from inside a container.

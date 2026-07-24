@@ -1,0 +1,8 @@
+# Optional promote overlay: mount a LOCAL directory as a promote destination.
+# Layered by the Makefile only when PROMOTE_LOCAL_DIR is set (compose merges the
+# volumes list onto the base server service). Reference /media/promote-local in
+# PROMOTE_DESTS.
+services:
+  server:
+    volumes:
+      - ${PROMOTE_LOCAL_DIR}:/media/promote-local

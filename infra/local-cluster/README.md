@@ -4,18 +4,26 @@ Runs one encode across several machines on your LAN — chunked like the cloud
 path, but with **no AWS**. Every piece is a container that comes back on
 power-on; the only per-box requirement is Docker.
 
+> **Bring-up moved.** The whole farm now comes up from the **unified
+> `docker-compose.yml` at the repo root** via two profiles (`master` /
+> `worker`) — see "Bring it up" below. The old split (a cluster compose here +
+> `run-worker.sh` + the Makefile's docker-run block) has been folded into it.
+> `run-worker.sh` survives only for the SSH remote-deploy scripts in this dir.
+
 ## Architecture
 
 ```
-master box (e.g. the Mac) — docker-compose.yml, all restart: unless-stopped
+master box (e.g. the Mac) — docker compose --profile master, all restart: unless-stopped
   ├─ temporal        durable workflow server (owns the DAG; reschedules lost work)
   ├─ temporal-ui     dashboard at http://<master>:8233
   ├─ postgresql      Temporal's datastore (state survives restarts)
-  └─ minio           shared blob store at :9000 (mezzanine, chunks, output)
+  ├─ minio           shared blob store at :9000 (mezzanine, chunks, output) — MASTER ONLY
+  ├─ server          encoder control plane + UI at http://<master>:8080
+  └─ encode-worker   the master's own worker (contributes its cores)
 
-each worker box (master included) — one container (run-worker.sh)
-  └─ encode-worker   polls temporal:7233 (outbound only), runs cli_phase encodes
-                     against MinIO. N concurrent = ENCODE_SLOTS (~cores/2).
+each EXTRA worker box — docker compose --profile worker (worker only, no cluster)
+  └─ encode-worker   polls <master>:7233 (outbound only), runs cli_phase encodes
+                     against <master>:9000 MinIO. N concurrent = ENCODE_SLOTS (~cores/2).
 ```
 
 **Why this shape:** workers *pull* work (only outbound connections), so no
@@ -28,21 +36,31 @@ video. See `../../scripts/infinite_streaming_encoder/temporal_worker.py` (activi
 
 ## Bring it up
 
-On the **master box** (sets the LAN IP others dial — update it in the compose
-`ports`/worker env if not 192.168.0.110):
+On the **master box** — one command brings up cluster + server + a local worker
+(cloud stays configured-but-idle):
 
 ```
-make dist-up        # postgres + temporal + temporal-ui + minio
-make dist-worker    # start a worker on the master too (uses its cores)
+make farm           # GHCR image (run `make push` first); or
+make farm-dev       # build from your working tree, live-mount the Python code
 ```
 
-On **each other box** (needs Docker + a current encoder image, or a synced
-`scripts/infinite_streaming_encoder` checkout + `CODE_MOUNT`):
+Prefer raw compose? `docker compose --profile master up -d` (set `SOURCE_DIR` /
+`OUTPUT_DIR` / `TMP_DIR` in `.env` first). Cluster-only or worker-only pieces:
+`make dist-up` (cluster) / `make dist-worker` (this box's worker).
+
+On **each EXTRA box** — Docker + the published image, nothing else. Point it at
+the master's LAN IP and start only the worker profile:
 
 ```
-cp infra/local-cluster/worker.env.example worker.env   # edit master IP + slots
-infra/local-cluster/run-worker.sh worker.env
+TEMPORAL_ADDRESS=<master-ip>:7233 \
+S3_ENDPOINT_URL=http://<master-ip>:9000 \
+MINIO_ACCESS_KEY=encoder MINIO_SECRET_KEY=encoder-secret \
+ENCODER_IMAGE=ghcr.io/jonathaneoliver/infinite-streaming-encoder:latest \
+docker compose --profile worker up -d
 ```
+
+Or let the master push it over SSH: set `DIST_WORKERS=label=ssh_target` in `.env`
+and `make farm` deploys each box (still via `run-worker.sh`).
 
 ## Run an encode
 
@@ -61,10 +79,12 @@ retries, which worker ran each chunk).
 
 ## Notes
 
-- First `make dist-up` runs Temporal `auto-setup` (schema + `default`
-  namespace) — give it ~30s. MinIO starts empty; the encoder creates the
-  `encoder-local` bucket keys as it uploads.
-- `make dist-down` stops the stack (volumes persist: Temporal history + MinIO
-  blobs). Add `-v` to wipe.
+- First bring-up runs Temporal `auto-setup` (schema + `default` namespace) —
+  the server waits on Postgres via a compose healthcheck, then Temporal comes
+  up (~30s). MinIO starts empty; the encoder creates the `encoder-local` bucket
+  keys as it uploads.
+- `make dist-down` (alias for `docker compose --profile master down`) stops the
+  whole stack (volumes persist: Temporal history + MinIO blobs). Add `ARGS=-v`
+  to wipe.
 - Slot sizing: x265 (HEVC) only ~half-fills a box per encode, so ~cores/2
   concurrent chunks saturate it. H264 scales further; tune `ENCODE_SLOTS`.

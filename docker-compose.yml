@@ -1,42 +1,233 @@
+# Unified bring-up for the distributed-local encoding farm.
+#
+# One file, two profiles:
+#
+#   master  — the box that runs everything: Temporal (+ UI) + Postgres + MinIO
+#             (the control plane), the encoder SERVER (control plane + UI on
+#             :8080), and one local WORKER. This is the "download the image and
+#             run one command" path:
+#                 docker compose --profile master up -d
+#
+#   worker  — an EXTRA box that only contributes cores. It runs the worker
+#             alone and dials the master's LAN Temporal + MinIO. No control
+#             plane, and crucially NO MinIO/Temporal locally:
+#                 MASTER_IP=<master-lan-ip> \
+#                 TEMPORAL_ADDRESS=$MASTER_IP:7233 \
+#                 S3_ENDPOINT_URL=http://$MASTER_IP:9000 \
+#                 docker compose --profile worker up -d
+#
+# Why MinIO/Temporal are master-only: they carry the shared queue + blobs; every
+# worker just needs OUTBOUND reach to them. The `master` profile is the only one
+# that includes them, so `--profile worker` can never start a second copy.
+#
+# NETWORKING CONTRACT (do not "simplify" to compose-DNS service names):
+# The encoder server spawns SHORT-LIVED per-job orchestrator containers via the
+# mounted docker.sock (internal/encode/job.go buildRunArgs). Those containers are
+# NOT on this compose network — they reach Temporal/MinIO through
+# `host.docker.internal` at the HOST-PUBLISHED ports (7233 / 9000). Remote
+# worker boxes reach them at the master's LAN IP. So every service here keeps its
+# host port binding, and server + worker address the cluster via the
+# TEMPORAL_ADDRESS / S3_ENDPOINT_URL env indirection (host.docker.internal on the
+# master, MASTER_IP on remote boxes) rather than `temporal:7233`.
+#
+# The old split — infra/local-cluster/docker-compose.yml (cluster) +
+# infra/local-cluster/run-worker.sh (worker) + the Makefile ENCODER_DOCKER_RUN
+# block (server) — is all folded into this file.
+
 services:
-  encoder:
-    build: .
-    ports:
-      - "8080:8080"
-    volumes:
-      # Source videos — read-only, the app browses this directory
-      - ${SOURCE_DIR:?SOURCE_DIR must be set in .env}:/media/originals:ro
-      # Encoded output — read-write
-      - ${OUTPUT_DIR:?OUTPUT_DIR must be set in .env}:/media/dynamic_content
-      # Temporary directory for in-progress encodes
-      - ${TMP_DIR:?TMP_DIR must be set in .env}:/media/tmp
-      # Docker socket — needed for local encoding via docker run
-      - /var/run/docker.sock:/var/run/docker.sock
-      # AWS credentials — needed for cloud encoding
-      - ${HOME}/.aws:/root/.aws:ro
-    environment:
-      - SOURCE_DIR=/media/originals
-      - OUTPUT_DIR=/media/dynamic_content
-      - TMP_DIR=/media/tmp
-      - SCRIPTS_DIR=/app/scripts
-      # Host-side paths — needed when spawning sibling worker containers, since
-      # `docker run -v` resolves against the host filesystem, not this container.
-      - HOST_SOURCE_DIR=${SOURCE_DIR}
-      - HOST_OUTPUT_DIR=${OUTPUT_DIR}
-      - HOST_TMP_DIR=${TMP_DIR}
-      - HOST_AWS_DIR=${HOME}/.aws
-      - ENCODER_IMAGE=${ENCODER_IMAGE:-encoder:latest}
-      - DOCKER_IMAGE=${DOCKER_IMAGE:-ghcr.io/jonathaneoliver/infinite-streaming-encoder:latest}
-      - AUTO_WATCH=${AUTO_WATCH:-true}
-      - DEFAULT_TARGET=${DEFAULT_TARGET:-local}
-      - DEFAULT_CODEC=${DEFAULT_CODEC:-both}
-      - DEFAULT_MAX_RES=${DEFAULT_MAX_RES:-}
-      - MAX_CONCURRENT=${MAX_CONCURRENT:-1}
-      - AWS_REGION=${AWS_REGION:-us-west-2}
-      - S3_BUCKET=${S3_BUCKET:-}
-      - SUBNET_ID=${SUBNET_ID:-}
-      - SECURITY_GROUP_ID=${SECURITY_GROUP_ID:-}
-      - INSTANCE_PROFILE=${INSTANCE_PROFILE:-encode-worker}
-      - INSTANCE_TYPE=${INSTANCE_TYPE:-c7i.xlarge}
-      - GHCR_PAT=${GHCR_PAT:-}
+  # ---- Control plane (master only) -----------------------------------------
+  postgresql:
+    image: postgres:16-alpine
+    profiles: [master]
     restart: unless-stopped
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    volumes:
+      - temporal_pg:/var/lib/postgresql/data
+    healthcheck:
+      # Gate Temporal on the DB actually accepting connections — this was the
+      # real startup race the Makefile's `nc -z 7233` loop papered over.
+      test: ["CMD-SHELL", "pg_isready -U temporal -d temporal"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  temporal:
+    image: temporalio/auto-setup:latest
+    profiles: [master]
+    restart: unless-stopped
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: postgresql
+    ports:
+      # Host port parameterized so an isolated stack (make oobe) can run a second
+      # cluster alongside the real one. Container port stays 7233.
+      - "${TEMPORAL_PORT:-7233}:7233"   # frontend — workers + orchestrators dial this
+    healthcheck:
+      # auto-setup registers the `default` namespace a few seconds AFTER the
+      # frontend starts accepting connections. Gate dependents on the namespace
+      # actually existing, not just the port — otherwise the first job fails with
+      # "Namespace default is not found." (The frontend binds the container IP,
+      # not 127.0.0.1, so target $(hostname -i). $$ escapes compose interpolation.)
+      test: ["CMD-SHELL", "temporal operator namespace describe -n default --address $$(hostname -i):7233 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    profiles: [master]
+    restart: unless-stopped
+    depends_on: [temporal]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:8233
+    ports:
+      - "${TEMPORAL_UI_PORT:-8233}:8080"   # web dashboard
+
+  minio:
+    image: minio/minio
+    profiles: [master]           # master only — never on a worker box
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      # Single source of truth for the S3 creds: MinIO's root user IS the access
+      # key the server + workers use, so they can never drift.
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-encoder}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-encoder-secret}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"       # S3 API — workers read/write here
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"   # MinIO console
+    volumes:
+      - minio_data:/data
+
+  # ---- Encoder server / control plane (master only) ------------------------
+  server:
+    image: ${ENCODER_IMAGE:-infinite-streaming-encoder:latest}
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+        GIT_SHA: ${GIT_SHA:-unknown}
+    profiles: [master]
+    container_name: ${CONTAINER_NAME:-infinite-streaming-encoder}
+    restart: unless-stopped
+    depends_on:
+      # service_healthy = the `default` namespace is registered, so the first
+      # spawned orchestrator won't hit "Namespace default is not found."
+      temporal:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    ports:
+      - "${PORT:-8080}:8080"
+    extra_hosts:
+      # Spawned orchestrator containers + remote workers reach the host-published
+      # Temporal/MinIO through this; also how the server itself would.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Sentinel defaults (not `:?`) so a worker box running `--profile worker`
+      # doesn't trip the mandatory-var check on this master-only service at
+      # parse time. On the master these are always set (make require-paths, or
+      # .env); if one is missing the server fails to start with the sentinel
+      # path right there in the error.
+      - ${SOURCE_DIR:-/SOURCE_DIR-not-set}:/media/originals
+      - ${OUTPUT_DIR:-/OUTPUT_DIR-not-set}:/media/dynamic_content
+      - ${TMP_DIR:-/TMP_DIR-not-set}:/media/tmp
+      - /var/run/docker.sock:/var/run/docker.sock   # spawn + control worker/orchestrator containers
+      - ${HOME}/.aws:/root/.aws:ro                  # cloud (AWS) creds — lazy, only used by cloud jobs
+      - ${HOME}/.ssh:/root/.ssh:ro                  # toggle remote workers over ssh (dist.go)
+    environment:
+      # In-container paths (all in-process file I/O).
+      SOURCE_DIR: /media/originals
+      OUTPUT_DIR: /media/dynamic_content
+      TMP_DIR: /media/tmp
+      SCRIPTS_DIR: /app/scripts
+      # Host-side paths — used only for `-v` flags when spawning sibling workers,
+      # since `docker run -v` resolves against the HOST filesystem.
+      HOST_SOURCE_DIR: ${SOURCE_DIR}
+      HOST_OUTPUT_DIR: ${OUTPUT_DIR}
+      HOST_TMP_DIR: ${TMP_DIR}
+      HOST_AWS_DIR: ${HOME}/.aws
+      # The image the server spawns worker/orchestrator containers from — same as
+      # this service's own image so local + spawned code match.
+      ENCODER_IMAGE: ${ENCODER_IMAGE:-infinite-streaming-encoder:latest}
+      # Dev only: overlay working-tree scripts onto spawned orchestrators (set by
+      # docker-compose.dev.yml / make farm-dev). Empty in normal runs.
+      HOST_SCRIPTS_DIR: ${HOST_SCRIPTS_DIR:-}
+      # Behavior / defaults.
+      AUTO_WATCH: ${AUTO_WATCH:-true}
+      DEFAULT_TARGET: ${DEFAULT_TARGET:-local}
+      DEFAULT_CODEC: ${DEFAULT_CODEC:-both}
+      DEFAULT_MAX_RES: ${DEFAULT_MAX_RES:-}
+      MAX_CONCURRENT: ${MAX_CONCURRENT:-1}
+      WARM_MIN_VCPUS: ${WARM_MIN_VCPUS:-}
+      PROMOTE_DESTS: ${PROMOTE_DESTS:-}
+      # Distributed-local (Temporal + MinIO) wiring. Cluster addresses default to
+      # the master's own host-published ports.
+      TEMPORAL_UI_ADDR: ${TEMPORAL_UI_ADDR:-http://host.docker.internal:8233}
+      TEMPORAL_ADDRESS: ${TEMPORAL_ADDRESS:-host.docker.internal:7233}
+      TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-encode}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://host.docker.internal:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-encoder}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-encoder-secret}
+      DIST_S3_BUCKET: ${DIST_S3_BUCKET:-encoder-local}
+      DIST_WORKERS: ${DIST_WORKERS:-}
+      LOCAL_WORKER_LABEL: ${LOCAL_WORKER_LABEL:-mac}
+      DIST_WORKER_CONTAINER: ${DIST_WORKER_CONTAINER:-encode-worker}
+      # Cloud (AWS Batch + Step Functions) — all lazy: env only, nothing here
+      # spins up until a cloud job is submitted. This is "cloud configured."
+      AWS_REGION: ${AWS_REGION:-us-west-2}
+      S3_BUCKET: ${S3_BUCKET:-}
+      SUBNET_ID: ${SUBNET_ID:-}
+      SECURITY_GROUP_ID: ${SECURITY_GROUP_ID:-}
+      INSTANCE_PROFILE: ${INSTANCE_PROFILE:-encode-worker}
+      INSTANCE_TYPE: ${INSTANCE_TYPE:-c7i.xlarge}
+      DOCKER_IMAGE: ${DOCKER_IMAGE:-}
+      WORKER_AMI_ID: ${WORKER_AMI:-}
+      STATE_MACHINE_ARN: ${STATE_MACHINE_ARN:-}
+      GHCR_PAT: ${GHCR_PAT:-}
+
+  # ---- Encode worker (master AND worker profiles) --------------------------
+  # One per box; each contributes its cores. Polls Temporal (outbound only) and
+  # reads/writes MinIO. Same definition on the master and on extra boxes — only
+  # the env (TEMPORAL_ADDRESS / S3_ENDPOINT_URL) differs, driven by .env.
+  worker:
+    image: ${ENCODER_IMAGE:-infinite-streaming-encoder:latest}
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+        GIT_SHA: ${GIT_SHA:-unknown}
+    profiles: [master, worker]
+    # Name is the toggle contract with internal/api/dist.go (docker start/stop).
+    container_name: ${DIST_WORKER_CONTAINER:-encode-worker}
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint: ["python3", "-m", "infinite_streaming_encoder.temporal_worker"]
+    environment:
+      TEMPORAL_ADDRESS: ${TEMPORAL_ADDRESS:-host.docker.internal:7233}
+      TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-encode}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://host.docker.internal:9000}
+      # MinIO creds handed to boto3 as AWS_* (kept off the server's real AWS creds).
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-encoder}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-encoder-secret}
+      AWS_REGION: ${MINIO_REGION:-us-east-1}
+      WORKER_LABEL: ${LOCAL_WORKER_LABEL:-mac}
+      # Concurrency: 0/unset => the worker detects physical cores in-container.
+      # A Mac master should pass a P-core-derived value (make farm computes it);
+      # never pass an empty string — the worker does int(ENCODE_SLOTS).
+      ENCODE_SLOTS: ${ENCODE_SLOTS:-0}
+
+volumes:
+  temporal_pg:
+  minio_data:

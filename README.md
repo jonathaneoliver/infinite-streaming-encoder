@@ -36,8 +36,8 @@ Every encode is split into chunks and fanned out. You choose where the workers r
 ## Requirements
 
 - Docker (with the daemon socket at `/var/run/docker.sock`).
-- For `local`: nothing else — `make dist-up` brings up Temporal + MinIO in
-  containers on the master.
+- For `local`: nothing else — `make farm` brings up the whole master profile
+  (Temporal + MinIO + server + a worker) from one `docker-compose.yml`.
 - For `cloud`: an AWS account, an existing S3 bucket, and the Terraform
   stack under `infra/terraform` applied (`make infra-setup`).
 
@@ -47,30 +47,35 @@ The image bakes in ffmpeg, Shaka Packager, the Docker CLI, and the AWS CLI.
 
 ```bash
 cp .env.example .env      # set SOURCE_DIR / OUTPUT_DIR / TMP_DIR (see below)
-make run                  # build the image, start the server + UI at :8080
+make farm                 # pull + bring up the whole master stack, UI at :8080
 ```
 
-Open `http://localhost:8080`, drop a file in `SOURCE_DIR`, and submit a job.
+`make farm` is one `docker compose --profile master up` — Temporal + Temporal-UI +
+Postgres + MinIO + the server + one local worker. Open `http://localhost:8080`,
+drop a file in `SOURCE_DIR`, and submit a job.
 
-To run the server **without building** (pull the published image from GHCR):
-
-```bash
-make run-remote
-```
+`make farm` pulls the published image from GHCR. To build from your **working
+tree** instead, use `make farm-dev` (below). `make run` / `make run-remote` bring
+up **just the server** (against an already-running cluster), which is what
+`make restart` / `make deploy` use to bounce it after an image change.
 
 ### A single-machine distributed encode (`local`)
 
+`make farm` already gives you this on one box — cluster + server + one worker.
+Prefer the pieces individually?
+
 ```bash
-make dist-up              # Temporal + Temporal-UI + Postgres + MinIO (containers)
-make dist-worker          # a worker on this box
-make run                  # server + UI
+make dist-up              # just the cluster: Temporal + Temporal-UI + Postgres + MinIO
+make dist-worker          # just this box's worker
+make run                  # just the server + UI
 ```
 Submit with target **Local (all machines)**; watch the Temporal UI at `:8233`.
 
 ### A multi-machine farm
 
-One command brings the whole farm up from this machine as master, pulling every
-image from GHCR (run `make push` first so GHCR has your code):
+`make farm` brings this box up as master (cluster + server + worker) in one
+compose command, then deploys a worker to each `DIST_WORKERS` box over SSH (run
+`make push` first so GHCR has your code):
 
 ```bash
 # .env: MASTER_IP=<this box's LAN IP>
@@ -78,8 +83,16 @@ image from GHCR (run `make push` first so GHCR has your code):
 make farm
 ```
 
-`make farm` = `dist-up` → a worker here → a worker on each `DIST_WORKERS` box →
-server/UI. See [`docs/PRD.md`](docs/PRD.md) and
+Each **extra box** is just the `worker` profile — no cluster, no source dirs, no
+MinIO/Temporal locally; it only dials the master's LAN Temporal + MinIO:
+
+```bash
+MASTER_IP=<master LAN IP> \
+TEMPORAL_ADDRESS=$MASTER_IP:7233 S3_ENDPOINT_URL=http://$MASTER_IP:9000 \
+  docker compose --profile worker up -d
+```
+
+See [`docs/PRD.md`](docs/PRD.md) and
 [`infra/local-cluster/README.md`](infra/local-cluster/README.md).
 
 ### Cloud encoding (`cloud`)
@@ -94,10 +107,11 @@ Then submit with target **Cloud (AWS Batch)**.
 `make farm-dev` runs the **whole farm from your working tree — nothing committed
 or pushed**:
 
-- `make build` compiles your working-tree Go + deps into the local image (the
-  server runs it).
-- Your working-tree `scripts/infinite_streaming_encoder` is bind-mounted into every worker and the
-  orchestrator, so uncommitted **Python** runs everywhere, any arch.
+- Builds the local image from your working-tree Go + deps (`up --build`).
+- The `docker-compose.dev.yml` overlay bind-mounts your working-tree
+  `scripts/infinite_streaming_encoder` into the server + worker (and, via
+  `HOST_SCRIPTS_DIR`, the orchestrator containers the server spawns), so
+  uncommitted **Python** runs everywhere without a rebuild.
 - Remote boxes go through the arch-aware `deploy-worker.sh` (transfer to
   same-arch boxes, native build on cross-arch ones).
 
@@ -106,7 +120,8 @@ make farm-dev                 # edit code → re-run to propagate
 make farm-dev DEV_BUILD=1     # also native-build uncommitted deps on cross-arch boxes
 ```
 
-The inner loop is rsync-diffs + restart; only the Go server rebuilds (fast, cached).
+The inner loop is a `compose up --build` (fast, layer-cached) plus rsync-diffs to
+remote boxes.
 
 ## Configuration
 
@@ -117,8 +132,9 @@ required; everything else has a working default. See
 - **Host paths (required):** `SOURCE_DIR`, `OUTPUT_DIR`, `TMP_DIR`.
 - **Server:** `AUTO_WATCH`, `DEFAULT_TARGET` (`local` | `cloud`),
   `DEFAULT_CODEC`, `DEFAULT_MAX_RES`, `MAX_CONCURRENT`.
-- **Distributed-local:** `MASTER_IP`, `DIST_WORKERS`, plus Temporal/MinIO vars
-  (defaults match `make dist-up`).
+- **Distributed-local:** `MASTER_IP`, `DIST_WORKERS`, `ENCODE_SLOTS`, plus
+  Temporal/MinIO vars (defaults match `make farm`; master vs. worker box is a
+  `docker compose` profile choice).
 - **Cloud:** `AWS_REGION`, `S3_BUCKET`, `STATE_MACHINE_ARN`, `WARM_MIN_VCPUS`.
 - **Image/registry:** `GHCR_PAT`, `DOCKER_IMAGE`.
 
@@ -136,6 +152,9 @@ One `Dockerfile`, published/used four ways:
 ## Repository layout
 
 ```
+docker-compose.yml   the unified farm: master / worker profiles (cluster + server + worker)
+docker-compose.dev.yml         working-tree code-mount overlay (make farm-dev)
+docker-compose.promote-*.yml   optional promote overlays (local dir / ssh remote)
 cmd/server/          Go entrypoint
 internal/encode/     control plane: Job/Manager, targets, scheduling, promote
 internal/api/        HTTP + SSE, dist worker toggle, static file servers
@@ -147,7 +166,7 @@ scripts/infinite_streaming_encoder/     the Python encoder package
   cli_batch.py         AWS Batch: Step Functions submit/poll
   cli_local.py         the phase entry point Batch job-defs invoke
   cloud/               boto3 helpers (Batch admin, inventory, sync, …)
-infra/local-cluster/ Temporal + MinIO compose, worker + deploy scripts
+infra/local-cluster/ worker + SSH deploy scripts (the cluster compose moved to ./docker-compose.yml)
 infra/terraform/     AWS Batch + Step Functions + ECR + IAM
 static/index.html    the single-file SPA
 docs/                design docs
