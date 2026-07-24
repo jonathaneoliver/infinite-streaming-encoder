@@ -155,25 +155,36 @@ status:
 clean: stop
 	docker rmi $(IMAGE_NAME) 2>/dev/null || true
 
-# Build multi-arch + publish the farm image to GHCR (:latest :VERSION :GIT_SHA).
-# Self-contained: logs into GHCR and ensures the docker-container buildx builder
-# exists, so it works on a fresh machine. Run before `make farm-up` so every box
-# pulls the same published image. (The cloud path publishes to ECR+GHCR via a
-# separate target, ecr-publish, invoked by cloud-up/deploy — see below.)
-publish:              ## build multi-arch + publish the farm image to GHCR (:latest :VERSION :GIT_SHA)
+# Unified publish (#55): ONE multi-arch build, BOTH provenance stamps baked
+# (GIT_SHA=real HEAD, IMAGE_TAG=content hash — see the IMAGE_TAG comment above).
+# GHCR is ALWAYS pushed (the farm image, AWS-free). ECR is ALSO pushed when a
+# cloud stack is configured (ECR_REPO resolves to a real *.dkr.ecr.* URL), so a
+# cloud deploy can never leave ECR + GHCR out of sync. Self-contained: logs into
+# GHCR (+ ECR when used) and ensures the docker-container buildx builder exists.
+# Requires GHCR_PAT (write:packages). Supersedes the old GHCR-only publish and
+# the ECR-only ecr-publish (now a thin alias).
+publish:              ## build once (multi-arch) → GHCR always, ECR when cloud is configured
 	@: $${GHCR_PAT:?GHCR_PAT is not set — create a classic PAT with write:packages scope}
 	@echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin
 	@docker buildx inspect encoder-builder >/dev/null 2>&1 || \
 		docker buildx create --name encoder-builder --driver docker-container >/dev/null
-	docker buildx build --builder encoder-builder \
-		--platform $(PLATFORMS) \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg GIT_SHA=$(GIT_SHA) \
-		--tag $(GHCR_IMAGE):latest \
-		--tag $(GHCR_IMAGE):$(VERSION) \
-		--tag $(GHCR_IMAGE):$(GIT_SHA) \
-		--push .
-	@echo "Published $(GHCR_IMAGE):latest :$(VERSION) :$(GIT_SHA) for $(PLATFORMS)"
+	@set -e; ecr_tags=""; ecr_note=""; \
+	if echo "$(ECR_REPO)" | grep -qE '\.dkr\.ecr\.'; then \
+	  echo ">>> cloud configured — pushing ECR ($(ECR_REPO)) in sync"; \
+	  aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(ECR_REGISTRY); \
+	  ecr_tags="--tag $(ECR_REPO):latest --tag $(ECR_REPO):$(IMAGE_TAG)"; \
+	  ecr_note=" + ECR ($(ECR_REPO)) :latest :$(IMAGE_TAG)"; \
+	elif [ -n "$$(printf '%s' '$(ECR_REPO)' | tr -d '[:space:]')" ]; then \
+	  echo ">>> WARNING: ECR_REPO set but not a valid *.dkr.ecr.* URL — skipping ECR (GHCR only). Value: '$(ECR_REPO)'"; \
+	else \
+	  echo ">>> no cloud stack (ECR_REPO empty) — GHCR-only publish"; \
+	fi; \
+	docker buildx build --builder encoder-builder --platform $(PLATFORMS) \
+		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(GIT_SHA) --build-arg IMAGE_TAG=$(IMAGE_TAG) \
+		--tag $(GHCR_IMAGE):latest --tag $(GHCR_IMAGE):$(VERSION) \
+		--tag $(GHCR_IMAGE):$(GIT_SHA) --tag $(GHCR_IMAGE):$(IMAGE_TAG) \
+		$$ecr_tags --push . ; \
+	echo "Published GHCR ($(GHCR_IMAGE)) :latest :$(VERSION) :$(GIT_SHA) :$(IMAGE_TAG)$$ecr_note [$(PLATFORMS)]"
 
 # ---------------------------------------------------------------------------
 # Cloud-batch deploy (AWS Batch + Step Functions). Replaces the manual
@@ -241,21 +252,10 @@ ecr-login:
 	aws ecr get-login-password --region $(AWS_REGION) | \
 	  docker login --username AWS --password-stdin $(ECR_REGISTRY)
 
-ecr-publish: ecr-login   ## build ONCE (amd64+arm64) + push to BOTH ECR and GHCR, in sync
-	# Single multi-arch build pushed to BOTH registries with the SAME tags, so the
-	# cloud-batch image (ECR, Graviton pulls arm64) and the local + local-dist
-	# image (GHCR; Macs arm64, ubuntu amd64) can never drift out of sync. Requires
-	# GHCR_PAT (write:packages) + a docker-container buildx builder for multi-arch.
-	@: $${GHCR_PAT:?GHCR_PAT is not set — required so deploy keeps ECR + GHCR in sync (classic PAT, write:packages)}
-	@echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin
-	@docker buildx inspect encoder-builder >/dev/null 2>&1 || \
-		docker buildx create --name encoder-builder --driver docker-container >/dev/null
-	docker buildx build --builder encoder-builder --platform linux/amd64,linux/arm64 \
-		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(IMAGE_TAG) \
-		--tag $(ECR_REPO):latest   --tag $(ECR_REPO):$(IMAGE_TAG) \
-		--tag $(GHCR_IMAGE):latest --tag $(GHCR_IMAGE):$(IMAGE_TAG) \
-		--push .
-	@echo "Pushed :latest :$(IMAGE_TAG) → ECR ($(ECR_REPO)) + GHCR ($(GHCR_IMAGE)) [amd64+arm64, in sync]"
+# DEPRECATED: folded into `publish` (#55), which now pushes ECR whenever a cloud
+# stack is configured (so ECR + GHCR stay in sync). Kept as a thin alias so
+# existing muscle-memory and any external scripts keep working.
+ecr-publish: publish   ## DEPRECATED alias for `publish` (pushes ECR when cloud is configured)
 
 infra-init:           ## tofu init (local backend override, if present)
 	cd $(TF_DIR) && tofu init
@@ -280,7 +280,7 @@ cloud-down:           ## FULL teardown -> $0/mo (no prompt): tofu destroy -auto-
 # re-resolves ECR_REPO / WORKER_AMI from CURRENT state. Order matters:
 #   1. init + apply   — create/reconcile ECR, Batch, VPC, SFN, IAM (image pulls
 #                       on boot unless an AMI is wired in below).
-#   2. ecr-publish       — push :IMAGE_TAG so the image exists to run (+ bake).
+#   2. publish        — push :IMAGE_TAG to ECR (+ GHCR) so the image exists to run.
 #   3. USE_AMI=1 only — ami-up (bake), wait for it, then a second plan+apply wires
 #                       the AMI into the launch template. Off by default (~60s
 #                       cold ECR pull is cheaper than the standing ~$1.50/mo).
@@ -289,7 +289,7 @@ cloud-up:             ## provision/reconcile the cloud stack to current code + v
 	$(MAKE) infra-init
 	$(MAKE) infra-plan
 	$(MAKE) infra-apply
-	$(MAKE) ecr-publish
+	$(MAKE) publish
 	@if [ "$(USE_AMI)" = 1 ]; then \
 	  $(MAKE) ami-up; \
 	  echo ">>> waiting for the baked AMI to be queryable (EC2 is eventually consistent)..."; \
@@ -319,7 +319,7 @@ cloud-check:          ## live cloud readiness: AWS creds + state machine + S3 bu
 deploy:               ## push image + restart + plan + APPLY infra (one shot)
 	@start=$$(date +%s); \
 	echo ">>> deploy started $$(date '+%H:%M:%S')  worker=$(IMAGE_TAG)"; \
-	if $(MAKE) ecr-publish && $(MAKE) restart && $(MAKE) infra-plan && $(MAKE) infra-apply; then \
+	if $(MAKE) publish && $(MAKE) restart && $(MAKE) infra-plan && $(MAKE) infra-apply; then \
 		el=$$(( $$(date +%s) - start )); \
 		printf '\a\n\033[1;32m==================================================\n'; \
 		printf '  DEPLOY COMPLETE  %dm %02ds   worker=%s\n' $$((el/60)) $$((el%60)) "$(IMAGE_TAG)"; \
