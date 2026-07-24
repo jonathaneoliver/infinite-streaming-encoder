@@ -82,6 +82,10 @@ build:
 version:
 	@echo $(VERSION) $(GIT_SHA)
 
+.PHONY: doctor
+doctor:               ## preflight: check .env / host tools / per-target config, report clearly
+	@bash scripts/doctor.sh
+
 # Shared server-launch recipe used by both `run` and `run-remote`. $(RUN_IMAGE)
 # selects the image for the server AND the worker containers it spawns, so the
 # two targets share every mount/env and differ only in that one value.
