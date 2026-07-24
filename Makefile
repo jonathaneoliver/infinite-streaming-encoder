@@ -55,7 +55,7 @@ RUN_IMAGE ?= $(IMAGE_NAME)
 REMOTE_IMAGE ?= $(GHCR_IMAGE):latest
 
 # Dev only: host path overlaid onto a spawned orchestrator's /app/scripts/infinite_streaming_encoder
-# so it runs current working-tree code without a rebuild. Set by `make farm-dev`;
+# so it runs current working-tree code without a rebuild. Set by `make farm-dev-up`;
 # empty in normal runs (the orchestrator then uses the image's baked scripts).
 HOST_SCRIPTS_DIR ?=
 
@@ -111,7 +111,7 @@ doctor:               ## preflight: check .env / host tools / per-target config,
 # Server-only lifecycle. `run` brings up JUST the encoder server (no cluster /
 # worker) via compose — this is what `restart`/`deploy` use to bounce the server
 # after an image push. `--no-deps` keeps it from dragging the cluster up; for the
-# whole master profile (cluster + server + worker) use `make farm` / `farm-dev`.
+# whole master profile (cluster + server + worker) use `make farm-up` / `farm-dev-up`.
 # ENCODER_IMAGE feeds BOTH this service's image and the image it spawns workers
 # from, so `run` (local build) and `run-remote` (GHCR) differ only in that value.
 run: require-paths
@@ -120,7 +120,7 @@ run: require-paths
 
 # Fire up the server from the published GHCR image instead of a local build.
 # Logs into GHCR first only if GHCR_PAT is set (needed when the package is
-# private). Pairs with `make farm` for a fully no-local-build bring-up.
+# private). Pairs with `make farm-up` for a fully no-local-build bring-up.
 run-remote: RUN_IMAGE = $(REMOTE_IMAGE)
 run-remote: require-paths
 	@if [ -n "$$GHCR_PAT" ]; then \
@@ -471,32 +471,56 @@ dist-deploy-ghcr:     ## GHCR-pull workers on each DIST_WORKERS box (no build/tr
 	@echo ">>> GHCR-pull workers deployed to $(words $(DIST_WORKERS)) box(es)."
 
 # ---- One-command farm --------------------------------------------------------
-# `make farm` brings the whole master profile up in ONE compose command (cluster
-# + server + one local worker), pulling the image from GHCR (no local build).
-# Extra boxes come from DIST_WORKERS in .env. Run `make push` first so GHCR has
-# your current code.
-# `make farm-dev` is the developer loop: local build + the dev overlay that
-# bind-mounts your working-tree scripts/infinite_streaming_encoder live into the
-# server + worker — re-run after edits (Go/deps still need the --build it does).
-.PHONY: farm farm-dev
+# `make farm-up` brings the whole master profile up in ONE compose command (cluster
+# + server + one local worker), pulling the image from GHCR (no local build). It's
+# the single canonical bring-up. Extra boxes come from DIST_WORKERS in .env. Run
+# `make push` first so GHCR has your current code.
+# `make farm-dev-up` is the developer loop: same bring-up but a local build + the
+# dev overlay that bind-mounts your working-tree scripts/infinite_streaming_encoder
+# live into the server + worker — re-run after edits (Go/deps still need --build).
+# `make farm-down` / `farm-dev-down` are the inverse (local stack + remote workers);
+# teardown is mode-agnostic so they're the same operation.
+.PHONY: farm-up farm-dev-up farm-dev-down farm-down
 
-farm: require-paths   ## bring the whole master farm up from GHCR (cluster + server + worker), + DIST_WORKERS
-	@echo ">>> [farm] pulling images + bringing up the master profile (cluster + server + worker) from GHCR..."
+farm-up: require-paths   ## bring the whole master farm up from GHCR (cluster + server + worker), + DIST_WORKERS
+	@echo ">>> [farm-up] pulling images + bringing up the master profile (cluster + server + worker) from GHCR..."
 	@if [ -n "$(GHCR_PAT)" ]; then echo "$(GHCR_PAT)" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin; fi
 	ENCODER_IMAGE=$(REMOTE_IMAGE) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) $(COMPOSE_BASE) --profile master pull
 	ENCODER_IMAGE=$(REMOTE_IMAGE) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) $(COMPOSE_BASE) --profile master up -d --no-build
-	@echo ">>> [farm] remote workers (from GHCR)..."
+	@echo ">>> [farm-up] remote workers (from GHCR)..."
 	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-ghcr; else echo "    (no DIST_WORKERS — master-only farm)"; fi
 	@echo ">>> farm up:  UI http://localhost:$(PORT)   Temporal UI http://localhost:$${TEMPORAL_UI_PORT:-8233}"
 
-farm-dev: require-paths   ## dev farm from your WORKING TREE (uncommitted): local build + live-mounted code
-	@echo ">>> [farm-dev] building from working tree + bringing up the master profile with live code..."
+farm-dev-up: require-paths   ## dev farm from your WORKING TREE (uncommitted): local build + live-mounted code
+	@echo ">>> [farm-dev-up] building from working tree + bringing up the master profile with live code..."
 	ENCODER_IMAGE=$(IMAGE_NAME) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) \
 	  HOST_SCRIPTS_DIR=$(CURDIR)/scripts/infinite_streaming_encoder \
 	  $(COMPOSE_DEV) --profile master up -d --build
-	@echo ">>> [farm-dev] remote workers (rsync code + transfer/build image)..."
+	@echo ">>> [farm-dev-up] remote workers (rsync code + transfer/build image)..."
 	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-workers; else echo "    (no DIST_WORKERS — master-only)"; fi
-	@echo ">>> farm-dev up (working tree — nothing committed/pushed). Re-run 'make farm-dev' after edits."
+	@echo ">>> farm-dev-up complete (working tree — nothing committed/pushed). Re-run 'make farm-dev-up' after edits."
+
+# True inverse of `make farm-up`: stop the local master stack AND the remote workers
+# on each DIST_WORKERS box (compose only manages the local project, so the remote
+# encode-worker containers are removed over SSH — same target `make farm-up` deploys
+# to). ARGS=-v also wipes the local Temporal/MinIO volumes.
+farm-down:            ## take the WHOLE farm down: local master stack + remote DIST_WORKERS (ARGS=-v wipes volumes)
+	@if [ -n "$(DIST_WORKERS)" ]; then \
+	  echo ">>> [farm-down] removing remote workers ($(words $(DIST_WORKERS)) box(es))..."; \
+	  for w in $(DIST_WORKERS); do \
+	    label=$${w%%=*}; host=$${w#*=}; \
+	    printf '    %s (%s): ' "$$label" "$$host"; \
+	    ssh -o IgnoreUnknown=UseKeychain -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=6 \
+	      "$$host" "docker rm -f $(DIST_WORKER_CONTAINER)" >/dev/null 2>&1 && echo "removed" || echo "(unreachable or no worker)"; \
+	  done; \
+	else echo ">>> [farm-down] no DIST_WORKERS — local only"; fi
+	@echo ">>> [farm-down] stopping local master stack..."
+	$(COMPOSE_BASE) --profile master down $(ARGS)
+
+# Teardown is mode-agnostic — a farm brought up by farm-dev-up lives in the same
+# compose project + encode-worker containers as one from farm-up — so farm-dev-down
+# is exactly farm-down. Kept as a distinct name for farm-dev-up/down symmetry.
+farm-dev-down: farm-down   ## take the dev farm down (identical to `make farm-down`; ARGS=-v wipes volumes)
 
 # ---- Smoke test --------------------------------------------------------------
 # End-to-end single-device check (docs/TESTING.md, test 1): generate a tiny clip,
@@ -515,7 +539,7 @@ smoke: require-paths build   ## end-to-end single-device smoke: tiny clip -> loc
 	@echo ">>> [smoke] clearing any prior smoke output..."
 	@rm -rf $(OUTPUT_DIR)/smoke_p200* 2>/dev/null || true
 	@echo ">>> [smoke] bringing up a single-device farm from the working tree..."
-	$(MAKE) farm-dev DIST_WORKERS=
+	$(MAKE) farm-dev-up DIST_WORKERS=
 	@echo ">>> [smoke] waiting for the server (:$(PORT))..."
 	@for i in $$(seq 1 30); do curl -sf http://localhost:$(PORT)/api/jobs >/dev/null 2>&1 && break; sleep 1; done
 	@echo ">>> [smoke] opening the jobs page (set SMOKE_OPEN=0 to skip)..."

@@ -40,8 +40,8 @@ On the **master box** — one command brings up cluster + server + a local worke
 (cloud stays configured-but-idle):
 
 ```
-make farm           # GHCR image (run `make push` first); or
-make farm-dev       # build from your working tree, live-mount the Python code
+make farm-up           # GHCR image (run `make push` first); or
+make farm-dev-up       # build from your working tree, live-mount the Python code
 ```
 
 Prefer raw compose? `docker compose --profile master up -d` (set `SOURCE_DIR` /
@@ -60,7 +60,7 @@ docker compose --profile worker up -d
 ```
 
 Or let the master push it over SSH: set `DIST_WORKERS=label=ssh_target` in `.env`
-and `make farm` deploys each box (still via `run-worker.sh`).
+and `make farm-up` deploys each box (still via `run-worker.sh`).
 
 ## Run an encode
 

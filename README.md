@@ -36,7 +36,7 @@ Every encode is split into chunks and fanned out. You choose where the workers r
 ## Requirements
 
 - Docker (with the daemon socket at `/var/run/docker.sock`).
-- For `local`: nothing else — `make farm` brings up the whole master profile
+- For `local`: nothing else — `make farm-up` brings up the whole master profile
   (Temporal + MinIO + server + a worker) from one `docker-compose.yml`.
 - For `cloud`: an AWS account, an existing S3 bucket, and the Terraform
   stack under `infra/terraform` applied (`make infra-setup`).
@@ -47,21 +47,21 @@ The image bakes in ffmpeg, Shaka Packager, the Docker CLI, and the AWS CLI.
 
 ```bash
 cp .env.example .env      # set SOURCE_DIR / OUTPUT_DIR / TMP_DIR (see below)
-make farm                 # pull + bring up the whole master stack, UI at :8080
+make farm-up                 # pull + bring up the whole master stack, UI at :8080
 ```
 
-`make farm` is one `docker compose --profile master up` — Temporal + Temporal-UI +
+`make farm-up` is one `docker compose --profile master up` — Temporal + Temporal-UI +
 Postgres + MinIO + the server + one local worker. Open `http://localhost:8080`,
 drop a file in `SOURCE_DIR`, and submit a job.
 
-`make farm` pulls the published image from GHCR. To build from your **working
-tree** instead, use `make farm-dev` (below). `make run` / `make run-remote` bring
+`make farm-up` pulls the published image from GHCR. To build from your **working
+tree** instead, use `make farm-dev-up` (below). `make run` / `make run-remote` bring
 up **just the server** (against an already-running cluster), which is what
 `make restart` / `make deploy` use to bounce it after an image change.
 
 ### A single-machine distributed encode (`local`)
 
-`make farm` already gives you this on one box — cluster + server + one worker.
+`make farm-up` already gives you this on one box — cluster + server + one worker.
 Prefer the pieces individually?
 
 ```bash
@@ -73,14 +73,14 @@ Submit with target **Local (all machines)**; watch the Temporal UI at `:8233`.
 
 ### A multi-machine farm
 
-`make farm` brings this box up as master (cluster + server + worker) in one
+`make farm-up` brings this box up as master (cluster + server + worker) in one
 compose command, then deploys a worker to each `DIST_WORKERS` box over SSH (run
 `make push` first so GHCR has your code):
 
 ```bash
 # .env: MASTER_IP=<this box's LAN IP>
 #       DIST_WORKERS=box2=me@box2.local box3=me@box3.local
-make farm
+make farm-up
 ```
 
 Each **extra box** is just the `worker` profile — no cluster, no source dirs, no
@@ -91,6 +91,11 @@ MASTER_IP=<master LAN IP> \
 TEMPORAL_ADDRESS=$MASTER_IP:7233 S3_ENDPOINT_URL=http://$MASTER_IP:9000 \
   docker compose --profile worker up -d
 ```
+
+Tear the whole farm down with `make farm-down` — it stops the local master stack
+**and** removes the `encode-worker` on each `DIST_WORKERS` box over SSH (the true
+inverse of `make farm-up`; `make down`/`dist-down` only stop the local stack). Add
+`ARGS=-v` to also wipe the local Temporal/MinIO volumes.
 
 See [`docs/PRD.md`](docs/PRD.md) and
 [`infra/local-cluster/README.md`](infra/local-cluster/README.md).
@@ -104,7 +109,7 @@ Then submit with target **Cloud (AWS Batch)**.
 
 ## Developing across the farm
 
-`make farm-dev` runs the **whole farm from your working tree — nothing committed
+`make farm-dev-up` runs the **whole farm from your working tree — nothing committed
 or pushed**:
 
 - Builds the local image from your working-tree Go + deps (`up --build`).
@@ -116,8 +121,8 @@ or pushed**:
   same-arch boxes, native build on cross-arch ones).
 
 ```bash
-make farm-dev                 # edit code → re-run to propagate
-make farm-dev DEV_BUILD=1     # also native-build uncommitted deps on cross-arch boxes
+make farm-dev-up                 # edit code → re-run to propagate
+make farm-dev-up DEV_BUILD=1     # also native-build uncommitted deps on cross-arch boxes
 ```
 
 The inner loop is a `compose up --build` (fast, layer-cached) plus rsync-diffs to
@@ -133,7 +138,7 @@ required; everything else has a working default. See
 - **Server:** `AUTO_WATCH`, `DEFAULT_TARGET` (`local` | `cloud`),
   `DEFAULT_CODEC`, `DEFAULT_MAX_RES`, `MAX_CONCURRENT`.
 - **Distributed-local:** `MASTER_IP`, `DIST_WORKERS`, `ENCODE_SLOTS`, plus
-  Temporal/MinIO vars (defaults match `make farm`; master vs. worker box is a
+  Temporal/MinIO vars (defaults match `make farm-up`; master vs. worker box is a
   `docker compose` profile choice).
 - **Cloud:** `AWS_REGION`, `S3_BUCKET`, `STATE_MACHINE_ARN`, `WARM_MIN_VCPUS`.
 - **Image/registry:** `GHCR_PAT`, `DOCKER_IMAGE`.
@@ -153,7 +158,7 @@ One `Dockerfile`, published/used four ways:
 
 ```
 docker-compose.yml   the unified farm: master / worker profiles (cluster + server + worker)
-docker-compose.dev.yml         working-tree code-mount overlay (make farm-dev)
+docker-compose.dev.yml         working-tree code-mount overlay (make farm-dev-up)
 docker-compose.promote-*.yml   optional promote overlays (local dir / ssh remote)
 cmd/server/          Go entrypoint
 internal/encode/     control plane: Job/Manager, targets, scheduling, promote
