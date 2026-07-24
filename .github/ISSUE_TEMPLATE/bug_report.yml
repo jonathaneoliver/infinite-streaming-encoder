@@ -1,0 +1,102 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. The more reproducible the report, the faster it can be fixed.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A clear, concrete description. Screenshots / log snippets welcome.
+      placeholder: e.g. "Job fails at the packager phase when max-res is 720p and codec is HEVC."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      placeholder: e.g. "The variant should package to LL-HLS and the job reach done."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Be specific — source file, target, codec, max-res, chunk duration.
+      value: |
+        1. Bring up the farm with `make farm-up` (or `make farm-dev-up`)
+        2. Drop `<file>` in SOURCE_DIR / submit via the UI or `POST /api/encode`
+        3. Settings: target=..., codec=..., max_res=..., chunk_duration=...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `cat VERSION` or the GHCR image tag you're running.
+      placeholder: e.g. v0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: target
+    attributes:
+      label: Encode target
+      options:
+        - Local farm (Temporal + MinIO)
+        - Cloud (AWS Batch)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How are you running it
+      options:
+        - make farm-up (published GHCR image)
+        - make farm-dev-up (built from working tree)
+        - Single-box (make smoke / one worker)
+        - Multi-box farm (DIST_WORKERS)
+        - Other (describe in "What happened")
+    validations:
+      required: true
+
+  - type: input
+    id: host
+    attributes:
+      label: Host
+      description: OS + arch of the box(es) — master and any workers.
+      placeholder: e.g. macOS 26 arm64 master + Ubuntu 24.04 amd64 worker
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        Paste the smallest log snippet that shows the issue.
+        Server: `make logs` or `docker logs <server-container>`.
+        Worker: `docker logs encode-worker`.
+      render: shell
+
+  - type: checkboxes
+    id: checked
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and didn't find a duplicate.
+          required: true
+        - label: I ran `make doctor` and my config checks out.
+          required: false
+        - label: I'm running the latest release (or `main`) and the bug still reproduces.
+          required: false

@@ -1,5 +1,16 @@
 # infinite-streaming-encoder
 
+[![CI](https://img.shields.io/github/actions/workflow/status/jonathaneoliver/infinite-streaming-encoder/ci.yml?branch=main&label=ci)](https://github.com/jonathaneoliver/infinite-streaming-encoder/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/jonathaneoliver/infinite-streaming-encoder?label=release&color=blue)](https://github.com/jonathaneoliver/infinite-streaming-encoder/releases/latest)
+[![License](https://img.shields.io/badge/license-InfiniteStream-lightgrey)](LICENSE)
+[![GHCR](https://img.shields.io/badge/ghcr.io-infinite--streaming--encoder-2496ED?logo=docker&logoColor=white)](https://github.com/jonathaneoliver/infinite-streaming-encoder/pkgs/container/infinite-streaming-encoder)
+[![Stars](https://img.shields.io/github/stars/jonathaneoliver/infinite-streaming-encoder?style=flat&color=yellow)](https://github.com/jonathaneoliver/infinite-streaming-encoder/stargazers)
+
+<!-- A screenshot of the dashboard (chunk grid + live progress) sells this tool instantly.
+     Drop one at docs/screenshots/dashboard.png and uncomment:
+![Dashboard](docs/screenshots/dashboard.png)
+-->
+
 A Go HTTP server + single-page UI that drives adaptive-bitrate (ABR) video
 encoding. The Go code is a thin **control plane**; the actual encoding —
 ffmpeg, Shaka Packager, LL-HLS/DASH packaging — lives in a Python package and
@@ -206,6 +217,19 @@ docs/                design docs
 - [`docs/chunked-encode-design.md`](docs/chunked-encode-design.md) — spot-resumable chunked encoding.
 - [`docs/apple-ladder-design.md`](docs/apple-ladder-design.md) — per-codec ABR ladder model.
 - [`CLAUDE.md`](CLAUDE.md) — orientation for working in this repo.
+
+## Contributing
+
+Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the dev loop, the
+smoke-test matrix (there's no unit suite), and PR conventions. By participating you agree to
+the [Code of Conduct](CODE_OF_CONDUCT.md). To report a vulnerability, see
+[`SECURITY.md`](SECURITY.md).
+
+## License
+
+Licensed under the **InfiniteStream License** (attribution + internal use + no productization
+without permission) — see [`LICENSE`](LICENSE). Redistributions must preserve attribution to
+Jonathan Oliver (see [`NOTICE`](NOTICE)).
 
 ## Notes
 

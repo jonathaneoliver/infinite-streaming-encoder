@@ -4,10 +4,13 @@ name: smoke
 # no Docker Desktop) — the truest OOBE. Runs the single-device local-dist smoke
 # encode end to end. This is what surfaces "works on my Mac" bugs like the
 # host.docker.internal gap and the fresh-MinIO bucket.
+#
+# MANUAL-ONLY. The full cold-boot encode takes ~15-30 min, too slow to gate every
+# PR — the fast `ci` workflow (gofmt/vet/build) is the per-PR gate instead. Run
+# this by hand before merging anything that touches chunking, orchestration,
+# packaging, the cloud path, or the farm scripts:
+#   Actions tab → smoke → "Run workflow", or:  gh workflow run smoke.yml
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:

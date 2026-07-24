@@ -125,9 +125,9 @@ var _commercialTiers = []struct {
 	maxH int
 	rate map[string]float64
 }{
-	{719, map[string]float64{"h264": 0.005, "hevc": 0.008, "av1": 0.010}},  // SD (<720)
-	{1080, map[string]float64{"h264": 0.010, "hevc": 0.015, "av1": 0.020}}, // HD
-	{1440, map[string]float64{"h264": 0.025, "hevc": 0.038, "av1": 0.050}}, // 1440p
+	{719, map[string]float64{"h264": 0.005, "hevc": 0.008, "av1": 0.010}},     // SD (<720)
+	{1080, map[string]float64{"h264": 0.010, "hevc": 0.015, "av1": 0.020}},    // HD
+	{1440, map[string]float64{"h264": 0.025, "hevc": 0.038, "av1": 0.050}},    // 1440p
 	{1 << 30, map[string]float64{"h264": 0.045, "hevc": 0.068, "av1": 0.090}}, // 4K+
 }
 

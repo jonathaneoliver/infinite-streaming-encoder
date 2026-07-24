@@ -432,10 +432,10 @@ dist-ps:              ## cluster + worker + server containers
 	$(COMPOSE_BASE) --profile master ps
 
 # DIST_WORKERS: space-separated label=ssh_target pairs of remote worker boxes,
-# e.g. DIST_WORKERS = ubuntu=jonathanoliver@jonathanoliver-ubuntu.local
+# e.g. DIST_WORKERS = ubuntu=me@worker-box.local
 # MASTER_IP: the master box's LAN IP that workers dial for Temporal + MinIO.
 DIST_WORKERS ?=
-MASTER_IP ?= 192.168.0.110
+MASTER_IP ?= 192.168.1.10
 .PHONY: dist-deploy-workers dist-deploy dist-deploy-ghcr
 
 dist-deploy-workers:  ## rsync code + rebuild image + (re)start worker on each DIST_WORKERS box

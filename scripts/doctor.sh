@@ -59,8 +59,8 @@ for pair in "Temporal:${TEMPORAL_PORT:-7233}" "MinIO:${MINIO_API_PORT:-9000}"; d
   else warn "$name not reachable on :$p — run 'make dist-up' before a local-dist encode"; fi
 done
 if [ -n "${DIST_WORKERS:-}" ]; then
-  mip="${MASTER_IP:-192.168.0.110}"
-  if [ "$mip" = "192.168.0.110" ]; then
+  mip="${MASTER_IP:-192.168.1.10}"
+  if [ "$mip" = "192.168.1.10" ]; then
     warn "MASTER_IP=$mip is the placeholder default — set it to THIS master's LAN IP, or remote workers can't reach Temporal/MinIO (they'll start but never poll)"
   else ok "MASTER_IP=$mip"; fi
   for w in $DIST_WORKERS; do
