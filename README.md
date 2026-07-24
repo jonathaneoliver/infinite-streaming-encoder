@@ -124,6 +124,39 @@ or AWS SDK compiled in. A job flows like this:
 For the full design — the output-dir naming contract, worker-container reattach,
 codec-skip logic, cloud user-data — see [`CLAUDE.md`](CLAUDE.md) and [`docs/`](docs/).
 
+## Performance: single machine vs local farm vs cloud
+
+Speed comes from one lever — **how many chunks encode at once** — traded against
+each target's **startup overhead**. The three modes sit at different points on that
+curve:
+
+| | **Single machine** | **Local farm** (multi-box) | **Cloud** (AWS Batch) |
+| --- | --- | --- | --- |
+| Parallel chunks | this box's slots (`physical-cores ÷ 2`, 2 threads each) | **sum** of every box's slots | scales out to your Batch max-vCPUs |
+| Startup overhead | none | none (workers already up) | ~60–90 s spot boot + ECR pull per cold box (an [AMI](#images--registries) removes the pull) |
+| Marginal cost | electricity | electricity | spot $/vCPU-hr while running; **$0 at rest** |
+| Resumability | reattaches on restart | lost chunk reschedules to another box | reclaimed spot chunk retries |
+| Best for | small / quick jobs on one machine | big jobs + idle LAN boxes, no cloud spend | huge jobs, or no local hardware — burst wide, then scale to zero |
+
+**The model in one paragraph.** Each worker runs `physical-cores ÷ 2` chunks
+concurrently (2 threads per chunk), so a 10-core box does ~5 at once. Adding boxes
+adds their slots, so a local farm scales **roughly linearly — until you run out of
+chunks**: a 20-second clip is only a chunk or two, so it can't fill a big farm and
+won't speed up much (the coordination just adds latency). Big, long jobs are where
+fan-out pays. Cloud trades a fixed cold-start tax (spot boot + image pull) for
+near-unlimited width — worth it when encode time far exceeds that tax (large jobs),
+not for a tiny clip where the boot dominates. AV1 is the slow codec on every target.
+
+**Don't guess — the app measures it.** Every job card reports the actual
+`local_wall_s` (wall time), `cpu_vcpu_h` (CPU-hours), and what the same encode
+*would* cost on AWS spot / on-demand / MediaConvert / a commercial encoder. For a
+cloud run, dig into where the time and CPU went:
+
+```bash
+make timing     EXEC=<execution-arn>   # per-phase where-did-the-time-go
+make cpu-report EXEC=<execution-arn>   # per-tier CPU utilization vs reserved vCPU
+```
+
 ## Requirements
 
 - Docker (with the daemon socket at `/var/run/docker.sock`).
@@ -264,15 +297,17 @@ the browser you can script. Submit an encode:
 ```bash
 curl -X POST http://localhost:8080/api/encode \
   -H 'Content-Type: application/json' \
-  -d '{
-        "files": ["myclip.mp4"],
-        "target": "local",          # local | cloud
-        "codec": "h264",            # h264 | hevc | av1 | both | all
-        "max_res": "1080p",         # cap the ladder; "" = all rungs
-        "chunk_duration": "12",     # seconds per chunk; "" = whole variant
-        "force_reencode": false      # re-encode even if output exists
-      }'
+  -d '{"files":["myclip.mp4"],"target":"local","codec":"h264","max_res":"1080p","chunk_duration":"12"}'
 ```
+
+| Field | Values |
+| --- | --- |
+| `files` | one or more names under `SOURCE_DIR` |
+| `target` | `local` (LAN farm) · `cloud` (AWS Batch) |
+| `codec` | `h264` · `hevc` · `av1` · `both` · `all` |
+| `max_res` | cap the ladder, e.g. `1080p`; omit / `""` = all rungs |
+| `chunk_duration` | seconds per chunk; omit / `""` = whole variant |
+| `force_reencode` | `true` to re-encode even if output already exists |
 
 Then watch it run and fetch the result:
 
