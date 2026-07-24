@@ -75,7 +75,7 @@ Submit with target **Local (all machines)**; watch the Temporal UI at `:8233`.
 
 `make farm-up` brings this box up as master (cluster + server + worker) in one
 compose command, then deploys a worker to each `DIST_WORKERS` box over SSH (run
-`make push` first so GHCR has your code):
+`make publish` first so GHCR has your code):
 
 ```bash
 # .env: MASTER_IP=<this box's LAN IP>
@@ -151,8 +151,8 @@ One `Dockerfile`, published/used four ways:
 | Built by | Where | For |
 | --- | --- | --- |
 | `make build` | local daemon (`infinite-streaming-encoder`) | server + local/same-arch workers |
-| `make push` | GHCR (multi-arch) | cross-arch workers + version display + `make run-remote` |
-| `make ecr-push` | ECR (arm64) | AWS Batch workers |
+| `make publish` | GHCR (multi-arch) | cross-arch workers + version display + `make run-remote` |
+| `make ecr-publish` | ECR (arm64) | AWS Batch workers |
 | `make ami-up` | AWS AMI | pre-pull the ECR image onto spot boxes |
 
 ## Repository layout
