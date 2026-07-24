@@ -14,15 +14,15 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-from encoder.burnin import BurninContext, build_filter, rate_label
-from encoder.chunking import Chunk, plan_chunks
-from encoder.gop import keyint
-from encoder.ladder import (
+from infinite_streaming_encoder.burnin import BurninContext, build_filter, rate_label
+from infinite_streaming_encoder.chunking import Chunk, plan_chunks
+from infinite_streaming_encoder.gop import keyint
+from infinite_streaming_encoder.ladder import (
     BUFSIZE_MULTIPLIER,
     DEFAULT_MAXRATE_PERCENT,
     Rung,
 )
-from encoder.progress import emit_stage, run_ffmpeg_with_progress
+from infinite_streaming_encoder.progress import emit_stage, run_ffmpeg_with_progress
 
 
 def variant_stage_key(codec: str, label: str, chunk_index: int | None = None) -> str:

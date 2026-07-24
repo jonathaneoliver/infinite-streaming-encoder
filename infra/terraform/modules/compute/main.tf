@@ -22,7 +22,7 @@ data "aws_iam_policy_document" "spot_fleet_assume" {
 }
 
 resource "aws_iam_role" "spot_fleet" {
-  name               = "encoder-batch-spotfleet"
+  name               = "infinite-streaming-encoder-batch-spotfleet"
   assume_role_policy = data.aws_iam_policy_document.spot_fleet_assume.json
 }
 
@@ -44,7 +44,7 @@ resource "aws_iam_role_policy_attachment" "spot_fleet_tagging" {
 #      already has the image loaded. Empty => Batch's default
 #      ECS-optimized Graviton AMI, which pulls on the first job.
 resource "aws_launch_template" "worker" {
-  name = "encoder-batch-worker"
+  name = "infinite-streaming-encoder-batch-worker"
 
   # NOTE: no image_id here — managed Batch ignores a launch-template AMI.
   # The custom AMI goes through compute_resources.ec2_configuration
@@ -64,23 +64,23 @@ resource "aws_launch_template" "worker" {
   EOT
   )
 
-  # Application=encoder-app is what the app's AWS page filters EC2 on
+  # Application=infinite-streaming-encoder-app is what the app's AWS page filters EC2 on
   # (aws.py app_tag_filter), so tagging workers here makes Batch spot
   # instances show up in the EC2 panel alongside jobs/executions. Tag
   # volumes too so any orphaned EBS is discoverable the same way.
   tag_specifications {
     resource_type = "instance"
     tags = {
-      Name        = "encoder-batch-worker"
-      Application = "encoder-app"
+      Name        = "infinite-streaming-encoder-batch-worker"
+      Application = "infinite-streaming-encoder-app"
     }
   }
 
   tag_specifications {
     resource_type = "volume"
     tags = {
-      Name        = "encoder-batch-worker"
-      Application = "encoder-app"
+      Name        = "infinite-streaming-encoder-batch-worker"
+      Application = "infinite-streaming-encoder-app"
     }
   }
 }
@@ -93,7 +93,7 @@ resource "aws_batch_compute_environment" "spot_graviton" {
   # build the new env, move the queue to it, then delete the old. A
   # fixed name forces delete-first, which AWS refuses while the job
   # queue is still attached ("found existing JobQueue relationship").
-  compute_environment_name_prefix = "encoder-spot-graviton-"
+  compute_environment_name_prefix = "infinite-streaming-encoder-spot-graviton-"
   type                            = "MANAGED"
   state                           = "ENABLED"
   service_role                    = aws_iam_service_linked_role.batch.arn
@@ -144,7 +144,7 @@ resource "aws_batch_compute_environment" "spot_graviton" {
     bid_percentage = 100
 
     tags = {
-      Name = "encoder-batch-worker"
+      Name = "infinite-streaming-encoder-batch-worker"
     }
   }
 
@@ -196,7 +196,7 @@ resource "aws_iam_service_linked_role" "batch" {
 # the SFN's SchedulingPriorityOverride), so 4K/HEVC variants win the next free
 # CPU over small ones — a hard scheduler guarantee, not just submission order.
 resource "aws_batch_scheduling_policy" "priority" {
-  name = "encoder-priority"
+  name = "infinite-streaming-encoder-priority"
 
   fair_share_policy {
     compute_reservation = 0
@@ -210,7 +210,7 @@ resource "aws_batch_scheduling_policy" "priority" {
 }
 
 resource "aws_batch_job_queue" "main" {
-  name                  = "encoder-queue"
+  name                  = "infinite-streaming-encoder-queue"
   state                 = "ENABLED"
   priority              = 1
   scheduling_policy_arn = aws_batch_scheduling_policy.priority.arn

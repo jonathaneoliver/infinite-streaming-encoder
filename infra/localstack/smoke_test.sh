@@ -2,7 +2,7 @@
 # Offline smoke test for the AWS Batch phase pipeline, against LocalStack S3
 # (community edition — no Batch/Step Functions, no AWS spend).
 #
-# It drives the SAME code each Batch job runs — `encoder.cli_local phase
+# It drives the SAME code each Batch job runs — `infinite_streaming_encoder.cli_local phase
 # <name>` — by hand in DAG order, wiring S3 in/out at LocalStack. This
 # exercises: the two-pass variant encode (--two-pass), every phase's S3
 # download/upload, and the .done sidecar completeness invariant.
@@ -60,7 +60,7 @@ awsls() { run_img aws --endpoint-url "$S3_ENDPOINT" "$@"; }
 # Run one pipeline phase. First arg = phase name, rest = phase flags.
 phase() {
   echo "  · phase $1"
-  run_img python3 -m encoder.cli_local phase "$@" >/dev/null
+  run_img python3 -m infinite_streaming_encoder.cli_local phase "$@" >/dev/null
 }
 
 # True if an S3 key exists under the job prefix.

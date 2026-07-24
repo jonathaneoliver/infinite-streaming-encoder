@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jonathaneoliver/encoder/internal/encode"
+	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/encode"
 )
 
 type Watcher struct {

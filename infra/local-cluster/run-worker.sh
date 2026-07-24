@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run a distributed-local encode worker on THIS box. The worker is a container
-# from the encoder image running `encoder.temporal_worker`; it polls the Temporal
+# from the encoder image running `infinite_streaming_encoder.temporal_worker`; it polls the Temporal
 # server (outbound only) and runs cli_phase encodes against MinIO. --restart
 # unless-stopped means it comes back on Docker/host start — boots on power-on.
 #
@@ -11,7 +11,7 @@
 #   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION   MinIO creds
 #   ENCODE_SLOTS       max concurrent encodes here (default: cores/2)
 #   ENCODER_IMAGE      image to run (default: encoder:latest)
-#   CODE_MOUNT         optional host path bind-mounted over /app/scripts/encoder
+#   CODE_MOUNT         optional host path bind-mounted over /app/scripts/infinite_streaming_encoder
 #                      (only needed if ENCODER_IMAGE is stale — e.g. ubuntu's
 #                      pulled image before a current one is published)
 #   WORKER_NAME        container name (default: encode-worker)
@@ -27,7 +27,7 @@ WORKER_NAME="${WORKER_NAME:-encode-worker}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 
 mount_args=()
-[ -n "${CODE_MOUNT:-}" ] && mount_args=(-v "${CODE_MOUNT}:/app/scripts/encoder:ro")
+[ -n "${CODE_MOUNT:-}" ] && mount_args=(-v "${CODE_MOUNT}:/app/scripts/infinite_streaming_encoder:ro")
 # Apple Silicon: the Docker VM hides performance vs efficiency cores, so size
 # concurrency from the HOST's performance-core count (perflevel0) — P-cores / 2,
 # with 2 threads each, fills the P-cores and leaves the weak E-cores idle. Linux
@@ -51,7 +51,7 @@ docker run -d --name "$WORKER_NAME" --restart unless-stopped \
   -e "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" \
   -e "AWS_REGION=${AWS_REGION}" \
   ${slots_args[@]+"${slots_args[@]}"} ${label_args[@]+"${label_args[@]}"} ${mount_args[@]+"${mount_args[@]}"} \
-  --entrypoint python3 "$ENCODER_IMAGE" -m encoder.temporal_worker
+  --entrypoint python3 "$ENCODER_IMAGE" -m infinite_streaming_encoder.temporal_worker
 
 echo "worker '$WORKER_NAME' started (image=$ENCODER_IMAGE, temporal=$TEMPORAL_ADDRESS)"
 sleep 3

@@ -27,12 +27,12 @@ locals {
 }
 
 resource "aws_cloudwatch_log_group" "state_machine" {
-  name              = "/aws/states/encoder"
+  name              = "/aws/states/infinite-streaming-encoder"
   retention_in_days = 14
 }
 
 resource "aws_sfn_state_machine" "encoder" {
-  name     = "encoder"
+  name     = "infinite-streaming-encoder"
   role_arn = var.workflow_role_arn
   type     = "STANDARD"
 

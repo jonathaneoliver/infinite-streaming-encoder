@@ -108,7 +108,7 @@ def encode_phase(spec: dict) -> None:
     # chunks download the mezzanine once instead of once each. cli_phase symlinks
     # it into each activity's work dir zero-copy.
     env.setdefault("MEZZ_CACHE_DIR", "/tmp/mezz-cache")
-    cmd = ["python3", "-m", "encoder.cli_phase", *spec["args"]]
+    cmd = ["python3", "-m", "infinite_streaming_encoder.cli_phase", *spec["args"]]
     proc = subprocess.Popen(cmd, text=True, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     assert proc.stdout is not None

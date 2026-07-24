@@ -1,6 +1,6 @@
 # AWS Batch infrastructure for encoder
 
-Terraform that provisions the Batch + Step Functions pipeline described in [issue #14](https://github.com/jonathaneoliver/Encoder/issues/14).
+Terraform that provisions the Batch + Step Functions pipeline described in [issue #14](https://github.com/jonathaneoliver/infinite-streaming-encoder/issues/14).
 
 ## First-run checklist
 
@@ -144,8 +144,8 @@ for you. Set `STATE_MACHINE_ARN` and pick the **cloud-batch** target in the UI.
   disagreed with a phase's (from the mezzanine duration). They match as long as
   the mezzanine isn't trimmed or padded; suspect any `--time` trimming.
 - **Watching it run** — the web UI shows a live per-chunk grid; the Step
-  Functions console renders the `Map` fan-out; CloudWatch has `/aws/batch/encoder`
-  (per job) and `/aws/states/encoder` (state machine).
+  Functions console renders the `Map` fan-out; CloudWatch has `/aws/batch/infinite-streaming-encoder`
+  (per job) and `/aws/states/infinite-streaming-encoder` (state machine).
 
 ## Cost & cleanup
 

@@ -13,7 +13,7 @@
 #
 # Env:
 #   MASTER_IP            LAN IP the worker dials for Temporal + MinIO (default 192.168.0.110)
-#   IMAGE                GHCR ref to pull (default ghcr.io/jonathaneoliver/encoder:latest)
+#   IMAGE                GHCR ref to pull (default ghcr.io/jonathaneoliver/infinite-streaming-encoder:latest)
 #   GHCR_PAT             set only if the package is private (piped over ssh stdin)
 #   GHCR_USERNAME        GHCR user for the login (default jonathaneoliver)
 #   MINIO_ROOT_USER / MINIO_ROOT_PASSWORD   MinIO creds (default encoder / encoder-secret)
@@ -22,7 +22,7 @@ set -euo pipefail
 SSH_TARGET="${1:?usage: deploy-worker-ghcr.sh <ssh_target> <label>}"
 LABEL="${2:?label (e.g. ubuntu) required}"
 MASTER_IP="${MASTER_IP:-192.168.0.110}"
-IMAGE="${IMAGE:-ghcr.io/jonathaneoliver/encoder:latest}"
+IMAGE="${IMAGE:-ghcr.io/jonathaneoliver/infinite-streaming-encoder:latest}"
 GHCR_USERNAME="${GHCR_USERNAME:-jonathaneoliver}"
 
 echo ">>> [$LABEL] $SSH_TARGET — pull $IMAGE from GHCR"

@@ -4,12 +4,12 @@ Each Batch job definition in infra/terraform/modules/jobs/main.tf
 invokes this module with a specific phase name + the S3 URIs of its
 inputs and outputs:
 
-  python -m encoder.cli_local phase mezzanine  --s3-in URI --s3-out URI
-  python -m encoder.cli_local phase variant    --codec C --tier T --s3-mezz URI --s3-out URI
-  python -m encoder.cli_local phase audio                  --s3-mezz URI --s3-out URI
-  python -m encoder.cli_local phase package    --codec C --s3-variants URI --s3-audio URI --s3-out URI
-  python -m encoder.cli_local phase hls        --codec C --s3-package URI --s3-out URI
-  python -m encoder.cli_local phase byteranges --codec C --s3-package URI --s3-out URI
+  python -m infinite_streaming_encoder.cli_local phase mezzanine  --s3-in URI --s3-out URI
+  python -m infinite_streaming_encoder.cli_local phase variant    --codec C --tier T --s3-mezz URI --s3-out URI
+  python -m infinite_streaming_encoder.cli_local phase audio                  --s3-mezz URI --s3-out URI
+  python -m infinite_streaming_encoder.cli_local phase package    --codec C --s3-variants URI --s3-audio URI --s3-out URI
+  python -m infinite_streaming_encoder.cli_local phase hls        --codec C --s3-package URI --s3-out URI
+  python -m infinite_streaming_encoder.cli_local phase byteranges --codec C --s3-package URI --s3-out URI
 
 Each phase:
   1. Downloads whatever prereqs it needs into /tmp/work/
@@ -38,24 +38,24 @@ import sys
 import time
 from pathlib import Path
 
-from encoder.audio import AudioSpec, create_audio
-from encoder.chunking import DEFAULT_CHUNK_DURATION_S, plan_chunks
-from encoder.encode_variants import (
+from infinite_streaming_encoder.audio import AudioSpec, create_audio
+from infinite_streaming_encoder.chunking import DEFAULT_CHUNK_DURATION_S, plan_chunks
+from infinite_streaming_encoder.encode_variants import (
     EncodeContext, _coalesce_runt_tail, concat_chunks, encode_variant,
 )
-from encoder.ffprobe import probe
-from encoder.hls import (
+from infinite_streaming_encoder.ffprobe import probe
+from infinite_streaming_encoder.hls import (
     TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls,
 )
-from encoder.manifests import write_fragmented_mpd
-from encoder.ladder import (
+from infinite_streaming_encoder.manifests import write_fragmented_mpd
+from infinite_streaming_encoder.ladder import (
     BUFSIZE_MULTIPLIER, DEFAULT_MAXRATE_PERCENT, Rung, burnin_for_height,
     label_res_name,
 )
-from encoder.mezzanine import MezzanineSpec, create_mezzanine
-from encoder.packager import PackageSpec, package
-from encoder.padding import multi_duration_lcm, plan_padding
-from encoder.progress import emit_boot_ami, emit_stage
+from infinite_streaming_encoder.mezzanine import MezzanineSpec, create_mezzanine
+from infinite_streaming_encoder.packager import PackageSpec, package
+from infinite_streaming_encoder.padding import multi_duration_lcm, plan_padding
+from infinite_streaming_encoder.progress import emit_boot_ami, emit_stage
 
 try:
     import boto3
@@ -927,7 +927,7 @@ def _download_dir(s3_prefix: str, local: Path) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="encoder.cli_local phase",
+        prog="infinite_streaming_encoder.cli_local phase",
         description="Per-phase S3-in/S3-out invocation used by Batch jobs.",
     )
     sub = p.add_subparsers(dest="phase", required=True)

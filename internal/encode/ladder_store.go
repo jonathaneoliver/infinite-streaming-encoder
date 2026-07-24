@@ -13,7 +13,7 @@ import (
 // serves the API, and resolves the concrete rungs the SFN hands to workers —
 // so a user-defined ladder flows through to both local and cloud encodes.
 //
-// The on-disk format is shared with the Python encoder (scripts/encoder/
+// The on-disk format is shared with the Python encoder (scripts/infinite_streaming_encoder/
 // ladder.py reads the same file), so a rung is a [width, height, bitrate_kbps]
 // triple and burn-in geometry is derived from height on both sides.
 
@@ -54,7 +54,7 @@ type LadderStore struct {
 }
 
 // defaultSeedLadders returns the built-in read-only ladders. Mirrors
-// scripts/encoder/ladder.py SEED_LADDERS (av1 == hevc). Kept in sync by hand;
+// scripts/infinite_streaming_encoder/ladder.py SEED_LADDERS (av1 == hevc). Kept in sync by hand;
 // the store persists a copy so both languages read the same file thereafter.
 func defaultSeedLadders() map[string]LadderDef {
 	legacyHEVC := [][]int{{640, 360, 300}, {960, 540, 1001}, {1280, 720, 1662}, {1920, 1080, 4273}, {2560, 1440, 10547}, {3840, 2160, 16458}}

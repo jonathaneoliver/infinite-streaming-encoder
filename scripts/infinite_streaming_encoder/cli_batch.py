@@ -2,11 +2,11 @@
 machine. Invoked by the Go server's `cloud-batch` target the same way
 it invokes cli_cloud.py for the legacy spot target:
 
-  python -m encoder.cli_batch submit \\
+  python -m infinite_streaming_encoder.cli_batch submit \\
     --state-machine-arn ARN --input-json FILE
   # prints the execution ARN on stdout
 
-  python -m encoder.cli_batch poll \\
+  python -m infinite_streaming_encoder.cli_batch poll \\
     --execution-arn ARN --s3-prefix URI --local-dir PATH
   # blocks until terminal state; emits ENCODER-STAGE markers as
   # per-step events land in GetExecutionHistory
@@ -110,7 +110,7 @@ def _reflect_batch_status(exec_name: str) -> None:
     STARTING → RUNNING — so we ask Batch directly. Done chunks are SUCCEEDED
     and won't appear in these lists, so their 'done' state is left intact."""
     batch = _batch()
-    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
 
     def _emit_for(status_filter: str, stage_status: str) -> None:
         try:
@@ -141,7 +141,7 @@ def _reflect_batch_status(exec_name: str) -> None:
 
 # CloudWatch log group the Batch job definitions write to (see
 # infra/terraform/modules/jobs/main.tf).
-_BATCH_LOG_GROUP = "/aws/batch/encoder"
+_BATCH_LOG_GROUP = "/aws/batch/infinite-streaming-encoder"
 
 # Only these lines from a running container are worth surfacing live — the
 # throttled S3 transfer bars (_Xfer in cli_phase) and the per-phase "[phase X]
@@ -190,7 +190,7 @@ def _backfill_completed_hosts(exec_name: str, log_state: dict) -> None:
     keys aren't coloured yet and emit their host. Bounded: only untagged jobs are
     described (via the name, no API call), so each is described at most once."""
     batch = _batch()
-    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
     try:
         done = batch.list_jobs(jobQueue=queue, jobStatus="SUCCEEDED"
                                ).get("jobSummaryList", [])
@@ -218,7 +218,7 @@ def _forward_running_logs(exec_name: str, log_state: dict) -> None:
     packaging, big S3 transfers) show live activity instead of a dark gap
     between 'submitted' and 'done'. Best-effort; never breaks polling."""
     batch = _batch()
-    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
     try:
         running = batch.list_jobs(jobQueue=queue, jobStatus="RUNNING"
                                   ).get("jobSummaryList", [])
@@ -449,7 +449,7 @@ def _report_live_reclaims(exec_name: str, seen: dict) -> None:
     reclaims. Emit ENCODER-RECLAIM (per-stage cumulative count + wasted seconds)
     on change, and flag the stage 'reclaimed' (red) while it's waiting to
     restart (RUNNABLE/STARTING after a failed attempt). Best-effort/cosmetic."""
-    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
     batch = _batch()
     status_by_id, name_by_id, ids = {}, {}, []
     for status in ("RUNNABLE", "STARTING", "RUNNING"):
@@ -845,7 +845,7 @@ def _collect_exec_jobs(exec_name: str) -> list:
     dropped everything past the first page and, worse, read 0 when the terminal
     states hadn't propagated yet). Retries a few times so a just-finished run's
     jobs have settled before we sum them."""
-    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
     batch = _batch()
     for attempt in range(6):
         ids = []
@@ -911,7 +911,7 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
     spot, ondemand = vh * _SPOT_VCPU_HR, vh * _ONDEMAND_VCPU_HR
     saved = ondemand - spot
     try:
-        from encoder.cloud.compute_env import get_vcpus
+        from infinite_streaming_encoder.cloud.compute_env import get_vcpus
         max_vcpus = int(get_vcpus().get("max_vcpus") or 0)
     except Exception:  # noqa: BLE001 — best-effort
         max_vcpus = 0
@@ -1036,7 +1036,7 @@ def cmd_poll(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="encoder.cli_batch")
+    p = argparse.ArgumentParser(prog="infinite_streaming_encoder.cli_batch")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     ps = sub.add_parser("submit")

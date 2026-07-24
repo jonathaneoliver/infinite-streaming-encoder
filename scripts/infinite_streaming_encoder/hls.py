@@ -1,6 +1,6 @@
 """Phases 6 & 7 — fragment sidecars, fMP4 HLS playlists, TS HLS variant.
 
-The DASH package produced by encoder.packager already has all the
+The DASH package produced by infinite_streaming_encoder.packager already has all the
 media bytes we need. This module adds:
 
 - Phase 6: walk every `.m4s` in the package and write its
@@ -8,7 +8,7 @@ media bytes we need. This module adds:
   LL-HLS EXT-X-PART tags downstream depend on these.
 
 - Phase 7: generate HLS master + per-variant playlists from the DASH
-  package (fMP4 segments). Reuses `encoder.manifests.hls_from_dash`.
+  package (fMP4 segments). Reuses `infinite_streaming_encoder.manifests.hls_from_dash`.
 
 - Phase 7b (optional): produce a parallel MPEG-TS HLS package from
   the same variant MP4s, for older clients. Skipped unless the caller
@@ -20,8 +20,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from encoder.fragments import parse_segment
-from encoder.manifests import hls_from_dash as _hls_from_dash
+from infinite_streaming_encoder.fragments import parse_segment
+from infinite_streaming_encoder.manifests import hls_from_dash as _hls_from_dash
 import json
 
 

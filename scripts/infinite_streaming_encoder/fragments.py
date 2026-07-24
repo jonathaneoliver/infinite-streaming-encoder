@@ -14,7 +14,7 @@ CLI (matches the --track-type/--segment-duration/--gop-duration surface
 the bash orchestrator expects, even though we don't need most of it —
 the durations are consumed by the caller, not here):
 
-    python3 -m encoder.fragments \\
+    python3 -m infinite_streaming_encoder.fragments \\
         --track-type <video|audio> \\
         --segment-duration <s> \\
         --gop-duration <s> \\
@@ -166,7 +166,7 @@ def parse_segment(path: Path, track_type: str) -> list[dict]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="encoder.fragments", description=__doc__)
+    parser = argparse.ArgumentParser(prog="infinite_streaming_encoder.fragments", description=__doc__)
     parser.add_argument("--track-type", choices=("video", "audio"), required=True)
     parser.add_argument("--segment-duration", type=float, default=0.0,
                         help="consumed upstream; ignored here")

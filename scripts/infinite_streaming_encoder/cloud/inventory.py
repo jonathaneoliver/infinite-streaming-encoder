@@ -1,10 +1,10 @@
 """Read-only inventory of every AWS resource this tool has tagged.
 
 Answers "what's running in AWS that will cost me money right now?"
-The Go server calls this via `python3 -m encoder.cloud.inventory --json`
+The Go server calls this via `python3 -m infinite_streaming_encoder.cloud.inventory --json`
 and surfaces the result in the AWS tab.
 
-All queries scope to `Application=encoder-app` — user-owned resources
+All queries scope to `Application=infinite-streaming-encoder-app` — user-owned resources
 are never included.
 
 Output shape (JSON):
@@ -37,7 +37,7 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
-from encoder.cloud.aws import (
+from infinite_streaming_encoder.cloud.aws import (
     APP_TAG_KEY, APP_TAG_VALUE, app_tag_filter, batch_client, cloudwatch_client,
     ec2_client, ecs_client, region, s3_client, sfn_client,
 )
@@ -302,7 +302,7 @@ _BATCH_STATUS_RANK = {"RUNNING": 0, "STARTING": 1, "RUNNABLE": 2, "PENDING": 3, 
 def _batch_jobs() -> list[dict[str, Any]]:
     """Active jobs on the encoder Batch queue (any non-terminal status),
     ordered most-recently-changed first within status."""
-    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
     batch = batch_client()
     out: list[dict[str, Any]] = []
     try:
@@ -440,7 +440,7 @@ def _enrich_fleet(batch_jobs: list[dict], instances: list[dict]) -> dict[str, An
 def _ecs_cluster_name() -> str | None:
     """Container-Insights ClusterName for the encoder Batch compute env."""
     try:
-        from encoder.cloud.compute_env import _encoder_ce
+        from infinite_streaming_encoder.cloud.compute_env import _encoder_ce
         ce = _encoder_ce()
         if not ce:
             return None
@@ -538,7 +538,7 @@ def _annotate_init_states(instances: list[dict]) -> None:
     if not running:
         return
     try:
-        from encoder.cloud.compute_env import _encoder_ce
+        from infinite_streaming_encoder.cloud.compute_env import _encoder_ce
         ce = _encoder_ce()
         cluster = None
         if ce:
@@ -640,7 +640,7 @@ def _current_vcpus():
     (never break inventory). max feeds the AWS panel's max-vCPUs radio; min is the
     live keep-warm floor (0 idle, WARM_MIN_VCPUS while a run is active)."""
     try:
-        from encoder.cloud.compute_env import get_vcpus
+        from infinite_streaming_encoder.cloud.compute_env import get_vcpus
         return get_vcpus()
     except Exception:  # noqa: BLE001 — best-effort
         return {}
@@ -749,7 +749,7 @@ def collect() -> dict[str, Any]:
 
 def _main() -> int:
     import argparse
-    p = argparse.ArgumentParser(prog="encoder.cloud.inventory")
+    p = argparse.ArgumentParser(prog="infinite_streaming_encoder.cloud.inventory")
     p.add_argument("--json", action="store_true",
                    help="emit machine-readable JSON (default: text summary)")
     args = p.parse_args()

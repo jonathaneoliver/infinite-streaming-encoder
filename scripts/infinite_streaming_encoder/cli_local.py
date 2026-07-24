@@ -28,25 +28,25 @@ import time
 from fractions import Fraction
 from pathlib import Path
 
-from encoder.audio import AudioSpec, create_audio
-from encoder.chunking import plan_chunks
-from encoder.encode_variants import (
+from infinite_streaming_encoder.audio import AudioSpec, create_audio
+from infinite_streaming_encoder.chunking import plan_chunks
+from infinite_streaming_encoder.encode_variants import (
     EncodeContext, _coalesce_runt_tail, encode_all, variant_stage_key,
 )
-from encoder.ffprobe import ProbeError, probe
-from encoder.hls import (
+from infinite_streaming_encoder.ffprobe import ProbeError, probe
+from infinite_streaming_encoder.hls import (
     TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls, generate_ts_hls,
 )
-from encoder.manifests import write_fragmented_mpd
-from encoder.ladder import (
+from infinite_streaming_encoder.manifests import write_fragmented_mpd
+from infinite_streaming_encoder.ladder import (
     Rung, get_ladder, label_height, ladder_bufsize_multiplier,
     ladder_maxrate_percent, parse_bitrate_override, select_rungs,
 )
-from encoder.mezzanine import MezzanineSpec, create_mezzanine
-from encoder.packager import PackageSpec, package
-from encoder.padding import multi_duration_lcm, plan_padding
-from encoder.progress import Stage, emit_boot_ami, emit_plan, emit_stage
-from encoder.resume import discover, resolve_codec_selection
+from infinite_streaming_encoder.mezzanine import MezzanineSpec, create_mezzanine
+from infinite_streaming_encoder.packager import PackageSpec, package
+from infinite_streaming_encoder.padding import multi_duration_lcm, plan_padding
+from infinite_streaming_encoder.progress import Stage, emit_boot_ami, emit_plan, emit_stage
+from infinite_streaming_encoder.resume import discover, resolve_codec_selection
 
 # Matches bash's minimum.
 MIN_WIDTH = 640
@@ -64,7 +64,7 @@ _TMP_ROOT = Path(os.environ.get("TMPDIR")
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="encoder.cli_local",
+        prog="infinite_streaming_encoder.cli_local",
         description="Encode one source file into a DASH + HLS ABR package.",
     )
     p.add_argument("--input", type=Path)
@@ -671,11 +671,11 @@ def _log_run_summary(wall_s: float, cpu_s: float) -> None:
 
 def main() -> int:
     # Batch job definitions invoke us as
-    # `python -m encoder.cli_local phase <name> ...`. Dispatch to the
+    # `python -m infinite_streaming_encoder.cli_local phase <name> ...`. Dispatch to the
     # phase handler before argparse gets hold of local-encode flags
     # that don't apply in the Batch context.
     if len(sys.argv) >= 2 and sys.argv[1] == "phase":
-        from encoder.cli_phase import main as phase_main
+        from infinite_streaming_encoder.cli_phase import main as phase_main
         return phase_main(sys.argv[2:])
 
     args = build_parser().parse_args()

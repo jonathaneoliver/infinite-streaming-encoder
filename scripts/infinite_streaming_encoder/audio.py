@@ -25,8 +25,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from encoder.ffprobe import probe
-from encoder.progress import run_ffmpeg_with_progress
+from infinite_streaming_encoder.ffprobe import probe
+from infinite_streaming_encoder.progress import run_ffmpeg_with_progress
 
 
 # Canonical AAC encode params — match dev bash (AAC-LC 192k, stereo, 48kHz).

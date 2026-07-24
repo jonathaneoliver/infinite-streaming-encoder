@@ -9,7 +9,7 @@ an optional audio MP4, runs Shaka Packager once to emit:
     manifest.mpd
 
 The resulting manifest.mpd uses SegmentTemplate URL patterns; we then
-rewrite it to SegmentList form via encoder.manifests. That rewrite is
+rewrite it to SegmentList form via infinite_streaming_encoder.manifests. That rewrite is
 driven from the same module on purpose — it's the same tree walker
 used by the caller today.
 """
@@ -20,7 +20,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from encoder.manifests import convert_segmentlist
+from infinite_streaming_encoder.manifests import convert_segmentlist
 
 
 @dataclass(frozen=True)

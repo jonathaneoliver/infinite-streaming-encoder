@@ -29,7 +29,7 @@ resource "aws_vpc" "this" {
   enable_dns_hostnames = true
 
   tags = {
-    Name = "encoder-batch"
+    Name = "infinite-streaming-encoder-batch"
   }
 }
 
@@ -37,7 +37,7 @@ resource "aws_internet_gateway" "this" {
   vpc_id = aws_vpc.this.id
 
   tags = {
-    Name = "encoder-batch"
+    Name = "infinite-streaming-encoder-batch"
   }
 }
 
@@ -50,7 +50,7 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = true # Batch EC2 workers get a public IP at launch
 
   tags = {
-    Name = "encoder-batch-public-${each.key}"
+    Name = "infinite-streaming-encoder-batch-public-${each.key}"
     Tier = "public"
   }
 }
@@ -65,7 +65,7 @@ resource "aws_route_table" "public" {
   }
 
   tags = {
-    Name = "encoder-batch-public"
+    Name = "infinite-streaming-encoder-batch-public"
   }
 }
 
@@ -87,7 +87,7 @@ resource "aws_vpc_endpoint" "s3" {
   route_table_ids   = [aws_route_table.public.id]
 
   tags = {
-    Name = "encoder-batch-s3"
+    Name = "infinite-streaming-encoder-batch-s3"
   }
 }
 
@@ -96,7 +96,7 @@ resource "aws_vpc_endpoint" "s3" {
 # egress via the internet gateway; S3 via the gateway endpoint above.
 # ---------------------------------------------------------------
 resource "aws_security_group" "batch" {
-  name        = "encoder-batch-compute"
+  name        = "infinite-streaming-encoder-batch-compute"
   description = "Batch compute instances; egress-only"
   vpc_id      = aws_vpc.this.id
 

@@ -15,7 +15,7 @@
 #       first time, but bakes your uncommitted deps for that arch (no QEMU, no
 #       push). Use it when you've changed requirements.txt / the Dockerfile.
 # Either way current code is rsync'd and bind-mounted, so routine code deploys
-# only move the small scripts/encoder dir, never the whole image.
+# only move the small scripts/infinite_streaming_encoder dir, never the whole image.
 #
 # Env: MASTER_IP (LAN IP of the master, default 192.168.0.110),
 #      MINIO_ROOT_USER / MINIO_ROOT_PASSWORD, FORCE_IMAGE=1 to re-transfer a
@@ -26,7 +26,7 @@ SSH_TARGET="${1:?usage: deploy-worker.sh <ssh_target> <label> [remote_code_dir]}
 LABEL="${2:?label (e.g. macmini) required}"
 REMOTE_CODE="${3:-/tmp/encoder-src/encoder}"
 MASTER_IP="${MASTER_IP:-192.168.0.110}"
-BASE_IMAGE="${BASE_IMAGE:-ghcr.io/jonathaneoliver/encoder:latest}"
+BASE_IMAGE="${BASE_IMAGE:-ghcr.io/jonathaneoliver/infinite-streaming-encoder:latest}"
 MASTER_IMAGE="${MASTER_IMAGE:-encoder:latest}"
 
 master_arch="$(docker image inspect "$MASTER_IMAGE" --format '{{.Architecture}}' 2>/dev/null || true)"
@@ -62,7 +62,7 @@ fi
 
 echo ">>> [$LABEL] syncing code + (re)starting worker"
 ssh -o BatchMode=yes "$SSH_TARGET" "mkdir -p $REMOTE_CODE"
-rsync -a --delete scripts/encoder/ "$SSH_TARGET:$REMOTE_CODE/"
+rsync -a --delete scripts/infinite_streaming_encoder/ "$SSH_TARGET:$REMOTE_CODE/"
 scp -q infra/local-cluster/run-worker.sh "$SSH_TARGET:/tmp/run-worker.sh"
 ssh -o BatchMode=yes "$SSH_TARGET" "cat > /tmp/worker.env" <<EOF
 TEMPORAL_ADDRESS=$MASTER_IP:7233

@@ -6,7 +6,7 @@ region plumbing.
 
 Also defines the resource-tagging contract this tool relies on for
 safe cleanup. Every EC2 instance, EBS volume, spot request, and
-(where the API permits) S3 object is tagged `Application=encoder-app`.
+(where the API permits) S3 object is tagged `Application=infinite-streaming-encoder-app`.
 The inventory and emergency-clear flows scope themselves strictly to
 that tag, so nothing un-tagged ever gets touched.
 """
@@ -23,11 +23,11 @@ import boto3
 # off this exact value, and anything that doesn't match is treated as
 # user-owned and never touched.
 APP_TAG_KEY = "Application"
-APP_TAG_VALUE = "encoder-app"
+APP_TAG_VALUE = "infinite-streaming-encoder-app"
 
 
 def app_tag() -> dict[str, str]:
-    """{'Key': 'Application', 'Value': 'encoder-app'} — the cleanup key."""
+    """{'Key': 'Application', 'Value': 'infinite-streaming-encoder-app'} — the cleanup key."""
     return {"Key": APP_TAG_KEY, "Value": APP_TAG_VALUE}
 
 
@@ -118,7 +118,7 @@ def resolve_al2023_ami(ami_id: str | None = None, ami_arch: str = "x86_64") -> s
 
 
 def resolve_worker_ami(image_tag: str, ami_arch: str = "arm64") -> str | None:
-    """Find a pre-baked `encoder-worker` AMI whose baked image tag matches
+    """Find a pre-baked `infinite-streaming-encoder-worker` AMI whose baked image tag matches
     `image_tag` — the SAME AMI the Batch compute env uses. Booting it means the
     worker image is already resident, so the remote's `docker pull` is a cheap
     manifest check with no layer download (~60s saved). Returns None when no
@@ -129,7 +129,7 @@ def resolve_worker_ami(image_tag: str, ami_arch: str = "arm64") -> str | None:
         resp = ec2_client().describe_images(
             Owners=["self"],
             Filters=[
-                {"Name": "tag:Name", "Values": ["encoder-worker"]},
+                {"Name": "tag:Name", "Values": ["infinite-streaming-encoder-worker"]},
                 {"Name": "tag:image_tag", "Values": [image_tag]},
                 {"Name": "architecture", "Values": [ami_arch]},
                 {"Name": "state", "Values": ["available"]},

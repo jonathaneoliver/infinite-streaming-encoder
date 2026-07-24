@@ -10,7 +10,7 @@
 // running — whatever the cause, an instance older than MaxLifetime
 // is a leak and gets cleaned up.
 //
-// Scoped strictly to Application=encoder-app tagged resources via the
+// Scoped strictly to Application=infinite-streaming-encoder-app tagged resources via the
 // same Python inventory module the HTTP handler uses.
 package awswatch
 
@@ -31,7 +31,7 @@ type Config struct {
 	// Instances older than this get flagged / terminated.
 	MaxLifetime time.Duration
 	// When true, stale instances are force-terminated via
-	// encoder.cloud.cleanup. When false, we only log warnings.
+	// infinite_streaming_encoder.cloud.cleanup. When false, we only log warnings.
 	AutoTerminateStale bool
 	// S3 staging prefix retention for FAILED jobs — prefixes whose
 	// _FAILED marker is older than this get garbage-collected. Gives
@@ -200,7 +200,7 @@ func reconcileWarmCapacity(cfg Config, inv *inventoryDoc) {
 }
 
 func setMinVCPUs(n int) error {
-	cmd := exec.Command("python3", "-m", "encoder.cloud.compute_env",
+	cmd := exec.Command("python3", "-m", "infinite_streaming_encoder.cloud.compute_env",
 		"--set-min-vcpus", strconv.Itoa(n))
 	cmd.Env = os.Environ()
 	out, err := cmd.Output()
@@ -222,7 +222,7 @@ func setMinVCPUs(n int) error {
 
 func gcFailedStaging(maxAge time.Duration) error {
 	args := []string{
-		"-m", "encoder.cloud.cleanup", "--json",
+		"-m", "infinite_streaming_encoder.cloud.cleanup", "--json",
 		"--gc-failed-staging",
 		"--max-age-s", strconv.Itoa(int(maxAge.Seconds())),
 	}
@@ -255,7 +255,7 @@ func gcFailedStaging(maxAge time.Duration) error {
 }
 
 func fetchInventory() (*inventoryDoc, error) {
-	cmd := exec.Command("python3", "-m", "encoder.cloud.inventory", "--json")
+	cmd := exec.Command("python3", "-m", "infinite_streaming_encoder.cloud.inventory", "--json")
 	cmd.Env = os.Environ()
 	out, err := cmd.Output()
 	if err != nil {
@@ -277,11 +277,11 @@ func fetchInventory() (*inventoryDoc, error) {
 func terminate(jobID, instanceID string) error {
 	var args []string
 	if jobID != "" {
-		args = []string{"-m", "encoder.cloud.cleanup", "--json", "--job-id", jobID}
+		args = []string{"-m", "infinite_streaming_encoder.cloud.cleanup", "--json", "--job-id", jobID}
 	} else {
 		// An instance with the Application tag but no JobId is a
 		// bug somewhere; sweep_all is the safe sledgehammer.
-		args = []string{"-m", "encoder.cloud.cleanup", "--json", "--sweep-all"}
+		args = []string{"-m", "infinite_streaming_encoder.cloud.cleanup", "--json", "--sweep-all"}
 	}
 	cmd := exec.Command("python3", args...)
 	cmd.Env = os.Environ()
@@ -303,7 +303,7 @@ type pyError struct {
 }
 
 func (e *pyError) Error() string {
-	return "python3 -m encoder.cloud." + e.module + " exited " +
+	return "python3 -m infinite_streaming_encoder.cloud." + e.module + " exited " +
 		itoa(e.code) + ": " + e.stderr
 }
 

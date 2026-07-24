@@ -24,8 +24,8 @@ from urllib.parse import urlparse
 
 from botocore.exceptions import ClientError
 
-from encoder.cloud.aws import s3_client
-from encoder.progress import emit_stage
+from infinite_streaming_encoder.cloud.aws import s3_client
+from infinite_streaming_encoder.progress import emit_stage
 
 
 # Don't emit ENCODER-STAGE updates more often than this during byte

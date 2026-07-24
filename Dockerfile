@@ -95,7 +95,7 @@ COPY scripts/ /app/scripts/
 RUN chmod +x /app/scripts/*.sh 2>/dev/null || true; \
     find /app/scripts -name '*.py' -exec chmod +x {} + 2>/dev/null || true
 
-# PYTHONPATH lets `python3 -m encoder.foo` and `from encoder.foo import bar`
+# PYTHONPATH lets `python3 -m infinite_streaming_encoder.foo` and `from infinite_streaming_encoder.foo import bar`
 # resolve regardless of the worker container's CWD.
 ENV PYTHONPATH=/app/scripts
 # Unbuffered stdout/stderr: our progress markers use flush=True, but this makes
@@ -107,6 +107,6 @@ WORKDIR /app
 EXPOSE 8080
 # CMD (not ENTRYPOINT) so the default run starts the server, but AWS Batch —
 # whose containerProperties can override `command` but not the entrypoint —
-# can run `python3 -m encoder.cli_local phase ...` directly. The local worker
+# can run `python3 -m infinite_streaming_encoder.cli_local phase ...` directly. The local worker
 # path overrides the entrypoint via `docker run --entrypoint`, which still works.
 CMD ["encoder"]

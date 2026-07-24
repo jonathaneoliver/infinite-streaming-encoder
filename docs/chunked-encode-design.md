@@ -160,14 +160,14 @@ mezzanine → Map(variant): [ array(chunk 0..N) → concat ] → per-codec: pack
 
 | Layer | File | Change |
 | --- | --- | --- |
-| Chunk math | `scripts/encoder/gop.py` / new `chunking.py` | chunk count + `[t0,t1)` windows from duration (30s, remainder) |
-| Encode | `scripts/encoder/encode_variants.py` | encode a time window (`-ss/-t`, forced IDR); output `_chunk{n}.mp4`; two-pass per chunk |
-| New phase | `scripts/encoder/cli_phase.py` | `phase variant` takes `--chunk-index`/`--chunk-count`; new `phase concat-variant` |
-| Resume | `scripts/encoder/resume.py` | discover by `{codec}_{tier}_chunk{n}.mp4`; variant "done" = all chunks done |
+| Chunk math | `scripts/infinite_streaming_encoder/gop.py` / new `chunking.py` | chunk count + `[t0,t1)` windows from duration (30s, remainder) |
+| Encode | `scripts/infinite_streaming_encoder/encode_variants.py` | encode a time window (`-ss/-t`, forced IDR); output `_chunk{n}.mp4`; two-pass per chunk |
+| New phase | `scripts/infinite_streaming_encoder/cli_phase.py` | `phase variant` takes `--chunk-index`/`--chunk-count`; new `phase concat-variant` |
+| Resume | `scripts/infinite_streaming_encoder/resume.py` | discover by `{codec}_{tier}_chunk{n}.mp4`; variant "done" = all chunks done |
 | Go SFN input | `internal/encode/job.go` (`buildSFNInput`) | emit chunk count per variant (from probed duration) |
 | SFN template | `infra/terraform/modules/workflow/definition.json.tpl` | array-job (or nested Map) for chunks + `concat` state |
-| Batch jobs | `infra/terraform/modules/jobs/main.tf` | `encoder-variant` as array-capable; new `encoder-concat` job def |
-| Local path | `scripts/encoder/cli_local.py` | optional: chunk locally too, or keep whole-clip for local (spot only matters in cloud) |
+| Batch jobs | `infra/terraform/modules/jobs/main.tf` | `infinite-streaming-encoder-variant` as array-capable; new `encoder-concat` job def |
+| Local path | `scripts/infinite_streaming_encoder/cli_local.py` | optional: chunk locally too, or keep whole-clip for local (spot only matters in cloud) |
 
 ## Interactions
 

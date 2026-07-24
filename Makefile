@@ -2,8 +2,8 @@
 -include .env
 export
 
-IMAGE_NAME ?= encoder
-CONTAINER_NAME ?= encoder
+IMAGE_NAME ?= infinite-streaming-encoder
+CONTAINER_NAME ?= infinite-streaming-encoder
 PORT ?= 8080
 # Temporal UI address the server queries for available distributed-local workers.
 TEMPORAL_UI_ADDR ?= http://host.docker.internal:8233
@@ -43,7 +43,7 @@ PROMOTE_ADDHOST := $(if $(PROMOTE_SSH_IP),--add-host $(PROMOTE_SSH_HOST):$(PROMO
 PROMOTE_SSH_AGENT := $(if $(PROMOTE_SSH_HOST),-v /run/host-services/ssh-auth.sock:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent,)
 
 # GHCR publishing
-GHCR_IMAGE ?= ghcr.io/jonathaneoliver/encoder
+GHCR_IMAGE ?= ghcr.io/jonathaneoliver/infinite-streaming-encoder
 GHCR_USERNAME ?= jonathaneoliver
 PLATFORMS ?= linux/amd64,linux/arm64
 
@@ -55,7 +55,7 @@ PLATFORMS ?= linux/amd64,linux/arm64
 RUN_IMAGE ?= $(IMAGE_NAME)
 REMOTE_IMAGE ?= $(GHCR_IMAGE):latest
 
-# Dev only: host path overlaid onto a spawned orchestrator's /app/scripts/encoder
+# Dev only: host path overlaid onto a spawned orchestrator's /app/scripts/infinite_streaming_encoder
 # so it runs current working-tree code without a rebuild. Set by `make farm-dev`;
 # empty in normal runs (the orchestrator then uses the image's baked scripts).
 HOST_SCRIPTS_DIR ?=
@@ -249,7 +249,7 @@ IMAGE_TAG := $(shell git log -1 --format=%h -- Dockerfile requirements.txt scrip
 # local IMAGE_TAG would break the legacy target whenever a bare `make restart`
 # advanced it to a tag that was only built locally, never pushed. A sha (not
 # :latest) so the shared-AMI lookup, which keys on image_tag, still matches.
-ECR_PUSHED_TAG := $(shell aws ecr describe-images --repository-name encoder-worker \
+ECR_PUSHED_TAG := $(shell aws ecr describe-images --repository-name infinite-streaming-encoder-worker \
 	--region $(AWS_REGION) --query 'reverse(sort_by(imageDetails,&imagePushedAt))[0].imageTags' \
 	--output text 2>/dev/null | tr '\t' '\n' | grep -v '^latest$$' | head -1)
 
@@ -364,17 +364,17 @@ deploy-review:        ## like deploy but stop at the plan (review before infra-a
 
 timing:               ## where-did-the-time-go for an execution: make timing EXEC=<arn>
 	@: $${EXEC:?set EXEC=<execution-arn>}
-	docker exec $(CONTAINER_NAME) python3 -m encoder.cloud.timing --execution-arn $(EXEC)
+	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.cloud.timing --execution-arn $(EXEC)
 
 cpu-report:           ## per-tier encode CPU utilization vs reserved vCPU: make cpu-report EXEC=<arn>
 	@: $${EXEC:?set EXEC=<execution-arn>}
-	docker exec $(CONTAINER_NAME) python3 -m encoder.cloud.cpu_report --execution-arn $(EXEC)
+	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.cloud.cpu_report --execution-arn $(EXEC)
 
 # ---- Worker-AMI cache (opt-in, one at a time) --------------------------------
 # The AMI is a pre-warmed cache: a cold spot instance boots with the encoder
 # image already resident, skipping the ~60s ECR pull. It's OPT-IN and costs
 # ~$1.50/mo in EBS-snapshot storage while it exists, so bake it before an
-# encode session and `make unbake-ami` after. Exactly one encoder-worker AMI
+# encode session and `make unbake-ami` after. Exactly one infinite-streaming-encoder-worker AMI
 # is ever kept: bake prunes every other one, unbake removes them all.
 
 bake-ami:             ## build a worker AMI with the current image pre-pulled (keeps only this one)
@@ -382,9 +382,9 @@ bake-ami:             ## build a worker AMI with the current image pre-pulled (k
 	cd infra/packer && packer init worker-ami.pkr.hcl && \
 	  packer build -var region=$(AWS_REGION) -var ecr_repo=$(ECR_REPO) \
 	    -var image_tag=$(IMAGE_TAG) worker-ami.pkr.hcl
-	@echo ">>> keeping only encoder-worker-$(IMAGE_TAG); removing any older worker AMIs..."
+	@echo ">>> keeping only infinite-streaming-encoder-worker-$(IMAGE_TAG); removing any older worker AMIs..."
 	@ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
-	    --filters "Name=tag:Name,Values=encoder-worker" \
+	    --filters "Name=tag:Name,Values=infinite-streaming-encoder-worker" \
 	    --query "Images[?Tags[?Key=='image_tag'&&Value!='$(IMAGE_TAG)']].ImageId" --output text); \
 	  for ami in $$ids; do \
 	    [ "$$ami" = "None" ] && continue; \
@@ -393,7 +393,7 @@ bake-ami:             ## build a worker AMI with the current image pre-pulled (k
 	    echo "deregister $$ami"; aws ec2 deregister-image --region $(AWS_REGION) --image-id $$ami; \
 	    for s in $$snaps; do echo "  delete snapshot $$s"; aws ec2 delete-snapshot --region $(AWS_REGION) --snapshot-id $$s; done; \
 	  done
-	@echo ">>> Baked encoder-worker-$(IMAGE_TAG) (1 AMI total). Now: make infra-apply  (wires it in)"
+	@echo ">>> Baked infinite-streaming-encoder-worker-$(IMAGE_TAG) (1 AMI total). Now: make infra-apply  (wires it in)"
 
 unbake-ami:           ## clear the compute-env AMI pointer, THEN delete the AMIs (self-clearing, no dangling ref)
 	# Clear the compute env's image_id_override FIRST so we never delete an AMI
@@ -408,8 +408,8 @@ unbake-ami:           ## clear the compute-env AMI pointer, THEN delete the AMIs
 	    -var image_tag=$(IMAGE_TAG) -var worker_ami_id="" ; \
 	else echo ">>> no compute env in state — skipping pointer clear"; fi
 	@ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
-	    --filters "Name=tag:Name,Values=encoder-worker" --query 'Images[].ImageId' --output text); \
-	  if [ -z "$$ids" ] || [ "$$ids" = "None" ]; then echo "no encoder-worker AMI to remove"; else \
+	    --filters "Name=tag:Name,Values=infinite-streaming-encoder-worker" --query 'Images[].ImageId' --output text); \
+	  if [ -z "$$ids" ] || [ "$$ids" = "None" ]; then echo "no infinite-streaming-encoder-worker AMI to remove"; else \
 	  for ami in $$ids; do \
 	    snaps=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) --image-ids $$ami \
 	      --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' --output text); \
@@ -423,13 +423,13 @@ unbake-ami:           ## clear the compute-env AMI pointer, THEN delete the AMIs
 # reusable stack (compute env, queue, SFN, VPC, IAM are all ~$0 at rest —
 # scale-to-zero spot, IGW/public subnets, free S3 gateway endpoint). It runs
 # the same tagged sweep as the app's Emergency Clear (instances / orphan
-# volumes / spot requests / S3 data tagged Application=encoder-app) and removes
+# volumes / spot requests / S3 data tagged Application=infinite-streaming-encoder-app) and removes
 # the worker AMI + snapshot. For a TOTAL teardown (also drops ECR images, log
 # groups, VPC — next use needs a full re-deploy) use `make infra-destroy`.
 
 clear-costs:          ## kill every idle AWS cost: sweep tagged instances/volumes/spot/S3 + remove worker AMI
-	@echo ">>> sweeping Application=encoder-app runtime resources (instances, volumes, spot, S3)..."
-	docker exec $(CONTAINER_NAME) python3 -m encoder.cloud.cleanup --sweep-all
+	@echo ">>> sweeping Application=infinite-streaming-encoder-app runtime resources (instances, volumes, spot, S3)..."
+	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.cloud.cleanup --sweep-all
 	@echo ">>> removing worker AMI(s)..."
 	$(MAKE) unbake-ami
 	@echo ">>> Idle cost generators cleared (AMI pointer self-cleared to pull-on-boot)."
@@ -501,7 +501,7 @@ dist-deploy-ghcr:     ## GHCR-pull workers on each DIST_WORKERS box (no build/tr
 # master, pulling every image from GHCR (no local build). The master always runs
 # a worker; extra boxes come from DIST_WORKERS in .env. Run `make push` first so
 # GHCR has your current code.
-# `make farm-dev` is the developer loop: it bind-mounts your local scripts/encoder
+# `make farm-dev` is the developer loop: it bind-mounts your local scripts/infinite_streaming_encoder
 # into every worker, so re-running it just rsyncs the diffs and restarts workers
 # (no rebuild, no re-pull) — the fastest way to get local changes onto all boxes.
 .PHONY: farm farm-dev
@@ -535,13 +535,13 @@ farm-dev: require-paths   ## dev farm from your WORKING TREE (uncommitted): loca
 	$(MAKE) dist-up
 	@for i in $$(seq 1 60); do nc -z localhost 7233 2>/dev/null && break; sleep 1; done; sleep 5
 	@echo ">>> [farm-dev] 3/5 worker on THIS machine (local image + LIVE working-tree code mount)..."
-	@ENCODER_IMAGE=$(IMAGE_NAME) CODE_MOUNT=$(CURDIR)/scripts/encoder $(_MASTER_WORKER_ENV) \
+	@ENCODER_IMAGE=$(IMAGE_NAME) CODE_MOUNT=$(CURDIR)/scripts/infinite_streaming_encoder $(_MASTER_WORKER_ENV) \
 	  bash infra/local-cluster/run-worker.sh
 	@echo ">>> [farm-dev] 4/5 sync code + image to DIST_WORKERS boxes (transfer same-arch / build cross-arch; code bind-mounted)..."
 	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-workers; else echo "    (no DIST_WORKERS — master-only)"; fi
 	@echo ">>> [farm-dev] 5/5 server + UI from the LOCAL build; orchestrator runs your working-tree code..."
 	@$(MAKE) stop
-	HOST_SCRIPTS_DIR=$(CURDIR)/scripts/encoder $(MAKE) run
+	HOST_SCRIPTS_DIR=$(CURDIR)/scripts/infinite_streaming_encoder $(MAKE) run
 	@echo ">>> farm-dev up (working tree — nothing committed/pushed). Re-run 'make farm-dev' after edits."
 
 # ---- Smoke test --------------------------------------------------------------
@@ -622,7 +622,7 @@ oobe: build   ## isolated first-run test: own dirs/ports/cluster -> encode -> as
 	  TEMPORAL_ADDRESS=host.docker.internal:$(OOBE_TEMPORAL_PORT) \
 	  S3_ENDPOINT_URL=http://host.docker.internal:$(OOBE_MINIO_PORT) \
 	  AWS_ACCESS_KEY_ID=$(MINIO_ACCESS_KEY) AWS_SECRET_ACCESS_KEY=$(MINIO_SECRET_KEY) \
-	  CODE_MOUNT=$(CURDIR)/scripts/encoder \
+	  CODE_MOUNT=$(CURDIR)/scripts/infinite_streaming_encoder \
 	  bash infra/local-cluster/run-worker.sh
 	@echo ">>> [oobe] isolated server '$(OOBE_SERVER)' on :$(OOBE_PORT)..."
 	@docker rm -f $(OOBE_SERVER) >/dev/null 2>&1 || true
@@ -630,7 +630,7 @@ oobe: build   ## isolated first-run test: own dirs/ports/cluster -> encode -> as
 	  SOURCE_DIR=$(OOBE_DIR)/source OUTPUT_DIR=$(OOBE_DIR)/output TMP_DIR=$(OOBE_DIR)/tmp \
 	  TEMPORAL_ADDRESS=host.docker.internal:$(OOBE_TEMPORAL_PORT) \
 	  MINIO_ENDPOINT=http://host.docker.internal:$(OOBE_MINIO_PORT) \
-	  DIST_WORKER_CONTAINER=$(OOBE_WORKER) HOST_SCRIPTS_DIR=$(CURDIR)/scripts/encoder
+	  DIST_WORKER_CONTAINER=$(OOBE_WORKER) HOST_SCRIPTS_DIR=$(CURDIR)/scripts/infinite_streaming_encoder
 	@echo ">>> [oobe] waiting for the isolated server (:$(OOBE_PORT))..."
 	@for i in $$(seq 1 30); do curl -sf http://localhost:$(OOBE_PORT)/api/jobs >/dev/null 2>&1 && break; sleep 1; done
 	@echo ">>> [oobe] submitting encode + waiting (timeout ~300s)..."

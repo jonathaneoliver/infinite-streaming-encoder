@@ -3,7 +3,7 @@
 # module — no internet egress.
 
 resource "aws_ecr_repository" "encoder_worker" {
-  name                 = "encoder-worker"
+  name                 = "infinite-streaming-encoder-worker"
   image_tag_mutability = "MUTABLE" # we overwrite :latest on every push
 
   # Let `tofu destroy` remove the repo even when it still holds images.
@@ -16,7 +16,7 @@ resource "aws_ecr_repository" "encoder_worker" {
   }
 
   tags = {
-    Name = "encoder-worker"
+    Name = "infinite-streaming-encoder-worker"
   }
 }
 
@@ -43,7 +43,7 @@ resource "aws_ecr_lifecycle_policy" "encoder_worker" {
 # (Removed) A Docker Hub pull-through cache rule used to live here, but
 # AWS now requires a Secrets Manager credential for the Docker Hub upstream
 # ("UnsupportedUpstreamRegistryException: requires authentication"). It was
-# never on the critical path — Batch workers pull encoder-worker:<tag>
+# never on the critical path — Batch workers pull infinite-streaming-encoder-worker:<tag>
 # directly, and our image builds FROM python:3.12-slim on the host at
 # `docker build` time, not inside Batch. Re-add with a credential secret if
 # a future base image needs to be mirrored.

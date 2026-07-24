@@ -10,7 +10,7 @@ import (
 // the SFN input, so the worker needs no ladder knowledge — which is what lets
 // user-defined ladders work in the cloud. res_name is derived as "{height}p"
 // and labels get an ordinal suffix when a codec repeats a resolution —
-// identical to scripts/encoder/ladder.py so cloud and local produce the same
+// identical to scripts/infinite_streaming_encoder/ladder.py so cloud and local produce the same
 // {codec}_{label} outputs.
 
 type ladderRung struct {

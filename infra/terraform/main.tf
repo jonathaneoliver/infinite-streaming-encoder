@@ -3,9 +3,9 @@ provider "aws" {
 
   default_tags {
     tags = {
-      Application = "encoder-app"
+      Application = "infinite-streaming-encoder-app"
       ManagedBy   = "terraform"
-      Stack       = "encoder-batch"
+      Stack       = "infinite-streaming-encoder-batch"
     }
   }
 }

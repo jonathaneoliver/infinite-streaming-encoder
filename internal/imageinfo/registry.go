@@ -16,7 +16,7 @@ import (
 )
 
 type Info struct {
-	Image    string `json:"image"`    // "ghcr.io/jonathaneoliver/encoder:latest"
+	Image    string `json:"image"`    // "ghcr.io/jonathaneoliver/infinite-streaming-encoder:latest"
 	Version  string `json:"version"`  // from org.opencontainers.image.version label
 	Revision string `json:"revision"` // from org.opencontainers.image.revision label
 	Digest   string `json:"digest"`   // manifest digest (sha256:...)
@@ -105,7 +105,7 @@ func (c *Client) fetch(ctx context.Context, image string) Info {
 	return info
 }
 
-// parseImage splits "ghcr.io/jonathaneoliver/encoder:v0.1.0" into
+// parseImage splits "ghcr.io/jonathaneoliver/infinite-streaming-encoder:v0.1.0" into
 // registry, repo, tag. Defaults tag to "latest" when absent.
 func parseImage(image string) (registry, repo, tag string, err error) {
 	slash := strings.Index(image, "/")

@@ -14,7 +14,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from encoder.progress import run_ffmpeg_with_progress
+from infinite_streaming_encoder.progress import run_ffmpeg_with_progress
 
 
 @dataclass(frozen=True)

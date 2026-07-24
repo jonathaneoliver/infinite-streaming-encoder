@@ -1,5 +1,5 @@
 # Six phase-specific job definitions. Each points at the SAME image
-# (encoder-worker:<tag> in ECR) but overrides command + resources so
+# (infinite-streaming-encoder-worker:<tag> in ECR) but overrides command + resources so
 # the scheduler can pack cheaper phases onto smaller CPU slices and
 # only the variant encodes chew through real cores.
 #
@@ -27,7 +27,7 @@ locals {
     { name = "PYTHONUNBUFFERED", value = "1" },
   ]
 
-  log_group_name = "/aws/batch/encoder"
+  log_group_name = "/aws/batch/infinite-streaming-encoder"
 }
 
 resource "aws_cloudwatch_log_group" "batch" {
@@ -92,11 +92,11 @@ locals {
 }
 
 # ------------------------------------------------------------------
-# encoder-mezzanine — stream-copy the input into a fragmented MP4.
+# infinite-streaming-encoder-mezzanine — stream-copy the input into a fragmented MP4.
 # CPU-light; 2 vCPU + 4 GiB is plenty.
 # ------------------------------------------------------------------
 resource "aws_batch_job_definition" "mezzanine" {
-  name = "encoder-mezzanine"
+  name = "infinite-streaming-encoder-mezzanine"
   type = "container"
 
   container_properties = jsonencode(merge(local.base_container, {
@@ -105,7 +105,7 @@ resource "aws_batch_job_definition" "mezzanine" {
       { type = "MEMORY", value = "4096" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "mezzanine",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "mezzanine",
       "--s3-in", "Ref::s3_in",
       "--s3-out", "Ref::s3_out",
     ]
@@ -132,13 +132,13 @@ resource "aws_batch_job_definition" "mezzanine" {
 }
 
 # ------------------------------------------------------------------
-# encoder-variant — single (codec, tier) ffmpeg encode. The bulk of
+# infinite-streaming-encoder-variant — single (codec, tier) ffmpeg encode. The bulk of
 # our compute cost. 8 vCPU matches the old c7g.8xlarge × 4 (each
 # variant gets a quarter of the old machine; Batch fits 4 variants
 # per instance). Memory scales with resolution; 16 GiB covers 4K.
 # ------------------------------------------------------------------
 resource "aws_batch_job_definition" "variant" {
-  name = "encoder-variant"
+  name = "infinite-streaming-encoder-variant"
   type = "container"
 
   container_properties = jsonencode(merge(local.base_container, {
@@ -147,7 +147,7 @@ resource "aws_batch_job_definition" "variant" {
       { type = "MEMORY", value = "16384" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "variant",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "variant",
       "--codec", "Ref::codec",
       # Concrete rung resolved by the control plane from the ladder store —
       # the worker needs no ladder knowledge, so user-defined ladders work.
@@ -183,10 +183,10 @@ resource "aws_batch_job_definition" "variant" {
 }
 
 # ------------------------------------------------------------------
-# encoder-audio — extract / transcode the audio track.
+# infinite-streaming-encoder-audio — extract / transcode the audio track.
 # ------------------------------------------------------------------
 resource "aws_batch_job_definition" "audio" {
-  name = "encoder-audio"
+  name = "infinite-streaming-encoder-audio"
   type = "container"
 
   container_properties = jsonencode(merge(local.base_container, {
@@ -195,7 +195,7 @@ resource "aws_batch_job_definition" "audio" {
       { type = "MEMORY", value = "4096" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "audio",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "audio",
       "--s3-mezz", "Ref::s3_mezz",
       "--s3-out", "Ref::s3_out",
     ]
@@ -222,11 +222,11 @@ resource "aws_batch_job_definition" "audio" {
 }
 
 # ------------------------------------------------------------------
-# encoder-package — Shaka Packager per codec. Consumes all variants
+# infinite-streaming-encoder-package — Shaka Packager per codec. Consumes all variants
 # for that codec + audio and produces DASH + fMP4 segments.
 # ------------------------------------------------------------------
 resource "aws_batch_job_definition" "package" {
-  name = "encoder-package"
+  name = "infinite-streaming-encoder-package"
   type = "container"
 
   container_properties = jsonencode(merge(local.base_container, {
@@ -235,7 +235,7 @@ resource "aws_batch_job_definition" "package" {
       { type = "MEMORY", value = "4096" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "package",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "package",
       "--codec", "Ref::codec",
       "--s3-variants", "Ref::s3_variants",
       "--s3-audio", "Ref::s3_audio",
@@ -264,14 +264,14 @@ resource "aws_batch_job_definition" "package" {
 }
 
 # ------------------------------------------------------------------
-# encoder-package-all — combined package + byteranges + fMP4 HLS in one
+# infinite-streaming-encoder-package-all — combined package + byteranges + fMP4 HLS in one
 # job. Downloads the ladder once and does all three steps locally, instead
 # of the package -> hls -> byteranges chain of 3 jobs that each cold-started
 # and re-downloaded the package. 2 vCPU / 4 GiB (Shaka Packager is the
 # heaviest of the three).
 # ------------------------------------------------------------------
 resource "aws_batch_job_definition" "package_all" {
-  name = "encoder-package-all"
+  name = "infinite-streaming-encoder-package-all"
   type = "container"
 
   container_properties = jsonencode(merge(local.base_container, {
@@ -280,7 +280,7 @@ resource "aws_batch_job_definition" "package_all" {
       { type = "MEMORY", value = "4096" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "package-all",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "package-all",
       "--codec", "Ref::codec",
       "--s3-variants", "Ref::s3_variants",
       "--s3-audio", "Ref::s3_audio",
@@ -309,10 +309,10 @@ resource "aws_batch_job_definition" "package_all" {
 }
 
 # ------------------------------------------------------------------
-# encoder-hls — pure-Python LL-HLS manifest. Fast; 1 vCPU.
+# infinite-streaming-encoder-hls — pure-Python LL-HLS manifest. Fast; 1 vCPU.
 # ------------------------------------------------------------------
 resource "aws_batch_job_definition" "hls" {
-  name = "encoder-hls"
+  name = "infinite-streaming-encoder-hls"
   type = "container"
 
   container_properties = jsonencode(merge(local.base_container, {
@@ -321,7 +321,7 @@ resource "aws_batch_job_definition" "hls" {
       { type = "MEMORY", value = "2048" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "hls",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "hls",
       "--codec", "Ref::codec",
       "--s3-package", "Ref::s3_package",
       "--s3-out", "Ref::s3_out",
@@ -349,11 +349,11 @@ resource "aws_batch_job_definition" "hls" {
 }
 
 # ------------------------------------------------------------------
-# encoder-byteranges — fMP4 fragment byterange sidecars for
+# infinite-streaming-encoder-byteranges — fMP4 fragment byterange sidecars for
 # EXT-X-PART partials.
 # ------------------------------------------------------------------
 resource "aws_batch_job_definition" "byteranges" {
-  name = "encoder-byteranges"
+  name = "infinite-streaming-encoder-byteranges"
   type = "container"
 
   container_properties = jsonencode(merge(local.base_container, {
@@ -362,7 +362,7 @@ resource "aws_batch_job_definition" "byteranges" {
       { type = "MEMORY", value = "2048" },
     ]
     command = [
-      "python3", "-m", "encoder.cli_local", "phase", "byteranges",
+      "python3", "-m", "infinite_streaming_encoder.cli_local", "phase", "byteranges",
       "--codec", "Ref::codec",
       "--s3-package", "Ref::s3_package",
       "--s3-out", "Ref::s3_out",

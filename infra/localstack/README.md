@@ -8,7 +8,7 @@ account, no spend — using LocalStack **community** edition.
 Community LocalStack emulates **S3** only. AWS Batch and Step Functions are
 Pro-gated, so this harness does **not** run the state machine. Instead
 `smoke_test.sh` drives the exact command each Batch job runs —
-`python3 -m encoder.cli_local phase <name> …` — by hand, in the DAG order
+`python3 -m infinite_streaming_encoder.cli_local phase <name> …` — by hand, in the DAG order
 defined in `infra/terraform/modules/workflow/definition.json.tpl`.
 
 | Exercised here | Needs real Batch/Spot (or LocalStack Pro) |
