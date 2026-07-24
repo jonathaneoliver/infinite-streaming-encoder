@@ -22,14 +22,20 @@ type encodeMeta struct {
 	GopS              string  `json:"gop_s"`
 	OutputTag         string  `json:"output_tag,omitempty"`
 	// Extra job config used to make this output.
-	MaxRes         string     `json:"max_res,omitempty"`
-	HevcSinglePass bool       `json:"hevc_single_pass,omitempty"`
-	Padding        string     `json:"padding,omitempty"`
-	ChunkDuration  string     `json:"chunk_duration,omitempty"`
-	ForceReencode  bool       `json:"force_reencode,omitempty"`
-	Source         string     `json:"source,omitempty"`
-	EncodedAt      string     `json:"encoded_at"`
-	Rungs          []metaRung `json:"rungs,omitempty"`
+	MaxRes         string `json:"max_res,omitempty"`
+	HevcSinglePass bool   `json:"hevc_single_pass,omitempty"`
+	// Per-codec encoding policy from the ladder profile (this rendition's codec):
+	// ExtraArgs are the raw ffmpeg tokens appended after rate control; Passes is
+	// the effective pass count (with the HevcSinglePass override applied). Both
+	// omitted when at defaults, so existing outputs' encode.json is unchanged.
+	ExtraArgs     string     `json:"extra_args,omitempty"`
+	Passes        int        `json:"passes,omitempty"`
+	Padding       string     `json:"padding,omitempty"`
+	ChunkDuration string     `json:"chunk_duration,omitempty"`
+	ForceReencode bool       `json:"force_reencode,omitempty"`
+	Source        string     `json:"source,omitempty"`
+	EncodedAt     string     `json:"encoded_at"`
+	Rungs         []metaRung `json:"rungs,omitempty"`
 }
 
 type metaRung struct {
@@ -84,6 +90,22 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig) {
 			rungs = append(rungs, metaRung{Height: r[1], BitrateKbps: r[2]})
 		}
 	}
+	// Effective pass count = the profile's, with the per-encode HevcSinglePass
+	// override forcing HEVC to 1. Record only when it DEVIATES from the
+	// codec-intrinsic default (hevc:2, else:1) so a plain ladder's encode.json
+	// stays unchanged; 0 is omitted by omitempty.
+	defaultPasses := 1
+	if codec == "hevc" {
+		defaultPasses = 2
+	}
+	effectivePasses := def.passesFor(codec)
+	if cfg.HevcSinglePass && codec == "hevc" {
+		effectivePasses = 1
+	}
+	metaPasses := 0
+	if effectivePasses != defaultPasses {
+		metaPasses = effectivePasses
+	}
 	meta := encodeMeta{
 		Profile:           ladderName,
 		Codec:             codec,
@@ -95,6 +117,8 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig) {
 		OutputTag:         cfg.OutputTag,
 		MaxRes:            cfg.MaxRes,
 		HevcSinglePass:    cfg.HevcSinglePass,
+		ExtraArgs:         def.extraArgsFor(codec),
+		Passes:            metaPasses,
 		Padding:           cfg.Padding,
 		ChunkDuration:     cfg.ChunkDuration,
 		ForceReencode:     cfg.ForceReencode,
@@ -110,6 +134,12 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig) {
 	line := fmt.Sprintf("encoder: profile=%s codec=%s maxrate=%d%% bufsize=%gx segment=%ss partial=%ss gop=%ss%s",
 		ladderName, codec, maxrate, buf, meta.SegmentS, meta.PartialS, meta.GopS,
 		tagNote(cfg.OutputTag))
+	if metaPasses != 0 {
+		line += fmt.Sprintf(" passes=%d", metaPasses)
+	}
+	if ea := def.extraArgsFor(codec); ea != "" {
+		line += " extra_args=[" + ea + "]"
+	}
 	injectM3U8Comment(filepath.Join(dir, "master.m3u8"), line)
 	injectMPDComment(filepath.Join(dir, "manifest.mpd"), line)
 }

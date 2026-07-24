@@ -1067,6 +1067,11 @@ function _edFromDef(name, def, isNew) {
         gop_duration: def.gop_duration || '',
         output_tag: def.output_tag || '',
         codecs,
+        // Per-codec profile knobs (#58/#59): raw ffmpeg extra_args and the pass
+        // count. Copied so edits don't mutate the cache; left undefined when the
+        // source ladder doesn't set them (so a plain ladder POSTs neither).
+        extra_args: def.extra_args ? { ...def.extra_args } : undefined,
+        passes: def.passes ? { ...def.passes } : undefined,
     };
 }
 
@@ -1126,6 +1131,21 @@ function _edSet(field, val, kind) {
     if (['maxrate_percent', 'bufsize_multiplier', 'segment_duration', 'partial_duration', 'gop_duration'].includes(field)) _edPreview();
 }
 function _edRung(c, i, field, val) { _ed.codecs[c][i][field] = parseInt(val, 10) || 0; _edPreview(); }
+// Per-codec extra ffmpeg args (#58): store only non-empty (a plain ladder keeps
+// no extra_args key). The server shlex-splits + rejects shell metacharacters.
+function _edSetExtra(c, val) {
+    _ed.extra_args = _ed.extra_args || {};
+    if (val && val.trim()) _ed.extra_args[c] = val; else delete _ed.extra_args[c];
+    if (!Object.keys(_ed.extra_args).length) delete _ed.extra_args;
+}
+// Per-codec pass count (#59): only HEVC varies (h264 always 1-pass, av1 has no
+// 2-pass path). Default is 2, so store only the 1-pass deviation to keep default
+// ladders clean; the server rejects h264:2 / av1:2.
+function _edSetPasses(c, val) {
+    _ed.passes = _ed.passes || {};
+    if (c === 'hevc' && parseInt(val, 10) === 1) _ed.passes.hevc = 1; else delete _ed.passes[c];
+    if (!Object.keys(_ed.passes).length) delete _ed.passes;
+}
 function _edDelRung(c, i) { _ed.codecs[c].splice(i, 1); if (!_ed.codecs[c].length) delete _ed.codecs[c]; _renderLadderEditor(); }
 function _edAddRung(c) {
     const rs = _ed.codecs[c]; const last = rs[rs.length - 1] || [1920, 1080, 5000];
@@ -1145,12 +1165,25 @@ function _edCodecTable(c) {
         <td><input type="number" value="${r[2]}" style="width:80px" oninput="_edRung('${c}',${i},2,this.value)" title="target bitrate (kbps)"></td>
         <td><button class="btn" style="padding:0 7px" onclick="_edDelRung('${c}',${i})" title="remove rung">×</button></td>
       </tr>`).join('');
+    const ea = (_ed.extra_args && _ed.extra_args[c]) || '';
+    const hevcPasses = (_ed.passes && _ed.passes.hevc) || 2;
+    const eg = c === 'hevc' ? '-x265-params aq-mode=3:psy-rd=2.0'
+        : c === 'av1' ? '-svtav1-params film-grain=8' : '-tune film';
+    const passesCtl = c === 'hevc'
+        ? `<select style="font-size:11px" onchange="_edSetPasses('hevc',this.value)">
+             <option value="2"${hevcPasses === 2 ? ' selected' : ''}>2-pass (default)</option>
+             <option value="1"${hevcPasses === 1 ? ' selected' : ''}>1-pass</option>
+           </select>`
+        : `<span style="color:#888;font-size:11px">1-pass (fixed)</span>`;
     return `<div style="min-width:250px">
         <div style="color:${color};font-weight:700;margin-bottom:4px">${c} <span style="color:#888;font-weight:400">(${rungs.length})</span></div>
         <table style="border-collapse:collapse;font-size:12px">
           <thead><tr style="color:#888"><th style="text-align:left;font-weight:400">W</th><th style="text-align:left;font-weight:400">H</th><th style="text-align:left;font-weight:400">kbps</th><th></th></tr></thead>
           <tbody>${rows}</tbody></table>
         <button class="btn" style="margin-top:5px;padding:2px 8px" onclick="_edAddRung('${c}')">+ rung</button>
+        <div style="margin-top:8px;color:#888;font-size:11px">extra ffmpeg args</div>
+        <input type="text" value="${_escAttr(ea)}" placeholder="${_escAttr(eg)}" style="width:232px;font-family:monospace;font-size:11px" oninput="_edSetExtra('${c}',this.value)" title="Raw ffmpeg tokens appended after rate control, before output. shlex-split to argv, never shell-eval'd. Adds/overrides at your own risk.">
+        <div style="margin-top:6px;color:#888;font-size:11px">passes ${passesCtl}</div>
       </div>`;
 }
 
@@ -1212,6 +1245,7 @@ async function saveLadder() {
             segment_duration: _ed.segment_duration, partial_duration: _ed.partial_duration,
             gop_duration: _ed.gop_duration, output_tag: _ed.output_tag,
             codecs: _ed.codecs,
+            extra_args: _ed.extra_args, passes: _ed.passes,
         })
     });
     if (!res.ok) { errEl.textContent = await res.text(); return; }
