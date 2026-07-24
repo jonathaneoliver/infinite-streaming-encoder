@@ -29,7 +29,7 @@ variable "region" {
 
 variable "ecr_repo" {
   type        = string
-  description = "Full ECR repo URL, e.g. 123456789012.dkr.ecr.us-west-2.amazonaws.com/encoder-worker"
+  description = "Full ECR repo URL, e.g. 123456789012.dkr.ecr.us-west-2.amazonaws.com/infinite-streaming-encoder-worker"
 }
 
 variable "image_tag" {
@@ -45,7 +45,7 @@ variable "instance_type" {
 variable "instance_profile" {
   type        = string
   description = "Existing IAM instance profile for the build instance (needs ECR pull). The Batch worker profile already has it."
-  default     = "encoder-batch-instance"
+  default     = "infinite-streaming-encoder-batch-instance"
 }
 
 # Latest ECS-optimized Amazon Linux 2023 Graviton (arm64) AMI. Same
@@ -69,9 +69,9 @@ source "amazon-ebs" "worker" {
 
   # AMI name carries the SHA; the image_tag tag is what `make infra-apply`
   # and `make unbake-ami` key off of.
-  ami_name = "encoder-worker-${var.image_tag}"
+  ami_name = "infinite-streaming-encoder-worker-${var.image_tag}"
 
-  # Reuse the Batch instance profile (encoder-batch-instance) for the
+  # Reuse the Batch instance profile (infinite-streaming-encoder-batch-instance) for the
   # build. It already carries AmazonEC2ContainerServiceforEC2Role, which
   # grants ECR pull — exactly what the provisioner needs. Reusing an
   # existing profile also avoids the temporary-instance-profile path,
@@ -80,14 +80,14 @@ source "amazon-ebs" "worker" {
   iam_instance_profile = var.instance_profile
 
   tags = {
-    Name      = "encoder-worker"
+    Name      = "infinite-streaming-encoder-worker"
     image_tag = var.image_tag
     ManagedBy = "packer"
   }
 }
 
 build {
-  name    = "encoder-worker"
+  name    = "infinite-streaming-encoder-worker"
   sources = ["source.amazon-ebs.worker"]
 
   # Log in to ECR and pull the exact SHA-tagged image so it's resident

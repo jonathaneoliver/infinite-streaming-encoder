@@ -643,7 +643,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <p>
                 Terminates every running instance, deletes every orphan volume,
                 cancels every spot request, and empties every S3 prefix that
-                this app has tagged <code>Application=encoder-app</code>.
+                this app has tagged <code>Application=infinite-streaming-encoder-app</code>.
                 <strong>Does not touch anything without that tag.</strong>
             </p>
             <button class="btn btn-danger" onclick="openClearModal()">Clear all AWS resources</button>
@@ -659,7 +659,7 @@ make clear-costs  # this button's sweep AND the AMI, in one command</code></pre>
             <p style="margin-top:6px;font-size:0.8rem;opacity:0.7">
                 Or by hand: <code>aws ec2 deregister-image --image-id &lt;ami&gt;</code>
                 then <code>aws ec2 delete-snapshot --snapshot-id &lt;snap&gt;</code>
-                (find them with <code>aws ec2 describe-images --owners self --filters Name=tag:Name,Values=encoder-worker</code>).
+                (find them with <code>aws ec2 describe-images --owners self --filters Name=tag:Name,Values=infinite-streaming-encoder-worker</code>).
             </p>
         </div>
     </div>
@@ -705,7 +705,7 @@ make clear-costs  # this button's sweep AND the AMI, in one command</code></pre>
         <p>
             This will terminate every instance, cancel every spot request,
             delete every orphan volume, and empty every S3 prefix tagged
-            <code>Application=encoder-app</code>.
+            <code>Application=infinite-streaming-encoder-app</code>.
         </p>
         <p>
             Type <code>CLEAR AWS</code> to confirm:

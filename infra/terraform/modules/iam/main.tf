@@ -45,7 +45,7 @@ data "aws_iam_policy_document" "ec2_assume" {
 }
 
 resource "aws_iam_role" "instance" {
-  name               = "encoder-batch-instance"
+  name               = "infinite-streaming-encoder-batch-instance"
   assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
 }
 
@@ -67,7 +67,7 @@ resource "aws_iam_role_policy" "instance_s3" {
 
 # Batch uses an instance profile; bare roles can't be attached to EC2.
 resource "aws_iam_instance_profile" "instance" {
-  name = "encoder-batch-instance"
+  name = "infinite-streaming-encoder-batch-instance"
   role = aws_iam_role.instance.name
 }
 
@@ -89,7 +89,7 @@ data "aws_iam_policy_document" "ecs_task_assume" {
 }
 
 resource "aws_iam_role" "task" {
-  name               = "encoder-batch-task"
+  name               = "infinite-streaming-encoder-batch-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_task_assume.json
 }
 
@@ -104,7 +104,7 @@ resource "aws_iam_role_policy" "task_s3" {
 # ship container stdout/stderr to CloudWatch Logs.
 # ---------------------------------------------------------------
 resource "aws_iam_role" "execution" {
-  name               = "encoder-batch-execution"
+  name               = "infinite-streaming-encoder-batch-execution"
   assume_role_policy = data.aws_iam_policy_document.ecs_task_assume.json
 }
 
@@ -163,7 +163,7 @@ data "aws_iam_policy_document" "sfn_batch" {
 }
 
 resource "aws_iam_role" "workflow" {
-  name               = "encoder-workflow"
+  name               = "infinite-streaming-encoder-workflow"
   assume_role_policy = data.aws_iam_policy_document.sfn_assume.json
 }
 

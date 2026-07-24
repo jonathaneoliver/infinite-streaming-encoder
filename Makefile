@@ -249,7 +249,7 @@ IMAGE_TAG := $(shell git log -1 --format=%h -- Dockerfile requirements.txt scrip
 # local IMAGE_TAG would break the legacy target whenever a bare `make restart`
 # advanced it to a tag that was only built locally, never pushed. A sha (not
 # :latest) so the shared-AMI lookup, which keys on image_tag, still matches.
-ECR_PUSHED_TAG := $(shell aws ecr describe-images --repository-name encoder-worker \
+ECR_PUSHED_TAG := $(shell aws ecr describe-images --repository-name infinite-streaming-encoder-worker \
 	--region $(AWS_REGION) --query 'reverse(sort_by(imageDetails,&imagePushedAt))[0].imageTags' \
 	--output text 2>/dev/null | tr '\t' '\n' | grep -v '^latest$$' | head -1)
 
@@ -374,7 +374,7 @@ cpu-report:           ## per-tier encode CPU utilization vs reserved vCPU: make 
 # The AMI is a pre-warmed cache: a cold spot instance boots with the encoder
 # image already resident, skipping the ~60s ECR pull. It's OPT-IN and costs
 # ~$1.50/mo in EBS-snapshot storage while it exists, so bake it before an
-# encode session and `make unbake-ami` after. Exactly one encoder-worker AMI
+# encode session and `make unbake-ami` after. Exactly one infinite-streaming-encoder-worker AMI
 # is ever kept: bake prunes every other one, unbake removes them all.
 
 bake-ami:             ## build a worker AMI with the current image pre-pulled (keeps only this one)
@@ -382,9 +382,9 @@ bake-ami:             ## build a worker AMI with the current image pre-pulled (k
 	cd infra/packer && packer init worker-ami.pkr.hcl && \
 	  packer build -var region=$(AWS_REGION) -var ecr_repo=$(ECR_REPO) \
 	    -var image_tag=$(IMAGE_TAG) worker-ami.pkr.hcl
-	@echo ">>> keeping only encoder-worker-$(IMAGE_TAG); removing any older worker AMIs..."
+	@echo ">>> keeping only infinite-streaming-encoder-worker-$(IMAGE_TAG); removing any older worker AMIs..."
 	@ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
-	    --filters "Name=tag:Name,Values=encoder-worker" \
+	    --filters "Name=tag:Name,Values=infinite-streaming-encoder-worker" \
 	    --query "Images[?Tags[?Key=='image_tag'&&Value!='$(IMAGE_TAG)']].ImageId" --output text); \
 	  for ami in $$ids; do \
 	    [ "$$ami" = "None" ] && continue; \
@@ -393,7 +393,7 @@ bake-ami:             ## build a worker AMI with the current image pre-pulled (k
 	    echo "deregister $$ami"; aws ec2 deregister-image --region $(AWS_REGION) --image-id $$ami; \
 	    for s in $$snaps; do echo "  delete snapshot $$s"; aws ec2 delete-snapshot --region $(AWS_REGION) --snapshot-id $$s; done; \
 	  done
-	@echo ">>> Baked encoder-worker-$(IMAGE_TAG) (1 AMI total). Now: make infra-apply  (wires it in)"
+	@echo ">>> Baked infinite-streaming-encoder-worker-$(IMAGE_TAG) (1 AMI total). Now: make infra-apply  (wires it in)"
 
 unbake-ami:           ## clear the compute-env AMI pointer, THEN delete the AMIs (self-clearing, no dangling ref)
 	# Clear the compute env's image_id_override FIRST so we never delete an AMI
@@ -408,8 +408,8 @@ unbake-ami:           ## clear the compute-env AMI pointer, THEN delete the AMIs
 	    -var image_tag=$(IMAGE_TAG) -var worker_ami_id="" ; \
 	else echo ">>> no compute env in state — skipping pointer clear"; fi
 	@ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
-	    --filters "Name=tag:Name,Values=encoder-worker" --query 'Images[].ImageId' --output text); \
-	  if [ -z "$$ids" ] || [ "$$ids" = "None" ]; then echo "no encoder-worker AMI to remove"; else \
+	    --filters "Name=tag:Name,Values=infinite-streaming-encoder-worker" --query 'Images[].ImageId' --output text); \
+	  if [ -z "$$ids" ] || [ "$$ids" = "None" ]; then echo "no infinite-streaming-encoder-worker AMI to remove"; else \
 	  for ami in $$ids; do \
 	    snaps=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) --image-ids $$ami \
 	      --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' --output text); \
@@ -423,12 +423,12 @@ unbake-ami:           ## clear the compute-env AMI pointer, THEN delete the AMIs
 # reusable stack (compute env, queue, SFN, VPC, IAM are all ~$0 at rest —
 # scale-to-zero spot, IGW/public subnets, free S3 gateway endpoint). It runs
 # the same tagged sweep as the app's Emergency Clear (instances / orphan
-# volumes / spot requests / S3 data tagged Application=encoder-app) and removes
+# volumes / spot requests / S3 data tagged Application=infinite-streaming-encoder-app) and removes
 # the worker AMI + snapshot. For a TOTAL teardown (also drops ECR images, log
 # groups, VPC — next use needs a full re-deploy) use `make infra-destroy`.
 
 clear-costs:          ## kill every idle AWS cost: sweep tagged instances/volumes/spot/S3 + remove worker AMI
-	@echo ">>> sweeping Application=encoder-app runtime resources (instances, volumes, spot, S3)..."
+	@echo ">>> sweeping Application=infinite-streaming-encoder-app runtime resources (instances, volumes, spot, S3)..."
 	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.cloud.cleanup --sweep-all
 	@echo ">>> removing worker AMI(s)..."
 	$(MAKE) unbake-ami

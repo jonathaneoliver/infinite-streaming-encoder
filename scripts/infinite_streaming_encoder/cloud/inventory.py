@@ -4,7 +4,7 @@ Answers "what's running in AWS that will cost me money right now?"
 The Go server calls this via `python3 -m infinite_streaming_encoder.cloud.inventory --json`
 and surfaces the result in the AWS tab.
 
-All queries scope to `Application=encoder-app` — user-owned resources
+All queries scope to `Application=infinite-streaming-encoder-app` — user-owned resources
 are never included.
 
 Output shape (JSON):
@@ -302,7 +302,7 @@ _BATCH_STATUS_RANK = {"RUNNING": 0, "STARTING": 1, "RUNNABLE": 2, "PENDING": 3, 
 def _batch_jobs() -> list[dict[str, Any]]:
     """Active jobs on the encoder Batch queue (any non-terminal status),
     ordered most-recently-changed first within status."""
-    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
     batch = batch_client()
     out: list[dict[str, Any]] = []
     try:

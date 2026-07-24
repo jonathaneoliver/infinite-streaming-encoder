@@ -374,7 +374,7 @@
     "Failed": {
       "Type": "Fail",
       "Error": "EncodeFailed",
-      "Cause": "See CloudWatch Logs under /aws/batch/encoder for the failing job's stream."
+      "Cause": "See CloudWatch Logs under /aws/batch/infinite-streaming-encoder for the failing job's stream."
     }
 
   }

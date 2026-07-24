@@ -17,7 +17,7 @@ from infinite_streaming_encoder.cloud.aws import batch_client
 
 def _encoder_ce() -> str | None:
     """Resolve the compute environment backing the encoder job queue."""
-    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
     b = batch_client()
     qs = b.describe_job_queues(jobQueues=[queue]).get("jobQueues", [])
     if not qs:

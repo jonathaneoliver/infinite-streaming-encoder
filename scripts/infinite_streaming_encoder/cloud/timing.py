@@ -32,7 +32,7 @@ try:
 except ImportError:  # pragma: no cover
     boto3 = None  # type: ignore
 
-_BATCH_LOG_GROUP = "/aws/batch/encoder"
+_BATCH_LOG_GROUP = "/aws/batch/infinite-streaming-encoder"
 _TIMING_RE = re.compile(r"\[\[ENCODER-TIMING (.+?)\]\]")
 
 
@@ -48,7 +48,7 @@ def _jobs_for_execution(exec_name: str) -> list[dict]:
     """Every Batch job whose name carries this execution's name. After a run
     they're mostly SUCCEEDED, some FAILED."""
     batch = batch_client()
-    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
     ids: list[str] = []
     for status in ("SUCCEEDED", "FAILED"):
         for j in batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", []):

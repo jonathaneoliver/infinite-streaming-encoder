@@ -3,10 +3,10 @@
 Two scopes:
 
 - `terminate_job(job_id)` — touches only resources tagged with both
-  `Application=encoder-app` AND `JobId=<job_id>`. Safe to call from
+  `Application=infinite-streaming-encoder-app` AND `JobId=<job_id>`. Safe to call from
   atexit handlers; idempotent.
 
-- `sweep_all()` — touches every `Application=encoder-app` resource
+- `sweep_all()` — touches every `Application=infinite-streaming-encoder-app` resource
   regardless of job. This is the emergency-clear path: when the user
   clicks "Clear all AWS resources" in the UI, or when the CLI is
   invoked with `--sweep-all`.
@@ -330,7 +330,7 @@ def gc_failed_staging(max_age_s: int = 3600) -> CleanupReport:
 
 
 def sweep_all() -> CleanupReport:
-    """Tear down every Application=encoder-app resource.
+    """Tear down every Application=infinite-streaming-encoder-app resource.
 
     Used by the emergency-clear button and the server's startup sanity
     check. Scoped filter means user-owned infra stays untouched.
@@ -364,7 +364,7 @@ def sweep_all() -> CleanupReport:
 # ---------------------------------------------------------------------------
 
 def backfill_tags() -> CleanupReport:
-    """Add Application=encoder-app to resources tagged with JobId but missing App.
+    """Add Application=infinite-streaming-encoder-app to resources tagged with JobId but missing App.
 
     Pre-phase-1 launches set only JobId=<id> and Name=encode-<id>; they
     wouldn't appear in inventory (scoped by Application) and wouldn't
@@ -391,7 +391,7 @@ def backfill_tags() -> CleanupReport:
                     kind=kind, id=rid,
                     job_id=job_ids[i] if i < len(job_ids) else None,
                     action="deleted",  # co-opting the enum; a "tagged" value would be cleaner
-                    detail="backfilled Application=encoder-app",
+                    detail="backfilled Application=infinite-streaming-encoder-app",
                 ))
         except ClientError as e:
             for i, rid in enumerate(ids):
@@ -502,9 +502,9 @@ def _main() -> int:
                        help="delete every object under one S3 prefix "
                             "(jobs/ or mezz/ only) — e.g. a single mezz-cache entry")
     group.add_argument("--sweep-all", action="store_true",
-                       help="tear down every Application=encoder-app resource")
+                       help="tear down every Application=infinite-streaming-encoder-app resource")
     group.add_argument("--backfill-tags", action="store_true",
-                       help="add Application=encoder-app to resources already "
+                       help="add Application=infinite-streaming-encoder-app to resources already "
                             "tagged with JobId (one-shot pre-phase-1 cleanup)")
     group.add_argument("--gc-failed-staging", action="store_true",
                        help="delete S3 staging for failed jobs whose _FAILED "

@@ -38,7 +38,7 @@ def _stop_execution(arn: str, terminate_jobs: bool = False) -> dict:
     report: dict = {"stopped_execution": arn}
     if terminate_jobs:
         name = arn.rsplit(":", 1)[-1]
-        queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+        queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
         batch = batch_client()
         terminated, errors = [], []
         for status in _ACTIVE_BATCH_STATUSES:
@@ -92,7 +92,7 @@ def _stop_all() -> dict:
         except ClientError as e:
             errors.append(f"list executions: {e}")
 
-    queue = os.environ.get("BATCH_JOB_QUEUE", "encoder-queue")
+    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
     batch = batch_client()
     for status in _ACTIVE_BATCH_STATUSES:
         try:

@@ -10,7 +10,7 @@
 // running — whatever the cause, an instance older than MaxLifetime
 // is a leak and gets cleaned up.
 //
-// Scoped strictly to Application=encoder-app tagged resources via the
+// Scoped strictly to Application=infinite-streaming-encoder-app tagged resources via the
 // same Python inventory module the HTTP handler uses.
 package awswatch
 
