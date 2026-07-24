@@ -20,8 +20,16 @@ jobs:
   update_release_draft:
     runs-on: ubuntu-latest
     steps:
-      - uses: release-drafter/release-drafter@v6
+      # v7 migration: token moved from `env: GITHUB_TOKEN` to `with: token`,
+      # and the autolabeler is now a SEPARATE action (was built into the main
+      # action in v6). The draft step runs on every trigger; the autolabeler
+      # only has a PR to label on pull_request events.
+      - uses: release-drafter/release-drafter@v7
         with:
           config-name: release-drafter.yml
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: release-drafter/release-drafter/autolabeler@v7
+        if: github.event_name == 'pull_request'
+        with:
+          config-name: release-drafter.yml
+          token: ${{ secrets.GITHUB_TOKEN }}
