@@ -177,6 +177,16 @@ _SEED_APPLE_HEVC_UNIQ = [
     [3776, 2124, 11600], [3840, 2160, 16800],
 ]
 
+# apple-uniq H.264 extended to 4K. Apple's spec caps H.264 at 1080p (HEVC
+# above), but high-bitrate 4K H.264 is still wanted for maximum player
+# compatibility. The three extra tiers mirror the HEVC-uniq top RESOLUTIONS
+# (1440 / 2124 / 2160) with H.264-appropriate (higher) bitrates — roughly the
+# legacy H.264 heights, so h264/hevc/av1 stay rung-count-parallel in this
+# ladder.
+_SEED_APPLE_H264_UNIQ_FULL = _SEED_APPLE_H264_UNIQ + [
+    [2560, 1440, 13500], [3776, 2124, 19000], [3840, 2160, 27000],
+]
+
 SEED_LADDERS: dict[str, dict] = {
     "legacy": {
         "description": "Default distinct-height geometric ladder "
@@ -222,6 +232,25 @@ SEED_LADDERS: dict[str, dict] = {
         "gop_duration": "1.0",
         "codecs": {
             "h264": _SEED_APPLE_H264_UNIQ,
+            "hevc": _SEED_APPLE_HEVC_UNIQ,
+            "av1":  _SEED_APPLE_HEVC_UNIQ,
+        },
+    },
+    "apple-uniq-live-full": {
+        "description": "apple-uniq-live, but H.264 climbs all the way to 4K "
+                       "(1440p/2124p/2160p) at high bitrates. Apple caps H.264 "
+                       "at 1080p (HEVC above), so this trades spec-compliance "
+                       "for max-compatibility high-bitrate 4K H.264. Same "
+                       "live/linear VBV (110%/0.10x, 0.2s parts, 1s GOP) and "
+                       "flexible _xs base as apple-uniq-live.",
+        "seed": True,
+        "maxrate_percent": 110,
+        "bufsize_multiplier": 0.10,
+        # Flexible base (no pinned segment_duration → _xs), same as apple-uniq-live.
+        "partial_duration": "0.2",
+        "gop_duration": "1.0",
+        "codecs": {
+            "h264": _SEED_APPLE_H264_UNIQ_FULL,
             "hevc": _SEED_APPLE_HEVC_UNIQ,
             "av1":  _SEED_APPLE_HEVC_UNIQ,
         },
