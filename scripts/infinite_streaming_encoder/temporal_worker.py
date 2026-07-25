@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import queue
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -40,15 +42,27 @@ _STAGE_PCT_RE = re.compile(r"percent=([0-9.]+)\]\]")
 
 
 def _terminate(proc: subprocess.Popen) -> None:
-    """Best-effort stop a phase subprocess: SIGTERM, then SIGKILL after a grace.
+    """Best-effort stop a phase subprocess AND every child it spawned — the
+    ffmpeg it runs for the encode AND the VMAF audit. cli_phase is launched in
+    its own session (start_new_session below), so we signal the whole PROCESS
+    GROUP: SIGTERM, then SIGKILL after a grace. Signalling only cli_phase's PID
+    (proc.terminate/kill) would leave its ffmpeg child orphaned and still
+    burning CPU after a cancel — the exact thing cancel is trying to stop.
     No-op if it already exited."""
     if proc.poll() is not None:
         return
     try:
-        proc.terminate()
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
     except Exception:  # noqa: BLE001
         pass
 
@@ -109,13 +123,57 @@ def encode_phase(spec: dict) -> None:
     # it into each activity's work dir zero-copy.
     env.setdefault("MEZZ_CACHE_DIR", "/tmp/mezz-cache")
     cmd = ["python3", "-m", "infinite_streaming_encoder.cli_phase", *spec["args"]]
-    proc = subprocess.Popen(cmd, text=True, env=env,
+    # start_new_session: run cli_phase as a process-group leader so a cancel can
+    # kill it AND its ffmpeg children (encode + VMAF) as one group — see _terminate.
+    proc = subprocess.Popen(cmd, text=True, env=env, start_new_session=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     assert proc.stdout is not None
     last = ""
     progress = 0.0
+    # Pump cli_phase stdout on a helper thread so the loop below wakes at least
+    # once a second even when cli_phase is quiet for a long stretch — e.g. a
+    # blocking VMAF-audit ffmpeg (subprocess.run) emits nothing to stdout. That
+    # lets us HEARTBEAT (which is how cancellation is delivered) and act on a
+    # cancel promptly, instead of only between output lines — otherwise a chunk
+    # mid-VMAF ignores the cancel until the VMAF pass finishes.
+    lines: "queue.Queue[str | None]" = queue.Queue()
+
+    def _pump() -> None:
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                lines.put(line)
+        finally:
+            lines.put(None)  # EOF sentinel
+
+    threading.Thread(target=_pump, daemon=True).start()
+
+    def _cancelled() -> bool:
+        # Cancellation rides in on the heartbeat response. Kill cli_phase AND its
+        # ffmpeg child (process group — see _terminate) so a cancelled chunk stops
+        # now instead of running to completion on this worker.
+        if activity.is_cancelled():
+            print("[temporal-worker] activity cancelled — killing encode + ffmpeg",
+                  flush=True)
+            _terminate(proc)
+            return True
+        return False
+
+    rc = None
     try:
-        for line in proc.stdout:
+        while True:
+            try:
+                line = lines.get(timeout=1.0)
+            except queue.Empty:
+                # No output for a second (quiet encode/VMAF pass) — still heartbeat
+                # + poll cancellation so we don't sleep through a cancel.
+                activity.heartbeat(last[:180], {
+                    "machine": _MACHINE, "busy": round(_busy_cores(), 2),
+                    "perf": _PERF_CORES, "progress": round(progress, 1)})
+                if _cancelled():
+                    raise asyncio.CancelledError
+                continue
+            if line is None:
+                break  # cli_phase closed stdout (exited)
             last = line.rstrip("\n")
             if last.startswith("[[ENCODER"):
                 print(last, flush=True)
@@ -131,14 +189,7 @@ def encode_phase(spec: dict) -> None:
             activity.heartbeat(last[:180], {
                 "machine": _MACHINE, "busy": round(_busy_cores(), 2),
                 "perf": _PERF_CORES, "progress": round(progress, 1)})
-            # Cancellation (from a workflow cancel when the user cancels the job)
-            # rides in on the heartbeat response. Kill ffmpeg now so a cancelled
-            # chunk stops immediately instead of running to completion on this
-            # remote worker.
-            if activity.is_cancelled():
-                print("[temporal-worker] activity cancelled — killing encode",
-                      flush=True)
-                _terminate(proc)
+            if _cancelled():
                 raise asyncio.CancelledError
         rc = proc.wait()
     finally:
