@@ -603,7 +603,13 @@ def phase_variant(args: argparse.Namespace) -> int:
                               chunk.index if chunk is not None else -1, r),
                   flush=True)
         except Exception as e:  # noqa: BLE001 — audit must never fail the encode
-            print(f"[vmaf] audit skipped ({args.codec} {args.label}): {e}",
+            # Prefix with [[ENCODER so the temporal worker relays it (it only
+            # forwards [[ENCODER… lines) — otherwise a VMAF failure is invisible.
+            import traceback
+            print(f"[[ENCODER-VMAF-ERROR codec={args.codec} label={args.label} "
+                  f"chunk={chunk.index if chunk is not None else -1}: "
+                  f"{type(e).__name__}: {str(e)[:220]}]]", flush=True)
+            print("[vmaf] " + traceback.format_exc().replace("\n", " | "),
                   flush=True)
         timer.mark("vmaf")
 
