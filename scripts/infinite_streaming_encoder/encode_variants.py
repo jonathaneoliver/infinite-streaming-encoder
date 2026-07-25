@@ -73,18 +73,19 @@ class EncodeContext:
     # via the null muxer), pass 2 distributes bits to hit the average
     # accurately while the SAME maxrate/bufsize VBV keeps peaks flat.
     #
-    # hevc_two_pass defaults True (the correct behaviour). Its value now comes
-    # from the ladder profile's per-codec `passes` (passes.hevc == 1 → False);
-    # the control moved off the per-encode form into the profile. Only HEVC
-    # varies (h264 is always 1-pass, av1 has no 2-pass path), so a single bool
-    # still captures the whole degree of freedom.
+    # LEGACY fallback for the two-pass decision when `passes` (below) is unset —
+    # only meaningful for HEVC. New code sets `passes` instead.
     hevc_two_pass: bool = True
+    # passes maps a codec to its pass count (1 or 2) — the ladder profile's
+    # per-codec `passes` (defaults h264:1, hevc:2, av1:2). This is the source of
+    # truth for two-pass; when set it supersedes hevc_two_pass and applies to
+    # ANY codec (HEVC, AV1, even H264). A per-codec map because a local run
+    # reuses one context across all codecs; a variant job carries just its own.
+    passes: dict[str, int] | None = None
     # extra_args maps a codec to raw ffmpeg tokens appended after the rung's
     # rate-control block and before the output — the ladder profile's per-codec
     # `extra_args`. Absent/"" for a codec = none. Split with shlex (never
-    # shell-eval'd). A per-codec map (not a single string) because a local run
-    # reuses one context across all codecs; a cloud variant job carries just its
-    # own codec's entry.
+    # shell-eval'd). Same per-codec-map rationale as `passes`.
     extra_args: dict[str, str] | None = None
 
 
@@ -273,6 +274,13 @@ def build_ffmpeg_cmd(
     cmd += _codec_specific_args(codec, target_kbps, k, rung.preset,
                                 pass_num=pass_num, stats_path=stats_path,
                                 threads_override=threads)
+    if codec == "av1" and pass_num is not None:
+        # SVT-AV1 two-pass uses ffmpeg's GENERIC 2-pass flags (not the x26x
+        # ":pass=N:stats=" param _pass_suffix appends for x264/x265): -pass N
+        # plus a -passlogfile PREFIX (ffmpeg writes "<prefix>-0.log"). Pass 1
+        # is still muxed to the null sink below. Gives AV1 an accurate target
+        # average; peak stays uncapped (the libsvtav1 wrapper rejects -maxrate).
+        cmd += ["-pass", str(pass_num), "-passlogfile", str(stats_path.with_suffix(""))]
     # VBV-capped ABR: target average + peak cap + buffer. SVT-AV1 is the
     # exception — its ffmpeg wrapper rejects -maxrate outside CRF mode
     # ("Max Bitrate only supported with CRF mode"), so av1 runs plain VBR to the
@@ -335,10 +343,15 @@ def encode_variant(
         total_duration_s = chunk.duration_s
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Two-pass is HEVC-only: x264's single-pass VBV already hits target
-    # average, and av1 (libsvtav1) has no two-pass path here (bash never
-    # two-passed it). So only libx265 runs the pass-1 stats profiling.
-    two_pass = ctx.hevc_two_pass and codec == "hevc"
+    # Pass count comes from the ladder profile (ctx.passes; defaults h264:1,
+    # hevc:2, av1:2). Two-pass now applies to ANY codec — HEVC (libx265) and
+    # AV1 (libsvtav1) both need it to hit the target average accurately; H264's
+    # single-pass VBV already lands the average, so it's 1-pass by default.
+    # Falls back to the legacy hevc_two_pass bool when passes is unset.
+    if ctx.passes and codec in ctx.passes:
+        two_pass = ctx.passes[codec] == 2
+    else:
+        two_pass = ctx.hevc_two_pass and codec == "hevc"
 
     try:
         if two_pass:

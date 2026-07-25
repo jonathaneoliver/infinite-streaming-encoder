@@ -92,11 +92,11 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig) {
 	}
 	// Effective pass count = the profile's, with the per-encode HevcSinglePass
 	// override forcing HEVC to 1. Record only when it DEVIATES from the
-	// codec-intrinsic default (hevc:2, else:1) so a plain ladder's encode.json
-	// stays unchanged; 0 is omitted by omitempty.
-	defaultPasses := 1
-	if codec == "hevc" {
-		defaultPasses = 2
+	// codec default (h264:1, hevc/av1:2) so a plain ladder's encode.json stays
+	// unchanged; 0 is omitted by omitempty.
+	defaultPasses := 2
+	if codec == "h264" {
+		defaultPasses = 1
 	}
 	effectivePasses := def.passesFor(codec)
 	if cfg.HevcSinglePass && codec == "hevc" {

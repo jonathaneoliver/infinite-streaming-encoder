@@ -506,6 +506,11 @@ def phase_variant(args: argparse.Namespace) -> int:
         # codec-correct decision; feeding it hevc_two_pass is a no-op for a
         # non-HEVC job (encode_variants gates on codec == "hevc").
         hevc_two_pass=args.two_pass or _env_flag("TWO_PASS"),
+        # Per-codec pass count for THIS variant's codec. TWO_PASS is already
+        # per-variant (the upstream resolved it from the profile's passes), so
+        # it carries the codec-correct 1/2 — map it under this codec. Supersedes
+        # hevc_two_pass and lets AV1/H264 two-pass, not just HEVC.
+        passes={args.codec: 2 if (args.two_pass or _env_flag("TWO_PASS")) else 1},
         # Per-codec profile extra_args: the --extra-args flag (local dist path)
         # or the EXTRA_ARGS container env (cloud SFN). This worker encodes a
         # single codec, so map the value under its own codec for
