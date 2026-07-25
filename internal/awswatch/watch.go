@@ -120,6 +120,12 @@ func runCheck(cfg Config) {
 	// quiet-path early return so the reset-to-0 still happens at zero fleet.
 	reconcileWarmCapacity(cfg, inv)
 
+	// Self-heal a dangling worker-AMI pointer (#79): if the compute env is wired
+	// to an AMI that no longer exists, clear it → pull-on-boot, so a deleted AMI
+	// degrades to a slow cold start instead of breaking every cloud encode. No-op
+	// for every safe state; cheap read + at most one UpdateComputeEnvironment.
+	healDanglingAMI()
+
 	if inv.Summary.RunningInstances == 0 && inv.Summary.OrphanVolumes == 0 {
 		// Quiet — but still run the staging GC since failed prefixes
 		// aren't reflected in the inventory summary.
@@ -218,6 +224,31 @@ func setMinVCPUs(n int) error {
 		return &pyError{module: "compute_env", stderr: doc.Error}
 	}
 	return nil
+}
+
+// healDanglingAMI clears the compute env's image_id_override when it points at a
+// deleted AMI (the one worker-AMI state that breaks encodes). Same live
+// UpdateComputeEnvironment path as setMinVCPUs; a no-op for warm / pull-on-boot /
+// wrong-tag states. Best-effort — logs only when it actually heals or errors.
+func healDanglingAMI() {
+	cmd := exec.Command("python3", "-m", "infinite_streaming_encoder.cloud.image_state", "--heal", "--json")
+	cmd.Env = os.Environ()
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			log.Printf("awswatch: image_state --heal failed (exit %d): %s",
+				ee.ExitCode(), strings.TrimSpace(string(ee.Stderr)))
+		}
+		return
+	}
+	var doc struct {
+		Healed     bool   `json:"healed"`
+		ClearedAMI string `json:"cleared_ami"`
+	}
+	if json.Unmarshal(out, &doc) == nil && doc.Healed {
+		log.Printf("awswatch: self-healed dangling worker AMI %s — compute env reset to pull-on-boot",
+			doc.ClearedAMI)
+	}
 }
 
 func gcFailedStaging(maxAge time.Duration) error {

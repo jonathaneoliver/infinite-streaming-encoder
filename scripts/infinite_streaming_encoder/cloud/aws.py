@@ -82,6 +82,10 @@ def batch_client():
     return boto3.client("batch", region_name=region())
 
 
+def ecr_client():
+    return boto3.client("ecr", region_name=region())
+
+
 def ecs_client():
     return boto3.client("ecs", region_name=region())
 

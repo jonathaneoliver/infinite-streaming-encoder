@@ -358,11 +358,16 @@ ami-up:             ## build a worker AMI with the current image pre-pulled (kee
 	  packer build -var region=$(AWS_REGION) -var ecr_repo=$(ECR_REPO) \
 	    -var image_tag=$(IMAGE_TAG) worker-ami.pkr.hcl
 	@echo ">>> keeping only infinite-streaming-encoder-worker-$(IMAGE_TAG); removing any older worker AMIs..."
-	@ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
+	@wired=$$(aws batch describe-compute-environments --region $(AWS_REGION) \
+	    --query "computeEnvironments[?contains(computeEnvironmentName,'infinite-streaming-encoder')].computeResources.ec2Configuration[0].imageIdOverride | [0]" \
+	    --output text 2>/dev/null); [ "$$wired" = "None" ] && wired=""; \
+	  ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
 	    --filters "Name=tag:Name,Values=infinite-streaming-encoder-worker" \
 	    --query "Images[?Tags[?Key=='image_tag'&&Value!='$(IMAGE_TAG)']].ImageId" --output text); \
 	  for ami in $$ids; do \
 	    [ "$$ami" = "None" ] && continue; \
+	    if [ "$$ami" = "$$wired" ]; then \
+	      echo "  keep $$ami (wired to the compute env — deregistering would strand Batch; run infra-apply to rewire or ami-down to clear first)"; continue; fi; \
 	    snaps=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) --image-ids $$ami \
 	      --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' --output text); \
 	    echo "deregister $$ami"; aws ec2 deregister-image --region $(AWS_REGION) --image-id $$ami; \

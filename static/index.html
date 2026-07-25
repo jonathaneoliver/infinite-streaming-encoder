@@ -685,6 +685,18 @@ make clear-costs  # this button's sweep AND the AMI, in one command</code></pre>
             <dd id="about-cloud-digest" style="font-family:monospace;font-size:0.75rem">—</dd>
         </dl>
 
+        <h3 class="about-subhead" style="margin-top:18px">Cloud image &amp; AMI <span id="about-amistate-badge" style="display:none"></span></h3>
+        <dl class="about-list" id="about-amistate">
+            <dt title="The tag the Batch job-defs actually pin — what cloud pulls on the next encode.">Expected tag</dt>
+            <dd id="about-exp-tag">—</dd>
+            <dt>In ECR</dt>
+            <dd id="about-ecr">—</dd>
+            <dt title="A pre-baked worker AMI wired to the compute env skips the ~60s ECR pull. Otherwise Batch pulls the image on boot.">Worker AMI</dt>
+            <dd id="about-ami">—</dd>
+            <dt>Available AMIs</dt>
+            <dd id="about-amis" style="font-size:0.85rem">—</dd>
+        </dl>
+
         <h3 class="about-subhead" style="margin-top:18px">Source</h3>
         <dl class="about-list">
             <dt>Repository</dt>
@@ -3854,7 +3866,54 @@ async function loadVersion() {
         } else {
             badge.style.display = 'none';
         }
+
+        loadImageState(j.cloud_configured);
     } catch (e) { /* offline — leave defaults */ }
+}
+
+// #80: cloud worker-image + AMI state — is the pinned tag in ECR, is a matching
+// AMI baked + wired (warm) vs pull-on-boot vs dangling, and what's available.
+async function loadImageState(configured) {
+    const sec = document.getElementById('about-amistate');
+    const head = sec ? sec.previousElementSibling : null;
+    if (!configured) { if (sec) sec.style.display = 'none'; if (head) head.style.display = 'none'; return; }
+    if (sec) sec.style.display = ''; if (head) head.style.display = '';
+    const badge = document.getElementById('about-amistate-badge');
+    try {
+        const res = await fetch('/api/aws/image-state');
+        if (!res.ok) return;
+        const s = await res.json();
+        if (s.error) { document.getElementById('about-exp-tag').textContent = '(' + s.error + ')'; return; }
+
+        document.getElementById('about-exp-tag').textContent = s.expected_tag || '—';
+
+        const ecr = s.ecr || {}, tags = ecr.tags || [];
+        document.getElementById('about-ecr').textContent = !ecr.reachable ? '(unreachable)'
+            : (s.expected_tag && tags.includes(s.expected_tag) ? '✓ present' : '⚠️ missing')
+              + ' · tags: ' + (tags.join(', ') || '(none)');
+
+        let ami;
+        if (!s.wired_ami) ami = 'pull-on-boot (no AMI wired)';
+        else if (!s.wired_ami_exists) ami = '⚠️ ' + s.wired_ami + ' — DELETED (dangling; awswatch auto-heals to pull-on-boot)';
+        else ami = s.wired_ami + ' · image_tag ' + (s.wired_ami_tag || '?')
+                 + (s.wired_ami_tag && s.expected_tag && s.wired_ami_tag !== s.expected_tag ? ' ⚠️ ≠ expected ' + s.expected_tag : '');
+        document.getElementById('about-ami').textContent = ami;
+
+        const amis = s.available_amis || [];
+        document.getElementById('about-amis').textContent = amis.length
+            ? amis.map(a => (a.image_tag || '?') + ' · ' + a.id + ' · ' + a.arch).join('   |   ') : 'none baked';
+
+        const st = ({
+            warm:              { c: '#3aa76d', t: 'warm (AMI wired)' },
+            'pull-on-boot':    { c: '#5a6a85', t: 'pull-on-boot' },
+            'baked-wrong-tag': { c: '#e08a2e', t: 'AMI tag ≠ job-def' },
+            dangling:          { c: '#ef476f', t: '⚠ dangling — self-healing' },
+        })[s.status] || { c: '#5a6a85', t: s.status || '' };
+        if (badge) {
+            badge.style.cssText = 'display:inline-block;background:' + st.c + ';color:#fff;padding:2px 8px;border-radius:10px;font-size:0.7rem;margin-left:8px;vertical-align:middle';
+            badge.textContent = st.t;
+        }
+    } catch (e) { if (badge) badge.style.display = 'none'; }
 }
 </script>
 </body>
