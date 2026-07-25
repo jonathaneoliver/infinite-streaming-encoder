@@ -1013,12 +1013,20 @@ function renderLaddersTab() {
             ? `<span class="job-ami-badge" title="Built-in, read-only">built-in</span>`
             : `<button class="btn" onclick="editLadder('${name}')">Edit</button>
                <button class="btn" style="background:#7a2b2b;color:#fff" onclick="deleteLadder('${name}')">Delete</button>`;
+        // Per-codec encoding options: pass count (default h264:1, hevc:2, av1:2)
+        // + any extra ffmpeg args, for the codecs this ladder defines.
+        const encOpts = _CODEC_ORDER.filter(c => d.codecs && d.codecs[c]).map(c => {
+            const p = (d.passes && d.passes[c]) || (c === 'h264' ? 1 : 2);
+            const ea = (d.extra_args && d.extra_args[c]) || '';
+            return `<span style="color:${_CODEC_COLOR[c]}">${c}</span> ${p}-pass${ea ? ` <span style="font-family:monospace;color:#aab">${escapeHtml(ea)}</span>` : ''}`;
+        }).join(' &nbsp;·&nbsp; ');
         return `<div class="panel" style="margin-bottom:16px">
           <div style="display:flex;align-items:center;gap:12px">
             <h3 style="margin:0;cursor:context-menu" title="Right-click to clone this profile" oncontextmenu="return _cloneMenu(event,'${name}')">${name}</h3>${actions}
             <span style="color:#888" title="VBV shaping applied to every rung">${vbv.join(' · ')}</span>
           </div>
           <p style="color:#888;margin:4px 0 10px">${d.description || ''}</p>
+          <div style="color:#999;font-size:12px;margin:0 0 8px">encoding · ${encOpts}</div>
           <div style="color:#888;font-size:12px;margin:0 0 6px">table: kbps + step× to previous rung (<span style="color:#6ab04c">1.25–2.4× ok</span> · <span style="color:#d06666">&lt;1.25× close</span> · <span style="color:#d0a24a">&gt;2.4× jump</span>) · charts: avg→peak per 1s/2s/6s segment, peak×avg vs Apple <span style="color:#6ab04c">live ≤1.25×</span>/<span style="color:#d0a24a">VOD ≤2×</span></div>
           <div style="display:flex;gap:20px;overflow-x:auto;align-items:flex-start">
             <div style="flex:0 0 auto">${_alignedLadderTable(d)}</div>
@@ -1133,12 +1141,14 @@ function _edSetExtra(c, val) {
     if (val && val.trim()) _ed.extra_args[c] = val; else delete _ed.extra_args[c];
     if (!Object.keys(_ed.extra_args).length) delete _ed.extra_args;
 }
-// Per-codec pass count (#59): only HEVC varies (h264 always 1-pass, av1 has no
-// 2-pass path). Default is 2, so store only the 1-pass deviation to keep default
-// ladders clean; the server rejects h264:2 / av1:2.
+// Per-codec pass count (#59). Every codec is settable; defaults are h264:1,
+// hevc:2, av1:2. Store only the deviation from the default so a plain ladder
+// keeps no passes key.
 function _edSetPasses(c, val) {
     _ed.passes = _ed.passes || {};
-    if (c === 'hevc' && parseInt(val, 10) === 1) _ed.passes.hevc = 1; else delete _ed.passes[c];
+    const n = parseInt(val, 10);
+    const def = c === 'h264' ? 1 : 2;
+    if ((n === 1 || n === 2) && n !== def) _ed.passes[c] = n; else delete _ed.passes[c];
     if (!Object.keys(_ed.passes).length) delete _ed.passes;
 }
 function _edDelRung(c, i) { _ed.codecs[c].splice(i, 1); if (!_ed.codecs[c].length) delete _ed.codecs[c]; _renderLadderEditor(); }
@@ -1161,15 +1171,14 @@ function _edCodecTable(c) {
         <td><button class="btn" style="padding:0 7px" onclick="_edDelRung('${c}',${i})" title="remove rung">×</button></td>
       </tr>`).join('');
     const ea = (_ed.extra_args && _ed.extra_args[c]) || '';
-    const hevcPasses = (_ed.passes && _ed.passes.hevc) || 2;
+    const defPass = c === 'h264' ? 1 : 2;
+    const curPass = (_ed.passes && _ed.passes[c]) || defPass;
     const eg = c === 'hevc' ? '-x265-params aq-mode=3:psy-rd=2.0'
         : c === 'av1' ? '-svtav1-params film-grain=8' : '-tune film';
-    const passesCtl = c === 'hevc'
-        ? `<select style="font-size:11px" onchange="_edSetPasses('hevc',this.value)">
-             <option value="2"${hevcPasses === 2 ? ' selected' : ''}>2-pass (default)</option>
-             <option value="1"${hevcPasses === 1 ? ' selected' : ''}>1-pass</option>
-           </select>`
-        : `<span style="color:#888;font-size:11px">1-pass (fixed)</span>`;
+    const passesCtl = `<select style="font-size:11px" onchange="_edSetPasses('${c}',this.value)" title="Encode passes. 2-pass hits the target average bitrate more accurately (recommended for HEVC + AV1); H264's single-pass VBV already lands the average.">
+             <option value="2"${curPass === 2 ? ' selected' : ''}>2-pass${defPass === 2 ? ' (default)' : ''}</option>
+             <option value="1"${curPass === 1 ? ' selected' : ''}>1-pass${defPass === 1 ? ' (default)' : ''}</option>
+           </select>`;
     return `<div style="min-width:250px">
         <div style="color:${color};font-weight:700;margin-bottom:4px">${c} <span style="color:#888;font-weight:400">(${rungs.length})</span></div>
         <table style="border-collapse:collapse;font-size:12px">

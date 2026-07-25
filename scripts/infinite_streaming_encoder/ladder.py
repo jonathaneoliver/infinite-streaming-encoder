@@ -409,13 +409,13 @@ def ladder_extra_args(ladder_def: dict, codec: str) -> str:
 
 def ladder_passes(ladder_def: dict, codec: str) -> int:
     """Encode pass count for a codec on this ladder, falling back to the
-    codec-intrinsic default (hevc:2, everything else:1) when unset. Mirrors
-    LadderDef.passesFor on the Go side — the single source of truth for the
-    two-pass decision now that it lives in the profile."""
+    per-codec default when unset: h264 → 1, hevc → 2, av1 → 2 (two-pass gives
+    AV1 an accurate target average, like HEVC). Mirrors LadderDef.passesFor on
+    the Go side — the single source of truth for the two-pass decision."""
     n = (ladder_def.get("passes") or {}).get(codec)
     if isinstance(n, int) and n > 0:
         return n
-    return 2 if codec == "hevc" else 1
+    return 1 if codec == "h264" else 2
 
 
 def _normalize_rung_row(row) -> tuple[int, int, int, str]:

@@ -356,17 +356,14 @@ func validateLadderDef(def LadderDef) error {
 			return fmt.Errorf("extra_args[%s]: command/variable substitution is not allowed", codec)
 		}
 	}
-	// passes: 1 or 2, and only HEVC may be 2 (h264 is always 1-pass; av1 has no
-	// 2-pass path). Absent keys fall back to the codec-intrinsic default.
+	// passes: 1 or 2 for any codec — every profile carries a per-codec default
+	// (h264:1, hevc:2, av1:2) and each is user-settable.
 	for codec, n := range def.Passes {
 		if codec != "h264" && codec != "hevc" && codec != "av1" {
 			return fmt.Errorf("passes: unknown codec %q (want h264/hevc/av1)", codec)
 		}
 		if n != 1 && n != 2 {
 			return fmt.Errorf("passes[%s]: must be 1 or 2", codec)
-		}
-		if n == 2 && codec != "hevc" {
-			return fmt.Errorf("passes[%s]: only HEVC supports 2-pass (h264 is always 1-pass, av1 has no 2-pass path)", codec)
 		}
 	}
 	return nil
@@ -383,19 +380,20 @@ func (d LadderDef) extraArgsFor(codec string) string {
 }
 
 // passesFor returns the encode pass count for a codec on this ladder, falling
-// back to the codec-intrinsic default (hevc:2, everything else:1) when the
-// ladder doesn't pin it. This is the single source of truth for the two-pass
-// decision now that it lives in the profile (was JobConfig.HevcSinglePass).
+// back to the per-codec default when the ladder doesn't pin it: h264 → 1,
+// hevc → 2, av1 → 2 (two-pass gives AV1 an accurate target average, same as
+// HEVC). Single source of truth for the two-pass decision (was
+// JobConfig.HevcSinglePass).
 func (d LadderDef) passesFor(codec string) int {
 	if d.Passes != nil {
 		if n, ok := d.Passes[codec]; ok && n > 0 {
 			return n
 		}
 	}
-	if codec == "hevc" {
-		return 2
+	if codec == "h264" {
+		return 1
 	}
-	return 1
+	return 2
 }
 
 // resolveRungs returns the rungs to encode for a (ladder, codec), filtered to

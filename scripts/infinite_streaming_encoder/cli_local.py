@@ -388,9 +388,13 @@ def run_full(args: argparse.Namespace) -> int:
             padding_duration_s=video_pad_s,
             maxrate_percent=ladder_maxrate_percent(ladder_def),
             bufsize_multiplier=ladder_bufsize_multiplier(ladder_def),
-            # Pass count + extra_args from the ladder profile; hevc_single_pass
-            # stays a per-encode override forcing HEVC single-pass.
-            hevc_two_pass=ladder_passes(ladder_def, "hevc") == 2 and not args.hevc_single_pass,
+            # Pass count + extra_args from the ladder profile (per-codec).
+            # hevc_single_pass stays a per-encode override forcing HEVC to 1.
+            passes={
+                "h264": ladder_passes(ladder_def, "h264"),
+                "hevc": 1 if args.hevc_single_pass else ladder_passes(ladder_def, "hevc"),
+                "av1": ladder_passes(ladder_def, "av1"),
+            },
             extra_args={c: ladder_extra_args(ladder_def, c) for c in ("h264", "hevc", "av1")},
         )
 
