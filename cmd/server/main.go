@@ -52,6 +52,10 @@ func main() {
 	tmpDir := flag.String("tmp-dir", env("TMP_DIR", "/media/tmp"), "temporary directory for in-progress encodes")
 	scriptsDir := flag.String("scripts-dir", env("SCRIPTS_DIR", "/scripts"), "directory containing encode scripts")
 	dockerImage := flag.String("docker-image", env("DOCKER_IMAGE", "ghcr.io/jonathaneoliver/infinite-streaming-encoder:latest"), "Docker image used for remote (EC2) encodes")
+	// The cloud worker image is an ECR ref, but the About tab reads OCI labels
+	// only from GHCR. `publish` keeps ECR + GHCR in sync by tag, so we look up
+	// the version/commit from the GHCR twin at the same tag.
+	ghcrImage := flag.String("ghcr-image", env("GHCR_IMAGE", "ghcr.io/jonathaneoliver/infinite-streaming-encoder"), "GHCR image (no tag) used to resolve the cloud image's version labels")
 	// Host-side paths for bind-mounting into sibling worker containers.
 	// `docker run -v` from inside a container resolves paths against the
 	// host daemon, so the in-container paths above aren't usable there.
@@ -142,6 +146,7 @@ func main() {
 	srv.GitSha = gitSha
 	srv.ImageTag = imageTag
 	srv.CloudImage = *dockerImage
+	srv.GHCRImage = *ghcrImage
 
 	log.Printf("encoder server %s (%s, image %s) listening on %s", version, gitSha, imageTag, *addr)
 	log.Printf("  source: %s", *sourceDir)
