@@ -117,6 +117,7 @@ services:
       args:
         VERSION: ${VERSION:-dev}
         GIT_SHA: ${GIT_SHA:-unknown}
+        IMAGE_TAG: ${IMAGE_TAG:-unknown}
     profiles: [master]
     container_name: ${CONTAINER_NAME:-infinite-streaming-encoder}
     restart: unless-stopped
@@ -195,6 +196,8 @@ services:
       WORKER_AMI_ID: ${WORKER_AMI:-}
       STATE_MACHINE_ARN: ${STATE_MACHINE_ARN:-}
       GHCR_PAT: ${GHCR_PAT:-}
+      # GHCR twin of the ECR worker image — About reads its version labels from GHCR.
+      GHCR_IMAGE: ${GHCR_IMAGE:-ghcr.io/jonathaneoliver/infinite-streaming-encoder}
 
   # ---- Encode worker (master AND worker profiles) --------------------------
   # One per box; each contributes its cores. Polls Temporal (outbound only) and
@@ -207,6 +210,7 @@ services:
       args:
         VERSION: ${VERSION:-dev}
         GIT_SHA: ${GIT_SHA:-unknown}
+        IMAGE_TAG: ${IMAGE_TAG:-unknown}
     profiles: [master, worker]
     # Name is the toggle contract with internal/api/dist.go (docker start/stop).
     container_name: ${DIST_WORKER_CONTAINER:-encode-worker}

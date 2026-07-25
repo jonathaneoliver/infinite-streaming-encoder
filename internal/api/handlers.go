@@ -28,6 +28,10 @@ type Server struct {
 	GitSha     string
 	ImageTag   string
 	CloudImage string
+	// GHCRImage is the GHCR image (no tag) whose OCI labels stand in for the
+	// cloud worker image's — the worker image is an ECR ref imageinfo can't
+	// query, but publish keeps ECR + GHCR in sync by tag.
+	GHCRImage string
 
 	imageInfo *imageinfo.Client
 
@@ -111,6 +115,20 @@ func noCache(h http.Handler) http.Handler {
 	})
 }
 
+// imageTagOf extracts the tag from an image ref (e.g. ".../worker:a044a7e" →
+// "a044a7e"), defaulting to "latest". Strips the registry/repo first so a
+// registry port (host:5000/...) is never mistaken for the tag.
+func imageTagOf(ref string) string {
+	rest := ref
+	if i := strings.LastIndex(rest, "/"); i >= 0 {
+		rest = rest[i+1:]
+	}
+	if i := strings.LastIndex(rest, ":"); i >= 0 {
+		return rest[i+1:]
+	}
+	return "latest"
+}
+
 func (s *Server) getVersion(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{
 		"local": map[string]string{
@@ -125,7 +143,14 @@ func (s *Server) getVersion(w http.ResponseWriter, r *http.Request) {
 		"cloud_configured": s.Manager.StateMachineArn != "",
 	}
 	if s.CloudImage != "" {
-		out["cloud"] = s.imageInfo.Get(r.Context(), s.CloudImage)
+		// imageinfo reads OCI labels only from GHCR. The cloud image is an ECR
+		// ref, so read the labels from its GHCR twin at the same tag (publish
+		// keeps them in sync). Non-ECR / already-GHCR refs pass through.
+		ref := s.CloudImage
+		if !strings.HasPrefix(ref, "ghcr.io/") && s.GHCRImage != "" {
+			ref = s.GHCRImage + ":" + imageTagOf(s.CloudImage)
+		}
+		out["cloud"] = s.imageInfo.Get(r.Context(), ref)
 	}
 	writeJSON(w, out)
 }
