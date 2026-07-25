@@ -261,6 +261,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .modal-result { margin-top: 16px; max-height: 240px; overflow-y: auto; background: #0a1428; border: 1px solid #2a3a5e; border-radius: 4px; padding: 10px 12px; font-family: 'SF Mono', Menlo, monospace; font-size: 0.8rem; }
 
 .output-dir { border-radius: 4px; cursor: pointer; border-bottom: 1px solid #0f3460; }
+.out-chev { color: #4361ee; font-size: 0.7rem; cursor: pointer; user-select: none; }
+/* #60: inline fold panel under a package row — the ladder table, indented. */
+.output-details { padding: 2px 12px 12px 24px; border-bottom: 1px solid #0f3460; background: #0c1526; }
 .output-dir:hover { background: #1a2a4a; }
 .output-dir:last-child { border-bottom: none; }
 .output-dir-name { font-family: 'SF Mono', Menlo, monospace; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1625,9 +1628,9 @@ function renderOutputs() {
             <span onclick="toggleOutputSort('mod_time')">Modified${sortIndicator(outputSort, 'mod_time')}</span>
             <span></span>
         </div>
-    ` + sorted.map(d => `
-        <div class="output-grid output-dir" onclick="loadOutputDetail('${escapeAttr(d.name)}')" oncontextmenu="showContextMenu(event, '${escapeAttr(d.name)}')">
-            <span style="color:#4361ee">&#128193;</span>
+    ` + sorted.map((d, i) => `
+        <div class="output-grid output-dir" onclick="toggleOutputDetail(${i}, '${escapeAttr(d.name)}')" oncontextmenu="showContextMenu(event, '${escapeAttr(d.name)}')">
+            <span class="out-chev" id="outchev-${i}" title="Expand ladder">&#9656;</span>
             <span class="output-dir-name">${escapeHtml(d.name)}</span>
             <span>${renderCodecBadge(d)}</span>
             <span>${renderResBadges(d)}</span>
@@ -1639,7 +1642,35 @@ function renderOutputs() {
                 ${_promoteDests.length ? `<span class="btn-promote" onclick="event.stopPropagation(); promoteOutput('${escapeAttr(d.name)}', this)" title="Promote to ${_promoteDests.length} live location(s)">&#8681;</span>` : ''}
             </span>
         </div>
+        <div class="output-details" id="outdet-${i}" style="display:none"></div>
     `).join('');
+}
+
+// #60: fold a package open in place (inline ladder table) instead of drilling
+// in/out. Multiple rows can be open at once; the ladder is lazy-fetched on first
+// expand. Raw file browsing stays on the "Browse files" context-menu action.
+async function toggleOutputDetail(i, name) {
+    const det = document.getElementById('outdet-' + i);
+    const chev = document.getElementById('outchev-' + i);
+    if (!det) return;
+    if (det.style.display !== 'none') {
+        det.style.display = 'none';
+        if (chev) chev.innerHTML = '&#9656;';   // ▸
+        return;
+    }
+    det.style.display = '';
+    if (chev) chev.innerHTML = '&#9662;';        // ▾
+    if (det.dataset.loaded) return;
+    det.innerHTML = '<div class="no-files" style="padding:6px 24px">Loading…</div>';
+    try {
+        const res = await fetch('/api/outputs/' + encodeURIComponent(name) + '/ladder');
+        const ladder = res.ok ? await res.json() : null;
+        det.innerHTML = renderLadderTable(ladder)
+            || '<div class="no-files" style="padding:6px 24px">No ladder data for this package</div>';
+        det.dataset.loaded = '1';
+    } catch (e) {
+        det.innerHTML = '<div class="no-files" style="padding:6px 24px">Failed to load ladder</div>';
+    }
 }
 
 function renderCodecBadge(d) {
