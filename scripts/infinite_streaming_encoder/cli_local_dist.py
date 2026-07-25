@@ -875,24 +875,45 @@ def run_temporal(args: argparse.Namespace) -> int:
         # ENCODER-STAGE markers (drives the UI chunk grid live).
         result_task = asyncio.ensure_future(handle.result())
         emitted: dict = {}
-        while not result_task.done():
-            if stop.is_set():
-                print("[dist] cancel requested — cancelling workflow "
-                      "(stops remote chunk encodes)", flush=True)
+        try:
+            while not result_task.done():
+                if stop.is_set():
+                    print("[dist] cancel requested — cancelling workflow "
+                          "(stops remote chunk encodes)", flush=True)
+                    try:
+                        await handle.cancel()
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[dist] workflow cancel failed: {e}", flush=True)
+                    result_task.cancel()
+                    return "cancelled"
+                await _emit_temporal_progress(handle, EventType, emitted)
+                await _emit_fleet_cpu(handle, client)
                 try:
-                    await handle.cancel()
-                except Exception as e:  # noqa: BLE001
-                    print(f"[dist] workflow cancel failed: {e}", flush=True)
-                result_task.cancel()
-                return "cancelled"
+                    await asyncio.wait_for(stop.wait(), timeout=1)  # 1s cadence
+                except asyncio.TimeoutError:
+                    pass
             await _emit_temporal_progress(handle, EventType, emitted)
-            await _emit_fleet_cpu(handle, client)
+            return await result_task
+        finally:
+            # ORPHAN GUARD. The only path above that cancels the workflow is the
+            # explicit SIGTERM one. But the orchestrator can also leave with the
+            # workflow still RUNNING — an exception in the progress loop, or
+            # handle.result() raising when a chunk fails terminally while siblings
+            # are still encoding. If we just exit, Temporal (durable) keeps
+            # dispatching the remaining chunks to the workers forever, pinning the
+            # CPU (the orphaned-workflow bug). So on ANY exit, if the workflow is
+            # still un-terminal, cancel it. Cancellation is server-side and
+            # durable, so it takes effect (and kills each activity's ffmpeg via
+            # activity.is_cancelled()) even though we're about to exit.
             try:
-                await asyncio.wait_for(stop.wait(), timeout=1)  # 1s progress cadence
-            except asyncio.TimeoutError:
-                pass
-        await _emit_temporal_progress(handle, EventType, emitted)
-        return await result_task
+                desc = await handle.describe()
+                status = str(getattr(desc.status, "name", desc.status) or "")
+                if "RUNNING" in status:
+                    print("[dist] workflow still RUNNING on orchestrator exit — "
+                          "cancelling to prevent an orphan", flush=True)
+                    await handle.cancel()
+            except Exception as e:  # noqa: BLE001
+                print(f"[dist] orphan-guard cancel failed: {e}", flush=True)
 
     try:
         result = asyncio.run(go())
