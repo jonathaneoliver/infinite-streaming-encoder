@@ -267,10 +267,31 @@ def build_ffmpeg_cmd(
         out_path = _chunk_path(ctx.output_dir, codec, rung.label, chunk.index)
     stats_path = _stats_path(ctx.output_dir, codec, rung.label, chunk) if pass_num else None
 
+    # Chunked encode: bound each chunk by an EXACT frame count from the global
+    # frame grid, not `-t seconds`. At a fractional fps (e.g. 30000/1001) a
+    # second-based `-t` makes every chunk independently round its own frame
+    # count, so the chunks over-emit and the concatenated variant runs longer
+    # than the source (+9 frames on a 334s 29.97fps clip; integer fps like 25 is
+    # unaffected). fb(t) = ceil(t*fps) = the number of frames with pts < t, which
+    # is exactly the boundary ffmpeg's input `-ss` uses to discard pre-seek
+    # frames — so adjacent chunks tile the grid with no overlap or gap. The final
+    # chunk stays unbounded (runs to EOF) so container-duration imprecision can't
+    # truncate or pad the tail. fps is a Fraction, so this is exact.
+    chunk_frames: int | None = None
+    if chunk is not None:
+        def _frames_before(t: float) -> int:
+            x = Fraction(t) * ctx.fps          # frames with pts < t
+            return max(0, -(-x.numerator // x.denominator))  # ceil(t * fps)
+        total_dur = ctx.content_duration_s + ctx.padding_duration_s
+        if chunk.end_s < total_dur - 1e-6:     # interior chunk; last runs to EOF
+            chunk_frames = _frames_before(chunk.end_s) - _frames_before(chunk.start_s)
+
     cmd = ["ffmpeg", "-y"]
     if chunk is not None:
-        # Input seek: fast (keyframe) seek + re-encode = frame-accurate window.
-        cmd += ["-ss", f"{chunk.start_s:.6f}", "-t", f"{chunk.duration_s:.6f}"]
+        # Input seek to the window start; the exact frame count is enforced on
+        # the OUTPUT side via -frames:v (chunk_frames) so fractional-fps chunks
+        # tile the grid without over-emitting.
+        cmd += ["-ss", f"{chunk.start_s:.6f}"]
     cmd += [
         "-i", str(ctx.mezzanine_path),
         "-vf", filter_str,
@@ -303,6 +324,10 @@ def build_ffmpeg_cmd(
     extra = (ctx.extra_args or {}).get(codec, "")
     if extra:
         cmd += shlex.split(extra)
+    # Interior chunk: cap to its exact frame-grid count (both passes must agree).
+    # None = whole variant or the final chunk, which run to EOF.
+    if chunk_frames is not None:
+        cmd += ["-frames:v", str(chunk_frames)]
     if pass_num == 1:
         # Analysis pass: discard the muxed output, keep only the stats.
         cmd += ["-an", "-f", "null", "-"]
