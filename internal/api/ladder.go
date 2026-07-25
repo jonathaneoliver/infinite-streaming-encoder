@@ -84,8 +84,11 @@ type profileInfo struct {
 	Padding           string  `json:"padding,omitempty"`
 	ChunkDuration     string  `json:"chunk_duration,omitempty"`
 	ForceReencode     bool    `json:"force_reencode,omitempty"`
-	Source            string  `json:"source,omitempty"`
-	EncodedAt         string  `json:"encoded_at,omitempty"`
+	// Burnin is nil when the overlay was on (default) and &false when disabled,
+	// mirroring encode.json — so the UI flags only the exception.
+	Burnin    *bool  `json:"burnin,omitempty"`
+	Source    string `json:"source,omitempty"`
+	EncodedAt string `json:"encoded_at,omitempty"`
 }
 
 // encodeJSON mirrors the encode.json written by the encoder (internal/encode/meta.go).
@@ -102,6 +105,7 @@ type encodeJSON struct {
 	Padding           string  `json:"padding"`
 	ChunkDuration     string  `json:"chunk_duration"`
 	ForceReencode     bool    `json:"force_reencode"`
+	Burnin            *bool   `json:"burnin"`
 	Source            string  `json:"source"`
 	EncodedAt         string  `json:"encoded_at"`
 	Rungs             []struct {
@@ -157,6 +161,7 @@ func (s *Server) ladder(w http.ResponseWriter, r *http.Request) {
 			PartialS: ej.PartialS, GopS: ej.GopS, OutputTag: ej.OutputTag,
 			MaxRes: ej.MaxRes, HevcSinglePass: ej.HevcSinglePass, Padding: ej.Padding,
 			ChunkDuration: ej.ChunkDuration, ForceReencode: ej.ForceReencode,
+			Burnin: ej.Burnin,
 			Source: ej.Source, EncodedAt: ej.EncodedAt,
 		}
 	}

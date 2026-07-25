@@ -782,6 +782,13 @@ type JobConfig struct {
 	Padding       string `json:"padding"`
 	KeepMezzanine bool   `json:"keep_mezzanine"`
 	ForceReencode bool   `json:"force_reencode"`
+	// Burnin toggles the per-variant burnt-in text overlay (timecode / rate /
+	// codec+res / encoder / watermark labels, plus the PADDING label). On by
+	// default — a pointer so nil (older persisted jobs, or a client that omits
+	// it) means "on", and only an explicit false disables it. Threaded to the
+	// local encoder via --no-burnin and to cloud-batch via the BURNIN env in
+	// each variant job's containerOverrides. See BurninEnabled.
+	Burnin *bool `json:"burnin,omitempty"`
 	// PromoteAfter rsyncs each produced output to the configured PROMOTE_DESTS
 	// (local + remote live libraries) once the encode succeeds and moves to
 	// OUTPUT_DIR — the automatic version of the per-output Promote button.
@@ -1939,6 +1946,13 @@ func (cfg *JobConfig) outputCodecDir(filename, codec string) string {
 	return name
 }
 
+// BurninEnabled reports whether the text overlay should be burnt in. Default is
+// on: a nil Burnin (older jobs / omitted by the client) counts as enabled, and
+// only an explicit false disables it.
+func (cfg *JobConfig) BurninEnabled() bool {
+	return cfg.Burnin == nil || *cfg.Burnin
+}
+
 // localChunkSeconds resolves the fixed chunk size for a LOCAL encode, driving
 // cli_local's --local-chunk-duration. Unlike the cloud (per-variant, complexity
 // aware), cli_local applies ONE chunk duration to every variant, so the cloud's
@@ -2006,6 +2020,9 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	}
 	if cfg.HevcSinglePass {
 		args = append(args, "--hevc-single-pass")
+	}
+	if !cfg.BurninEnabled() {
+		args = append(args, "--no-burnin")
 	}
 	return args
 }
@@ -2312,7 +2329,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// Source fps: keys the speed model (encode time ∝ frame count), so chunk
 		// sizes/priorities match the graviton keys learned at the same rate.
 		srcFps := probeSourceFps(localSrc)
-		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, srcWidth, srcFps, durationS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), job.AppendLog)
+		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), srcWidth, srcFps, durationS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), job.AppendLog)
 		expectedEncodes = expEnc
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
@@ -2581,7 +2598,7 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached bool, sourceWidth, sourceFps int, clipDurationS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, logf func(string)) (string, int) {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached, burnin bool, sourceWidth, sourceFps int, clipDurationS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, logf func(string)) (string, int) {
 	if ladderName == "" {
 		ladderName = "apple-uniq-live"
 	}
@@ -2739,6 +2756,10 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		"segment_duration": segDur,
 		"partial_duration": partDur,
 		"gop_duration":     gopDur,
+		// Text-overlay toggle → BURNIN env on every variant job (see the ASL
+		// containerOverrides). "true"/"false" so cli_phase's _env_flag_default_on
+		// reads it; on by default, only an explicit false disables it.
+		"burnin": strconv.FormatBool(burnin),
 		// Banded priorities for the fixed phases (chunks carry their own banded
 		// priority per variant). Keeps a job's whole pipeline in one band so an
 		// earlier job's package isn't starved by a later job's chunks.

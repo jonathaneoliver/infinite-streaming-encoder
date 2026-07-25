@@ -107,6 +107,7 @@
                 "segment_duration.$": "$.segment_duration",
                 "partial_duration.$": "$.partial_duration",
                 "gop_duration.$": "$.gop_duration",
+                "burnin.$": "$.burnin",
                 "chunked.$": "$$.Map.Item.Value.chunked"
               },
               "ItemProcessor": {
@@ -148,7 +149,8 @@
                           { "Name": "MAXRATE_PERCENT", "Value.$": "$.maxrate_percent" },
                           { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" },
                           { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
-                          { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" }
+                          { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" },
+                          { "Name": "BURNIN", "Value.$": "$.burnin" }
                         ],
                         "ResourceRequirements": [
                           { "Type": "VCPU", "Value.$": "$.vcpu" },
@@ -182,7 +184,8 @@
                       "maxrate_percent.$": "$.maxrate_percent",
                       "bufsize_multiplier.$": "$.bufsize_multiplier",
                       "segment_duration.$": "$.segment_duration",
-                      "gop_duration.$": "$.gop_duration"
+                      "gop_duration.$": "$.gop_duration",
+                      "burnin.$": "$.burnin"
                     },
                     "ItemProcessor": {
                       "StartAt": "EncodeChunk",
@@ -215,7 +218,8 @@
                                 { "Name": "MAXRATE_PERCENT", "Value.$": "$.maxrate_percent" },
                                 { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" },
                                 { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
-                                { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" }
+                                { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" },
+                                { "Name": "BURNIN", "Value.$": "$.burnin" }
                               ],
                               "ResourceRequirements": [
                                 { "Type": "VCPU", "Value.$": "$.vcpu" },

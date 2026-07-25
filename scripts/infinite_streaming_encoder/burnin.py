@@ -90,10 +90,15 @@ def _drawtext(
     return "drawtext=" + ":".join(parts)
 
 
-def build_filter(ctx: BurninContext) -> str:
+def build_filter(ctx: BurninContext, burnin: bool = True) -> str:
     """Return the full `-vf` filter expression for this variant.
 
     Filter chain: scale → (optional tpad) → drawtext×5 (+ optional PADDING).
+
+    With `burnin=False` the drawtext overlays (the 5 stacked labels AND the
+    PADDING label) are omitted — the chain is just scale (+ optional tpad), so
+    the output carries no burnt-in text. The tpad segment-boundary padding is
+    NOT text and always stays; only the drawn labels are toggled off.
     """
     tier = ctx.tier
     chain: list[str] = [f"scale={tier.width}:{tier.height}"]
@@ -105,6 +110,10 @@ def build_filter(ctx: BurninContext) -> str:
         chain.append(
             f"tpad=stop_mode=add:stop_duration={ctx.padding_duration_s}:color=black"
         )
+
+    if not burnin:
+        # No text overlay: keep only the scale (+ tpad) geometry.
+        return ",".join(chain)
 
     # Stack heights: timecode (tc), rate, codec/res/fps, encoder, watermark.
     y_tc = tier.burnin_y_tc

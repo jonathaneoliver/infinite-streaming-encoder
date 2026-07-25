@@ -87,6 +87,10 @@ class EncodeContext:
     # `extra_args`. Absent/"" for a codec = none. Split with shlex (never
     # shell-eval'd). Same per-codec-map rationale as `passes`.
     extra_args: dict[str, str] | None = None
+    # burnin toggles the per-variant text overlay (timecode/rate/codec/watermark
+    # labels + the PADDING label). On by default; a job-level flag, not per-codec.
+    # False → the -vf chain is just scale (+ any tpad padding), no drawtext.
+    burnin: bool = True
 
 
 class EncodeError(RuntimeError):
@@ -255,7 +259,7 @@ def build_ffmpeg_cmd(
         content_duration_s=ctx.content_duration_s,
         padding_duration_s=ctx.padding_duration_s,
         timecode_start_s=chunk.start_s if chunk else 0.0,
-    ))
+    ), burnin=ctx.burnin)
 
     if chunk is None:
         out_path = _variant_path(ctx.output_dir, codec, rung.label)
