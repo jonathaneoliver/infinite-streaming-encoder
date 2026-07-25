@@ -6,10 +6,9 @@
 [![GHCR](https://img.shields.io/badge/ghcr.io-infinite--streaming--encoder-2496ED?logo=docker&logoColor=white)](https://github.com/jonathaneoliver/infinite-streaming-encoder/pkgs/container/infinite-streaming-encoder)
 [![Stars](https://img.shields.io/github/stars/jonathaneoliver/infinite-streaming-encoder?style=flat&color=yellow)](https://github.com/jonathaneoliver/infinite-streaming-encoder/stargazers)
 
-<!-- A screenshot of the dashboard (chunk grid + live progress) sells this tool instantly.
-     Drop one at docs/screenshots/dashboard.png and uncomment:
-![Dashboard](docs/screenshots/dashboard.png)
--->
+![The dashboard mid-encode: a cloud job fanned out across a 10-instance AWS Batch spot fleet, with the live per-instance chunk grid, cost/utilization sparklines, and the per-variant progress DAG.](docs/screenshots/dashboard.png)
+
+<p align="center"><em>One HEVC/H.264 cloud encode fanned out over 10 spot instances (96/96 vCPU busy, 151 Batch jobs, $1.38/hr) — live chunk grid, cost tracking, and a per-variant progress DAG with an ETA and a MediaConvert/on-demand/spot cost comparison.</em></p>
 
 A Go HTTP server + single-page UI that drives adaptive-bitrate (ABR) video
 encoding. The Go code is a thin **control plane**; the actual encoding —
@@ -24,6 +23,27 @@ One Docker image plays three roles: the **server** (Go control plane, default
 > generating test-ready ABR content and experimenting with encode ladders,
 > packaging, and spot-resumable fan-out — tuned for reproducibility on a home lab,
 > not for scale or an SLA. See [Project scope & roadmap](#project-scope--roadmap).
+
+## Contents
+
+- [Why you might want this](#why-you-might-want-this)
+- [Two run modes](#two-run-modes)
+- [What it does](#what-it-does)
+- [How it works](#how-it-works)
+- [Performance: single machine vs local farm vs cloud](#performance-single-machine-vs-local-farm-vs-cloud)
+- [Requirements](#requirements)
+- [Quickstart](#quickstart)
+- [Developing across the farm](#developing-across-the-farm)
+- [Configuration](#configuration)
+- [Programmatic use (HTTP API)](#programmatic-use-http-api)
+- [Images & registries](#images--registries)
+- [Repository layout](#repository-layout)
+- [Documentation](#documentation)
+- [Known limitations](#known-limitations)
+- [Project scope & roadmap](#project-scope--roadmap)
+- [Contributing](#contributing)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
 
 ## Why you might want this
 
@@ -421,6 +441,29 @@ Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the d
 smoke-test matrix (there's no unit suite), and PR conventions. By participating you agree to
 the [Code of Conduct](CODE_OF_CONDUCT.md). To report a vulnerability, see
 [`SECURITY.md`](SECURITY.md).
+
+## Acknowledgements
+
+This tool is a control plane — the heavy lifting is done by excellent open-source
+projects it orchestrates:
+
+- **[FFmpeg](https://ffmpeg.org/)** — probing, mezzanine stream-copy, and every
+  variant encode (libx264 / libx265 / libsvtav1).
+- **[Shaka Packager](https://github.com/shaka-project/shaka-packager)** (Google) —
+  fMP4 packaging and DASH manifest generation.
+- **[hls.js](https://github.com/video-dev/hls.js)** — in-browser LL-HLS playback in
+  the dashboard.
+- **[Temporal](https://temporal.io/)** — durable orchestration of the local farm's
+  chunk fan-out (survives worker/box restarts).
+- **[MinIO](https://min.io/)** — the LAN-local S3-compatible shared chunk store.
+- **[AWS Batch](https://aws.amazon.com/batch/) + [Step Functions](https://aws.amazon.com/step-functions/)**
+  — spot-instance fan-out and the cloud encode DAG.
+- **[boto3](https://github.com/boto/boto3)** and the Go standard library — the only
+  language-level dependencies of note.
+
+Codecs and standards: **H.264/AVC**, **H.265/HEVC**, **AV1** (via
+[SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1)), **HLS**/**LL-HLS**, and
+**MPEG-DASH**.
 
 ## License
 
