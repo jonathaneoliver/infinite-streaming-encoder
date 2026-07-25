@@ -590,11 +590,15 @@ def phase_variant(args: argparse.Namespace) -> int:
     if getattr(args, "measure_vmaf", False) or _env_flag("MEASURE_VMAF"):
         try:
             from infinite_streaming_encoder.vmaf_audit import (
-                measure_vmaf, pick_model, vmaf_marker,
+                common_dimensions, measure_vmaf, pick_model, vmaf_marker,
             )
+            # Compare at the source res CAPPED to MAX_VMAF_HEIGHT (default
+            # 1080p) — a 4K comparison OOM-kills on 8-10 GB Docker VMs and runs
+            # ~2x slower; the model follows the capped height (#24).
+            cmn_w, cmn_h = common_dimensions(info.width, info.height)
             r = measure_vmaf(
-                out_path, ctx.mezzanine_path, info.width, info.height,
-                pick_model(info.height),
+                out_path, ctx.mezzanine_path, cmn_w, cmn_h,
+                pick_model(cmn_h),
                 ref_start_s=(chunk.start_s if chunk is not None else 0.0),
                 ref_duration_s=(chunk.duration_s if chunk is not None else None),
                 n_subsample=5, n_threads=(_threads_env or 0),

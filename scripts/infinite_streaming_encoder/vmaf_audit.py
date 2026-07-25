@@ -8,10 +8,18 @@ scores into a per-rung number).
 
 Two decisions that make the scores meaningful (see #24):
   1. COMMON comparison resolution — both the rendition and the reference are
-     bicubic-scaled to the SOURCE native res, so a higher-res rung legitimately
-     scores higher (this models what a viewer sees on a source-res display).
-  2. SOURCE-driven model — vmaf_4k_v0.6.1 for >=1440p sources (the 1080p model
-     saturates above 1080p), else the default 1080p model.
+     bicubic-scaled to a common res: the SOURCE native res, CAPPED at
+     MAX_VMAF_HEIGHT (default 1080p). Below the cap a higher-res rung
+     legitimately scores higher (models what a viewer sees on a source-res
+     display); at/above the cap, rungs are compared at the cap. The cap exists
+     because an uncapped 4K comparison makes each libvmaf ~1.5-2 GB and ~2x
+     slower than the encode (#24 field data) — enough to OOM-kill the audit on
+     an 8-10 GB Docker VM. Capped it is ~0.5 GB and ~2x faster, so the audit is
+     portable across the fleet. Raise VMAF_MAX_HEIGHT on boxes with the RAM for
+     true 4K fidelity (the trade-off: rungs above the cap stop being
+     differentiated from each other).
+  2. Model follows the CAPPED comparison height — vmaf_4k_v0.6.1 only when the
+     capped common res is >=1440p, else the default 1080p model.
 
 KNOWN BIASES (experimental — refine later):
   - Burn-in overlay: renditions carry a burn-in the mezzanine lacks, so VMAF
@@ -24,15 +32,35 @@ KNOWN BIASES (experimental — refine later):
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
 
+# The common resolution both streams are scaled to for the comparison is capped
+# at this height: uncapped (4K) it's ~1.5-2 GB / ~2x slower per libvmaf and
+# OOM-kills on 8-10 GB Docker VMs; capped to 1080p it's ~0.5 GB and ~2x faster.
+# Override per-box (e.g. VMAF_MAX_HEIGHT=2160 on a 32 GB worker) for 4K fidelity.
+MAX_VMAF_HEIGHT = int(os.environ.get("VMAF_MAX_HEIGHT", "1080") or "1080")
 
-def pick_model(source_height: int) -> str:
-    """VMAF model keyed off the SOURCE height (globally, not per-rung): the
-    4K-trained model for >=1440p sources, else the default 1080p model."""
-    return "vmaf_4k_v0.6.1" if source_height >= 1440 else "vmaf_v0.6.1"
+
+def pick_model(common_height: int) -> str:
+    """VMAF model keyed off the CAPPED comparison height (not the raw source):
+    the 4K-trained model only when the common res is >=1440p, else the default
+    1080p model (the 4K model on <=1080p content mis-scores)."""
+    return "vmaf_4k_v0.6.1" if common_height >= 1440 else "vmaf_v0.6.1"
+
+
+def common_dimensions(src_w: int, src_h: int,
+                      max_h: int = MAX_VMAF_HEIGHT) -> tuple[int, int]:
+    """The (even) resolution both streams are bicubic-scaled to for the VMAF
+    comparison: the source res, but never taller than `max_h` and never
+    UP-scaled past the source. Width tracks the capped height to preserve aspect
+    ratio. Even dims because libvmaf runs on yuv420p."""
+    if src_h <= max_h:
+        return (src_w - (src_w % 2), src_h - (src_h % 2))
+    w = round(src_w * max_h / src_h)
+    return (w - (w % 2), max_h - (max_h % 2))
 
 
 class VmafError(RuntimeError):
