@@ -446,13 +446,6 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="pink">Pink</option>
                 </select>
             </div>
-            <div class="control-group">
-                <label title="Two-pass is applied automatically per codec: HEVC (libx265) needs it for an accurate average/peak bitrate, H264 (libx264) does not, AV1 never. This only affects HEVC — pick 1-pass to run a faster, less-accurate HEVC encode for comparison.">HEVC pass</label>
-                <select id="hevc-pass">
-                    <option value="2" selected>2-pass (accurate, default)</option>
-                    <option value="1">1-pass (faster, for comparison)</option>
-                </select>
-            </div>
             <div class="control-group" id="promote-group" style="display:none;align-self:center;padding-top:16px">
                 <label id="promote-after-label"><input type="checkbox" id="promote-after" style="width:auto;min-width:auto"> Promote after encode</label>
             </div>
@@ -1477,7 +1470,6 @@ async function startEncode(force = false) {
         time: document.getElementById('time-limit').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
-        hevc_single_pass: document.getElementById('hevc-pass').value === '1',
         ladder: document.getElementById('ladder').value,
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,
@@ -1724,7 +1716,8 @@ function renderLadderTable(ladder) {
              · seg ${p.segment_s}s · partial ${p.partial_s}s · gop ${p.gop_s}s
              ${p.output_tag ? ` · suffix _${escapeHtml(p.output_tag)}` : ''}
              ${p.max_res ? ` · max-res ${escapeHtml(p.max_res)}` : ''}
-             ${chip('hevc single-pass', p.hevc_single_pass)}
+             ${p.passes ? ` · ${p.passes}-pass` : (p.hevc_single_pass ? ' · hevc 1-pass' : '')}
+             ${p.extra_args ? ` · args [${escapeHtml(p.extra_args)}]` : ''}
              ${p.padding && p.padding !== 'off' ? ` · padding ${escapeHtml(p.padding)}` : ''}
              ${p.chunk_duration ? ` · chunk ${escapeHtml(p.chunk_duration)}` : ''}
              ${chip('force re-encode', p.force_reencode)}
@@ -3524,7 +3517,6 @@ async function forceReencode(fileName) {
         time: document.getElementById('time-limit').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
-        hevc_single_pass: document.getElementById('hevc-pass').value === '1',
         ladder: document.getElementById('ladder').value,
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,
