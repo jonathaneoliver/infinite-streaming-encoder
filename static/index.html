@@ -451,6 +451,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             </div>
             <div class="control-group" style="align-self:center;padding-top:16px">
                 <label title="Burn the diagnostic text overlay (timecode, bitrate, codec/resolution, encoder, watermark) into every variant. On by default; uncheck for clean output."><input type="checkbox" id="burnin" checked style="width:auto;min-width:auto"> Burn-in text overlay</label>
+                <label title="Measure per-rendition VMAF quality after encoding (each rendition vs the source at source resolution). Slow — adds a post-encode pass per rung, fanned across the workers. Off by default. Scores show in the Outputs VMAF column."><input type="checkbox" id="measure-vmaf" style="width:auto;min-width:auto"> Measure VMAF</label>
             </div>
             <div class="control-group" id="promote-group" style="display:none;align-self:center;padding-top:16px">
                 <label id="promote-after-label"><input type="checkbox" id="promote-after" style="width:auto;min-width:auto"> Promote after encode</label>
@@ -1504,6 +1505,7 @@ async function startEncode(force = false) {
         files: selected,
         target: target,
         codec: codecValue(),
+        measure_vmaf: document.getElementById('measure-vmaf').checked,
         max_res: document.getElementById('max-res').value,
         time: document.getElementById('time-limit').value,
         hls_format: document.getElementById('hls-format').value,
@@ -3679,6 +3681,7 @@ async function forceReencode(fileName) {
         files: [fileName],
         target: document.getElementById('target').value,
         codec: codecValue(),
+        measure_vmaf: document.getElementById('measure-vmaf').checked,
         max_res: document.getElementById('max-res').value,
         time: document.getElementById('time-limit').value,
         hls_format: document.getElementById('hls-format').value,
