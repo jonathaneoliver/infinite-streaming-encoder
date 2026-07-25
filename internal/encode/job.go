@@ -167,6 +167,11 @@ var (
 	// machine (mac/ubuntu/macmini local worker label, or "graviton" on cloud
 	// batch), codec, height, pass, preset, fps. Consumed by Manager.learnSpeed.
 	speedMarkerRe = regexp.MustCompile(`^\[\[ENCODER-SPEED machine=(\S+) codec=(\S+) height=(\d+) two_pass=([01]) preset=(\S+) fps=(\d+) content_s=([0-9.]+) encode_s=([0-9.]+)\]\]$`)
+	// ENCODER-VMAF reports one rendition's VMAF (#24) — emitted per chunk (or
+	// chunk=-1 for a whole-variant encode). frames + inv_sum let the control
+	// plane recombine the frame-weighted mean and the harmonic mean correctly
+	// across chunks (chunk means/harmonics can't just be averaged).
+	vmafMarkerRe = regexp.MustCompile(`^\[\[ENCODER-VMAF codec=(\S+) label=(\S+) height=(\d+) chunk=(-?\d+) mean=([0-9.]+) harmonic=([0-9.]+) min=([0-9.]+) frames=(\d+) inv_sum=([0-9.]+)\]\]$`)
 	// ENCODER-RECLAIM reports one encode chunk's spot-reclaim accounting:
 	// count (# reclaimed attempts), lost_s (encode wall-time thrown away), and
 	// total_s (all attempts' wall-time = the "total encoded" denominator).
@@ -394,6 +399,41 @@ func sizeToBytes(num, unit string) float64 {
 // (and was applied to the job), so the caller can skip appending it to
 // the raw log buffer.
 func (j *Job) parseMarker(line string) bool {
+	if m := vmafMarkerRe.FindStringSubmatch(line); m != nil {
+		codec, label := m[1], m[2]
+		mean, _ := strconv.ParseFloat(m[5], 64)
+		mn, _ := strconv.ParseFloat(m[7], 64)
+		frames, _ := strconv.Atoi(m[8])
+		invSum, _ := strconv.ParseFloat(m[9], 64)
+		w := frames
+		if w <= 0 {
+			w = 1 // pooled-fallback marker (no per-frame data): weight as one sample
+		}
+		key := codec + "/" + label
+		j.mu.Lock()
+		if j.Vmaf == nil {
+			j.Vmaf = map[string]*VmafScore{}
+		}
+		acc := j.Vmaf[key]
+		if acc == nil {
+			acc = &VmafScore{Min: mn}
+			j.Vmaf[key] = acc
+		}
+		acc.sumMeanW += mean * float64(w)
+		acc.Frames += w
+		acc.invSum += invSum
+		if mn < acc.Min {
+			acc.Min = mn
+		}
+		acc.Mean = acc.sumMeanW / float64(acc.Frames)
+		if acc.invSum > 0 {
+			acc.Harmonic = float64(acc.Frames) / acc.invSum
+		} else {
+			acc.Harmonic = acc.Mean
+		}
+		j.mu.Unlock()
+		return true
+	}
 	if m := planMarkerRe.FindStringSubmatch(line); m != nil {
 		type stageDesc struct {
 			Key   string `json:"key"`
@@ -796,6 +836,11 @@ type JobConfig struct {
 	// Local passes --hevc-single-pass to cli_local.py; cloud bakes the
 	// per-codec decision into each variant's TWO_PASS via the SFN input.
 	HevcSinglePass bool `json:"hevc_single_pass,omitempty"`
+	// MeasureVmaf enables the per-rendition VMAF quality audit (#24): after each
+	// chunk encodes, the worker scores it against the mezzanine at source res and
+	// emits an [[ENCODER-VMAF …]] marker; the control plane aggregates per rung.
+	// Off by default (slow — see the cost notes on #24). Local only for now.
+	MeasureVmaf bool `json:"measure_vmaf,omitempty"`
 	// CPU architecture for cloud encodes: "intel" | "amd" | "graviton".
 	// Empty defaults to intel. Ignored for local encodes (which always
 	// run on the host's native architecture).
@@ -832,6 +877,18 @@ type StageProgress struct {
 	// timing summary so the user can see where the wall-clock went.
 	StartedAt *time.Time `json:"started_at,omitempty"`
 	EndedAt   *time.Time `json:"ended_at,omitempty"`
+}
+
+// VmafScore is the aggregated VMAF for one rendition (#24). Mean/Harmonic/Min +
+// Frames are the display values; sumMeanW/invSum are running accumulators (not
+// serialized) that make the cross-chunk recombination correct.
+type VmafScore struct {
+	Mean     float64 `json:"mean"`
+	Harmonic float64 `json:"harmonic"`
+	Min      float64 `json:"min"`
+	Frames   int     `json:"frames"`
+	sumMeanW float64 // Σ(chunk_mean × chunk_frames)
+	invSum   float64 // Σ(chunk inv_sum)
 }
 
 type Job struct {
@@ -957,6 +1014,12 @@ type Job struct {
 	CurrentFile      string `json:"current_file,omitempty"`
 	CurrentFileIndex int    `json:"current_file_index,omitempty"`
 	TotalFiles       int    `json:"total_files,omitempty"`
+
+	// Vmaf holds per-rendition VMAF scores (#24), keyed by "codec/label" (e.g.
+	// "hevc/1080p"), aggregated from [[ENCODER-VMAF]] markers. Populated only
+	// when the job ran with MeasureVmaf. Per-chunk markers fold together with a
+	// frame-weighted mean + a correctly recombined harmonic mean.
+	Vmaf map[string]*VmafScore `json:"vmaf,omitempty"`
 
 	// StagesHistory holds the finished files' stages so end-of-job
 	// timing can show every phase that ran, not just the last file's.
@@ -2006,6 +2069,9 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	}
 	if cfg.HevcSinglePass {
 		args = append(args, "--hevc-single-pass")
+	}
+	if cfg.MeasureVmaf {
+		args = append(args, "--measure-vmaf")
 	}
 	return args
 }

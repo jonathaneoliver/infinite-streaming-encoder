@@ -573,6 +573,31 @@ def phase_variant(args: argparse.Namespace) -> int:
     else:
         print(f"[mem] {args.codec} {args.label}: peak RSS {peak_mib:.0f} MiB", flush=True)
 
+    # VMAF audit (#24, opt-in via measure_vmaf). Score THIS rendition against the
+    # mezzanine at the SOURCE resolution (common-res upscale + source-driven
+    # model). Runs per-chunk so it fans out across the fleet exactly like the
+    # encode; the control plane aggregates the ENCODER-VMAF markers into a
+    # per-rung score. Best-effort — a VMAF failure never fails the encode.
+    if getattr(args, "measure_vmaf", False) or _env_flag("MEASURE_VMAF"):
+        try:
+            from infinite_streaming_encoder.vmaf_audit import (
+                measure_vmaf, pick_model, vmaf_marker,
+            )
+            r = measure_vmaf(
+                out_path, ctx.mezzanine_path, info.width, info.height,
+                pick_model(info.height),
+                ref_start_s=(chunk.start_s if chunk is not None else 0.0),
+                ref_duration_s=(chunk.duration_s if chunk is not None else None),
+                n_subsample=5, n_threads=(_threads_env or 0),
+            )
+            print(vmaf_marker(args.codec, args.label, rung.height,
+                              chunk.index if chunk is not None else -1, r),
+                  flush=True)
+        except Exception as e:  # noqa: BLE001 — audit must never fail the encode
+            print(f"[vmaf] audit skipped ({args.codec} {args.label}): {e}",
+                  flush=True)
+        timer.mark("vmaf")
+
     # out_path.name is {codec}_{tier}.mp4 whole-clip, or
     # {codec}_{tier}_chunkNNN.mp4 for a chunk — upload under the same name.
     out_uri = args.s3_out.rstrip("/") + f"/{out_path.name}"
@@ -965,6 +990,10 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="raw per-codec ffmpeg args from the ladder profile, "
                         "appended after rate control (also honors EXTRA_ARGS "
                         "env); shlex-split to argv, never shell-eval'd")
+    v.add_argument("--measure-vmaf", action="store_true", dest="measure_vmaf",
+                   help="after encoding, measure per-rendition VMAF vs the "
+                        "mezzanine at source res (also honors MEASURE_VMAF env); "
+                        "emits an [[ENCODER-VMAF …]] marker. Slow — off by default")
     v.add_argument("--chunk-index", type=int, default=None, dest="chunk_index",
                    help="encode only this 0-based chunk of the variant "
                         "(Batch array index); omit for a whole-clip encode")
