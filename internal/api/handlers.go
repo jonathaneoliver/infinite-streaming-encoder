@@ -77,6 +77,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/jobs/{id}/workdir", s.jobWorkdir)
 	// AWS inventory + cleanup (issue #5)
 	s.Mux.HandleFunc("GET /api/aws/inventory", s.awsInventory)
+	s.Mux.HandleFunc("GET /api/aws/image-state", s.awsImageState)
 	s.Mux.HandleFunc("POST /api/aws/clear", s.awsClearAll)
 	s.Mux.HandleFunc("POST /api/aws/jobs/{id}/cleanup", s.awsCleanupJob)
 	s.Mux.HandleFunc("POST /api/aws/s3/delete-prefix", s.awsDeleteS3Prefix)
@@ -921,6 +922,19 @@ func runPythonCloud(module string, args ...string) ([]byte, error) {
 
 func (s *Server) awsInventory(w http.ResponseWriter, r *http.Request) {
 	out, err := runPythonCloud("inventory")
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+// awsImageState reports the cloud worker-image + AMI state for the About tab
+// (#80): the job-def-pinned tag, whether it's in ECR, and whether a matching
+// AMI is baked + wired (warm) vs baked-only vs pull-on-boot vs dangling.
+func (s *Server) awsImageState(w http.ResponseWriter, r *http.Request) {
+	out, err := runPythonCloud("image_state")
 	if err != nil {
 		http.Error(w, err.Error(), 502)
 		return
