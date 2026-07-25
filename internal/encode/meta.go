@@ -28,14 +28,18 @@ type encodeMeta struct {
 	// ExtraArgs are the raw ffmpeg tokens appended after rate control; Passes is
 	// the effective pass count (with the HevcSinglePass override applied). Both
 	// omitted when at defaults, so existing outputs' encode.json is unchanged.
-	ExtraArgs     string     `json:"extra_args,omitempty"`
-	Passes        int        `json:"passes,omitempty"`
-	Padding       string     `json:"padding,omitempty"`
-	ChunkDuration string     `json:"chunk_duration,omitempty"`
-	ForceReencode bool       `json:"force_reencode,omitempty"`
-	Source        string     `json:"source,omitempty"`
-	EncodedAt     string     `json:"encoded_at"`
-	Rungs         []metaRung `json:"rungs,omitempty"`
+	ExtraArgs     string `json:"extra_args,omitempty"`
+	Passes        int    `json:"passes,omitempty"`
+	Padding       string `json:"padding,omitempty"`
+	ChunkDuration string `json:"chunk_duration,omitempty"`
+	ForceReencode bool   `json:"force_reencode,omitempty"`
+	// Burnin records the text-overlay toggle only when it DEVIATES from the
+	// default (on): a pointer left nil when burn-in was on, so existing outputs'
+	// encode.json is byte-unchanged; set to &false when the overlay was disabled.
+	Burnin    *bool      `json:"burnin,omitempty"`
+	Source    string     `json:"source,omitempty"`
+	EncodedAt string     `json:"encoded_at"`
+	Rungs     []metaRung `json:"rungs,omitempty"`
 }
 
 type metaRung struct {
@@ -129,6 +133,13 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 	if effectivePasses != defaultPasses {
 		metaPasses = effectivePasses
 	}
+	// Record burn-in only when disabled (default is on) — keeps the common
+	// case's encode.json unchanged.
+	var burnin *bool
+	if !cfg.BurninEnabled() {
+		off := false
+		burnin = &off
+	}
 	meta := encodeMeta{
 		Profile:           ladderName,
 		Codec:             codec,
@@ -145,6 +156,7 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 		Padding:           cfg.Padding,
 		ChunkDuration:     cfg.ChunkDuration,
 		ForceReencode:     cfg.ForceReencode,
+		Burnin:            burnin,
 		Source:            strings.Join(cfg.Files, ", "),
 		EncodedAt:         time.Now().UTC().Format(time.RFC3339),
 		Rungs:             rungs,
@@ -162,6 +174,9 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 	}
 	if ea := def.extraArgsFor(codec); ea != "" {
 		line += " extra_args=[" + ea + "]"
+	}
+	if !cfg.BurninEnabled() {
+		line += " burnin=off"
 	}
 	injectM3U8Comment(filepath.Join(dir, "master.m3u8"), line)
 	injectMPDComment(filepath.Join(dir, "manifest.mpd"), line)

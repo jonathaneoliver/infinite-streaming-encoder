@@ -171,6 +171,7 @@ class EncodeWorkflow:
 
     Input `plan` (computed by the caller — Go control plane or cli_local_dist):
       bucket, job_prefix, src_key, has_audio, chunk_duration_s, n_chunks,
+      burnin (bool, default True — the per-variant text overlay),
       codecs = {codec: {"two_pass": bool, "rungs": [{label,width,height,bitrate}]}}
 
     mezzanine + audio run first (sequential); then every (codec, rung, chunk) is
@@ -202,6 +203,7 @@ class EncodeWorkflow:
         # underway from the start. Deterministic (pure plan math) → Temporal-safe.
         codec_cost = {"h264": 1.0, "hevc": 3.5, "av1": 8.0}
         measure_vmaf = bool(plan.get("measure_vmaf"))  # job-global VMAF audit flag
+        bn = plan.get("burnin", True)  # job-level text-overlay toggle (default on)
         specs = []
         for codec, ci in plan["codecs"].items():
             tp = ci["two_pass"]
@@ -224,10 +226,12 @@ class EncodeWorkflow:
                 args += ["--extra-args", ea]
             if measure_vmaf:
                 args.append("--measure-vmaf")
+            if not bn:
+                args.append("--no-burnin")
             env = {"CHUNK_DURATION_S": str(cd), "COALESCE_RUNT_TAIL": "1",
                    "TWO_PASS": "1" if tp else "0", "EXTRA_ARGS": ea,
                    "MEASURE_VMAF": "1" if measure_vmaf else "0",
-                   "ENCODE_THREADS": "2"}
+                   "BURNIN": "1" if bn else "0", "ENCODE_THREADS": "2"}
             chunk_acts.append(self._phase(
                 args, env, f"enc-{codec}-{r['label']}-c{i}"))
         await asyncio.gather(*chunk_acts)

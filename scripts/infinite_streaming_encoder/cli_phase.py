@@ -294,6 +294,12 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
 
+def _env_flag_default_on(name: str) -> bool:
+    """A default-ON env flag: enabled unless explicitly set falsy (0/false/no).
+    Unset → True. Used for BURNIN (the text overlay ships on by default)."""
+    return os.environ.get(name, "").strip().lower() not in ("0", "false", "no")
+
+
 def _env_num(name: str, default: float) -> float:
     """Numeric env var → float, or `default` if unset/unparseable. Used for the
     ladder-level VBV knobs (MAXRATE_PERCENT / BUFSIZE_MULT) the SFN injects."""
@@ -516,6 +522,9 @@ def phase_variant(args: argparse.Namespace) -> int:
         # single codec, so map the value under its own codec for
         # build_ffmpeg_cmd's ctx.extra_args[codec] lookup.
         extra_args={args.codec: (getattr(args, "extra_args", "") or os.environ.get("EXTRA_ARGS", ""))},
+        # Text overlay, on by default. Disabled by EITHER the --no-burnin flag
+        # (local-dist path) OR a falsy BURNIN env (cloud SFN containerOverrides).
+        burnin=getattr(args, "burnin", True) and _env_flag_default_on("BURNIN"),
     )
 
     # Chunked mode: encode only chunk `--chunk-index` of the variant. The
@@ -997,7 +1006,11 @@ def _build_parser() -> argparse.ArgumentParser:
     v.add_argument("--chunk-index", type=int, default=None, dest="chunk_index",
                    help="encode only this 0-based chunk of the variant "
                         "(Batch array index); omit for a whole-clip encode")
-    v.set_defaults(fn=phase_variant)
+    v.add_argument("--no-burnin", action="store_false", dest="burnin",
+                   help="disable the burnt-in text overlay (timecode/rate/codec/"
+                        "watermark labels); on by default. Also honors BURNIN env "
+                        "(0/false/no disables)")
+    v.set_defaults(fn=phase_variant, burnin=True)
 
     a = sub.add_parser("audio")
     a.add_argument("--s3-mezz", required=True, dest="s3_mezz")
