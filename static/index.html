@@ -449,6 +449,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="pink">Pink</option>
                 </select>
             </div>
+            <div class="control-group" style="align-self:center;padding-top:16px">
+                <label title="Burn the diagnostic text overlay (timecode, bitrate, codec/resolution, encoder, watermark) into every variant. On by default; uncheck for clean output."><input type="checkbox" id="burnin" checked style="width:auto;min-width:auto"> Burn-in text overlay</label>
+            </div>
             <div class="control-group" id="promote-group" style="display:none;align-self:center;padding-top:16px">
                 <label id="promote-after-label"><input type="checkbox" id="promote-after" style="width:auto;min-width:auto"> Promote after encode</label>
             </div>
@@ -1502,6 +1505,7 @@ async function startEncode(force = false) {
         use_spot: document.getElementById('use-spot').checked,
         simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
         force_reencode: force,
+        burnin: document.getElementById('burnin').checked,
         promote: document.getElementById('promote-after').checked
     };
 
@@ -1774,6 +1778,7 @@ function renderLadderTable(ladder) {
              ${p.extra_args ? ` · args [${escapeHtml(p.extra_args)}]` : ''}
              ${p.padding && p.padding !== 'off' ? ` · padding ${escapeHtml(p.padding)}` : ''}
              ${p.chunk_duration ? ` · chunk ${escapeHtml(p.chunk_duration)}` : ''}
+             ${p.burnin === false ? ` · overlay off` : ''}
              ${chip('force re-encode', p.force_reencode)}
              ${p.encoded_at ? `<span style="color:#889"> · ${new Date(p.encoded_at).toLocaleString()}</span>` : ''}
            </div>`
@@ -1826,6 +1831,8 @@ function _jobConfigHtml(c) {
     if (c.padding) chips.push(chip('padding', c.padding));
     if (c.time) chips.push(chip('time', c.time));
     if (c.force_reencode) chips.push(chip('force', 're-encode', '#d0883a'));
+    // Overlay is on by default; only flag the exception (burnin === false).
+    if (c.burnin === false) chips.push(chip('overlay', 'off', '#d0883a'));
     return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px">${chips.join('')}</div>`;
 }
 
@@ -3577,6 +3584,7 @@ async function forceReencode(fileName) {
         use_spot: document.getElementById('use-spot').checked,
         simulate_interrupt_after_s: parseInt(document.getElementById('simulate-interrupt').value) || 0,
         force_reencode: true,
+        burnin: document.getElementById('burnin').checked,
         promote: document.getElementById('promote-after').checked
     };
 
