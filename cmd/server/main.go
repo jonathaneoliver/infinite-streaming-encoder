@@ -15,13 +15,15 @@ import (
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/watcher"
 )
 
-// Version + gitSha are stamped at build time via
-// `-ldflags "-X main.version=... -X main.gitSha=..."`. The Makefile
-// reads ./VERSION and `git rev-parse --short HEAD`; unstamped builds
-// (plain `go build`) fall back to the defaults below.
+// Version, gitSha, and imageTag are stamped at build time via
+// `-ldflags "-X main.version=... -X main.gitSha=... -X main.imageTag=..."`.
+// The Makefile reads ./VERSION and `git rev-parse --short HEAD` (gitSha =
+// real HEAD) and the content hash (imageTag); unstamped builds (plain
+// `go build`) fall back to the defaults below.
 var (
-	version = "dev"
-	gitSha  = "unknown"
+	version  = "dev"
+	gitSha   = "unknown"
+	imageTag = "unknown"
 )
 
 func env(key, fallback string) string {
@@ -138,9 +140,10 @@ func main() {
 	srv := api.NewServer(mgr)
 	srv.Version = version
 	srv.GitSha = gitSha
+	srv.ImageTag = imageTag
 	srv.CloudImage = *dockerImage
 
-	log.Printf("encoder server %s (%s) listening on %s", version, gitSha, *addr)
+	log.Printf("encoder server %s (%s, image %s) listening on %s", version, gitSha, imageTag, *addr)
 	log.Printf("  source: %s", *sourceDir)
 	log.Printf("  output: %s", *outputDir)
 	log.Printf("  tmp: %s", *tmpDir)
