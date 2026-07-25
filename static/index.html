@@ -450,8 +450,11 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 </select>
             </div>
             <div class="control-group" style="align-self:center;padding-top:16px">
-                <label title="Burn the diagnostic text overlay (timecode, bitrate, codec/resolution, encoder, watermark) into every variant. On by default; uncheck for clean output."><input type="checkbox" id="burnin" checked style="width:auto;min-width:auto"> Burn-in text overlay</label>
-                <label title="Measure per-rendition VMAF quality after encoding (each rendition vs the source at source resolution). Slow — adds a post-encode pass per rung, fanned across the workers. Off by default. Scores show in the Outputs VMAF column."><input type="checkbox" id="measure-vmaf" style="width:auto;min-width:auto"> Measure VMAF</label>
+                <label title="Measure per-rendition VMAF quality after encoding (each rendition vs the source at source resolution). Slow — adds a post-encode pass per rung, fanned across the workers. Off by default. Scores show in the Outputs VMAF column. Ticking this clears Burn-in, since the overlay biases VMAF."><input type="checkbox" id="measure-vmaf" onchange="_vmafBurninSync(true)" style="width:auto;min-width:auto"> Measure VMAF</label>
+            </div>
+            <div class="control-group" style="align-self:center;padding-top:16px">
+                <label title="Burn the diagnostic text overlay (timecode, bitrate, codec/resolution, encoder, watermark) into every variant. On by default; uncheck for clean output."><input type="checkbox" id="burnin" checked onchange="_vmafBurninSync(false)" style="width:auto;min-width:auto"> Burn-in text overlay</label>
+                <span id="vmaf-burnin-hint" style="display:none;color:#d0a24a;font-size:11px">⚠ overlay biases VMAF — uncheck for accurate scores</span>
             </div>
             <div class="control-group" id="promote-group" style="display:none;align-self:center;padding-top:16px">
                 <label id="promote-after-label"><input type="checkbox" id="promote-after" style="width:auto;min-width:auto"> Promote after encode</label>
@@ -1879,6 +1882,19 @@ function renderJobStats(el, j) {
 // "both"/"all" for the common combos, a comma-list for any other subset (both
 // buildSFNInput and cli_local accept all of these). Never empty — falls back to
 // h264 so a submit always encodes something.
+// VMAF ⇄ burn-in interaction (#24): the burn-in overlay is on the rendition but
+// NOT on the mezzanine reference, so VMAF counts it as distortion. Ticking
+// "Measure VMAF" auto-clears burn-in for an apples-to-apples score; if the user
+// re-enables burn-in while measuring, warn that scores will be biased.
+function _vmafBurninSync(fromVmaf) {
+    const v = document.getElementById('measure-vmaf');
+    const b = document.getElementById('burnin');
+    const hint = document.getElementById('vmaf-burnin-hint');
+    if (!v || !b) return;
+    if (fromVmaf && v.checked && b.checked) b.checked = false;  // the nudge
+    if (hint) hint.style.display = (v.checked && b.checked) ? '' : 'none';
+}
+
 function codecValue() {
     const on = ['h264', 'hevc', 'av1'].filter(c =>
         document.querySelector(`.codec-cb[value="${c}"]`)?.checked);
