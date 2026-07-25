@@ -117,6 +117,7 @@ services:
       args:
         VERSION: ${VERSION:-dev}
         GIT_SHA: ${GIT_SHA:-unknown}
+        IMAGE_TAG: ${IMAGE_TAG:-unknown}
     profiles: [master]
     container_name: ${CONTAINER_NAME:-infinite-streaming-encoder}
     restart: unless-stopped
@@ -209,6 +210,7 @@ services:
       args:
         VERSION: ${VERSION:-dev}
         GIT_SHA: ${GIT_SHA:-unknown}
+        IMAGE_TAG: ${IMAGE_TAG:-unknown}
     profiles: [master, worker]
     # Name is the toggle contract with internal/api/dist.go (docker start/stop).
     container_name: ${DIST_WORKER_CONTAINER:-encode-worker}
