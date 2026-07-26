@@ -86,6 +86,11 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("POST /api/aws/jobs/{id}/cleanup", s.awsCleanupJob)
 	s.Mux.HandleFunc("POST /api/aws/s3/delete-prefix", s.awsDeleteS3Prefix)
 	s.Mux.HandleFunc("POST /api/aws/max-vcpus", s.awsSetMaxVCPUs)
+	// local-dist (MinIO) staging usage + manual reclaim (#93) — the local twin
+	// of the AWS S3 staging controls above.
+	s.Mux.HandleFunc("GET /api/dist/staging", s.distStagingUsage)
+	s.Mux.HandleFunc("POST /api/dist/staging/gc", s.distStagingGC)
+	s.Mux.HandleFunc("POST /api/dist/staging/delete-prefix", s.distStagingDeletePrefix)
 	// Cloud-batch release controls (Step Functions executions + Batch jobs).
 	s.Mux.HandleFunc("POST /api/aws/executions/stop", s.awsStopExecution)
 	s.Mux.HandleFunc("POST /api/aws/batch-jobs/terminate", s.awsTerminateBatchJob)
@@ -1033,6 +1038,101 @@ func (s *Server) awsDeleteS3Prefix(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := runPythonCloud("cleanup", "--delete-prefix", body.Prefix)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+// runPythonDist is runPythonCloud's local-dist twin: it drives the MinIO
+// staging module instead of the AWS cloud package. Same env-passthrough
+// contract — the module reads MINIO_ENDPOINT / MINIO_ACCESS_KEY /
+// MINIO_SECRET_KEY / DIST_S3_BUCKET from the server's own environment.
+func runPythonDist(args ...string) ([]byte, error) {
+	full := append([]string{"-m", "infinite_streaming_encoder.dist_staging", "--json"}, args...)
+	cmd := exec.Command("python3", full...)
+	cmd.Env = os.Environ()
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			// Exit 1 means some prefix failed to delete but the report was
+			// still printed — hand it to the UI so it can show the partial
+			// result, same as the AWS panel does for a partial sweep.
+			if ee.ExitCode() == 1 && len(out) > 0 {
+				return out, nil
+			}
+			return nil, fmt.Errorf("python3 -m infinite_streaming_encoder.dist_staging exited %d: %s",
+				ee.ExitCode(), strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("python3 -m infinite_streaming_encoder.dist_staging: %w", err)
+	}
+	return out, nil
+}
+
+// distStagingUsage reports what the local-dist MinIO bucket is holding, per job
+// prefix — the "why is the disk full" view.
+func (s *Server) distStagingUsage(w http.ResponseWriter, r *http.Request) {
+	out, err := runPythonDist("--usage")
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+// distStagingGC reclaims job staging idle longer than max_age_s (default 24h),
+// on demand rather than waiting for the diststage watchdog's next sweep. The
+// keep-list is always the current queued/running jobs, so a manual reclaim —
+// even with max_age_s 0 — can't delete a running encode's staging.
+func (s *Server) distStagingGC(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		MaxAgeS *float64 `json:"max_age_s"`
+		DryRun  bool     `json:"dry_run"`
+	}
+	// An empty body is fine — it means "use the defaults".
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	maxAge := 86400.0
+	if body.MaxAgeS != nil && *body.MaxAgeS >= 0 {
+		maxAge = *body.MaxAgeS
+	}
+	args := []string{"--gc", "--max-age-s", strconv.FormatFloat(maxAge, 'f', 0, 64)}
+	if body.DryRun {
+		args = append(args, "--dry-run")
+	}
+	for _, p := range s.Manager.ActiveDistPrefixes() {
+		args = append(args, "--keep", p)
+	}
+	out, err := runPythonDist(args...)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+// distStagingDeletePrefix removes one job's staging. dist_staging restricts the
+// prefix to jobs/<id>/, and an active job's prefix is refused here so the UI
+// can't reclaim an encode out from under itself.
+func (s *Server) distStagingDeletePrefix(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Prefix string `json:"prefix"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Prefix == "" {
+		http.Error(w, `bad request: {"prefix": "..."} required`, 400)
+		return
+	}
+	want := strings.Trim(body.Prefix, "/")
+	for _, p := range s.Manager.ActiveDistPrefixes() {
+		if strings.Trim(p, "/") == want {
+			http.Error(w, "refused: that job is still queued or running", 409)
+			return
+		}
+	}
+	out, err := runPythonDist("--delete-prefix", body.Prefix)
 	if err != nil {
 		http.Error(w, err.Error(), 502)
 		return

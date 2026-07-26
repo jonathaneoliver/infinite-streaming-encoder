@@ -11,6 +11,7 @@ import (
 
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/api"
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/awswatch"
+	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/diststage"
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/encode"
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/watcher"
 )
@@ -80,6 +81,18 @@ func main() {
 	awsAutoTerminate := flag.Bool("aws-auto-terminate-stale",
 		env("AUTO_TERMINATE_STALE", "true") == "true",
 		"force-terminate stale instances (false = warn-only)")
+
+	// local-dist (MinIO) staging reclaim (#93). The orchestrator deletes its
+	// own staging on success; this sweeps what's left by failed / cancelled /
+	// crashed jobs, which otherwise grew the master's MinIO without bound.
+	distStageInterval := flag.Duration("dist-staging-interval", 30*time.Minute,
+		"MinIO staging sweep interval; 0 disables")
+	distStageMaxAge := flag.Duration("dist-staging-max-age",
+		time.Duration(intEnv("DIST_STAGING_MAX_AGE_H", 24))*time.Hour,
+		"reclaim job staging idle longer than this (also the failed-job debugging window)")
+	distStageLifecycleDays := flag.Int("dist-staging-lifecycle-days",
+		intEnv("DIST_STAGING_LIFECYCLE_DAYS", 3),
+		"MinIO bucket expiry for jobs/, in days; 0 disables")
 	flag.Parse()
 
 	// Buffered so a job start/finalize never blocks on nudging the keep-warm
@@ -139,6 +152,14 @@ func main() {
 		ActiveJobs: mgr.ActiveCloudJobs,
 		// React immediately to a job start/finalize instead of on the next tick.
 		Trigger: warmTrigger,
+	})
+
+	go diststage.Run(context.Background(), diststage.Config{
+		Interval:      *distStageInterval,
+		MaxAge:        *distStageMaxAge,
+		LifecycleDays: *distStageLifecycleDays,
+		// Never reclaim staging a queued/running job is still using.
+		ActivePrefixes: mgr.ActiveDistPrefixes,
 	})
 
 	srv := api.NewServer(mgr)

@@ -1992,7 +1992,6 @@ func (cfg *JobConfig) localChunkSeconds() float64 {
 // implicit. MinIO endpoint/creds ride in as env (buildRunArgs).
 func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID string) []string {
 	stem := cfg.OutputStem(filename)
-	base := strings.TrimSuffix(filename, filepath.Ext(filename))
 	args := []string{
 		"--input", sourceDir + "/" + filename,
 		"--output", stem,
@@ -2000,7 +1999,7 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 		"--backend", "temporal",
 		"--temporal-address", envOr("TEMPORAL_ADDRESS", "host.docker.internal:7233"),
 		"--s3-bucket", envOr("DIST_S3_BUCKET", "encoder-local"),
-		"--job-prefix", fmt.Sprintf("jobs/%s-%s", jobID, base),
+		"--job-prefix", DistJobPrefix(jobID, filename),
 	}
 	if cfg.Codec != "" {
 		args = append(args, "--codec", cfg.Codec)
@@ -2025,6 +2024,40 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 		args = append(args, "--no-burnin")
 	}
 	return args
+}
+
+// DistJobPrefix is the MinIO key prefix one local-dist file stages under.
+// Shared by the orchestrator's --job-prefix argument and the staging GC's
+// keep-list (ActiveDistPrefixes), so "which prefix belongs to this job" is
+// defined once — the GC deleting a prefix an in-flight job is still writing
+// would destroy a running encode.
+func DistJobPrefix(jobID, filename string) string {
+	base := strings.TrimSuffix(filename, filepath.Ext(filename))
+	return fmt.Sprintf("jobs/%s-%s", jobID, base)
+}
+
+// ActiveDistPrefixes lists the staging prefixes of every queued/running
+// local-dist job — the GC's keep-list. Covers all of a job's files, not just
+// the current one: a multi-file job's later prefixes don't exist in MinIO yet
+// (nothing to skip) and its earlier ones are already reclaimed by the
+// orchestrator, so naming them all is harmless and keeps this independent of
+// where the job has got to.
+func (m *Manager) ActiveDistPrefixes() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, j := range m.jobs {
+		if j.Status != StatusQueued && j.Status != StatusRunning {
+			continue
+		}
+		if j.Config.Target != TargetLocalDist {
+			continue
+		}
+		for _, f := range j.Config.Files {
+			out = append(out, DistJobPrefix(j.ID, f))
+		}
+	}
+	return out
 }
 
 // effectiveTiming resolves one profile timing value with precedence

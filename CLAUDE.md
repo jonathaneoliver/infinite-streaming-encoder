@@ -80,6 +80,38 @@ Two key naming/skip conventions in this file:
 
 The worker container's entrypoint is overridden to `scripts/infinite_streaming_encoder/cli_local.py` (local) or `scripts/infinite_streaming_encoder/cli_cloud.py` (cloud). Cloud workers additionally receive `HOST_AWS_DIR` as `/root/.aws:ro` and the AWS/GHCR env vars listed in `cloudEnvPassthrough`. Stdout is line-scanned into `job.logLines` (capped at 1000 lines, trimmed to last 500) and the latest line (ANSI-stripped) becomes `job.Progress`, which the SSE stream surfaces live.
 
+### MinIO staging lifecycle (local-dist)
+
+Every local-dist file stages through `s3://$DIST_S3_BUCKET/jobs/<jobID>-<base>/`
+(source upload, mezzanine, per-chunk encodes, variants, packaged output — ~2.3 GB
+for a typical clip). `encode.DistJobPrefix` is the single definition of that key,
+shared by the orchestrator's `--job-prefix` argument and the GC's keep-list.
+
+Reclaim is three layers, all in `scripts/infinite_streaming_encoder/dist_staging.py`:
+
+1. **Success path** — `cli_local_dist` deletes its own prefix immediately after
+   `download:outputs` has landed every file on disk (skipped by `--keep-staging`,
+   and skipped automatically if nothing downloaded, since an empty download means
+   the staging is the only copy of the encode).
+2. **`internal/diststage`** — a server goroutine sweeping prefixes idle longer than
+   `-dist-staging-max-age` (24h), which is what catches failed, cancelled (the
+   control plane `docker stop`s the orchestrator, so its own cleanup never runs)
+   and crashed jobs. The idle age doubles as the debugging window. It passes
+   `Manager.ActiveDistPrefixes()` as a keep-list, so a running encode can never be
+   reclaimed out from under itself. The same pass aborts stale multipart uploads —
+   a killed mid-upload leaves parts that hold space but never appear in a
+   `list_objects_v2` scan, so nothing else can see them.
+3. **Bucket lifecycle** — a `jobs/` object-expiry rule re-asserted on every sweep;
+   the backstop if the server never runs again. Expiry only: MinIO silently drops
+   an `AbortIncompleteMultipartUpload` directive paired with `Expiration` and
+   rejects it on its own, which is why the multipart abort lives in the GC.
+
+`dist_staging` requires an explicit MinIO endpoint (`S3_ENDPOINT_URL` in worker
+containers, `MINIO_ENDPOINT` on the server) and never falls back to the default
+boto3 chain — without that guard it would resolve to real AWS S3 and start
+deleting the *cloud* bucket's staging. Manual controls: `make minio-usage` /
+`make minio-clean` and `GET /api/dist/staging` + `POST /api/dist/staging/gc`.
+
 **`internal/api/handlers.go`** — the HTTP surface. Routes defined in `NewServer`:
 - JSON API: `GET /api/sources`, `GET/POST` under `/api/encode`, `/api/jobs`, `/api/jobs/{id}/logs`, `/api/outputs`, `/api/outputs/{name}`, `/api/outputs/{name}/playlists`, `/api/outputs/{name}/logs`.
 - SSE: `GET /api/jobs/stream` — emits the full current job list immediately, then streams updates from `Manager.Subscribe()`.
@@ -120,3 +152,4 @@ The EC2 user-data itself is still bash (it runs on the remote instance) — `clo
 - The docker.sock mount is what lets the Go server spawn and talk to worker containers. Without it, `docker run` / `docker logs -f` / `docker inspect` all fail and no encoding happens.
 - Host paths: the server needs both container-side paths (`SOURCE_DIR`, `OUTPUT_DIR`, `TMP_DIR` — used for all in-process file I/O) and host-side paths (`HOST_*` — used only for `-v` flags when launching workers). Workers mount host paths at the same paths the Go server uses, so script args don't need translation.
 - `move to OutputDir` only happens on success. A failed job leaves nothing in `OutputDir` (the `$TMP_DIR/<job_id>/` is unconditionally removed in `run`'s defer path).
+- The MinIO staging key (`encode.DistJobPrefix` → `jobs/<jobID>-<base>/`) is a contract between the orchestrator's `--job-prefix` and the staging GC's keep-list. Deriving it separately in either place is how you get a GC that deletes a running encode's chunks.

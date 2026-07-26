@@ -419,7 +419,7 @@ cloud-clear:          ## kill every idle AWS cost: sweep tagged instances/volume
 # All-container control plane on this (master) box; workers run one-per-box and
 # pull work. All of this now lives in the unified docker-compose.yml (master /
 # worker profiles); these are convenience aliases for pieces of it.
-.PHONY: dist-up dist-down dist-worker dist-logs dist-ps
+.PHONY: dist-up dist-down dist-worker dist-logs dist-ps minio-usage minio-clean
 
 dist-up: require-paths   ## bring up ONLY the local cluster (temporal + ui + postgres + minio)
 	$(COMPOSE_BASE) up -d postgresql temporal temporal-ui minio
@@ -436,6 +436,21 @@ dist-logs:            ## follow the local worker log
 
 dist-ps:              ## cluster + worker + server containers
 	$(COMPOSE_BASE) --profile master ps
+
+# MinIO staging (#93). A finished job's orchestrator deletes its own staging and
+# the server sweeps what failed/cancelled jobs leave behind; these are the manual
+# equivalents for when you want to look or reclaim right now. Both run inside the
+# server container, which already has the MinIO endpoint + creds in its env.
+# MINIO_MAX_AGE_S is the idle-age floor: nothing newer is touched, so a running
+# encode is never reclaimed (the server's own sweep also passes a keep-list).
+MINIO_MAX_AGE_S ?= 86400
+
+minio-usage:          ## what the local-dist MinIO staging is holding, per job prefix
+	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.dist_staging --usage
+
+minio-clean:          ## reclaim staging idle > MINIO_MAX_AGE_S (default 24h); DRY_RUN=1 to preview
+	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.dist_staging \
+	  --gc --max-age-s $(MINIO_MAX_AGE_S) $(if $(DRY_RUN),--dry-run,)
 
 # DIST_WORKERS: space-separated label=ssh_target pairs of remote worker boxes,
 # e.g. DIST_WORKERS = ubuntu=me@worker-box.local
