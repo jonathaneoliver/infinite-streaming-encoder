@@ -1117,6 +1117,12 @@ func (s *Server) distStagingGC(w http.ResponseWriter, r *http.Request) {
 // distStagingDeletePrefix removes one job's staging. dist_staging restricts the
 // prefix to jobs/<id>/, and an active job's prefix is refused here so the UI
 // can't reclaim an encode out from under itself.
+//
+// The request's prefix is never handed to the subprocess: it's matched against
+// the bucket's own listing and the *listed* prefix is what gets deleted. Job
+// prefixes carry the source filename stem, so a character allowlist would
+// reject legitimate names; resolving through the listing is both the stricter
+// check and the one that can't put request data on an argv.
 func (s *Server) distStagingDeletePrefix(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Prefix string `json:"prefix"`
@@ -1132,7 +1138,32 @@ func (s *Server) distStagingDeletePrefix(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-	out, err := runPythonDist("--delete-prefix", body.Prefix)
+	listed, err := runPythonDist("--usage")
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	var doc struct {
+		Prefixes []struct {
+			Prefix string `json:"prefix"`
+		} `json:"prefixes"`
+	}
+	if err := json.Unmarshal(listed, &doc); err != nil {
+		http.Error(w, "could not list staging prefixes: "+err.Error(), 502)
+		return
+	}
+	target := ""
+	for _, p := range doc.Prefixes {
+		if strings.Trim(p.Prefix, "/") == want {
+			target = p.Prefix
+			break
+		}
+	}
+	if target == "" {
+		http.Error(w, "no such staging prefix", 404)
+		return
+	}
+	out, err := runPythonDist("--delete-prefix", target)
 	if err != nil {
 		http.Error(w, err.Error(), 502)
 		return
