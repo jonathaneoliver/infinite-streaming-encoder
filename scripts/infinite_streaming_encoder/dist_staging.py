@@ -82,6 +82,17 @@ DEFAULT_BUCKET = "encoder-local"
 # ever touched — same containment contract as cloud.cleanup.delete_prefix.
 JOBS_PREFIX = "jobs/"
 
+# The cross-job, content-addressed mezzanine cache (cli_local_dist keys it by
+# source size+mtime+name). It deliberately lives OUTSIDE jobs/, so per-job
+# delete_prefix never reclaims it — one source's mezzanine is reused by every
+# job that encodes it. gc() sweeps it on its own idle window: a mezzanine
+# unused for this long is evicted; an actively-reused one is kept because the
+# orchestrator refreshes its idle clock on every cache hit (see
+# cli_local_dist._touch_prefix). A source re-encoded within a day (the audit
+# loop) always hits; one untouched for 24h ages out and re-produces on demand.
+MEZZ_CACHE_PREFIX = "mezz-cache/"
+MEZZ_CACHE_MAX_AGE_S = 24 * 3600  # 24 hours idle
+
 # Lifecycle rule id. Stable, so re-running ensure_lifecycle updates our
 # rule in place instead of stacking duplicates (and leaves any rule the
 # user added by hand alone).
@@ -159,8 +170,10 @@ def _normalize_prefix(prefix: str) -> str:
     return p.strip("/") + "/" if p.strip("/") else ""
 
 
-def scan(bucket: str | None = None) -> dict[str, dict]:
-    """Group every object under `jobs/` by its job prefix.
+def scan(bucket: str | None = None, top: str = JOBS_PREFIX) -> dict[str, dict]:
+    """Group every object under `top` (default `jobs/`) by its two-segment
+    prefix (`jobs/<id>/`, or `mezz-cache/<key>/` for the shared mezzanine
+    cache).
 
     Returns {prefix: {"objects": n, "bytes": n, "idle_s": seconds since
     the NEWEST object was written}}. Idle age (not oldest-object age) is
@@ -171,7 +184,7 @@ def scan(bucket: str | None = None) -> dict[str, dict]:
     s3 = _s3()
     now = datetime.now(timezone.utc)
     groups: dict[str, dict] = {}
-    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=b, Prefix=JOBS_PREFIX):
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=b, Prefix=top):
         for obj in page.get("Contents", []):
             parts = obj["Key"].split("/", 2)
             if len(parts) < 3 or not parts[1]:
@@ -351,6 +364,15 @@ def gc(max_age_s: float, bucket: str | None = None,
             continue
         _delete_one_prefix(s3, b, prefix, report, dry_run,
                            detail_suffix=f", idle {g['idle_s'] / 3600:.1f}h")
+    # Shared mezzanine cache — its own, much longer idle window (it's meant to
+    # persist for cross-job reuse). `keep` holds job prefixes only, so it never
+    # applies here; an actively-reused mezzanine stays fresh because the
+    # orchestrator touches it on each hit.
+    for prefix, g in sorted(scan(b, top=MEZZ_CACHE_PREFIX).items()):
+        if g["idle_s"] < MEZZ_CACHE_MAX_AGE_S:
+            continue
+        _delete_one_prefix(s3, b, prefix, report, dry_run,
+                           detail_suffix=f", mezz idle {g['idle_s'] / 3600:.1f}h")
     abort_stale_uploads(max_age_s, b, report, keep_set, dry_run)
     return report
 

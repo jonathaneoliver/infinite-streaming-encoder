@@ -238,11 +238,17 @@ class EncodeWorkflow:
         pfx = plan["job_prefix"].strip("/")
         s3_work = f"s3://{b}/{pfx}/work"
         s3_out = f"s3://{b}/{pfx}/out"
+        # Mezzanine lives in a cross-job, content-addressed cache (mezz-cache/)
+        # when the orchestrator supplies it; older plans fall back to per-job
+        # work/. The mezzanine phase reuses it if already present, so a repeat
+        # source skips the source download + stream-copy (and each worker's
+        # /tmp/mezz-cache, keyed off this URI, skips the MinIO fetch too).
+        mezz = plan.get("mezz_prefix") or s3_work
 
         await self._phase(["mezzanine", "--s3-in", f"s3://{b}/{plan['src_key']}",
-                           "--s3-out", s3_work], {}, "mezzanine")
+                           "--s3-out", mezz], {}, "mezzanine")
         if plan.get("has_audio"):
-            await self._phase(["audio", "--s3-mezz", s3_work, "--s3-out", s3_work],
+            await self._phase(["audio", "--s3-mezz", mezz, "--s3-out", s3_work],
                               {}, "audio")
 
         cd = plan["chunk_duration_s"]
@@ -270,7 +276,7 @@ class EncodeWorkflow:
             args = ["variant", "--codec", codec, "--label", r["label"],
                     "--width", str(r["width"]), "--height", str(r["height"]),
                     "--bitrate", str(r["bitrate"]), "--chunk-index", str(i),
-                    "--s3-mezz", s3_work, "--s3-out", s3_work]
+                    "--s3-mezz", mezz, "--s3-out", s3_work]
             if tp:
                 args.append("--two-pass")
             if ea:

@@ -34,6 +34,7 @@ explicit count.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import queue
 import re
@@ -253,6 +254,43 @@ def _object_exists(bucket: str, key: str) -> bool:
         return True
     except Exception:
         return False
+
+
+# Content-addressed staging for the mezzanine, SHARED across jobs. The
+# mezzanine is a pure stream-copy of the source (no padding/burnin/partial —
+# those apply later, per chunk), so its bytes depend only on the source file.
+# Two jobs on the same source therefore want the SAME mezzanine, whatever their
+# codec/ladder/overlay settings. Key = sha256(basename:size:mtime_ns): cheap
+# (no full read) and it invalidates the moment a file is edited (size or mtime
+# moves). Lives at `mezz-cache/<key>/` — OUTSIDE the per-job `jobs/<id>/`
+# prefix, so job cleanup (delete_prefix) never reclaims it; dist_staging.gc
+# sweeps mezz-cache separately on a longer idle window. The chunk phase's
+# per-worker /tmp/mezz-cache is keyed off this URI too, so a box that already
+# encoded this source skips the MinIO download entirely (symlinks its copy).
+MEZZ_CACHE_PREFIX = "mezz-cache"
+
+
+def _mezz_cache_rel(input_path: Path) -> str:
+    """Bucket-relative prefix (`mezz-cache/<key>`) for this source's shared
+    mezzanine. See MEZZ_CACHE_PREFIX."""
+    st = input_path.stat()
+    sig = f"{input_path.name}:{st.st_size}:{st.st_mtime_ns}"
+    key = hashlib.sha256(sig.encode()).hexdigest()[:32]
+    return f"{MEZZ_CACHE_PREFIX}/{key}"
+
+
+def _touch_prefix(bucket: str, rel: str) -> None:
+    """Refresh a shared-cache prefix's idle clock on a cache HIT. The staging
+    GC (dist_staging.gc) evicts a mezzanine idle past MEZZ_CACHE_MAX_AGE_S, and
+    keys idle off the NEWEST object — but reads don't move LastModified. So a
+    mezzanine reused by job after job would look progressively staler and could
+    be reclaimed out from under a running job. Dropping a tiny marker resets the
+    prefix's clock, so anything actively reused is kept; only a genuinely unused
+    mezzanine ages out. Best-effort — never fail a job over it."""
+    try:
+        _s3().put_object(Bucket=bucket, Key=f"{rel}/.touch", Body=b"")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _reclaim_staging(bucket: str, prefix: str, keep: bool) -> None:
@@ -620,18 +658,29 @@ def run(args: argparse.Namespace) -> int:
         args.worker or ["local"], args.image_local, args.image_remote,
         args.encode_threads or 2, args.remote_code_mount)
 
-    # 1. source -> MinIO
-    _upload_source(input_path, bucket, src_key)
+    # 1. source -> MinIO, unless the cross-job mezzanine cache already has this
+    # source's mezzanine (then the source is never read — skip the upload).
+    mezz_rel = _mezz_cache_rel(input_path)
+    mezz_prefix = f"s3://{bucket}/{mezz_rel}"
+    if _object_exists(bucket, f"{mezz_rel}/mezzanine.mp4.done"):
+        print(f"[dist] mezzanine cache HIT {mezz_prefix} — skipping source "
+              f"upload + mezzanine (same source encoded before)", flush=True)
+        _touch_prefix(bucket, mezz_rel)  # keep it fresh while this job reuses it
+        emit_stage("upload:source", "done", 100.0)
+    else:
+        _upload_source(input_path, bucket, src_key)
 
-    # 2. mezzanine + audio (local only — one-shot, cheap, needs no fan-out)
+    # 2. mezzanine + audio (local only — one-shot, cheap, needs no fan-out).
+    # Mezzanine writes to the shared content-addressed cache; on a hit the
+    # phase reuses it. Audio reads it but stays per-job.
     local = next(w for w in pool if w.is_local)
     print("[dist] === mezzanine ===", flush=True)
     if run_phase(local, ["mezzanine", "--s3-in", f"s3://{bucket}/{src_key}",
-                         "--s3-out", s3_work], env={}, log_prefix="mezzanine"):
+                         "--s3-out", mezz_prefix], env={}, log_prefix="mezzanine"):
         return 1
     if info.has_audio:
         print("[dist] === audio ===", flush=True)
-        if run_phase(local, ["audio", "--s3-mezz", s3_work, "--s3-out", s3_work],
+        if run_phase(local, ["audio", "--s3-mezz", mezz_prefix, "--s3-out", s3_work],
                      env={}, log_prefix="audio"):
             return 1
 
@@ -653,7 +702,7 @@ def run(args: argparse.Namespace) -> int:
     sh = _Shared(q=queue.Queue(), bucket=bucket, work_prefix=work_prefix,
                  chunk_duration_s=args.chunk_duration_s, burnin=args.burnin,
                  measure_vmaf=args.measure_vmaf)
-    encode_chunks_distributed(pool, tasks, sh, s3_work, s3_work)
+    encode_chunks_distributed(pool, tasks, sh, mezz_prefix, s3_work)
     if sh.failed:
         print(f"[dist] FAILED chunks: {', '.join(sh.failed)}", file=sys.stderr)
         return 1
@@ -863,7 +912,21 @@ def run_temporal(args: argparse.Namespace) -> int:
                info.has_audio)
     _emit_commercial_cost(rungs_by_codec, info, input_path,
                           hevc_two_pass=not args.hevc_single_pass)
-    _upload_source(input_path, bucket, src_key)
+
+    # Cross-job mezzanine cache. If this exact source already has a completed
+    # mezzanine in MinIO, the mezzanine phase will reuse it — and since the
+    # source is ONLY consumed by that phase, we can skip uploading it entirely
+    # (the biggest single I/O in the prep). On a miss, upload as usual and the
+    # mezzanine phase populates the shared cache for the next job.
+    mezz_rel = _mezz_cache_rel(input_path)
+    mezz_prefix = f"s3://{bucket}/{mezz_rel}"
+    if _object_exists(bucket, f"{mezz_rel}/mezzanine.mp4.done"):
+        print(f"[dist] mezzanine cache HIT {mezz_prefix} — skipping source "
+              f"upload + mezzanine (same source encoded before)", flush=True)
+        _touch_prefix(bucket, mezz_rel)  # keep it fresh while this job reuses it
+        emit_stage("upload:source", "done", 100.0)
+    else:
+        _upload_source(input_path, bucket, src_key)
 
     # Pass count + extra_args come from the ladder profile now; hevc_single_pass
     # remains a per-encode override forcing HEVC single-pass.
@@ -873,6 +936,7 @@ def run_temporal(args: argparse.Namespace) -> int:
         two_pass["hevc"] = False
     plan = {
         "bucket": bucket, "job_prefix": prefix, "src_key": src_key,
+        "mezz_prefix": mezz_prefix,
         "has_audio": info.has_audio, "chunk_duration_s": args.chunk_duration_s,
         "n_chunks": n_chunks, "burnin": args.burnin,
         "measure_vmaf": args.measure_vmaf,
