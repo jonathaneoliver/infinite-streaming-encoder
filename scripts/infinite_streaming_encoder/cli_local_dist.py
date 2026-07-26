@@ -255,6 +255,34 @@ def _object_exists(bucket: str, key: str) -> bool:
         return False
 
 
+def _reclaim_staging(bucket: str, prefix: str, keep: bool) -> None:
+    """Delete this job's MinIO staging now that the outputs are on disk (#93).
+
+    Everything under `jobs/<id>-<base>/` — the source upload, the mezzanine,
+    every per-chunk encode, the variants, the packaged HLS — is dead weight
+    once `_download_prefix` has pulled the output down; nothing downstream
+    reads it (a Retry submits a NEW job id, so it stages afresh). Left alone
+    it accumulated ~2.3 GB per job forever.
+
+    Best-effort by design: a reclaim failure must never turn a successful
+    encode into a failed one. Whatever is left behind is picked up by the
+    server's age-based GC and the bucket lifecycle rule (dist_staging.gc /
+    ensure_lifecycle).
+    """
+    if keep:
+        print(f"[dist] --keep-staging: leaving s3://{bucket}/{prefix}/", flush=True)
+        return
+    try:
+        from infinite_streaming_encoder import dist_staging
+        report = dist_staging.delete_prefix(f"{prefix}/", bucket=bucket)
+    except Exception as e:  # noqa: BLE001
+        print(f"[dist] staging cleanup skipped (non-fatal): {e}", flush=True)
+        return
+    for a in report.actions:
+        print(f"[dist] staging {a.action}: {a.id}"
+              f"{f' — {a.detail}' if a.detail else ''}", flush=True)
+
+
 def _download_prefix(bucket: str, prefix: str, dest: Path) -> int:
     """Download every object under `prefix` into `dest`, preserving the tail
     path after `prefix`. Emits throttled download:outputs progress by bytes.
@@ -642,11 +670,19 @@ def run(args: argparse.Namespace) -> int:
 
     # 5. download output_<codec>/ -> <output-dir>/<stem>_<codec>/
     out_dir = Path(args.output_dir)
+    downloaded = []
     for codec in rungs_by_codec:
         dest = out_dir / (f"{args.output}_{codec}"
                           + (f"_{args.output_tag}" if args.output_tag else ""))
         n = _download_prefix(bucket, f"{out_prefix}/output_{codec}/", dest)
         print(f"[dist] downloaded {n} file(s) -> {dest}", flush=True)
+        downloaded.append(n)
+
+    # 6. reclaim staging — only once EVERY codec landed something on disk. A
+    # codec that downloaded nothing means its packaged output never made it to
+    # MinIO, and deleting the prefix would destroy the only copy of the encode.
+    if downloaded and all(n > 0 for n in downloaded):
+        _reclaim_staging(bucket, prefix, args.keep_staging)
 
     print("[dist] done", flush=True)
     return 0
@@ -922,11 +958,16 @@ def run_temporal(args: argparse.Namespace) -> int:
     print(f"[dist] workflow result: {result}", flush=True)
 
     out_dir = Path(args.output_dir)
+    downloaded = []
     for codec in rungs_by_codec:
         dest = out_dir / (f"{args.output}_{codec}"
                           + (f"_{args.output_tag}" if args.output_tag else ""))
         n = _download_prefix(bucket, f"{prefix}/out/output_{codec}/", dest)
         print(f"[dist] downloaded {n} file(s) -> {dest}", flush=True)
+        downloaded.append(n)
+    # Same reclaim + empty-download guard as the pool backend above.
+    if downloaded and all(n > 0 for n in downloaded):
+        _reclaim_staging(bucket, prefix, args.keep_staging)
     print("[dist] done", flush=True)
     return 0
 
@@ -956,6 +997,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--s3-bucket", required=True, dest="s3_bucket")
     p.add_argument("--job-prefix", required=True, dest="job_prefix",
                    help="MinIO key prefix for this job's objects")
+    p.add_argument("--keep-staging", action="store_true", dest="keep_staging",
+                   help="don't delete this job's MinIO staging after the outputs "
+                        "download (default: reclaim it — see dist_staging)")
     # Pool
     p.add_argument("--worker", action="append", default=None,
                    help="repeatable: 'local' or 'ssh://user@host'")

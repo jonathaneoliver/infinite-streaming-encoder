@@ -637,6 +637,15 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div id="aws-s3"></div>
         </div>
 
+        <div class="aws-section">
+            <div class="aws-header" style="margin-bottom:8px">
+                <h3 style="margin:0" title="Per-job staging in the local farm's MinIO. A finished encode deletes its own; these are what failed/cancelled/crashed jobs left behind.">Local Staging (MinIO)</h3>
+                <button class="btn btn-small" onclick="reclaimDistStaging()"
+                        title="Delete staging idle for more than 24h. A queued or running job's staging is never touched.">Reclaim idle &gt; 24h</button>
+            </div>
+            <div id="dist-staging"><div class="aws-empty">Loading…</div></div>
+        </div>
+
         <div class="aws-danger">
             <h3>☢ Emergency Clear</h3>
             <p>
@@ -2619,6 +2628,10 @@ async function refreshAws() {
     } catch (e) {
         if (lastEl) lastEl.textContent = 'refresh failed: ' + e.message;
     }
+    // Local (MinIO) staging is a separate endpoint and must not be gated on
+    // the AWS inventory succeeding — on a farm with no cloud configured the
+    // fetch above fails and this is the only section with anything to show.
+    refreshDistStaging();
 }
 
 function renderAws(data) {
@@ -3362,6 +3375,98 @@ async function deleteS3Prefix(prefix) {
         await refreshAws();
     } catch (e) {
         alert('Delete failed: ' + e.message);
+    }
+}
+
+// ---- Local-dist staging (MinIO) ------------------------------------------
+// The local twin of the S3 Staging table. A successful encode's orchestrator
+// deletes its own prefix and the server sweeps idle ones on an interval, so
+// anything listed here is either in flight or the residue of a failed /
+// cancelled job — hence the reclaim controls rather than a plain read-out.
+
+async function refreshDistStaging() {
+    const el = document.getElementById('dist-staging');
+    if (!el) return;
+    try {
+        const res = await fetch('/api/dist/staging');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        renderDistStaging(await res.json());
+    } catch (e) {
+        // MinIO isn't reachable / isn't configured — that's normal on a
+        // cloud-only box, so state it plainly instead of erroring.
+        el.innerHTML = '<div class="aws-empty">No local staging (' +
+            escapeHtml(e.message) + ').</div>';
+    }
+}
+
+function renderDistStaging(doc) {
+    const el = document.getElementById('dist-staging');
+    const prefixes = doc.prefixes || [];
+    if (prefixes.length === 0) {
+        el.innerHTML = '<div class="aws-empty">No local staging.</div>';
+        return;
+    }
+    const rows = prefixes.map(p => {
+        const hours = (p.idle_s || 0) / 3600;
+        // Under an hour idle almost always means a job is writing right now.
+        const idle = hours < 1
+            ? `<span title="Recently written — likely an encode in flight">${Math.round((p.idle_s || 0) / 60)}m</span>`
+            : hours.toFixed(1) + 'h';
+        return `
+        <tr>
+            <td>${escapeHtml(p.prefix)}</td>
+            <td>${formatBytes(p.bytes || 0)}</td>
+            <td>${p.objects || 0}</td>
+            <td>${idle}</td>
+            <td><span class="aws-row-action" onclick="deleteDistPrefix('${escapeAttr(p.prefix)}')">delete</span></td>
+        </tr>`;
+    }).join('');
+    el.innerHTML = `
+        <table class="aws-table">
+            <thead><tr>
+                <th>Prefix</th><th>Size</th><th>Objects</th><th>Idle</th><th></th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table>
+        <div class="aws-refresh-time" style="margin-top:6px">
+            ${escapeHtml(doc.bucket || '')}: ${formatBytes(doc.total_bytes || 0)} across
+            ${prefixes.length} job prefix(es)
+        </div>
+    `;
+}
+
+async function deleteDistPrefix(prefix) {
+    if (!confirm('Delete all objects under ' + prefix + '?\n\n' +
+                 'This is encode staging, not output — the finished output already ' +
+                 'lives in the output directory.')) return;
+    try {
+        const res = await fetch('/api/dist/staging/delete-prefix', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prefix }),
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
+        await refreshDistStaging();
+    } catch (e) {
+        alert('Delete failed: ' + e.message);
+    }
+}
+
+async function reclaimDistStaging() {
+    if (!confirm('Delete local staging idle for more than 24h?\n\n' +
+                 'Queued and running jobs are skipped.')) return;
+    try {
+        const res = await fetch('/api/dist/staging/gc', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ max_age_s: 86400 }),
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
+        const report = await res.json();
+        const n = (report.summary || {}).deleted || 0;
+        showToast(n ? `Reclaimed ${n} staging prefix(es)` : 'Nothing to reclaim',
+                  n ? 'success' : '');
+        await refreshDistStaging();
+    } catch (e) {
+        alert('Reclaim failed: ' + e.message);
     }
 }
 
