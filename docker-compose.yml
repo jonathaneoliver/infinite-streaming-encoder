@@ -66,6 +66,13 @@ services:
       POSTGRES_USER: temporal
       POSTGRES_PWD: temporal
       POSTGRES_SEEDS: postgresql
+      # Single-partition the "encode" task queue so the workflow's highest-cost-
+      # first (LPT) chunk dispatch is actually honored as a global FIFO — the
+      # default 4 partitions only preserve order within a partition, letting
+      # cheap chunks leak ahead of the slow 4K/HEVC work. See the mounted file.
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/encode.yaml
+    volumes:
+      - ./infra/local-cluster/dynamicconfig/encode.yaml:/etc/temporal/config/dynamicconfig/encode.yaml:ro
     ports:
       # Host port parameterized so an isolated stack (make oobe) can run a second
       # cluster alongside the real one. Container port stays 7233.
