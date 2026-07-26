@@ -433,6 +433,13 @@ async def main() -> None:
             activities=[encode_phase],
             workflows=[TestChunkWorkflow, EncodeWorkflow],
             activity_executor=pool, max_concurrent_activities=slots,
+            # encode_phase heartbeats every output line (its live % rides the
+            # heartbeat), but the SDK throttles the actual heartbeat RPC — default
+            # ~30s, max ~60s — so a slow 2160p chunk's progress bar only nudged
+            # once a minute. A handful of chunks heartbeating a tiny payload every
+            # couple seconds is negligible load; make the UI feel live.
+            default_heartbeat_throttle_interval=timedelta(seconds=2),
+            max_heartbeat_throttle_interval=timedelta(seconds=3),
         )
         await worker.run()
 
