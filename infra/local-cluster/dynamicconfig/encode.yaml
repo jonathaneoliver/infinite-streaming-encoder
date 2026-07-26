@@ -1,0 +1,26 @@
+# Temporal dynamic config for the local encode cluster.
+#
+# Why this exists: the per-file encode fans every chunk out as an activity on the
+# "encode" task queue, dispatched HIGHEST-COST-FIRST (LPT) by the workflow so the
+# slow 4K/HEVC-2pass chunks lead and the cheap 360p chunks trail (see
+# scripts/infinite_streaming_encoder/temporal_worker.py). That ordering is only a
+# hint unless the queue is a single global FIFO.
+#
+# By default a Temporal task queue is split into 4 read/write PARTITIONS for
+# throughput, and FIFO is preserved only WITHIN a partition — so the cost-sorted
+# order gets shuffled across partitions and cheap chunks leak to the front. Our
+# fleet is ~12 slots / a few hundred tasks per job: nowhere near needing 4-way
+# sharding. Collapsing the "encode" queue to a single partition restores the
+# global FIFO the LPT sort assumes, so heavy chunks actually lead.
+#
+# Scoped to taskQueueName: encode only — every other queue keeps the 4-partition
+# default. See issue tracking this + the worker slot-count imbalance.
+
+matching.numTaskqueueReadPartitions:
+  - value: 1
+    constraints:
+      taskQueueName: encode
+matching.numTaskqueueWritePartitions:
+  - value: 1
+    constraints:
+      taskQueueName: encode
