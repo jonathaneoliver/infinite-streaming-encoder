@@ -256,11 +256,21 @@ class EncodeWorkflow:
         # /tmp/mezz-cache, keyed off this URI, skips the MinIO fetch too).
         mezz = plan.get("mezz_prefix") or s3_work
 
+        # Cross-job priority spans the WHOLE job lifecycle, not just chunks. Every
+        # non-chunk phase (mezzanine, audio, package, fragments, hls) rides the TOP
+        # band of this job's range (job_rank*BANDS + 1) so that an older job's
+        # setup AND finalization outrank a younger job's encoding — otherwise the
+        # default band (~PRIORITY_LEVELS/2) would let a newer job's chunks preempt
+        # this job's mezzanine (delaying its start) or its packaging (delaying its
+        # finish). Chunks get the finer composite key below.
+        job_rank = int(plan.get("job_rank", 0))
+        job_top = min(PRIORITY_LEVELS, job_rank * PRIORITY_BANDS + 1)
+
         await self._phase(["mezzanine", "--s3-in", f"s3://{b}/{plan['src_key']}",
-                           "--s3-out", mezz], {}, "mezzanine")
+                           "--s3-out", mezz], {}, "mezzanine", priority_key=job_top)
         if plan.get("has_audio"):
             await self._phase(["audio", "--s3-mezz", mezz, "--s3-out", s3_work],
-                              {}, "audio")
+                              {}, "audio", priority_key=job_top)
 
         cd = plan["chunk_duration_s"]
         n = plan["n_chunks"]
@@ -290,7 +300,6 @@ class EncodeWorkflow:
         # so an older job's whole ladder outranks a younger job's; cost_band orders
         # tiers within a job. Deterministic (pure plan math over the sorted distinct
         # weights) → Temporal-replay-safe.
-        job_rank = int(plan.get("job_rank", 0))
         distinct_w = sorted({s[0] for s in specs}, reverse=True)
         _wband = {
             wv: min(PRIORITY_BANDS, 1 + (idx * PRIORITY_BANDS) // max(1, len(distinct_w)))
@@ -319,13 +328,17 @@ class EncodeWorkflow:
                 args, env, f"enc-{codec}-{r['label']}-c{i}", priority_key=key))
         await asyncio.gather(*chunk_acts)
 
+        # Finalization (DASH packaging, fragment byteranges, HLS) — one set per
+        # codec. All ride job_top too, so an older job's packaging/manifests
+        # outrank a younger job's chunk encoding and its outputs land first.
         for codec in plan["codecs"]:
             await self._phase(["package-all", "--codec", codec, "--s3-variants",
                               s3_work, "--s3-audio", s3_work, "--s3-out", s3_out],
-                              {}, f"pkg-{codec}")
+                              {}, f"pkg-{codec}", priority_key=job_top)
             for ph in ("byteranges", "hls"):
                 await self._phase([ph, "--codec", codec, "--s3-package", s3_out,
-                                  "--s3-out", s3_out], {}, f"{ph}-{codec}")
+                                  "--s3-out", s3_out], {}, f"{ph}-{codec}",
+                                  priority_key=job_top)
         return "done"
 
     async def _phase(self, args, env, act_id, priority_key: int | None = None):
