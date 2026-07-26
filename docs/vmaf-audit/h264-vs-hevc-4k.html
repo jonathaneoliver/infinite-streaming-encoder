@@ -1,0 +1,213 @@
+<title>H.264 vs HEVC — 4K reference</title>
+<style>
+  :root{
+    --bg:#eef1f5; --surface:#fbfcfe; --panel:#ffffff;
+    --ink:#141a21; --muted:#5b6672; --faint:#8a94a0;
+    --line:#e2e7ee; --grid:#eaeef3;
+    --h264:#0d7f9c; --h264-soft:#0d7f9c1f; --hevc:#b3541e; --hevc-soft:#b3541e1a;
+    --good:#1a8f57; --warn:#b5791a; --crit:#cf4550;
+    --good-bg:#1a8f5714; --warn-bg:#b5791a16; --crit-bg:#cf455014;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){:root{
+    --bg:#0b0f14; --surface:#0f151c; --panel:#141b23; --ink:#e7edf3; --muted:#94a1af; --faint:#66727f;
+    --line:#212a34; --grid:#1a222c; --h264:#38bdd8; --h264-soft:#38bdd820; --hevc:#f0894a; --hevc-soft:#f0894a1c;
+    --good:#3ddc8a; --warn:#e2ad4d; --crit:#ec6b74; --good-bg:#3ddc8a14; --warn-bg:#e2ad4d16; --crit-bg:#ec6b7414; }}
+  :root[data-theme="light"]{
+    --bg:#eef1f5; --surface:#fbfcfe; --panel:#ffffff; --ink:#141a21; --muted:#5b6672; --faint:#8a94a0;
+    --line:#e2e7ee; --grid:#eaeef3; --h264:#0d7f9c; --h264-soft:#0d7f9c1f; --hevc:#b3541e; --hevc-soft:#b3541e1a;
+    --good:#1a8f57; --warn:#b5791a; --crit:#cf4550; --good-bg:#1a8f5714; --warn-bg:#b5791a16; --crit-bg:#cf455014; }
+  :root[data-theme="dark"]{
+    --bg:#0b0f14; --surface:#0f151c; --panel:#141b23; --ink:#e7edf3; --muted:#94a1af; --faint:#66727f;
+    --line:#212a34; --grid:#1a222c; --h264:#38bdd8; --h264-soft:#38bdd820; --hevc:#f0894a; --hevc-soft:#f0894a1c;
+    --good:#3ddc8a; --warn:#e2ad4d; --crit:#ec6b74; --good-bg:#3ddc8a14; --warn-bg:#e2ad4d16; --crit-bg:#ec6b7414; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6;-webkit-font-smoothing:antialiased;font-size:15px}
+  .wrap{max-width:940px;margin:0 auto;padding:48px 24px 96px}
+  .eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--hevc);font-weight:600;margin:0 0 14px}
+  h1{font-size:30px;line-height:1.15;margin:0 0 10px;font-weight:680;letter-spacing:-.01em;text-wrap:balance}
+  h2{font-size:19px;margin:56px 0 4px;font-weight:660;letter-spacing:-.005em}
+  h2 + .sub{margin-top:2px}
+  .sub{color:var(--muted);font-size:14px;margin:0 0 18px}
+  .lead{color:var(--muted);font-size:15.5px;max-width:64ch}
+  a{color:var(--h264)}
+  code{font-family:var(--mono);font-size:.88em;background:var(--h264-soft);padding:1px 5px;border-radius:4px;color:var(--ink)}
+  .note{display:flex;gap:12px;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--hevc);border-radius:9px;padding:14px 16px;margin:22px 0 0;font-size:14px}
+  .note .k{font-family:var(--mono);color:var(--hevc);font-weight:600;flex:none}
+  .note p{margin:0;color:var(--muted)} .note b{color:var(--ink);font-weight:600}
+  .hero{display:flex;align-items:baseline;gap:16px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px 24px;margin:26px 0 0;flex-wrap:wrap}
+  .hero .big{font-family:var(--mono);font-size:44px;font-weight:680;letter-spacing:-.02em;color:var(--hevc);line-height:1}
+  .hero .cap{font-size:14px;color:var(--muted);max-width:46ch}
+  .hero .cap b{color:var(--ink)}
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:11px;overflow:hidden;margin:18px 0 0}
+  .stat{background:var(--panel);padding:15px 16px 14px}
+  .stat .n{font-family:var(--mono);font-size:20px;font-weight:600;font-variant-numeric:tabular-nums}
+  .stat .l{font-size:11.5px;color:var(--muted);margin-top:3px}
+  @media(max-width:720px){.stats{grid-template-columns:repeat(2,1fr)}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px 18px 14px;margin-top:18px}
+  .chart-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:6px;flex-wrap:wrap}
+  .chart-head .t{font-weight:620;font-size:15px}
+  .chart-head .lg{font-family:var(--mono);font-size:11.5px;color:var(--muted);display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+  .chart-head .lg span{display:inline-flex;align-items:center;gap:6px}
+  .swatch{width:11px;height:11px;border-radius:3px;display:inline-block}
+  .chart-scroll{overflow-x:auto}
+  svg{display:block;max-width:100%;height:auto}
+  .axtxt{font-family:var(--mono);font-size:10.5px;fill:var(--faint)} .axlab{font-family:var(--mono);font-size:11px;fill:var(--muted)}
+  .tip{position:fixed;pointer-events:none;z-index:50;background:var(--ink);color:var(--bg);font-family:var(--mono);font-size:11.5px;line-height:1.5;padding:8px 10px;border-radius:7px;opacity:0;transition:opacity .08s;white-space:nowrap;box-shadow:0 6px 20px #0006}
+  .issues{display:flex;flex-direction:column;gap:10px;margin-top:6px}
+  .issue{display:grid;grid-template-columns:auto 1fr;gap:14px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:15px 17px}
+  .issue .sev{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;font-weight:700;padding:4px 8px;border-radius:5px;height:fit-content;white-space:nowrap}
+  .sev.good{color:var(--good);background:var(--good-bg)} .sev.warn{color:var(--warn);background:var(--warn-bg)} .sev.info{color:var(--muted);background:var(--line)} .sev.crit{color:var(--crit);background:var(--crit-bg)}
+  .issue h3{margin:0 0 3px;font-size:14.5px;font-weight:640} .issue p{margin:0;color:var(--muted);font-size:13.5px} .issue .fig{font-family:var(--mono);color:var(--ink);font-weight:600}
+  .twrap{overflow-x:auto;border:1px solid var(--line);border-radius:11px;margin-top:8px}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th,td{padding:9px 12px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--line)}
+  th{font-family:var(--mono);font-size:10.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);font-weight:600;background:var(--surface);position:sticky;top:0}
+  th:first-child,td:first-child{text-align:left}
+  td{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  tr:last-child td{border-bottom:0} tbody tr:hover{background:var(--h264-soft)}
+  .rung{color:var(--ink);font-weight:600} .dim{color:var(--faint)} .save{color:var(--good);font-weight:600}
+  .prose{max-width:66ch} .prose p{margin:14px 0;color:var(--muted)} .prose b{color:var(--ink);font-weight:600}
+  .prose h3{font-size:14px;font-family:var(--mono);letter-spacing:.02em;color:var(--ink);margin:26px 0 2px;font-weight:600}
+  .foot{margin-top:64px;padding-top:20px;border-top:1px solid var(--line);color:var(--faint);font-family:var(--mono);font-size:11.5px;line-height:1.7}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Encoder · Codec Comparison</p>
+  <h1>H.264 vs HEVC — 4K reference</h1>
+  <p class="lead"><code>insane_fpv_shots_hydrofoil_windsurfing</code> · ladder <code>apple-uniq-live-full</code> · H.264 (1-pass) vs <b style="color:var(--ink)">HEVC (2-pass)</b>, graded against the 4K master at the source 4K resolution.</p>
+
+  <div class="hero">
+    <span class="big" id="bd"></span>
+    <span class="cap"><b>less bitrate at equal quality</b> — HEVC's Bjøntegaard-delta rate vs H.264 over the overlapping VMAF range (<span id="range"></span>). Same picture, fewer bits.</span>
+  </div>
+  <div class="stats" id="stats"></div>
+
+  <h2>Rate–quality curves — both codecs</h2>
+  <p class="sub">HEVC's curve sits left of H.264's: it reaches the same VMAF at a lower bitrate. The horizontal gap at any quality level is the saving.</p>
+  <div class="card">
+    <div class="chart-head"><span class="t">Mean VMAF vs delivered bitrate (log)</span>
+      <span class="lg"><span><i class="swatch" style="background:var(--h264)"></i>H.264</span><span><i class="swatch" style="background:var(--hevc)"></i>HEVC</span></span></div>
+    <div class="chart-scroll"><svg id="rq" viewBox="0 0 880 430" role="img" aria-label="rate-quality curves"></svg></div>
+  </div>
+
+  <h2>Bitrate to hit a quality target</h2>
+  <p class="sub">What each codec needs to reach a given VMAF (interpolated on the curves), and HEVC's saving.</p>
+  <div class="twrap"><table id="anchors"><thead><tr><th>Target VMAF</th><th>H.264 needs</th><th>HEVC needs</th><th>HEVC saving</th></tr></thead><tbody></tbody></table></div>
+
+  <h2>HEVC ladder health</h2>
+  <p class="sub">Does the HEVC ladder have the same fill-in problems as H.264?</p>
+  <div class="issues" id="issues"></div>
+
+  <h2>HEVC per-rung detail</h2>
+  <p class="sub"><b style="color:var(--ink)">harm</b> = harmonic (worst-moments) · <b style="color:var(--ink)">hull</b> = convex-hull margin (negative = dominated) · spark = per-30s timeline.</p>
+  <div class="twrap"><table id="tbl"><thead><tr>
+    <th>Rung</th><th>Resolution</th><th>kbps</th><th>mean</th><th>harm</th><th>min</th><th>hull</th><th>timeline</th>
+  </tr></thead><tbody></tbody></table></div>
+
+  <h2>Reading it</h2>
+  <div class="prose">
+    <h3>what BD-rate means</h3>
+    <p>Bjøntegaard-delta rate is the standard codec-comparison number: average % bitrate difference at <b>equal quality</b>, integrated across the overlapping VMAF range (on a log-bitrate axis). <span id="bdprose"></span> It's a fairer summary than any single rung, because it accounts for the whole curve.</p>
+    <h3>why HEVC wins here</h3>
+    <p>HEVC's larger coding units, better intra prediction, and — critically on this run — <b>two-pass rate control</b> let it place bits where the content needs them. On brutal high-motion FPV footage under a tight live VBV, that's worth roughly a fifth to a quarter of the bitrate. The gap <b>widens with resolution</b>: at 2160p HEVC needs 16.4 Mbps for VMAF 96.2 where H.264 spends 26.2 Mbps for 96.5 — ~37% off the top rung.</p>
+    <h3>the ladder is cleaner too</h3>
+    <p id="ladderprose"></p>
+    <p>Note: this is one clip. BD-rate is content-dependent — validate across a corpus before locking ladder decisions (see the generic-vs-per-title discussion).</p>
+  </div>
+
+  <div class="foot" id="foot"></div>
+</div>
+<div class="tip" id="tip"></div>
+
+<script>
+const D = {"hevc": [{"rung": "360p", "w": 640, "h": 360, "kbps": 151, "mean": 32.34, "harmonic": 29.41, "min": 7.67, "max": 100.0, "frames": 2005, "pct_lt10": 0.15, "pct_lt50": 94.81, "timeline": [30.6, 35.2, 27.8, 30.8, 30.1, 35.6, 31.6, 28.2, 28.2, 41.6, 31.8, 62.6], "rc": 0, "dVmaf": null, "eff": null, "hull_delta": null}, {"rung": "432p", "w": 768, "h": 432, "kbps": 301, "mean": 42.28, "harmonic": 39.06, "min": 10.92, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 74.96, "timeline": [42.2, 51.4, 34.1, 40.8, 38.8, 45.4, 41.2, 35.5, 34.6, 51.1, 45.7, 74.2], "rc": 0, "dVmaf": 9.9, "eff": 66.267, "hull_delta": 3.53}, {"rung": "468p", "w": 832, "h": 468, "kbps": 593, "mean": 51.23, "harmonic": 47.76, "min": 17.31, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 50.52, "timeline": [51.5, 63.1, 42.2, 52.1, 48.2, 55.6, 50.2, 42.0, 41.0, 59.4, 54.2, 80.8], "rc": 0, "dVmaf": 8.9, "eff": 30.651, "hull_delta": 1.45}, {"rung": "504p", "w": 896, "h": 504, "kbps": 886, "mean": 57.31, "harmonic": 53.87, "min": 17.98, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 33.87, "timeline": [57.6, 69.7, 48.8, 59.4, 55.0, 63.1, 56.8, 47.6, 45.9, 64.4, 58.7, 83.1], "rc": 0, "dVmaf": 6.1, "eff": 20.751, "hull_delta": 1.91}, {"rung": "540p", "w": 960, "h": 540, "kbps": 1566, "mean": 65.09, "harmonic": 61.86, "min": 18.83, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 13.97, "timeline": [64.7, 76.4, 58.7, 69.9, 64.6, 72.0, 65.1, 54.8, 53.2, 70.9, 62.7, 86.4], "rc": 0, "dVmaf": 7.8, "eff": 11.441, "hull_delta": 0.37}, {"rung": "684p", "w": 1216, "h": 684, "kbps": 2345, "mean": 73.21, "harmonic": 70.25, "min": 19.02, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 3.89, "timeline": [72.5, 84.0, 67.6, 78.1, 73.0, 79.7, 74.0, 65.1, 62.1, 78.4, 68.4, 91.2], "rc": 0, "dVmaf": 8.1, "eff": 10.424, "hull_delta": 2.43}, {"rung": "720p", "w": 1280, "h": 720, "kbps": 3330, "mean": 77.97, "harmonic": 75.14, "min": 18.89, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 2.84, "timeline": [76.8, 87.0, 74.1, 83.6, 78.8, 84.7, 79.2, 71.1, 67.6, 82.4, 70.3, 92.5], "rc": 0, "dVmaf": 4.8, "eff": 4.832, "hull_delta": -0.28}, {"rung": "1044p", "w": 1856, "h": 1044, "kbps": 4399, "mean": 83.72, "harmonic": 80.98, "min": 19.94, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 2.54, "timeline": [83.2, 92.3, 79.9, 88.4, 84.2, 89.1, 85.3, 79.2, 75.3, 87.8, 74.4, 96.1], "rc": 0, "dVmaf": 5.8, "eff": 5.379, "hull_delta": 1.76}, {"rung": "1080p", "w": 1920, "h": 1080, "kbps": 5670, "mean": 86.7, "harmonic": 84.02, "min": 20.24, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 2.49, "timeline": [85.9, 93.8, 84.1, 91.3, 87.9, 91.9, 88.3, 83.6, 79.5, 90.6, 75.4, 96.9], "rc": 0, "dVmaf": 3.0, "eff": 2.345, "hull_delta": 0.47}, {"rung": "1440p", "w": 2560, "h": 1440, "kbps": 7922, "mean": 90.69, "harmonic": 88.02, "min": 20.61, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 2.39, "timeline": [90.2, 96.5, 89.2, 94.9, 92.2, 94.8, 92.5, 90.1, 85.4, 93.7, 77.1, 98.4], "rc": 0, "dVmaf": 4.0, "eff": 1.772, "hull_delta": 1.28}, {"rung": "2124p", "w": 3776, "h": 2124, "kbps": 11352, "mean": 93.55, "harmonic": 90.82, "min": 20.04, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 2.39, "timeline": [93.4, 98.2, 93.3, 97.1, 95.4, 96.9, 95.4, 94.2, 90.1, 96.1, 78.1, 99.4], "rc": 0, "dVmaf": 2.9, "eff": 0.834, "hull_delta": 0.63}, {"rung": "2160p", "w": 3840, "h": 2160, "kbps": 16442, "mean": 96.23, "harmonic": 93.44, "min": 20.87, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 2.39, "timeline": [96.7, 99.5, 97.3, 99.4, 98.8, 99.1, 97.9, 97.5, 94.8, 98.4, 78.7, 99.9], "rc": 0, "dVmaf": 2.7, "eff": 0.527, "hull_delta": null}], "h264": [{"kbps": 138, "mean": 24.74, "rung": "234p"}, {"kbps": 339, "mean": 38.26, "rung": "360p"}, {"kbps": 673, "mean": 47.87, "rung": "396p"}, {"kbps": 1013, "mean": 54.41, "rung": "432p"}, {"kbps": 1856, "mean": 64.93, "rung": "540p"}, {"kbps": 2798, "mean": 72.68, "rung": "684p"}, {"kbps": 4220, "mean": 78.49, "rung": "720p"}, {"kbps": 5669, "mean": 83.12, "rung": "1044p"}, {"kbps": 7423, "mean": 86.6, "rung": "1080p"}, {"kbps": 12975, "mean": 92.12, "rung": "1440p"}, {"kbps": 18376, "mean": 93.67, "rung": "2124p"}, {"kbps": 26190, "mean": 96.51, "rung": "2160p"}], "bdrate": -26.5, "range": [32.3, 96.2]};
+const MODE = "4K";
+const $ = s => document.querySelector(s);
+const tip = $('#tip');
+const fmt = k => k>=1000 ? (k/1000).toFixed(k<10000?1:0)+' Mbps' : Math.round(k)+' kbps';
+const HEVC=D.hevc, H264=D.h264, BD=D.bdrate;
+
+/* hero + stats */
+$('#bd').textContent = Math.abs(BD).toFixed(0)+'%';
+$('#range').textContent = 'VMAF '+D.range[0]+'–'+D.range[1];
+const domH = HEVC.filter(r=>r.hull_delta!=null && r.hull_delta<0);
+$('#stats').innerHTML=[
+  [Math.abs(BD).toFixed(0)+'%','HEVC bitrate saving'],
+  ['2-pass','HEVC rate control'],
+  [HEVC.length+' / '+H264.length,'HEVC / H.264 rungs'],
+  [domH.length,'HEVC dominated rungs'],
+].map(([n,l])=>`<div class="stat"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('');
+
+/* rate-quality overlay */
+const W=880,H=430,m={l:52,r:20,t:16,b:48},iw=W-m.l-m.r,ih=H-m.t-m.b;
+const allk=[...HEVC,...H264].map(r=>r.kbps), kmin=Math.min(...allk), kmax=Math.max(...allk);
+const lx=k=>m.l+(Math.log10(k)-Math.log10(kmin))/(Math.log10(kmax)-Math.log10(kmin))*iw;
+const ly=v=>m.t+(1-(v-Math.min(20,D.range[0]))/(100-Math.min(20,D.range[0])))*ih;
+(function(){
+  let s='';
+  const y0=Math.min(20,D.range[0]);
+  for(let v=Math.ceil(y0/10)*10;v<=100;v+=10){const y=ly(v);s+=`<line x1="${m.l}" y1="${y}" x2="${W-m.r}" y2="${y}" stroke="var(--grid)"/><text x="${m.l-9}" y="${y+3.5}" text-anchor="end" class="axtxt">${v}</text>`;}
+  [100,300,1000,3000,10000,30000].filter(k=>k>=kmin*0.8&&k<=kmax*1.3).forEach(k=>{const x=lx(k);s+=`<line x1="${x}" y1="${m.t}" x2="${x}" y2="${H-m.b}" stroke="var(--grid)"/><text x="${x}" y="${H-m.b+16}" text-anchor="middle" class="axtxt">${k>=1000?k/1000+'M':k+'k'}</text>`;});
+  s+=`<text x="${m.l+iw/2}" y="${H-6}" text-anchor="middle" class="axlab">delivered bitrate (log)</text>`;
+  s+=`<text transform="translate(14 ${m.t+ih/2}) rotate(-90)" text-anchor="middle" class="axlab">mean VMAF</text>`;
+  const line=(rows,col)=>`<path d="${rows.map((d,i)=>(i?'L':'M')+lx(d.kbps).toFixed(1)+' '+ly(d.mean).toFixed(1)).join(' ')}" fill="none" stroke="${col}" stroke-width="2.2" stroke-linejoin="round"/>`;
+  s+=line(H264,'var(--h264)'); s+=line(HEVC,'var(--hevc)');
+  const dots=(rows,col,cls)=>rows.forEach(d=>{s+=`<circle cx="${lx(d.kbps).toFixed(1)}" cy="${ly(d.mean).toFixed(1)}" r="4" fill="${col}" stroke="var(--panel)" stroke-width="1.5" class="${cls}" data-r="${d.rung}" data-k="${d.kbps}" data-m="${d.mean}" style="cursor:pointer"/>`;});
+  dots(H264,'var(--h264)','ptA'); dots(HEVC,'var(--hevc)','ptB');
+  // labels at the top rung of each
+  const tA=H264[H264.length-1], tB=HEVC[HEVC.length-1];
+  s+=`<text x="${lx(tA.kbps)+8}" y="${ly(tA.mean)+4}" font-family="var(--mono)" font-size="11" font-weight="600" fill="var(--h264)">H.264</text>`;
+  s+=`<text x="${lx(tB.kbps)-8}" y="${ly(tB.mean)-8}" text-anchor="end" font-family="var(--mono)" font-size="11" font-weight="600" fill="var(--hevc)">HEVC</text>`;
+  $('#rq').innerHTML=s;
+  $('#rq').querySelectorAll('circle').forEach(c=>{
+    const codec=c.classList.contains('ptB')?'HEVC':'H.264';
+    c.addEventListener('mousemove',e=>{tip.innerHTML=`<b>${codec} ${c.dataset.r}</b><br>${fmt(+c.dataset.k)} · VMAF ${(+c.dataset.m).toFixed(1)}`;tip.style.opacity=1;tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-10)+'px';});
+    c.addEventListener('mouseleave',()=>tip.style.opacity=0);
+  });
+})();
+
+/* anchor table: bitrate to hit VMAF target */
+function bitrateAt(rows,v){
+  const P=rows.map(r=>[r.mean,r.kbps]).sort((a,b)=>a[0]-b[0]);
+  if(v<=P[0][0]||v>=P[P.length-1][0])return null;
+  for(let i=1;i<P.length;i++) if(P[i][0]>=v){const[v0,k0]=P[i-1],[v1,k1]=P[i]; return Math.exp(Math.log(k0)+(Math.log(k1)-Math.log(k0))*(v-v0)/(v1-v0));}
+}
+const anchors=[70,80,85,90,95].filter(v=>v>=D.range[0]&&v<=D.range[1]);
+$('#anchors tbody').innerHTML=anchors.map(v=>{
+  const a=bitrateAt(H264,v),b=bitrateAt(HEVC,v);
+  if(!a||!b)return '';
+  const sv=(1-b/a)*100;
+  return `<tr><td class="rung">VMAF ${v}</td><td>${fmt(a)}</td><td>${fmt(b)}</td><td class="save">−${sv.toFixed(0)}%</td></tr>`;
+}).join('');
+
+/* issues */
+$('#bdprose').textContent = `Here HEVC lands ${Math.abs(BD).toFixed(0)}% below H.264 across VMAF ${D.range[0]}–${D.range[1]}.`;
+const ladderClean = domH.length===0;
+$('#ladderprose').innerHTML = ladderClean
+  ? `Unlike H.264 — where 2124p was dominated and 1044p borderline — <b>no HEVC rung is off the convex hull</b> in this view. HEVC's native bitrate assignments space the fill-in rungs (1044p, 2124p) well enough that they each earn their slot, so the re-sizing in #91 is less urgent for HEVC than for the H.264 full-ladder extension.`
+  : `HEVC has ${domH.length} dominated rung(s): ${domH.map(r=>r.rung).join(', ')} — the same fill-in spacing issue flagged for H.264 in #91.`;
+const ISSUES = ladderClean ? [
+  ['good','HEVC saves ~'+Math.abs(BD).toFixed(0)+'% bitrate at equal quality',
+   `Across VMAF <span class="fig">${D.range[0]}–${D.range[1]}</span>, HEVC's curve sits a clean <span class="fig">${Math.abs(BD).toFixed(0)}%</span> left of H.264's — and the gap <b>widens with resolution</b> (≈37% at 2160p).`],
+  ['good','No dominated HEVC rungs',
+   `Every HEVC rung is on the convex hull in this view. The fill-in rungs (1044p, 2124p) that dominate the H.264 full ladder sit fine here — HEVC's bitrate spacing carries them.`],
+  ['info','Still validate across content',
+   `This is one high-motion clip. BD-rate swings with content type — confirm on a corpus before committing to an HEVC-first ladder or dropping H.264 rungs.`],
+] : [
+  ['good','HEVC saves ~'+Math.abs(BD).toFixed(0)+'% bitrate at equal quality',`HEVC's curve sits ${Math.abs(BD).toFixed(0)}% left of H.264's over VMAF ${D.range[0]}–${D.range[1]}.`],
+  ['warn','HEVC has dominated rungs too',`${domH.map(r=>r.rung).join(', ')} — the fill-in spacing issue from #91 applies to HEVC as well.`],
+];
+$('#issues').innerHTML=ISSUES.map(([s,h,p])=>`<div class="issue"><span class="sev ${s}">${s=='good'?'win':s}</span><div><h3>${h}</h3><p>${p}</p></div></div>`).join('');
+
+/* per-rung table */
+function spark(tl){const w=100,h=22,n=tl.length,sx=w/(n-1),sy=v=>h-2-(v/100)*(h-4);
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><polyline points="${tl.map((v,i)=>`${(i*sx).toFixed(1)},${sy(v).toFixed(1)}`).join(' ')}" fill="none" stroke="var(--hevc)" stroke-width="1.5" opacity=".9"/></svg>`;}
+$('#tbl tbody').innerHTML=HEVC.map(d=>{const bad=d.hull_delta!=null&&d.hull_delta<0;
+  return `<tr><td class="rung">${d.rung}</td><td class="dim">${d.w}×${d.h}</td><td>${d.kbps.toLocaleString()}</td>
+   <td>${d.mean.toFixed(1)}</td><td>${d.harmonic.toFixed(1)}</td><td>${d.min.toFixed(1)}</td>
+   <td class="${bad?'':'dim'}" ${bad?'style="color:var(--crit)"':''}>${d.hull_delta==null?'—':(d.hull_delta>0?'+':'')+d.hull_delta.toFixed(1)}</td><td>${spark(d.timeline)}</td></tr>`;}).join('');
+
+$('#foot').innerHTML = `method: each rung reassembled from init.mp4 + fMP4 segments · HEVC 2-pass · H.264 1-pass · both graded at the source 4K resolution vs the native 4K master (model ${MODE==='4K'?'vmaf_4k_v0.6.1':'vmaf_v0.6.1'}) · n_subsample=5 · fps-paired 30000/1001 · native ffmpeg+libvmaf · BD-rate integrated on log-bitrate over the overlapping VMAF range.<br>source insane_fpv_shots_hydrofoil_windsurfing 334.4s @ 29.97fps · frame-exact chunked encode (#90).`;
+</script>

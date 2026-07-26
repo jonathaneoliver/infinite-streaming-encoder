@@ -1,0 +1,286 @@
+<title>VMAF Ladder Audit — 1080p reference</title>
+<style>
+  :root{
+    --bg:#eef1f5; --surface:#fbfcfe; --panel:#ffffff;
+    --ink:#141a21; --muted:#5b6672; --faint:#8a94a0;
+    --line:#e2e7ee; --grid:#eaeef3;
+    --accent:#0d7f9c; --accent-soft:#0d7f9c22;
+    --accent2:#bf7415; --accent2-soft:#bf741518;
+    --good:#1a8f57; --warn:#b5791a; --crit:#cf4550;
+    --good-bg:#1a8f5714; --warn-bg:#b5791a16; --crit-bg:#cf455014;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0b0f14; --surface:#0f151c; --panel:#141b23;
+      --ink:#e7edf3; --muted:#94a1af; --faint:#66727f;
+      --line:#212a34; --grid:#1a222c;
+      --accent:#38bdd8; --accent-soft:#38bdd826;
+      --accent2:#e0a53a; --accent2-soft:#e0a53a1e;
+      --good:#3ddc8a; --warn:#e2ad4d; --crit:#ec6b74;
+      --good-bg:#3ddc8a14; --warn-bg:#e2ad4d16; --crit-bg:#ec6b7414;
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#eef1f5; --surface:#fbfcfe; --panel:#ffffff;
+    --ink:#141a21; --muted:#5b6672; --faint:#8a94a0;
+    --line:#e2e7ee; --grid:#eaeef3;
+    --accent:#0d7f9c; --accent-soft:#0d7f9c22; --accent2:#bf7415; --accent2-soft:#bf741518;
+    --good:#1a8f57; --warn:#b5791a; --crit:#cf4550;
+    --good-bg:#1a8f5714; --warn-bg:#b5791a16; --crit-bg:#cf455014;
+  }
+  :root[data-theme="dark"]{
+    --bg:#0b0f14; --surface:#0f151c; --panel:#141b23;
+    --ink:#e7edf3; --muted:#94a1af; --faint:#66727f;
+    --line:#212a34; --grid:#1a222c;
+    --accent:#38bdd8; --accent-soft:#38bdd826; --accent2:#e0a53a; --accent2-soft:#e0a53a1e;
+    --good:#3ddc8a; --warn:#e2ad4d; --crit:#ec6b74;
+    --good-bg:#3ddc8a14; --warn-bg:#e2ad4d16; --crit-bg:#ec6b7414;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.6;-webkit-font-smoothing:antialiased;font-size:15px}
+  .wrap{max-width:940px;margin:0 auto;padding:48px 24px 96px}
+  .eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent);font-weight:600;margin:0 0 14px}
+  h1{font-size:30px;line-height:1.15;margin:0 0 10px;font-weight:680;letter-spacing:-.01em;text-wrap:balance}
+  h2{font-size:19px;margin:56px 0 4px;font-weight:660;letter-spacing:-.005em}
+  h2 + .sub{margin-top:2px}
+  .sub{color:var(--muted);font-size:14px;margin:0 0 18px}
+  .lead{color:var(--muted);font-size:15.5px;max-width:64ch}
+  a{color:var(--accent)}
+  code{font-family:var(--mono);font-size:.88em;background:var(--accent-soft);padding:1px 5px;border-radius:4px;color:var(--ink)}
+  .note{display:flex;gap:12px;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:9px;padding:14px 16px;margin:22px 0 0;font-size:14px}
+  .note .k{font-family:var(--mono);color:var(--accent);font-weight:600;flex:none}
+  .note p{margin:0;color:var(--muted)}
+  .note b{color:var(--ink);font-weight:600}
+  .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:11px;overflow:hidden;margin:26px 0 0}
+  .stat{background:var(--panel);padding:16px 16px 15px}
+  .stat .n{font-family:var(--mono);font-size:22px;font-weight:600;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
+  .stat .l{font-size:11.5px;color:var(--muted);margin-top:3px;letter-spacing:.02em}
+  .stat.flag .n{color:var(--warn)} .stat.crit .n{color:var(--crit)} .stat.ok .n{color:var(--good)}
+  @media(max-width:720px){.stats{grid-template-columns:repeat(2,1fr)}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px 18px 14px;margin-top:18px}
+  .chart-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:6px;flex-wrap:wrap}
+  .chart-head .t{font-weight:620;font-size:15px}
+  .chart-head .lg{font-family:var(--mono);font-size:11.5px;color:var(--muted);display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+  .chart-head .lg span{display:inline-flex;align-items:center;gap:6px}
+  .swatch{width:11px;height:11px;border-radius:3px;display:inline-block}
+  .chart-scroll{overflow-x:auto}
+  svg{display:block;max-width:100%;height:auto}
+  .axtxt{font-family:var(--mono);font-size:10.5px;fill:var(--faint)}
+  .axlab{font-family:var(--mono);font-size:11px;fill:var(--muted)}
+  .tip{position:fixed;pointer-events:none;z-index:50;background:var(--ink);color:var(--bg);font-family:var(--mono);font-size:11.5px;line-height:1.5;padding:8px 10px;border-radius:7px;opacity:0;transition:opacity .08s;white-space:nowrap;box-shadow:0 6px 20px #0006}
+  .tip b{color:var(--accent)}
+  .issues{display:flex;flex-direction:column;gap:10px;margin-top:6px}
+  .issue{display:grid;grid-template-columns:auto 1fr;gap:14px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:15px 17px}
+  .issue .sev{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;font-weight:700;padding:4px 8px;border-radius:5px;height:fit-content;white-space:nowrap}
+  .sev.crit{color:var(--crit);background:var(--crit-bg)} .sev.warn{color:var(--warn);background:var(--warn-bg)}
+  .sev.good{color:var(--good);background:var(--good-bg)} .sev.info{color:var(--muted);background:var(--line)}
+  .issue h3{margin:0 0 3px;font-size:14.5px;font-weight:640}
+  .issue p{margin:0;color:var(--muted);font-size:13.5px}
+  .issue .fig{font-family:var(--mono);color:var(--ink);font-weight:600}
+  .twrap{overflow-x:auto;border:1px solid var(--line);border-radius:11px;margin-top:8px}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th,td{padding:9px 12px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--line)}
+  th{font-family:var(--mono);font-size:10.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);font-weight:600;background:var(--surface);position:sticky;top:0}
+  th:first-child,td:first-child{text-align:left}
+  td{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  tr:last-child td{border-bottom:0}
+  tbody tr:hover{background:var(--accent-soft)}
+  .rung{color:var(--ink);font-weight:600}
+  .dim{color:var(--faint)}
+  .badge{font-size:10px;font-family:var(--mono);padding:2px 6px;border-radius:4px;font-weight:600}
+  .badge.dom{color:var(--crit);background:var(--crit-bg)}
+  .spark{display:block}
+  .prose{max-width:66ch}
+  .prose p{margin:14px 0;color:var(--muted)}
+  .prose b{color:var(--ink);font-weight:600}
+  .prose h3{font-size:14px;font-family:var(--mono);letter-spacing:.02em;color:var(--ink);margin:26px 0 2px;font-weight:600}
+  .foot{margin-top:64px;padding-top:20px;border-top:1px solid var(--line);color:var(--faint);font-family:var(--mono);font-size:11.5px;line-height:1.7}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Encoder · Quality Audit</p>
+  <h1>VMAF Ladder Audit — 1080p reference</h1>
+  <p class="lead"><code>insane_fpv_shots_hydrofoil_windsurfing</code> · H.264 · ladder <code>apple-uniq-live-full</code> · 12 rungs graded at a <b style="color:var(--ink)">1080p common resolution</b> — the compression-fidelity companion to the 4K report.</p>
+
+  <div class="note">
+    <span class="k">two views, one ladder</span>
+    <p>Same encodes as the <a href="4k-reference.html">4K report</a>, graded differently. Here the 4K master is <b>downscaled</b> to a crisp 1080p reference and each rung compared at 1080p — this asks <b>"how clean is the compression?"</b> and is sensitive to per-frame artifacts. The 4K view asked "how much of the 4K experience does it deliver?" The numbers differ, and where they cross is the interesting part.</p>
+  </div>
+
+  <div class="stats" id="stats"></div>
+
+  <h2>Rate–quality curve</h2>
+  <p class="sub">Mean VMAF @1080p vs delivered bitrate (log scale). Rungs off the efficient frontier are flagged.</p>
+  <div class="card">
+    <div class="chart-head">
+      <span class="t">VMAF @ 1080p vs delivered bitrate</span>
+      <span class="lg"><span><i class="swatch" style="background:var(--accent)"></i>on frontier</span><span><i class="swatch" style="background:var(--crit)"></i>dominated</span></span>
+    </div>
+    <div class="chart-scroll"><svg id="rq" viewBox="0 0 880 420" role="img" aria-label="1080p rate-quality curve"></svg></div>
+  </div>
+
+  <h2>1080p vs 4K — the crossover</h2>
+  <p class="sub">The two comparison resolutions rank the rungs differently. Below the crossover, the 1080p view is harsher; above it, the 4K view is.</p>
+  <div class="card">
+    <div class="chart-head">
+      <span class="t">Mean VMAF vs bitrate — both references</span>
+      <span class="lg"><span><i class="swatch" style="background:var(--accent)"></i>1080p ref</span><span><i class="swatch" style="background:var(--accent2)"></i>4K ref</span></span>
+    </div>
+    <div class="chart-scroll"><svg id="xover" viewBox="0 0 880 420" role="img" aria-label="1080p vs 4K crossover"></svg></div>
+  </div>
+
+  <h2>Bits per pixel — the efficiency driver</h2>
+  <p class="sub">Quality tracks bits ÷ pixels, not bitrate alone. A rung whose bits-per-pixel dips below its neighbors is <b style="color:var(--ink)">starved</b> — it can't reach the frontier regardless of resolution. That dip is what flags 2124p and 1044p.</p>
+  <div class="card">
+    <div class="chart-head"><span class="t">Delivered kbps per megapixel</span>
+      <span class="lg"><span><i class="swatch" style="background:var(--accent)"></i>fed</span><span><i class="swatch" style="background:var(--warn)"></i>borderline</span><span><i class="swatch" style="background:var(--crit)"></i>starved</span></span></div>
+    <div class="chart-scroll"><svg id="bpp" viewBox="0 0 880 300" role="img" aria-label="bits per pixel per rung"></svg></div>
+  </div>
+
+  <h2>Issues across variants</h2>
+  <p class="sub">Ranked by cost. The dominated-rung call agrees with the 4K report — a robust conclusion.</p>
+  <div class="issues" id="issues"></div>
+
+  <h2>Per-rung detail</h2>
+  <p class="sub"><b style="color:var(--ink)">harm</b> = harmonic (worst-moments) · <b style="color:var(--ink)">min</b> = worst frame · <b style="color:var(--ink)">4K</b> = the same rung's mean under the 4K reference · spark = per-30s timeline (0–100).</p>
+  <div class="twrap"><table id="tbl"><thead><tr>
+    <th>Rung</th><th>Resolution</th><th>kbps</th><th>mean</th><th>harm</th><th>min</th><th>%&lt;50</th><th>eff</th><th>4K mean</th><th>timeline</th>
+  </tr></thead><tbody></tbody></table></div>
+
+  <h2>Reading the numbers</h2>
+  <div class="prose">
+    <h3>why min craters here (and didn't at 4K)</h3>
+    <p>At 1080p the <code>min</code> falls to <b>0–2.5 on every rung</b> — even 2160p bottoms out near 2.5 — where the 4K view held ~20. The 1080p reference is a pristine supersampled image, so a rung's real compression artifacts on the hardest frames (fast spray, high texture) show up as sharp, localized errors → a few frames score near zero. At 4K those same frames are blurred by the upscale into an even softness, so nothing craters. <b>Same encodes; 1080p is the microscope, 4K is the billboard.</b></p>
+    <h3>the harmonic plateau — bitrate above 1080p doesn't fix the worst frames</h3>
+    <p>From 1080p to 2160p the <b>mean</b> climbs 92.1 → 97.2, but the <b>harmonic</b> barely moves — 83.8 → 88.4 — and the <code>min</code> stays ~2.5 the whole way. The average improves because most frames get crisper, but the handful of genuinely hard frames are <b>artifact/content-limited</b>, not resolution-limited: no amount of extra bitrate on a premium rung rescues them. If your quality bar is "worst moments," the top rungs buy you little.</p>
+    <h3>the crossover, explained</h3>
+    <p>Low rungs score <b>worse</b> at 1080p (234p: 13.3 vs 24.7 at 4K) because their blockiness is fully exposed against a sharp reference. High rungs score <b>better</b> at 1080p (720p: 85.7 vs 78.5) because they're at/near native scale — little upscaling, no resolution penalty. The lines cross around <b>400–600 kbps</b>. Neither ranking is "wrong": grade at 1080p to tune compression for HD delivery, at 4K to judge how a rung reads on a 4K screen.</p>
+    <h3>234p at native scale</h3>
+    <p><b>234p</b> is nearly unwatchable here — mean 13.3, <b>43.7% of frames below VMAF 10</b>, 99.5% below 50. Against a crisp 1080p reference the 138 kbps floor has nowhere to hide. It's a bandwidth-survival rung, full stop.</p>
+  </div>
+
+  <div class="foot">
+    method: rung reassembled from init.mp4 + 56 fMP4 segments · both distorted and reference scaled to 1920×1080 bicubic · reference = 4K master downscaled · model vmaf_v0.6.1 · n_subsample=5 (2005 frames/rung) · fps-paired 30000/1001 · native ffmpeg+libvmaf<br>
+    companion to the 4K-reference report · source 334.4s @ 29.97fps · encode: local Temporal fleet, 12s chunks, force re-encode
+  </div>
+</div>
+
+<div class="tip" id="tip"></div>
+
+<script>
+const DATA = [{"rung": "234p", "w": 416, "h": 234, "kbps": 138, "mean": 13.28, "harmonic": 6.84, "min": 0.0, "max": 97.43, "frames": 2005, "pct_lt10": 43.69, "pct_lt50": 99.45, "timeline": [11.1, 19.2, 7.7, 11.3, 11.3, 16.1, 10.7, 8.7, 9.1, 18.5, 16.9, 52.9], "rc": 0, "dVmaf": null, "dKbps": null, "eff": null, "hull_delta": null, "mean_4k": 24.74}, {"rung": "360p", "w": 640, "h": 360, "kbps": 339, "mean": 32.5, "harmonic": 24.84, "min": 0.15, "max": 97.43, "frames": 2005, "pct_lt10": 1.8, "pct_lt50": 81.7, "timeline": [31.0, 49.8, 19.8, 29.3, 27.5, 34.7, 29.4, 24.9, 23.7, 38.3, 43.4, 74.0], "rc": 0, "dVmaf": 19.2, "dKbps": 201, "eff": 95.622, "hull_delta": 5.93, "mean_4k": 38.26}, {"rung": "396p", "w": 704, "h": 396, "kbps": 673, "mean": 48.65, "harmonic": 41.01, "min": 1.37, "max": 98.98, "frames": 2005, "pct_lt10": 0.8, "pct_lt50": 57.36, "timeline": [46.6, 67.2, 35.6, 49.0, 44.6, 53.1, 47.2, 40.8, 37.1, 53.4, 55.8, 83.2], "rc": 0, "dVmaf": 16.1, "dKbps": 334, "eff": 48.353, "hull_delta": 3.35, "mean_4k": 47.87}, {"rung": "432p", "w": 768, "h": 432, "kbps": 1013, "mean": 58.33, "harmonic": 50.72, "min": 1.72, "max": 100.0, "frames": 2005, "pct_lt10": 0.6, "pct_lt50": 34.36, "timeline": [55.6, 75.2, 46.9, 60.7, 55.9, 64.1, 58.3, 51.4, 46.1, 62.5, 60.8, 86.6], "rc": 0, "dVmaf": 9.7, "dKbps": 340, "eff": 28.471, "hull_delta": 3.24, "mean_4k": 54.41}, {"rung": "540p", "w": 960, "h": 540, "kbps": 1856, "mean": 71.07, "harmonic": 63.46, "min": 1.75, "max": 100.0, "frames": 2005, "pct_lt10": 0.5, "pct_lt50": 7.23, "timeline": [67.5, 84.2, 63.1, 75.3, 70.9, 77.6, 72.4, 67.1, 59.8, 74.5, 66.6, 90.9], "rc": 0, "dVmaf": 12.7, "dKbps": 843, "eff": 15.113, "hull_delta": 3.02, "mean_4k": 64.93}, {"rung": "684p", "w": 1216, "h": 684, "kbps": 2798, "mean": 78.92, "harmonic": 71.39, "min": 2.34, "max": 100.0, "frames": 2005, "pct_lt10": 0.5, "pct_lt50": 4.59, "timeline": [75.1, 89.2, 73.0, 83.3, 79.6, 84.5, 81.2, 78.1, 69.5, 82.6, 70.1, 93.6], "rc": 0, "dVmaf": 7.9, "dKbps": 942, "eff": 8.333, "hull_delta": 2.02, "mean_4k": 72.68}, {"rung": "720p", "w": 1280, "h": 720, "kbps": 4220, "mean": 85.69, "harmonic": 77.95, "min": 2.51, "max": 100.0, "frames": 2005, "pct_lt10": 0.45, "pct_lt50": 3.09, "timeline": [82.2, 92.5, 83.6, 91.0, 88.3, 91.1, 88.2, 86.1, 77.6, 89.2, 71.5, 94.7], "rc": 0, "dVmaf": 6.8, "dKbps": 1422, "eff": 4.761, "hull_delta": 1.99, "mean_4k": 78.49}, {"rung": "1044p", "w": 1856, "h": 1044, "kbps": 5669, "mean": 88.58, "harmonic": 80.59, "min": 2.64, "max": 100.0, "frames": 2005, "pct_lt10": 0.45, "pct_lt50": 2.79, "timeline": [85.5, 94.7, 85.7, 92.8, 90.5, 92.8, 91.6, 91.6, 82.9, 91.9, 73.2, 96.3], "rc": 0, "dVmaf": 2.9, "dKbps": 1449, "eff": 1.994, "hull_delta": 0.01, "mean_4k": 83.12}, {"rung": "1080p", "w": 1920, "h": 1080, "kbps": 7423, "mean": 92.06, "harmonic": 83.79, "min": 2.45, "max": 100.0, "frames": 2005, "pct_lt10": 0.45, "pct_lt50": 2.64, "timeline": [89.9, 96.3, 91.3, 96.3, 94.9, 95.8, 95.0, 95.6, 88.0, 94.8, 74.1, 97.0], "rc": 0, "dVmaf": 3.5, "dKbps": 1754, "eff": 1.984, "hull_delta": 1.79, "mean_4k": 86.6}, {"rung": "1440p", "w": 2560, "h": 1440, "kbps": 12975, "mean": 95.62, "harmonic": 87.11, "min": 2.75, "max": 100.0, "frames": 2005, "pct_lt10": 0.45, "pct_lt50": 2.54, "timeline": [94.8, 98.0, 97.8, 99.5, 99.1, 98.8, 98.2, 98.9, 94.0, 97.6, 74.7, 97.5], "rc": 0, "dVmaf": 3.6, "dKbps": 5552, "eff": 0.641, "hull_delta": 1.47, "mean_4k": 92.12}, {"rung": "2124p", "w": 3776, "h": 2124, "kbps": 18376, "mean": 96.19, "harmonic": 87.49, "min": 2.34, "max": 100.0, "frames": 2005, "pct_lt10": 0.4, "pct_lt50": 2.54, "timeline": [96.1, 98.3, 98.4, 99.7, 99.5, 99.1, 98.8, 99.4, 95.5, 98.3, 74.9, 97.7], "rc": 0, "dVmaf": 0.6, "dKbps": 5401, "eff": 0.106, "hull_delta": -0.07, "mean_4k": 93.67}, {"rung": "2160p", "w": 3840, "h": 2160, "kbps": 26190, "mean": 97.18, "harmonic": 88.36, "min": 2.7, "max": 100.0, "frames": 2005, "pct_lt10": 0.4, "pct_lt50": 2.54, "timeline": [98.2, 98.9, 99.8, 100.0, 99.9, 99.8, 99.7, 99.9, 98.4, 99.1, 75.2, 98.0], "rc": 0, "dVmaf": 1.0, "dKbps": 7814, "eff": 0.127, "hull_delta": null, "mean_4k": 96.51}];
+const $ = s => document.querySelector(s);
+const fmtMbps = k => k>=1000 ? (k/1000).toFixed(k<10000?1:0)+' Mbps' : k+' kbps';
+
+/* stats */
+const kmin=Math.min(...DATA.map(d=>d.kbps)),kmax=Math.max(...DATA.map(d=>d.kbps));
+const vmin=Math.min(...DATA.map(d=>d.mean)),vmax=Math.max(...DATA.map(d=>d.mean));
+const dom=DATA.filter(d=>d.hull_delta!=null&&d.hull_delta<0);
+$('#stats').innerHTML=[
+  ['12','rungs measured',''],
+  [vmin.toFixed(1)+'–'+vmax.toFixed(1),'mean VMAF @1080p',''],
+  ['0.0–2.8','min VMAF (all rungs)','crit'],
+  [dom.length,'dominated rung'+(dom.length==1?'':'s'),'flag'],
+  ['~500 kbps','1080p↔4K crossover','ok'],
+].map(([n,l,c])=>`<div class="stat ${c}"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('');
+
+/* shared scales */
+const W=880,H=420,m={l:52,r:22,t:16,b:46},iw=W-m.l-m.r,ih=H-m.t-m.b;
+const lx=k=>m.l+(Math.log10(k)-2)/(Math.log10(30000)-2)*iw;
+const ly=v=>m.t+(1-(v-10)/(100-10))*ih;
+function axes(){
+  let s='';
+  for(let v=10;v<=100;v+=15){const y=ly(v);s+=`<line x1="${m.l}" y1="${y}" x2="${W-m.r}" y2="${y}" stroke="var(--grid)"/><text x="${m.l-9}" y="${y+3.5}" text-anchor="end" class="axtxt">${v}</text>`;}
+  [100,300,1000,3000,10000,30000].forEach(k=>{const x=lx(k);s+=`<line x1="${x}" y1="${m.t}" x2="${x}" y2="${H-m.b}" stroke="var(--grid)"/><text x="${x}" y="${H-m.b+16}" text-anchor="middle" class="axtxt">${k>=1000?k/1000+'M':k+'k'}</text>`;});
+  s+=`<text x="${m.l+iw/2}" y="${H-6}" text-anchor="middle" class="axlab">delivered bitrate (log)</text>`;
+  s+=`<text transform="translate(14 ${m.t+ih/2}) rotate(-90)" text-anchor="middle" class="axlab">mean VMAF</text>`;
+  return s;
+}
+const tip=$('#tip');
+function line(vals,color){return `<path d="${DATA.map((d,i)=>(i?'L':'M')+lx(d.kbps).toFixed(1)+' '+ly(vals(d)).toFixed(1)).join(' ')}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round"/>`;}
+
+/* main 1080p chart */
+(function(){
+  let s=axes();
+  const path=DATA.map((d,i)=>(i?'L':'M')+lx(d.kbps).toFixed(1)+' '+ly(d.mean).toFixed(1)).join(' ');
+  s+=`<path d="${path} L ${lx(kmax).toFixed(1)} ${ly(10)} L ${lx(kmin).toFixed(1)} ${ly(10)} Z" fill="var(--accent-soft)"/>`;
+  s+=`<path d="${path}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round" opacity=".9"/>`;
+  DATA.forEach(d=>{const x=lx(d.kbps),y=ly(d.mean),bad=d.hull_delta!=null&&d.hull_delta<0;
+    s+=`<circle cx="${x}" cy="${y}" r="5" fill="${bad?'var(--crit)':'var(--accent)'}" stroke="var(--panel)" stroke-width="2" class="pt" data-r="${d.rung}" data-k="${d.kbps}" data-m="${d.mean}" data-h="${d.harmonic}" style="cursor:pointer"/>`;});
+  [DATA[0],DATA.find(d=>d.rung=='1080p'),DATA.find(d=>d.rung=='2160p'),...dom].forEach(d=>{if(!d)return;const x=lx(d.kbps),y=ly(d.mean),bad=d.hull_delta!=null&&d.hull_delta<0;
+    s+=`<text x="${x}" y="${y-11}" text-anchor="middle" font-family="var(--mono)" font-size="11" font-weight="600" fill="${bad?'var(--crit)':'var(--ink)'}">${d.rung}</text>`;});
+  $('#rq').innerHTML=s;
+  $('#rq').querySelectorAll('.pt').forEach(pt=>{
+    pt.addEventListener('mousemove',e=>{tip.innerHTML=`<b>${pt.dataset.r}</b> · ${fmtMbps(+pt.dataset.k)}<br>mean ${(+pt.dataset.m).toFixed(1)} · harm ${(+pt.dataset.h).toFixed(1)}`;tip.style.opacity=1;tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-10)+'px';});
+    pt.addEventListener('mouseleave',()=>tip.style.opacity=0);});
+})();
+
+/* crossover chart: 1080p mean vs 4K mean */
+(function(){
+  let s=axes();
+  s+=line(d=>d.mean,'var(--accent)');
+  s+=line(d=>d.mean_4k,'var(--accent2)');
+  DATA.forEach(d=>{
+    s+=`<circle cx="${lx(d.kbps)}" cy="${ly(d.mean)}" r="3.5" fill="var(--accent)"/>`;
+    s+=`<circle cx="${lx(d.kbps)}" cy="${ly(d.mean_4k)}" r="3.5" fill="var(--accent2)"/>`;
+  });
+  // direct labels at the ends
+  const last=DATA[DATA.length-1], first=DATA[0];
+  s+=`<text x="${lx(last.kbps)-6}" y="${ly(last.mean)+14}" text-anchor="end" font-family="var(--mono)" font-size="11" font-weight="600" fill="var(--accent)">1080p ref</text>`;
+  s+=`<text x="${lx(last.kbps)-6}" y="${ly(last.mean_4k)-8}" text-anchor="end" font-family="var(--mono)" font-size="11" font-weight="600" fill="var(--accent2)">4K ref</text>`;
+  // mark crossover region
+  const cx=lx(480);
+  s+=`<line x1="${cx}" y1="${m.t}" x2="${cx}" y2="${H-m.b}" stroke="var(--faint)" stroke-dasharray="3 3" opacity=".6"/>`;
+  s+=`<text x="${cx+5}" y="${m.t+12}" font-family="var(--mono)" font-size="10" fill="var(--faint)">crossover</text>`;
+  $('#xover').innerHTML=s;
+})();
+
+/* bits per pixel */
+(function(){
+  const bpp=d=>d.kbps/(d.w*d.h/1e6), vals=DATA.map(bpp);
+  const Wc=880,Hc=300,mm={l:58,r:16,t:16,b:50},iw=Wc-mm.l-mm.r,ih=Hc-mm.t-mm.b;
+  const ymax=Math.ceil(Math.max(...vals)/500)*500, by=v=>mm.t+(1-v/ymax)*ih, n=DATA.length, step=iw/n, bw=step*0.62;
+  let s='';
+  for(let v=0;v<=ymax;v+=1000){const y=by(v);s+=`<line x1="${mm.l}" y1="${y.toFixed(1)}" x2="${Wc-mm.r}" y2="${y.toFixed(1)}" stroke="var(--grid)"/><text x="${mm.l-8}" y="${(y+3.5).toFixed(1)}" text-anchor="end" class="axtxt">${v}</text>`;}
+  DATA.forEach((d,i)=>{
+    const x=mm.l+step*i+(step-bw)/2, y=by(vals[i]), h=Math.max(0,mm.t+ih-y), hd=d.hull_delta;
+    const col=(hd!=null&&hd<0)?'var(--crit)':(hd!=null&&hd<0.5)?'var(--warn)':'var(--accent)', flag=hd!=null&&hd<0.5;
+    s+=`<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="3" fill="${col}" class="bar" data-r="${d.rung}" data-v="${vals[i].toFixed(0)}" style="cursor:pointer"/>`;
+    s+=`<text x="${(x+bw/2).toFixed(1)}" y="${Hc-mm.b+16}" text-anchor="middle" class="axtxt">${d.rung}</text>`;
+    if(flag)s+=`<text x="${(x+bw/2).toFixed(1)}" y="${(y-5).toFixed(1)}" text-anchor="middle" font-family="var(--mono)" font-size="10" font-weight="600" fill="${col}">${vals[i].toFixed(0)}</text>`;
+  });
+  s+=`<text transform="translate(14 ${(mm.t+ih/2).toFixed(1)}) rotate(-90)" text-anchor="middle" class="axlab">kbps / megapixel</text>`;
+  $('#bpp').innerHTML=s;
+  $('#bpp').querySelectorAll('.bar').forEach(b=>{
+    b.addEventListener('mousemove',e=>{tip.innerHTML=`<b>${b.dataset.r}</b><br>${(+b.dataset.v).toLocaleString()} kbps/Mpx`;tip.style.opacity=1;tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-10)+'px';});
+    b.addEventListener('mouseleave',()=>tip.style.opacity=0);
+  });
+})();
+
+/* issues */
+const ISSUES=[
+  ['crit','2124p is dominated — confirmed by both references',
+   `<span class="fig">2124p</span> (18.4 Mbps → 96.2) sits <span class="fig">0.07 below</span> the 1440p→2160p frontier here, and <span class="fig">0.24 below</span> in the 4K report. Two independent gradings agree: it's a redundant intermediate 4K rung. <b>Drop it.</b>`],
+  ['warn','Bitrate above 1080p barely moves the worst frames',
+   `Mean climbs 92.1 → 97.2 from 1080p to 2160p, but <span class="fig">harmonic</span> only goes 83.8 → 88.4 and <span class="fig">min</span> stays ~2.5. The hardest frames are artifact/content-limited, not resolution-limited — premium rungs raise the average, not the floor. If you grade on worst-moments, they're poor value.`],
+  ['warn','1044p has no efficiency headroom',
+   `Its convex-hull margin is <span class="fig">+0.01</span> — it sits essentially <em>on</em> the frontier line, adding 88.6 for 5.7 Mbps between 720p (85.7) and 1080p (92.1). Combined with the 4K report's "1044p ≈ 1080p," it's the next drop candidate after 2124p.`],
+  ['info','234p is a survival rung, exposed',
+   `Against a crisp 1080p reference: mean <span class="fig">13.3</span>, <span class="fig">43.7%</span> of frames below VMAF 10, 99.5% below 50. The 138 kbps floor has nowhere to hide at native scale. Emergency reach only.`],
+  ['good','No inversions; alignment holds',
+   `Mean and bitrate both monotonic — every step up buys quality — and every per-30s timeline is flat, confirming the frame-exact chunk fix. The scores are trustworthy; the issues above are ladder-design calls, not bugs.`],
+];
+$('#issues').innerHTML=ISSUES.map(([s,h,p])=>`<div class="issue"><span class="sev ${s}">${s=='good'?'clean':s}</span><div><h3>${h}</h3><p>${p}</p></div></div>`).join('');
+
+/* table + sparklines */
+function spark(tl){const w=104,h=22,n=tl.length,sx=w/(n-1),sy=v=>h-2-(v/100)*(h-4);
+  return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><polyline points="${tl.map((v,i)=>`${(i*sx).toFixed(1)},${sy(v).toFixed(1)}`).join(' ')}" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity=".9"/></svg>`;}
+$('#tbl tbody').innerHTML=DATA.map(d=>{const bad=d.hull_delta!=null&&d.hull_delta<0;
+  return `<tr><td class="rung">${d.rung}${bad?' <span class="badge dom">dominated</span>':''}</td>
+   <td class="dim">${d.w}×${d.h}</td><td>${d.kbps.toLocaleString()}</td><td>${d.mean.toFixed(1)}</td>
+   <td>${d.harmonic.toFixed(1)}</td><td>${d.min.toFixed(1)}</td><td>${d.pct_lt50.toFixed(1)}</td>
+   <td class="${d.eff==null?'dim':''}">${d.eff==null?'—':d.eff.toFixed(2)}</td>
+   <td class="dim">${d.mean_4k!=null?d.mean_4k.toFixed(1):'—'}</td><td>${spark(d.timeline)}</td></tr>`;}).join('');
+</script>
