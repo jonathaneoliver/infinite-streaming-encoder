@@ -372,11 +372,14 @@ def _rung_from_args(args: argparse.Namespace) -> Rung:
 def phase_mezzanine(args: argparse.Namespace) -> int:
     work = _prepare_work_dir()
 
-    # Idempotency / resume: if mezzanine.mp4 is already in S3 (a prior run or a
-    # retry), reuse it — skip the source download + stream-copy entirely.
-    # FORCE_REENCODE overrides.
+    # Idempotency / resume / cross-job cache: if a COMPLETE mezzanine is already
+    # in S3 (a prior run, a retry, or another job on the same source when
+    # --s3-out is the shared mezz-cache/ prefix), reuse it — skip the source
+    # download + stream-copy entirely. Gate on the .done sidecar, not the .mp4:
+    # a half-uploaded mezzanine has the .mp4 but no .done, and reusing it would
+    # feed chunks a truncated file. FORCE_REENCODE overrides.
     out_uri = args.s3_out.rstrip("/") + "/mezzanine.mp4"
-    if not _env_flag("FORCE_REENCODE") and _s3_exists(out_uri):
+    if not _env_flag("FORCE_REENCODE") and _s3_exists(out_uri + ".done"):
         print("[phase mezzanine] reusing mezzanine.mp4 — already in S3, "
               "skipping download + stream-copy", flush=True)
         emit_stage("mezzanine", "done", 100.0)
