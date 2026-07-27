@@ -640,7 +640,7 @@ def run(args: argparse.Namespace) -> int:
     rungs_by_codec: dict[str, list[Rung]] = {}
     for codec in codecs:
         rungs = select_rungs(ladder_def, codec, args.max_res, info.width,
-                             overrides[codec])
+                             overrides[codec], min_res=args.min_res)
         if rungs:
             rungs_by_codec[codec] = rungs
     if not rungs_by_codec:
@@ -767,7 +767,8 @@ def _resolve_plan(args, info):
         args.codec, [args.codec])
     rungs_by_codec: dict[str, list[Rung]] = {}
     for codec in codecs:
-        rr = select_rungs(ladder_def, codec, args.max_res, info.width, overrides[codec])
+        rr = select_rungs(ladder_def, codec, args.max_res, info.width, overrides[codec],
+                          min_res=args.min_res)
         if rr:
             rungs_by_codec[codec] = rr
     chunks = _coalesce_runt_tail(
@@ -1071,7 +1072,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", required=True, dest="output_dir")
     p.add_argument("--codec", default="hevc")
     p.add_argument("--ladder", default="apple-uniq-live")
+    # No `choices=`: tier options are derived from the selected ladder's real
+    # rung heights, which include non-standard ones (1044p, 2124p...).
     p.add_argument("--max-res", default=None, dest="max_res")
+    p.add_argument("--min-res", default=None, dest="min_res")
     p.add_argument("--hevc-single-pass", action="store_true", dest="hevc_single_pass")
     p.add_argument("--measure-vmaf", action="store_true", dest="measure_vmaf",
                    help="per-rendition VMAF audit after each chunk encode (slow)")
