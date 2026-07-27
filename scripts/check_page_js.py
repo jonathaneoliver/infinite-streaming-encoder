@@ -30,12 +30,30 @@ def main() -> int:
         print(f"{PAGE} not found")
         return 1
 
-    # Only bare <script> blocks: a src= tag has no inline body, and a
-    # type="application/json" block isn't JavaScript.
-    blocks = re.findall(r"<script>(.*?)</script>", PAGE.read_text(), re.S)
+    # Match the opening tag WITH its attributes, case-insensitively. A
+    # case-sensitive `<script>` literal would silently skip a `<SCRIPT>` or
+    # `<script type="module">` block — and a checker that quietly covers
+    # nothing is worse than no checker, since it still reports success.
+    blocks: list[str] = []
+    skipped = 0
+    for attrs, body in re.findall(
+        r"<script([^>]*)>(.*?)</script>", PAGE.read_text(), re.S | re.I
+    ):
+        a = attrs.lower()
+        # An external script has no inline body to check, and a non-JS type
+        # (application/json, text/template) isn't JavaScript.
+        if "src=" in a or ("type=" in a and "javascript" not in a and "module" not in a):
+            skipped += 1
+            continue
+        blocks.append(body)
+
     if not blocks:
-        print("no inline <script> blocks found — nothing to check")
-        return 0
+        # index.html is a single self-contained page whose whole UI is inline
+        # JS. Finding none means the extraction broke, not that there's
+        # nothing to check — fail rather than report a vacuous pass.
+        print(f"no inline <script> blocks found in {PAGE.name} — extraction is broken")
+        return 1
+    print(f"{len(blocks)} inline block(s), {skipped} external/non-JS skipped", end=" ")
 
     with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
         f.write("\n".join(blocks))
