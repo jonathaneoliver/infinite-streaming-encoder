@@ -2,6 +2,8 @@ package encode
 
 import (
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // Shared ladder types + helpers for the cloud-batch path. The control plane
@@ -53,10 +55,36 @@ type sfnVariant struct {
 	Chunked       string `json:"chunked"`
 }
 
-// maxResHeight maps a --max-res tier name to its pixel height for capping.
+// maxResHeight maps a legacy tier name to its pixel height. Only a fallback
+// for any name that isn't literally "<height>p" — see resHeight.
 var maxResHeight = map[string]int{
 	"360p": 360, "540p": 540, "720p": 720,
 	"1080p": 1080, "1440p": 1440, "2160p": 2160,
+}
+
+// resHeight parses a --min-res/--max-res tier name: "1080p" -> 1080, true.
+// An empty or unparseable name means "no bound" (0, false).
+//
+// Parsed rather than table-driven because the UI derives its tier options from
+// the SELECTED LADDER's actual rung heights, and the Apple-uniq ladders carry
+// non-standard ones (1044p, 2124p, 684p...). A fixed table silently ignored
+// every tier it didn't know about. Mirrors ladder.res_height.
+// ResHeight is resHeight for callers outside the package (the API's min/max
+// band validation).
+func ResHeight(name string) (int, bool) { return resHeight(name) }
+
+func resHeight(name string) (int, bool) {
+	n := strings.TrimSpace(name)
+	if n == "" {
+		return 0, false
+	}
+	if strings.HasSuffix(n, "p") {
+		if h, err := strconv.Atoi(n[:len(n)-1]); err == nil && h > 0 {
+			return h, true
+		}
+	}
+	h, ok := maxResHeight[n]
+	return h, ok
 }
 
 // variantResourcesFor sizes a variant/chunk encode job by CODEC, not just

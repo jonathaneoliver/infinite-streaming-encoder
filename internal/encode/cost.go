@@ -42,7 +42,7 @@ func (m *Manager) projectCloudCost(cfg JobConfig, sourceWidth, fps int, duration
 		ladderName = "apple-uniq-live"
 	}
 	for _, c := range parseCodecSel(cfg.Codec) {
-		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, sourceWidth) {
+		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
 			twoPass := c == "hevc" && !cfg.HevcSinglePass
 			sp := m.Speeds.Speed("graviton", c, r.Height, twoPass, r.Preset, fps)
 			if sp <= 0 {
@@ -94,7 +94,7 @@ func (m *Manager) projectLocalWallSeconds(cfg JobConfig, sourceWidth, fps int, d
 	}
 	var coreSeconds, floor float64
 	for _, c := range parseCodecSel(cfg.Codec) {
-		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, sourceWidth) {
+		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
 			twoPass := c == "hevc" && !cfg.HevcSinglePass
 			sp := m.Speeds.LocalSpeed(c, r.Height, twoPass, r.Preset, fps)
 			if sp <= 0 {
@@ -211,7 +211,7 @@ func (m *Manager) projectSaaSCosts(cfg JobConfig, sourceWidth, fps int, duration
 		mcMult = 2.0
 	}
 	for _, c := range parseCodecSel(cfg.Codec) {
-		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, sourceWidth) {
+		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
 			commercial += minutes*_commercialRate(r.Height, c)*cMult + minutes*_commercialRepackPerMin
 			mediaconvert += minutes * _mcRate(r.Height, c) * mcMult
 		}

@@ -397,10 +397,11 @@ func (d LadderDef) passesFor(codec string) int {
 }
 
 // resolveRungs returns the rungs to encode for a (ladder, codec), filtered to
-// those that fit the source (no upscale) and --max-res, with ordinal labels
-// for repeated resolutions. Mirrors ladder.select_rungs. av1 reuses the hevc
-// column. Returns nil for an unknown ladder/codec.
-func (s *LadderStore) resolveRungs(ladderName, codec, maxRes string, sourceWidth int) []ladderRung {
+// those that fit the source (no upscale) and the --min-res/--max-res band
+// (both inclusive), with ordinal labels for repeated resolutions. Mirrors
+// ladder.select_rungs. av1 reuses the hevc column. Returns nil for an unknown
+// ladder/codec.
+func (s *LadderStore) resolveRungs(ladderName, codec, maxRes, minRes string, sourceWidth int) []ladderRung {
 	def, ok := s.Get(ladderName)
 	if !ok {
 		return nil
@@ -424,7 +425,8 @@ func (s *LadderStore) resolveRungs(ladderName, codec, maxRes string, sourceWidth
 		counts[fmt.Sprintf("%dp", r[1])]++
 	}
 
-	maxH, capByRes := maxResHeight[maxRes]
+	maxH, capByRes := resHeight(maxRes)
+	minH, floorByRes := resHeight(minRes)
 	idx := map[string]int{}
 	var out []ladderRung
 	for _, r := range rows {
@@ -442,6 +444,9 @@ func (s *LadderStore) resolveRungs(ladderName, codec, maxRes string, sourceWidth
 			continue
 		}
 		if capByRes && h > maxH {
+			continue
+		}
+		if floorByRes && h < minH {
 			continue
 		}
 		out = append(out, ladderRung{

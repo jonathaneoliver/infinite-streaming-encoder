@@ -801,6 +801,9 @@ type JobConfig struct {
 	// encoder via --ladder and resolved by buildSFNInput for the cloud path.
 	Ladder          string `json:"ladder,omitempty"`
 	MaxRes          string `json:"max_res"`
+	// MinRes is MaxRes's floor: rungs shorter than this tier are dropped, so
+	// the pair selects a contiguous band of the ladder. Empty = no floor.
+	MinRes          string `json:"min_res,omitempty"`
 	Target          Target `json:"target"`
 	Time            string `json:"time"`
 	SegmentDuration string `json:"segment_duration"`
@@ -1776,6 +1779,9 @@ func (m *Manager) writeHistory(job *Job) {
 	if job.Config.MaxRes != "" {
 		fmt.Fprintf(f, "- **Max Res:** %s\n", job.Config.MaxRes)
 	}
+	if job.Config.MinRes != "" {
+		fmt.Fprintf(f, "- **Min Res:** %s\n", job.Config.MinRes)
+	}
 	if job.Config.Time != "" {
 		fmt.Fprintf(f, "- **Time limit:** %ss\n", job.Config.Time)
 	}
@@ -2100,6 +2106,9 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	}
 	if cfg.MaxRes != "" {
 		args = append(args, "--max-res", cfg.MaxRes)
+	}
+	if cfg.MinRes != "" {
+		args = append(args, "--min-res", cfg.MinRes)
 	}
 	// Always pass it — including 0, which means "whole variant" (the UI's
 	// "whole" option). Omitting the flag would let cli_local_dist's argparse
@@ -2461,7 +2470,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// Source fps: keys the speed model (encode time ∝ frame count), so chunk
 		// sizes/priorities match the graviton keys learned at the same rate.
 		srcFps := probeSourceFps(localSrc)
-		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), srcWidth, srcFps, durationS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), job.AppendLog)
+		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), srcWidth, srcFps, durationS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), job.AppendLog)
 		expectedEncodes = expEnc
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
@@ -2730,7 +2739,7 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes string, hevcSinglePass, mezzCached, burnin bool, sourceWidth, sourceFps int, clipDurationS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, logf func(string)) (string, int) {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin bool, sourceWidth, sourceFps int, clipDurationS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, logf func(string)) (string, int) {
 	if ladderName == "" {
 		ladderName = "apple-uniq-live"
 	}
@@ -2773,7 +2782,7 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	var scores []float64 // predicted encode wall per variant, aligned with variants (for rank-based priority)
 	doH264, doHevc, doAV1 := false, false, false
 	for _, c := range codecs {
-		rungs := store.resolveRungs(ladderName, c, maxRes, sourceWidth)
+		rungs := store.resolveRungs(ladderName, c, maxRes, minRes, sourceWidth)
 		if len(rungs) == 0 {
 			continue
 		}
