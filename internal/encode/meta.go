@@ -56,11 +56,31 @@ func (m *Manager) writeEncodeMetaForDirs(job *Job, dirs []string) {
 		if IsDatedBackup(name) || strings.HasPrefix(name, ".") {
 			continue
 		}
-		m.writeEncodeMeta(name, job.Config)
+		m.writeEncodeMeta(name, job.Config, job.Vmaf)
 	}
 }
 
-func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig) {
+// vmafForRung returns the measured VMAF mean for a codec+height rung from the
+// job's aggregated ENCODER-VMAF scores (#24), or 0 when unmeasured. Matches the
+// base "<codec>/<h>p" label first, then a dup-resolution "<codec>/<h>p_*".
+func vmafForRung(vmaf map[string]*VmafScore, codec string, height int) float64 {
+	if vmaf == nil {
+		return 0
+	}
+	base := fmt.Sprintf("%s/%dp", codec, height)
+	if v := vmaf[base]; v != nil {
+		return v.Mean
+	}
+	prefix := base + "_"
+	for k, v := range vmaf {
+		if v != nil && strings.HasPrefix(k, prefix) {
+			return v.Mean
+		}
+	}
+	return 0
+}
+
+func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string]*VmafScore) {
 	dir := filepath.Join(m.OutputDir, dirName)
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 		return
@@ -91,7 +111,10 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig) {
 	var rungs []metaRung
 	for _, r := range def.Codecs[codec] { // [width, height, bitrate_kbps]
 		if len(r) >= 3 {
-			rungs = append(rungs, metaRung{Height: r[1], BitrateKbps: r[2]})
+			rungs = append(rungs, metaRung{
+				Height: r[1], BitrateKbps: r[2],
+				Vmaf: vmafForRung(vmaf, codec, r[1]),
+			})
 		}
 	}
 	// Effective pass count = the profile's, with the per-encode HevcSinglePass

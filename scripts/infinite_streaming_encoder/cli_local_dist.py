@@ -396,6 +396,7 @@ class _Shared:
     lock: threading.Lock = field(default_factory=threading.Lock)
     failed: list[str] = field(default_factory=list)
     remaining: int = 0
+    measure_vmaf: bool = False
 
 
 def _chunk_key(work_prefix: str, codec: str, label: str, index: int) -> str:
@@ -435,7 +436,8 @@ def _worker_loop(w: Worker, sh: _Shared, s3_mezz: str, s3_out: str) -> None:
                        env={"CHUNK_DURATION_S": f"{sh.chunk_duration_s:g}",
                             "TWO_PASS": "1" if task.two_pass else "0",
                             "EXTRA_ARGS": task.extra_args,
-                            "BURNIN": "1" if sh.burnin else "0"},
+                            "BURNIN": "1" if sh.burnin else "0",
+                            "MEASURE_VMAF": "1" if sh.measure_vmaf else "0"},
                        log_prefix=stage)
         if rc == 0 and _object_exists(sh.bucket, key):
             with sh.lock:
@@ -649,7 +651,8 @@ def run(args: argparse.Namespace) -> int:
     print(f"[dist] === {len(tasks)} chunk task(s) across "
           f"{sum(w.slots for w in pool)} slot(s) ===", flush=True)
     sh = _Shared(q=queue.Queue(), bucket=bucket, work_prefix=work_prefix,
-                 chunk_duration_s=args.chunk_duration_s, burnin=args.burnin)
+                 chunk_duration_s=args.chunk_duration_s, burnin=args.burnin,
+                 measure_vmaf=args.measure_vmaf)
     encode_chunks_distributed(pool, tasks, sh, s3_work, s3_work)
     if sh.failed:
         print(f"[dist] FAILED chunks: {', '.join(sh.failed)}", file=sys.stderr)
@@ -872,6 +875,7 @@ def run_temporal(args: argparse.Namespace) -> int:
         "bucket": bucket, "job_prefix": prefix, "src_key": src_key,
         "has_audio": info.has_audio, "chunk_duration_s": args.chunk_duration_s,
         "n_chunks": n_chunks, "burnin": args.burnin,
+        "measure_vmaf": args.measure_vmaf,
         "codecs": {c: {"two_pass": two_pass[c],
                        "extra_args": ladder_extra_args(ladder_def, c),
                        "rungs": [{"label": r.label, "width": r.width,
@@ -987,6 +991,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-burnin", action="store_false", dest="burnin", default=True,
                    help="disable the burnt-in text overlay on every variant; "
                         "on by default")
+    p.add_argument("--measure-vmaf", action="store_true", dest="measure_vmaf",
+                   help="per-rendition VMAF audit after each chunk encode (slow)")
     p.add_argument("--bitrate-override-hevc", default=None, dest="bitrate_override_hevc")
     p.add_argument("--bitrate-override-h264", default=None, dest="bitrate_override_h264")
     p.add_argument("--chunk-duration", type=float, default=12.0,
