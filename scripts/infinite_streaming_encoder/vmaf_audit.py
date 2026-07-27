@@ -71,7 +71,7 @@ def measure_vmaf(distorted: Path, reference: Path, common_w: int, common_h: int,
                  model: str, ref_start_s: float = 0.0,
                  ref_duration_s: float | None = None,
                  n_subsample: int = 5, n_threads: int = 0,
-                 fps: str | None = None) -> dict:
+                 fps: str | None = None, n_frames: int | None = None) -> dict:
     """Score `distorted` against a [ref_start_s, +ref_duration_s) window of
     `reference`, both bicubic-scaled to (common_w x common_h). Returns
     {mean, harmonic_mean, min, frames, inv_sum} — inv_sum = sum(1/frame_vmaf),
@@ -85,23 +85,33 @@ def measure_vmaf(distorted: Path, reference: Path, common_w: int, common_h: int,
     high-motion content). Regenerating a common CFR clock from decode order
     sidesteps that — pass the source fps whenever it's known.
 
+    `n_frames` clamps BOTH streams to exactly that many frames after the CFR
+    re-time. Per-chunk audits seek the reference window with `-ss`/`-t`, whose
+    frame count drifts from the chunk's frame-exact length (#90) by ~1 at the
+    seam; libvmaf then pairs the leftover frame against the wrong partner and
+    logs a spurious ~0-VMAF frame, pinning `min`/harmonic to noise even on a
+    clean rung (#108). Trimming both to the chunk's known frame count removes
+    that mispair. Omit for whole-clip audits.
+
     Raises VmafError on ffmpeg failure or an unparseable log.
     """
     log_path = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
     try:
         # Distorted (input 0) is already just this window (the chunk). The
         # reference (input 1) is seeked to the matching window. `fps` re-times
-        # both to one CFR grid (decode order), then setpts re-zeros PTS, so they
-        # align frame-for-frame regardless of source cadence quirks.
+        # both to one CFR grid (decode order); `trim` clamps both to the chunk's
+        # exact frame count so no leftover seam frame mispairs; then setpts
+        # re-zeros PTS so they align frame-for-frame.
         ref_seek = ["-ss", f"{ref_start_s:.6f}"] if ref_start_s > 0 else []
         ref_dur = ["-t", f"{ref_duration_s:.6f}"] if ref_duration_s else []
         threads_opt = f":n_threads={n_threads}" if n_threads else ""
         fps_pre = f"fps={fps}," if fps else ""
+        trim = f"trim=end_frame={n_frames}," if n_frames else ""
         lavfi = (
             f"[0:v]{fps_pre}scale={common_w}:{common_h}:flags=bicubic,"
-            f"format=yuv420p,setsar=1,setpts=PTS-STARTPTS[dist];"
+            f"format=yuv420p,setsar=1,{trim}setpts=PTS-STARTPTS[dist];"
             f"[1:v]{fps_pre}scale={common_w}:{common_h}:flags=bicubic,"
-            f"format=yuv420p,setsar=1,setpts=PTS-STARTPTS[ref];"
+            f"format=yuv420p,setsar=1,{trim}setpts=PTS-STARTPTS[ref];"
             f"[dist][ref]libvmaf=model=version={model}:n_subsample={n_subsample}"
             f"{threads_opt}:log_fmt=json:log_path={log_path}"
         )

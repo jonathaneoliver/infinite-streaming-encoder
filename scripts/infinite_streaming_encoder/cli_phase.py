@@ -599,6 +599,19 @@ def phase_variant(args: argparse.Namespace) -> int:
             # 1080p) — a 4K comparison OOM-kills on 8-10 GB Docker VMs and runs
             # ~2x slower; the model follows the capped height (#24).
             cmn_w, cmn_h = common_dimensions(info.width, info.height)
+            # This chunk's frame-exact length (same ceil(t*fps) math the encode
+            # uses, #90) so the audit can clamp both streams to it — otherwise the
+            # seeked reference window's ~1-frame seam drift injects a spurious
+            # 0-VMAF frame that pins min/harmonic to noise (#108). Whole-clip
+            # (chunk is None) needs no clamp.
+            n_frames = None
+            if chunk is not None:
+                from fractions import Fraction
+
+                def _frames_before(t: float) -> int:
+                    x = Fraction(t) * info.fps
+                    return max(0, -(-x.numerator // x.denominator))  # ceil(t*fps)
+                n_frames = _frames_before(chunk.end_s) - _frames_before(chunk.start_s)
             r = measure_vmaf(
                 out_path, ctx.mezzanine_path, cmn_w, cmn_h,
                 pick_model(cmn_h),
@@ -609,6 +622,7 @@ def phase_variant(args: argparse.Namespace) -> int:
                 # slip can't desync the comparison (learned from the offline
                 # ladder audit — VMAF craters on a 1-frame slip in high motion).
                 fps=str(info.fps),
+                n_frames=n_frames,
             )
             print(vmaf_marker(args.codec, args.label, rung.height,
                               chunk.index if chunk is not None else -1, r),
