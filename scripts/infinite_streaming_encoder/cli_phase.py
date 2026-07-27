@@ -672,10 +672,17 @@ def phase_variant(args: argparse.Namespace) -> int:
             _max_h = int(os.environ.get("VMAF_MAX_HEIGHT", "1080") or "1080")
             _vref_uri = args.s3_mezz.rstrip("/") + f"/mezzanine_vmafref_cap{_max_h}.mp4"
             _vref_local = work / f"mezzanine_vmafref_cap{_max_h}.mp4"
-            vmaf_ref = (_vref_local
-                        if _fetch_mezz_cached(_vref_uri, _vref_local,
+            # A missing reference (older job, build failure, or S3 404) must
+            # degrade to the native mezzanine — never fail the audit. _fetch_*
+            # raises ClientError on a 404, so catch broadly here.
+            try:
+                _has_ref = _fetch_mezz_cached(_vref_uri, _vref_local,
                                               what="VMAF reference")
-                        else ctx.mezzanine_path)
+            except Exception as _e:  # noqa: BLE001 — fall back to the mezzanine
+                print(f"[phase variant] no pre-scaled VMAF reference "
+                      f"({type(_e).__name__}); using native mezzanine", flush=True)
+                _has_ref = False
+            vmaf_ref = _vref_local if _has_ref else ctx.mezzanine_path
             # This chunk's frame-exact length (same ceil(t*fps) math the encode
             # uses, #90) so the audit can clamp both streams to it — otherwise the
             # seeked reference window's ~1-frame seam drift injects a spurious

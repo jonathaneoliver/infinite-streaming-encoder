@@ -266,8 +266,14 @@ class EncodeWorkflow:
         job_rank = int(plan.get("job_rank", 0))
         job_top = min(PRIORITY_LEVELS, job_rank * PRIORITY_BANDS + 1)
 
+        # #109: the mezzanine phase stages the pre-scaled VMAF reference when the
+        # job has VMAF on, so it needs the same MEASURE_VMAF flag the chunk
+        # activities get — otherwise it skips the reference and every chunk falls
+        # back to re-downscaling the native mezzanine.
         await self._phase(["mezzanine", "--s3-in", f"s3://{b}/{plan['src_key']}",
-                           "--s3-out", mezz], {}, "mezzanine", priority_key=job_top)
+                           "--s3-out", mezz],
+                          {"MEASURE_VMAF": "1" if plan.get("measure_vmaf") else "0"},
+                          "mezzanine", priority_key=job_top)
         if plan.get("has_audio"):
             await self._phase(["audio", "--s3-mezz", mezz, "--s3-out", s3_work],
                               {}, "audio", priority_key=job_top)
