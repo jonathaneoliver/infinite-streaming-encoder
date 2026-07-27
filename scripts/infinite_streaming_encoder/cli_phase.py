@@ -398,30 +398,33 @@ def _ensure_prescaled_ref(args: argparse.Namespace, work: Path,
     reference is actually missing. Best-effort: on any failure the per-chunk audit
     just falls back to the native mezzanine, so this can't break an encode."""
     from infinite_streaming_encoder.vmaf_audit import common_dimensions
+    # [[ENCODER-VMAFREF …]] markers are relayed by the temporal worker to the
+    # orchestrator log (like ENCODER-VMAF), so the pre-scale is observable no
+    # matter which worker runs the mezzanine. A total ABSENCE of these means the
+    # mezzanine activity never got MEASURE_VMAF (so this fn wasn't called).
+    print("[[ENCODER-VMAFREF status=enter]]", flush=True)
     max_h = int(os.environ.get("VMAF_MAX_HEIGHT", "1080") or "1080")
     ref_uri = args.s3_out.rstrip("/") + f"/mezzanine_vmafref_cap{max_h}.mp4"
     if not _env_flag("FORCE_REENCODE") and _s3_exists(ref_uri + ".done"):
-        print("[phase mezzanine] VMAF reference already staged", flush=True)
+        print("[[ENCODER-VMAFREF status=cached]]", flush=True)
         return
     local, vinfo = mezz_local, info
     if local is None or vinfo is None:  # mezzanine reuse path: fetch to build ref
         local = work / "mezzanine.mp4"
         if not _download_if_complete(mezz_uri, local):
-            print("[phase mezzanine] VMAF reference skipped: mezzanine unavailable",
-                  file=sys.stderr)
+            print("[[ENCODER-VMAFREF status=skipped reason=mezz-unavailable]]", flush=True)
             return
         vinfo = probe(local)
     cw, ch = common_dimensions(vinfo.width, vinfo.height, max_h)
     ref_local = work / f"mezzanine_vmafref_cap{max_h}.mp4"
-    print(f"[phase mezzanine] building VMAF reference {cw}x{ch} (lossless, #109)",
-          flush=True)
+    print(f"[[ENCODER-VMAFREF status=building dims={cw}x{ch}]]", flush=True)
     try:
         _build_prescaled_ref(local, ref_local, cw, ch, str(vinfo.fps))
         _upload_with_done(ref_local, ref_uri)
-        print(f"[phase mezzanine] VMAF reference staged -> {ref_uri}", flush=True)
+        print(f"[[ENCODER-VMAFREF status=staged dims={cw}x{ch}]]", flush=True)
     except Exception as e:  # noqa: BLE001 — best-effort; per-chunk falls back
-        print(f"[phase mezzanine] VMAF reference build failed ({e}); per-chunk "
-              f"will fall back to the native mezzanine", file=sys.stderr)
+        print(f"[[ENCODER-VMAFREF status=failed err={type(e).__name__}:{str(e)[:120]}]]",
+              flush=True)
 
 
 def phase_mezzanine(args: argparse.Namespace) -> int:
