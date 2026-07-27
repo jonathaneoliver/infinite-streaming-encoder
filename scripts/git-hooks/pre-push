@@ -21,4 +21,15 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     done
 done
 
+# Run the same static checks CI runs, before the push rather than after. These
+# are the cheap ones (a few seconds); the end-to-end encode stays in smoke.yml.
+# `make check` skips any tool that isn't installed, so this never blocks a push
+# for a missing local dependency.
+if ! make check; then
+    echo
+    echo "✋ Push blocked: 'make check' failed (this is what CI would have caught)."
+    echo "   Fix the above, or bypass with: git push --no-verify"
+    exit 1
+fi
+
 exit 0

@@ -89,6 +89,37 @@ FARM_ENCODE_SLOTS := $(shell P=$$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/nul
 setup-hooks:
 	git config core.hooksPath scripts/git-hooks
 	@echo "git hooks active (scripts/git-hooks). Direct pushes to main are now blocked — use a PR."
+	@echo "'make check' now also runs on every push."
+
+.PHONY: check
+check:                ## run the same static checks CI runs (gofmt/vet/build, tofu fmt, py compile, page JS)
+	@fail=0; \
+	printf '  gofmt          '; \
+	unformatted=$$(gofmt -l . 2>/dev/null); \
+	if [ -n "$$unformatted" ]; then \
+	  echo "FAIL"; echo "$$unformatted" | sed 's/^/                 /'; \
+	  echo "                 fix: gofmt -w ."; fail=1; \
+	else echo "ok"; fi; \
+	printf '  go vet         '; \
+	if out=$$(go vet ./... 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  go build       '; \
+	if out=$$(go build ./... 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  tofu fmt       '; \
+	if ! command -v tofu >/dev/null 2>&1; then echo "skipped (tofu not installed)"; \
+	elif out=$$(tofu -chdir=infra/terraform fmt -check -recursive 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; \
+	  echo "                 fix: tofu -chdir=infra/terraform fmt -recursive"; fail=1; fi; \
+	printf '  python compile '; \
+	if out=$$(cd scripts && python3 -m compileall -q infinite_streaming_encoder 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  page JS syntax '; \
+	if ! command -v node >/dev/null 2>&1; then echo "skipped (node not installed)"; \
+	elif out=$$(python3 scripts/check_page_js.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	if [ $$fail -ne 0 ]; then echo; echo "make check: FAILED"; exit 1; fi; \
+	echo "make check: all passed"
 
 require-paths:
 	@: $${SOURCE_DIR:?SOURCE_DIR is not set — create a .env (see .env.example)}
