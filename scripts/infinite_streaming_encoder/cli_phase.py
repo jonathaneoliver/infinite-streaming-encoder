@@ -605,6 +605,10 @@ def phase_variant(args: argparse.Namespace) -> int:
                 ref_start_s=(chunk.start_s if chunk is not None else 0.0),
                 ref_duration_s=(chunk.duration_s if chunk is not None else None),
                 n_subsample=5, n_threads=(_threads_env or 0),
+                # Force both streams onto the source's frame grid so a cadence
+                # slip can't desync the comparison (learned from the offline
+                # ladder audit — VMAF craters on a 1-frame slip in high motion).
+                fps=str(info.fps),
             )
             print(vmaf_marker(args.codec, args.label, rung.height,
                               chunk.index if chunk is not None else -1, r),
