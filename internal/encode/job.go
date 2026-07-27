@@ -799,8 +799,8 @@ type JobConfig struct {
 	// Ladder selects the bitrate ladder by name (legacy | apple | apple-uniq |
 	// any custom ladder). Empty defaults to "legacy". Threaded to the local
 	// encoder via --ladder and resolved by buildSFNInput for the cloud path.
-	Ladder          string `json:"ladder,omitempty"`
-	MaxRes          string `json:"max_res"`
+	Ladder string `json:"ladder,omitempty"`
+	MaxRes string `json:"max_res"`
 	// MinRes is MaxRes's floor: rungs shorter than this tier are dropped, so
 	// the pair selects a contiguous band of the ladder. Empty = no floor.
 	MinRes          string `json:"min_res,omitempty"`

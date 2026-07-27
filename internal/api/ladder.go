@@ -162,7 +162,7 @@ func (s *Server) ladder(w http.ResponseWriter, r *http.Request) {
 			BufsizeMultiplier: ej.BufsizeMultiplier, SegmentS: ej.SegmentS,
 			PartialS: ej.PartialS, GopS: ej.GopS, OutputTag: ej.OutputTag,
 			MaxRes: ej.MaxRes, MinRes: ej.MinRes, HevcSinglePass: ej.HevcSinglePass,
-			Padding: ej.Padding,
+			Padding:       ej.Padding,
 			ChunkDuration: ej.ChunkDuration, ForceReencode: ej.ForceReencode,
 			Burnin: ej.Burnin,
 			Source: ej.Source, EncodedAt: ej.EncodedAt,
