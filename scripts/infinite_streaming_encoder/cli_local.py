@@ -351,6 +351,11 @@ def run_full(args: argparse.Namespace) -> int:
                     input_path=input_path,
                     output_path=mezz_path,
                     time_limit_s=args.time_limit_s,
+                    # Normalize any VFR source to EXACT CFR here (lossless), so
+                    # the variant encodes pass frames through 1:1 and the VMAF
+                    # audit can't drift (see mezzanine.py docstring).
+                    fps_num=info.fps.numerator,
+                    fps_den=info.fps.denominator,
                 ),
                 stage_key="mezzanine",
                 duration_s=mezz_expected_duration,

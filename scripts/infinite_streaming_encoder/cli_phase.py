@@ -245,13 +245,15 @@ def _prune_mezz_cache(cache_dir: Path, keep: int = 6) -> None:
                 pass
 
 
-def _fetch_mezz_cached(mezz_uri: str, mezz_local: Path) -> bool:
-    """Fetch the mezzanine, cached PER WORKER so N chunks on one box download it
-    once instead of once per chunk. Keyed by the mezz URI (unique per job, so it
-    hits across that job's chunks) and symlinked into the per-activity work dir
-    (zero-copy). A file lock makes concurrent chunks on the same box share one
-    download. MEZZ_CACHE_DIR unset → plain per-chunk download (the AWS Batch path,
-    where each chunk is its own ephemeral container anyway)."""
+def _fetch_mezz_cached(mezz_uri: str, mezz_local: Path,
+                       what: str = "mezzanine") -> bool:
+    """Fetch a large per-job artifact (the mezzanine, or #109's pre-scaled VMAF
+    reference), cached PER WORKER so N chunks on one box download it once instead
+    of once per chunk. Keyed by the URI (unique per job, so it hits across that
+    job's chunks) and symlinked into the per-activity work dir (zero-copy). A file
+    lock makes concurrent chunks on the same box share one download. MEZZ_CACHE_DIR
+    unset → plain per-chunk download (the AWS Batch path, where each chunk is its
+    own ephemeral container anyway). `what` is the log label only."""
     cache_dir = os.environ.get("MEZZ_CACHE_DIR")
     if not cache_dir:
         return _download_if_complete(mezz_uri, mezz_local)
@@ -264,9 +266,9 @@ def _fetch_mezz_cached(mezz_uri: str, mezz_local: Path) -> bool:
     with open(Path(cache_dir) / f"mezz-{key}.lock", "w") as lockf:
         fcntl.flock(lockf, fcntl.LOCK_EX)
         if cached.is_file() and cached_done.is_file():
-            print("[phase variant] mezzanine served from worker cache", flush=True)
+            print(f"[phase variant] {what} served from worker cache", flush=True)
         else:
-            print("[phase variant] caching mezzanine (first chunk on this box)", flush=True)
+            print(f"[phase variant] caching {what} (first chunk on this box)", flush=True)
             if not _download_if_complete(mezz_uri, cached):
                 return False
             _prune_mezz_cache(Path(cache_dir))
@@ -369,6 +371,59 @@ def _rung_from_args(args: argparse.Namespace) -> Rung:
 # subsequent encode/audio phases share one normalised input.
 # ---------------------------------------------------------------------------
 
+def _build_prescaled_ref(mezz_path: Path, ref_path: Path,
+                         cw: int, ch: int, fps: str) -> None:
+    """Downscale the mezzanine to (cw x ch) LOSSLESSLY (x264 -qp 0), applying the
+    SAME filter chain measure_vmaf uses on the reference (fps -> bicubic scale ->
+    yuv420p -> setsar). The decoded frames are therefore bit-identical to the
+    per-chunk downscale, so VMAF scores are unchanged — this is purely a
+    decode-cost optimization (#109). Video-only; input timestamps (CFR) are
+    preserved so per-chunk window seeks still land."""
+    vf = f"fps={fps},scale={cw}:{ch}:flags=bicubic,format=yuv420p,setsar=1"
+    subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+         "-i", str(mezz_path), "-map", "0:v:0", "-vf", vf,
+         "-c:v", "libx264", "-qp", "0", "-preset", "ultrafast", "-an",
+         str(ref_path)],
+        check=True)
+
+
+def _ensure_prescaled_ref(args: argparse.Namespace, work: Path,
+                          mezz_uri: str, mezz_local: Path | None, info) -> None:
+    """#109 (Option B): stage, ONCE, a lossless reference pre-scaled to the VMAF
+    comparison resolution alongside the mezzanine, so per-chunk audits decode a
+    small file instead of re-downscaling the native (4K) mezzanine on every chunk.
+    ONLY called when VMAF is enabled. Idempotent via the .done sidecar; on a
+    mezzanine cache-hit (no local copy) it fetches the mezzanine only if the
+    reference is actually missing. Best-effort: on any failure the per-chunk audit
+    just falls back to the native mezzanine, so this can't break an encode."""
+    from infinite_streaming_encoder.vmaf_audit import common_dimensions
+    max_h = int(os.environ.get("VMAF_MAX_HEIGHT", "1080") or "1080")
+    ref_uri = args.s3_out.rstrip("/") + f"/mezzanine_vmafref_cap{max_h}.mp4"
+    if not _env_flag("FORCE_REENCODE") and _s3_exists(ref_uri + ".done"):
+        print("[phase mezzanine] VMAF reference already staged", flush=True)
+        return
+    local, vinfo = mezz_local, info
+    if local is None or vinfo is None:  # mezzanine reuse path: fetch to build ref
+        local = work / "mezzanine.mp4"
+        if not _download_if_complete(mezz_uri, local):
+            print("[phase mezzanine] VMAF reference skipped: mezzanine unavailable",
+                  file=sys.stderr)
+            return
+        vinfo = probe(local)
+    cw, ch = common_dimensions(vinfo.width, vinfo.height, max_h)
+    ref_local = work / f"mezzanine_vmafref_cap{max_h}.mp4"
+    print(f"[phase mezzanine] building VMAF reference {cw}x{ch} (lossless, #109)",
+          flush=True)
+    try:
+        _build_prescaled_ref(local, ref_local, cw, ch, str(vinfo.fps))
+        _upload_with_done(ref_local, ref_uri)
+        print(f"[phase mezzanine] VMAF reference staged -> {ref_uri}", flush=True)
+    except Exception as e:  # noqa: BLE001 — best-effort; per-chunk falls back
+        print(f"[phase mezzanine] VMAF reference build failed ({e}); per-chunk "
+              f"will fall back to the native mezzanine", file=sys.stderr)
+
+
 def phase_mezzanine(args: argparse.Namespace) -> int:
     work = _prepare_work_dir()
 
@@ -382,6 +437,8 @@ def phase_mezzanine(args: argparse.Namespace) -> int:
     if not _env_flag("FORCE_REENCODE") and _s3_exists(out_uri + ".done"):
         print("[phase mezzanine] reusing mezzanine.mp4 — already in S3, "
               "skipping download + stream-copy", flush=True)
+        if _env_flag("MEASURE_VMAF") or getattr(args, "measure_vmaf", False):
+            _ensure_prescaled_ref(args, work, out_uri, None, None)
         emit_stage("mezzanine", "done", 100.0)
         return 0
 
@@ -404,6 +461,11 @@ def phase_mezzanine(args: argparse.Namespace) -> int:
             input_path=local_in,
             output_path=out_path,
             time_limit_s=None,
+            # Normalize any VFR source to EXACT CFR here (lossless), so the
+            # per-chunk encodes pass frames through 1:1 and the VMAF audit
+            # can't drift on a jittery reference (see mezzanine.py docstring).
+            fps_num=info.fps.numerator,
+            fps_den=info.fps.denominator,
         ),
         stage_key="mezzanine",
         duration_s=info.duration_s,
@@ -413,6 +475,8 @@ def phase_mezzanine(args: argparse.Namespace) -> int:
     out_uri = args.s3_out.rstrip("/") + "/mezzanine.mp4"
     print(f"[phase mezzanine] uploading {out_uri}", flush=True)
     _upload_with_done(out_path, out_uri, stage=("mezzanine", 55.0, 100.0))
+    if _env_flag("MEASURE_VMAF") or getattr(args, "measure_vmaf", False):
+        _ensure_prescaled_ref(args, work, out_uri, out_path, info)
     emit_stage("mezzanine", "done", 100.0)
     return 0
 
@@ -599,6 +663,19 @@ def phase_variant(args: argparse.Namespace) -> int:
             # 1080p) — a 4K comparison OOM-kills on 8-10 GB Docker VMs and runs
             # ~2x slower; the model follows the capped height (#24).
             cmn_w, cmn_h = common_dimensions(info.width, info.height)
+            # #109: prefer the pre-scaled VMAF reference the mezzanine phase
+            # staged (already cmn_w x cmn_h) — decode a small lossless file
+            # instead of re-downscaling the native (4K) mezzanine on every chunk.
+            # measure_vmaf's fps+scale become no-ops on it (CFR + same dims), so
+            # scores are identical. Fall back to the mezzanine if it's absent
+            # (older job / build failed).
+            _max_h = int(os.environ.get("VMAF_MAX_HEIGHT", "1080") or "1080")
+            _vref_uri = args.s3_mezz.rstrip("/") + f"/mezzanine_vmafref_cap{_max_h}.mp4"
+            _vref_local = work / f"mezzanine_vmafref_cap{_max_h}.mp4"
+            vmaf_ref = (_vref_local
+                        if _fetch_mezz_cached(_vref_uri, _vref_local,
+                                              what="VMAF reference")
+                        else ctx.mezzanine_path)
             # This chunk's frame-exact length (same ceil(t*fps) math the encode
             # uses, #90) so the audit can clamp both streams to it — otherwise the
             # seeked reference window's ~1-frame seam drift injects a spurious
@@ -613,7 +690,7 @@ def phase_variant(args: argparse.Namespace) -> int:
                     return max(0, -(-x.numerator // x.denominator))  # ceil(t*fps)
                 n_frames = _frames_before(chunk.end_s) - _frames_before(chunk.start_s)
             r = measure_vmaf(
-                out_path, ctx.mezzanine_path, cmn_w, cmn_h,
+                out_path, vmaf_ref, cmn_w, cmn_h,
                 pick_model(cmn_h),
                 ref_start_s=(chunk.start_s if chunk is not None else 0.0),
                 ref_duration_s=(chunk.duration_s if chunk is not None else None),
