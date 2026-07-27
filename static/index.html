@@ -414,19 +414,23 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             </div>
             <div class="control-group">
                 <label title="Bitrate ladder (resolutions + target bitrates) AND its output timing (segment / partial / GOP). Manage ladders in the Ladders tab.">Ladder / Profile</label>
-                <select id="ladder">
+                <select id="ladder" onchange="syncResTiers()">
                     <option value="apple-uniq-live">apple-uniq-live</option>
                 </select>
             </div>
+            <!-- Options are rebuilt from the SELECTED LADDER's real rung heights
+                 by syncResTiers() — these placeholders only cover the moment
+                 before /api/ladders lands. -->
             <div class="control-group">
-                <label>Max Resolution</label>
-                <select id="max-res">
+                <label title="Drop ladder rungs TALLER than this. Tiers come from the selected ladder.">Max Resolution</label>
+                <select id="max-res" onchange="syncResTiers()">
                     <option value="">No limit (all rungs)</option>
-                    <option value="2160p">2160p</option>
-                    <option value="1440p">1440p</option>
-                    <option value="1080p">1080p</option>
-                    <option value="720p">720p</option>
-                    <option value="540p">540p</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label title="Drop ladder rungs SHORTER than this. Combined with Max Resolution it selects a contiguous band of the ladder.">Min Resolution</label>
+                <select id="min-res" onchange="syncResTiers()">
+                    <option value="">No limit (all rungs)</option>
                 </select>
             </div>
             <div class="control-group">
@@ -874,6 +878,51 @@ async function loadLadders() {
             `<option value="${n}">${n}${laddersCache[n].seed ? '' : ' (custom)'}</option>`).join('');
         sel.value = names.includes(cur) ? cur : (names.includes(DEFAULT) ? DEFAULT : names[0] || '');
     }
+    syncResTiers();
+}
+
+// Rebuild the Min/Max Resolution tiers from the SELECTED ladder's actual rung
+// heights, union'd across its codecs.
+//
+// These used to be five hardcoded <option>s (2160/1440/1080/720/540) that never
+// changed with the ladder — so they offered caps a ladder didn't have (Apple's
+// H.264 column stops at 1080p, making "2160p" a no-op) and hid the ones it did
+// (apple-uniq encodes at 1044p, 2124p, 684p...). Deriving them means every tier
+// shown is a real boundary in the ladder you're about to encode.
+//
+// Also keeps the pair consistent: options above the chosen max are disabled in
+// the min list and vice versa, so an inverted band (which would encode nothing)
+// can't be selected. The server rejects it too — this just stops it earlier.
+function syncResTiers() {
+    const d = laddersCache[document.getElementById('ladder')?.value];
+    const maxSel = document.getElementById('max-res');
+    const minSel = document.getElementById('min-res');
+    if (!maxSel || !minSel) return;
+
+    const heights = [...new Set(
+        _CODEC_ORDER.flatMap(c => (d && d.codecs && d.codecs[c] || []).map(r => r[1]))
+    )].sort((a, b) => b - a);
+
+    // Preserve each selection across a ladder switch when the new ladder still
+    // has that tier; otherwise fall back to "no limit" rather than silently
+    // shifting the user to a neighbouring tier.
+    const keep = (sel) => {
+        const cur = sel.value;
+        sel.innerHTML = '<option value="">No limit (all rungs)</option>'
+            + heights.map(h => `<option value="${h}p">${h}p</option>`).join('');
+        sel.value = heights.some(h => `${h}p` === cur) ? cur : '';
+    };
+    keep(maxSel);
+    keep(minSel);
+
+    const maxH = parseInt(maxSel.value, 10);
+    const minH = parseInt(minSel.value, 10);
+    [...minSel.options].forEach(o => {
+        o.disabled = !!o.value && !isNaN(maxH) && parseInt(o.value, 10) > maxH;
+    });
+    [...maxSel.options].forEach(o => {
+        o.disabled = !!o.value && !isNaN(minH) && parseInt(o.value, 10) < minH;
+    });
 }
 
 // One table per ladder: rows are resolutions (highest first), columns are
@@ -1513,6 +1562,7 @@ async function startEncode(force = false) {
         codec: codecValue(),
         measure_vmaf: document.getElementById('measure-vmaf').checked,
         max_res: document.getElementById('max-res').value,
+        min_res: document.getElementById('min-res').value,
         time: document.getElementById('time-limit').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
@@ -1792,6 +1842,7 @@ function renderLadderTable(ladder) {
              · seg ${p.segment_s}s · partial ${p.partial_s}s · gop ${p.gop_s}s
              ${p.output_tag ? ` · suffix _${escapeHtml(p.output_tag)}` : ''}
              ${p.max_res ? ` · max-res ${escapeHtml(p.max_res)}` : ''}
+             ${p.min_res ? ` · min-res ${escapeHtml(p.min_res)}` : ''}
              ${p.passes ? ` · ${p.passes}-pass` : (p.hevc_single_pass ? ' · hevc 1-pass' : '')}
              ${p.extra_args ? ` · args [${escapeHtml(p.extra_args)}]` : ''}
              ${p.padding && p.padding !== 'off' ? ` · padding ${escapeHtml(p.padding)}` : ''}
@@ -1843,6 +1894,7 @@ function _jobConfigHtml(c) {
         chip('target', c.target || 'local'),
     ];
     if (c.max_res) chips.push(chip('max-res', c.max_res));
+    if (c.min_res) chips.push(chip('min-res', c.min_res));
     if (c.hevc_single_pass) chips.push(chip('hevc', '1-pass'));
     if (c.chunk_duration) chips.push(chip('chunk', /^\d+$/.test(c.chunk_duration) ? c.chunk_duration + 's' : c.chunk_duration));
     if (c.cpu_arch && (c.target === 'cloud' || c.target === 'cloud-batch')) chips.push(chip('cpu', c.cpu_arch));
@@ -1919,7 +1971,7 @@ function jobRowHtml(j) {
             <div class="job-header">
                 <div>
                     <span class="job-files">${escapeHtml((j.config.files || []).join(', '))}</span>
-                    <span class="job-meta"> — ${j.config.target} / ${j.config.codec} / ${j.config.ladder || 'apple-uniq-live'}${j.config.max_res ? ' / ' + j.config.max_res : ''}</span>
+                    <span class="job-meta"> — ${j.config.target} / ${j.config.codec} / ${j.config.ladder || 'apple-uniq-live'}${j.config.max_res ? ' / \u2264' + j.config.max_res : ''}${j.config.min_res ? ' / \u2265' + j.config.min_res : ''}</span>
                     ${cloudBadge}
                     <span class="job-ami-badge" style="display:none"></span>
                     <span class="job-reclaim-badge" style="display:none"></span>
@@ -3705,6 +3757,7 @@ async function forceReencode(fileName) {
         codec: codecValue(),
         measure_vmaf: document.getElementById('measure-vmaf').checked,
         max_res: document.getElementById('max-res').value,
+        min_res: document.getElementById('min-res').value,
         time: document.getElementById('time-limit').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,

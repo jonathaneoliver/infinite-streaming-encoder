@@ -80,6 +80,7 @@ type profileInfo struct {
 	GopS              string  `json:"gop_s"`
 	OutputTag         string  `json:"output_tag,omitempty"`
 	MaxRes            string  `json:"max_res,omitempty"`
+	MinRes            string  `json:"min_res,omitempty"`
 	HevcSinglePass    bool    `json:"hevc_single_pass,omitempty"`
 	Padding           string  `json:"padding,omitempty"`
 	ChunkDuration     string  `json:"chunk_duration,omitempty"`
@@ -101,6 +102,7 @@ type encodeJSON struct {
 	GopS              string  `json:"gop_s"`
 	OutputTag         string  `json:"output_tag"`
 	MaxRes            string  `json:"max_res"`
+	MinRes            string  `json:"min_res"`
 	HevcSinglePass    bool    `json:"hevc_single_pass"`
 	Padding           string  `json:"padding"`
 	ChunkDuration     string  `json:"chunk_duration"`
@@ -159,7 +161,8 @@ func (s *Server) ladder(w http.ResponseWriter, r *http.Request) {
 			Name: ej.Profile, MaxratePercent: ej.MaxratePercent,
 			BufsizeMultiplier: ej.BufsizeMultiplier, SegmentS: ej.SegmentS,
 			PartialS: ej.PartialS, GopS: ej.GopS, OutputTag: ej.OutputTag,
-			MaxRes: ej.MaxRes, HevcSinglePass: ej.HevcSinglePass, Padding: ej.Padding,
+			MaxRes: ej.MaxRes, MinRes: ej.MinRes, HevcSinglePass: ej.HevcSinglePass,
+			Padding:       ej.Padding,
 			ChunkDuration: ej.ChunkDuration, ForceReencode: ej.ForceReencode,
 			Burnin: ej.Burnin,
 			Source: ej.Source, EncodedAt: ej.EncodedAt,

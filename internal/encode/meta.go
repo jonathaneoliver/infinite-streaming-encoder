@@ -23,6 +23,7 @@ type encodeMeta struct {
 	OutputTag         string  `json:"output_tag,omitempty"`
 	// Extra job config used to make this output.
 	MaxRes         string `json:"max_res,omitempty"`
+	MinRes         string `json:"min_res,omitempty"`
 	HevcSinglePass bool   `json:"hevc_single_pass,omitempty"`
 	// Per-codec encoding policy from the ladder profile (this rendition's codec):
 	// ExtraArgs are the raw ffmpeg tokens appended after rate control; Passes is
@@ -150,6 +151,7 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 		GopS:              defaultVal(cfg.GopDuration, "1.0"),
 		OutputTag:         cfg.OutputTag,
 		MaxRes:            cfg.MaxRes,
+		MinRes:            cfg.MinRes,
 		HevcSinglePass:    cfg.HevcSinglePass,
 		ExtraArgs:         def.extraArgsFor(codec),
 		Passes:            metaPasses,

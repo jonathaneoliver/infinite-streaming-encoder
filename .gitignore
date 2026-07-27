@@ -1,5 +1,9 @@
 /server
+# `.env` alone matches only that exact name — any sibling (.env.bak-*, .env.local,
+# .env.prod) held real credentials and was fully committable.
 .env
+.env.*
+!.env.example
 .DS_Store
 __pycache__/
 *.pyc

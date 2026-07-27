@@ -72,6 +72,7 @@ func main() {
 	defaultCodec := flag.String("default-codec", env("DEFAULT_CODEC", "both"), "default codec: h264, hevc, both")
 	defaultLadder := flag.String("default-ladder", env("DEFAULT_LADDER", "apple-uniq-live"), "default encoding ladder profile")
 	defaultMaxRes := flag.String("default-max-res", env("DEFAULT_MAX_RES", ""), "default max resolution (empty = no limit)")
+	defaultMinRes := flag.String("default-min-res", env("DEFAULT_MIN_RES", ""), "default min resolution (empty = no floor)")
 	maxConcurrent := flag.Int("max-concurrent", intEnv("MAX_CONCURRENT", 1), "max concurrent encode jobs")
 	// AWS watchdog (issue #5 phase 5). Polls `infinite_streaming_encoder.cloud.inventory` on
 	// an interval; any instance older than the lifetime budget is flagged
@@ -131,6 +132,7 @@ func main() {
 			Codec:  *defaultCodec,
 			Ladder: *defaultLadder,
 			MaxRes: *defaultMaxRes,
+			MinRes: *defaultMinRes,
 			Target: encode.NormalizeTarget(encode.Target(*defaultTarget)),
 		}
 		w := watcher.New(*sourceDir, *watchInterval, mgr, defaults)

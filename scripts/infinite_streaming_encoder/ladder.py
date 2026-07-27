@@ -119,11 +119,28 @@ def res_name_for_height(height: int) -> str:
     return f"{height}p"
 
 
-# Standard-tier heights, for `--max-res` capping (max_res names -> height).
+# Standard-tier heights, kept as a fallback for any legacy tier name that
+# isn't literally "<height>p".
 _MAX_RES_HEIGHT = {
     "360p": 360, "540p": 540, "720p": 720,
     "1080p": 1080, "1440p": 1440, "2160p": 2160,
 }
+
+
+def res_height(name: str | None) -> int | None:
+    """`"1080p"` -> 1080. None/empty/unparseable -> None (i.e. no bound).
+
+    Parsed rather than looked up because the UI derives its min/max tier
+    options from the SELECTED LADDER's actual rung heights, and the Apple-uniq
+    ladders carry non-standard ones (1044p, 2124p, 684p...). A fixed table
+    would silently ignore every tier it didn't know about.
+    """
+    if not name:
+        return None
+    n = name.strip()
+    if n.endswith("p") and n[:-1].isdigit():
+        return int(n[:-1])
+    return _MAX_RES_HEIGHT.get(n)
 
 
 # ---------------------------------------------------------------------------
@@ -474,24 +491,32 @@ def select_rungs(
     max_res: str | None,
     source_width: int,
     override: dict[str, int] | None = None,
+    min_res: str | None = None,
 ) -> list[Rung]:
     """Rungs to actually encode for a codec: the full ladder, filtered to
-    those that fit the source (no upscale) and `--max-res`, with any
-    per-resolution bitrate override applied.
+    those that fit the source (no upscale) and the `--min-res`/`--max-res`
+    band, with any per-resolution bitrate override applied.
 
     - No upscale: keep rungs whose width <= source_width (skipped when
       source_width <= 0, i.e. the probe was unavailable).
-    - max_res: keep rungs whose height <= that tier's height.
+    - max_res / min_res: keep rungs whose height is within [min, max].
+      Both bounds are inclusive, so min == max encodes exactly that tier.
     - override: {res_name: kbps} replaces the rung's bitrate by resolution.
+
+    `min_res` is keyword-only in practice — it's appended after `override` so
+    every existing positional call site keeps working unchanged.
     """
     override = override or {}
-    max_h = _MAX_RES_HEIGHT.get(max_res or "", None)
+    max_h = res_height(max_res)
+    min_h = res_height(min_res)
 
     out: list[Rung] = []
     for rung in build_rungs(ladder_def, codec):
         if source_width > 0 and rung.width > source_width:
             continue
         if max_h is not None and rung.height > max_h:
+            continue
+        if min_h is not None and rung.height < min_h:
             continue
         if rung.res_name in override:
             rung = Rung(**{**rung.__dict__, "bitrate": override[rung.res_name]})

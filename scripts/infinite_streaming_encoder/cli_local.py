@@ -41,7 +41,7 @@ from infinite_streaming_encoder.manifests import write_fragmented_mpd
 from infinite_streaming_encoder.ladder import (
     Rung, get_ladder, label_height, ladder_bufsize_multiplier,
     ladder_extra_args, ladder_maxrate_percent, ladder_passes,
-    parse_bitrate_override, select_rungs,
+    parse_bitrate_override, res_height, select_rungs,
 )
 from infinite_streaming_encoder.mezzanine import MezzanineSpec, create_mezzanine
 from infinite_streaming_encoder.packager import PackageSpec, package
@@ -85,8 +85,14 @@ def build_parser() -> argparse.ArgumentParser:
     # get_ladder at run time.
     p.add_argument("--ladder", default="apple-uniq-live", dest="ladder",
                    help="encoding ladder name (default: apple-uniq-live)")
+    # No `choices=` on either bound: the UI derives its tier options from the
+    # selected ladder's real rung heights, and the Apple-uniq ladders carry
+    # non-standard ones (1044p, 2124p, 684p...). Any "<height>p" is valid; an
+    # unparseable value means "no bound" (see ladder.res_height).
     p.add_argument("--max-res", default=None, dest="max_res",
-                   choices=("360p", "540p", "720p", "1080p", "1440p", "2160p"))
+                   help="drop rungs taller than this tier, e.g. 1080p")
+    p.add_argument("--min-res", default=None, dest="min_res",
+                   help="drop rungs shorter than this tier, e.g. 540p")
     p.add_argument("--time", type=float, default=None, dest="time_limit_s",
                    help="limit mezzanine duration (seconds)")
 
@@ -286,7 +292,7 @@ def run_full(args: argparse.Namespace) -> int:
     rungs_by_codec: dict[str, list[Rung]] = {}
     for codec in _codec_list(args.codec):
         rungs = select_rungs(ladder_def, codec, args.max_res, info.width,
-                             overrides[codec])
+                             overrides[codec], min_res=getattr(args, "min_res", None))
         if rungs:
             rungs_by_codec[codec] = rungs
     if not rungs_by_codec:
@@ -603,16 +609,18 @@ def run_resume(args: argparse.Namespace) -> int:
     codec_selection = resolve_codec_selection(inventory, args.codec or None)
 
     # Package each codec from whatever labels it has on disk (per-codec, since
-    # a ladder can give codecs different rung sets). --max-res caps by the
-    # rung's encoded height, parsed from its label ("1080p_2" -> 1080).
+    # a ladder can give codecs different rung sets). --max-res / --min-res band
+    # by the rung's encoded height, parsed from its label ("1080p_2" -> 1080).
     selected_codecs = _codec_list(codec_selection)
-    max_h = {"360p": 360, "540p": 540, "720p": 720,
-             "1080p": 1080, "1440p": 1440, "2160p": 2160}.get(args.max_res or "")
+    max_h = res_height(args.max_res)
+    min_h = res_height(getattr(args, "min_res", None))
 
     def _labels_for(codec: str) -> list[str]:
         labels = inventory.available.get(codec, [])
         if max_h is not None:
             labels = [lbl for lbl in labels if label_height(lbl) <= max_h]
+        if min_h is not None:
+            labels = [lbl for lbl in labels if label_height(lbl) >= min_h]
         return labels
 
     stem = args.output or resume_dir.name

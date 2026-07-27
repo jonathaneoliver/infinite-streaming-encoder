@@ -267,6 +267,15 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 	if cfg.Codec == "" {
 		cfg.Codec = "both"
 	}
+	// An inverted min/max band selects no rungs at all, which would otherwise
+	// surface as a job that "succeeded" with an empty ladder. Reject it here.
+	if minH, ok := encode.ResHeight(cfg.MinRes); ok {
+		if maxH, ok2 := encode.ResHeight(cfg.MaxRes); ok2 && minH > maxH {
+			http.Error(w, fmt.Sprintf("min resolution %s is above max resolution %s — no rungs would be encoded",
+				cfg.MinRes, cfg.MaxRes), http.StatusBadRequest)
+			return
+		}
+	}
 	// Reject unknown targets up front with a clear message, rather than letting
 	// a bad target string fail cryptically deep in the encode path.
 	switch cfg.Target {
