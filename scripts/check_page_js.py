@@ -12,14 +12,52 @@ installed (so `make check` stays usable without it).
 """
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from html.parser import HTMLParser
 from pathlib import Path
 
 PAGE = Path(__file__).resolve().parent.parent / "static" / "index.html"
+
+
+class ScriptCollector(HTMLParser):
+    """Collect the body of every inline <script>.
+
+    Uses the stdlib parser rather than a regex deliberately. Regex tag matching
+    kept missing real forms — `<SCRIPT>`, `<script type="module">`, `</script >`
+    — and each miss was SILENT: the block was skipped and the checker still
+    reported success, which is worse than having no checker. HTMLParser handles
+    tag case, attributes and whitespace by construction, so the class of bug is
+    gone rather than patched case by case.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.blocks: list[str] = []
+        self.skipped = 0
+        self._collecting = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "script":
+            return
+        d = {k.lower(): (v or "").lower() for k, v in attrs}
+        # An external script has no inline body to check, and a non-JS type
+        # (application/json, text/template) isn't JavaScript.
+        t = d.get("type", "")
+        if "src" in d or (t and "javascript" not in t and t != "module"):
+            self.skipped += 1
+            return
+        self._collecting = True
+
+    def handle_data(self, data: str) -> None:
+        if self._collecting:
+            self.blocks.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script":
+            self._collecting = False
 
 
 def main() -> int:
@@ -30,22 +68,10 @@ def main() -> int:
         print(f"{PAGE} not found")
         return 1
 
-    # Match the opening tag WITH its attributes, case-insensitively. A
-    # case-sensitive `<script>` literal would silently skip a `<SCRIPT>` or
-    # `<script type="module">` block — and a checker that quietly covers
-    # nothing is worse than no checker, since it still reports success.
-    blocks: list[str] = []
-    skipped = 0
-    for attrs, body in re.findall(
-        r"<script([^>]*)>(.*?)</script>", PAGE.read_text(), re.S | re.I
-    ):
-        a = attrs.lower()
-        # An external script has no inline body to check, and a non-JS type
-        # (application/json, text/template) isn't JavaScript.
-        if "src=" in a or ("type=" in a and "javascript" not in a and "module" not in a):
-            skipped += 1
-            continue
-        blocks.append(body)
+    collector = ScriptCollector()
+    collector.feed(PAGE.read_text())
+    collector.close()
+    blocks, skipped = collector.blocks, collector.skipped
 
     if not blocks:
         # index.html is a single self-contained page whose whole UI is inline
