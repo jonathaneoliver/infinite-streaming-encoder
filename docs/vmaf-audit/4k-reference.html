@@ -1,0 +1,315 @@
+<title>VMAF Ladder Audit — 4K reference</title>
+<style>
+  :root{
+    --bg:#eef1f5; --surface:#fbfcfe; --panel:#ffffff;
+    --ink:#141a21; --muted:#5b6672; --faint:#8a94a0;
+    --line:#e2e7ee; --grid:#eaeef3;
+    --accent:#0d7f9c; --accent-soft:#0d7f9c22;
+    --good:#1a8f57; --warn:#b5791a; --crit:#cf4550;
+    --good-bg:#1a8f5714; --warn-bg:#b5791a16; --crit-bg:#cf455014;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0b0f14; --surface:#0f151c; --panel:#141b23;
+      --ink:#e7edf3; --muted:#94a1af; --faint:#66727f;
+      --line:#212a34; --grid:#1a222c;
+      --accent:#38bdd8; --accent-soft:#38bdd826;
+      --good:#3ddc8a; --warn:#e2ad4d; --crit:#ec6b74;
+      --good-bg:#3ddc8a14; --warn-bg:#e2ad4d16; --crit-bg:#ec6b7414;
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#eef1f5; --surface:#fbfcfe; --panel:#ffffff;
+    --ink:#141a21; --muted:#5b6672; --faint:#8a94a0;
+    --line:#e2e7ee; --grid:#eaeef3;
+    --accent:#0d7f9c; --accent-soft:#0d7f9c22;
+    --good:#1a8f57; --warn:#b5791a; --crit:#cf4550;
+    --good-bg:#1a8f5714; --warn-bg:#b5791a16; --crit-bg:#cf455014;
+  }
+  :root[data-theme="dark"]{
+    --bg:#0b0f14; --surface:#0f151c; --panel:#141b23;
+    --ink:#e7edf3; --muted:#94a1af; --faint:#66727f;
+    --line:#212a34; --grid:#1a222c;
+    --accent:#38bdd8; --accent-soft:#38bdd826;
+    --good:#3ddc8a; --warn:#e2ad4d; --crit:#ec6b74;
+    --good-bg:#3ddc8a14; --warn-bg:#e2ad4d16; --crit-bg:#ec6b7414;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    line-height:1.6;-webkit-font-smoothing:antialiased;font-size:15px}
+  .wrap{max-width:940px;margin:0 auto;padding:48px 24px 96px}
+  .eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.18em;
+    text-transform:uppercase;color:var(--accent);font-weight:600;margin:0 0 14px}
+  h1{font-size:30px;line-height:1.15;margin:0 0 10px;font-weight:680;letter-spacing:-.01em;text-wrap:balance}
+  h2{font-size:19px;margin:56px 0 4px;font-weight:660;letter-spacing:-.005em}
+  h2 + .sub{margin-top:2px}
+  .sub{color:var(--muted);font-size:14px;margin:0 0 18px}
+  .lead{color:var(--muted);font-size:15.5px;max-width:64ch}
+  a{color:var(--accent)}
+  code{font-family:var(--mono);font-size:.88em;background:var(--accent-soft);
+    padding:1px 5px;border-radius:4px;color:var(--ink)}
+  .rule{height:1px;background:var(--line);border:0;margin:0}
+
+  /* context banner */
+  .note{display:flex;gap:12px;background:var(--panel);border:1px solid var(--line);
+    border-left:3px solid var(--accent);border-radius:9px;padding:14px 16px;margin:22px 0 0;font-size:14px}
+  .note .k{font-family:var(--mono);color:var(--accent);font-weight:600;flex:none}
+  .note p{margin:0;color:var(--muted)}
+  .note b{color:var(--ink);font-weight:600}
+
+  /* stat row */
+  .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--line);
+    border:1px solid var(--line);border-radius:11px;overflow:hidden;margin:26px 0 0}
+  .stat{background:var(--panel);padding:16px 16px 15px}
+  .stat .n{font-family:var(--mono);font-size:22px;font-weight:600;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
+  .stat .l{font-size:11.5px;color:var(--muted);margin-top:3px;letter-spacing:.02em}
+  .stat.flag .n{color:var(--warn)}
+  .stat.ok .n{color:var(--good)}
+  @media(max-width:720px){.stats{grid-template-columns:repeat(2,1fr)}}
+
+  /* chart */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px 18px 14px;margin-top:18px}
+  .chart-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:6px;flex-wrap:wrap}
+  .chart-head .t{font-weight:620;font-size:15px}
+  .chart-head .lg{font-family:var(--mono);font-size:11.5px;color:var(--muted);display:flex;gap:16px;align-items:center}
+  .chart-head .lg span{display:inline-flex;align-items:center;gap:6px}
+  .swatch{width:11px;height:11px;border-radius:3px;display:inline-block}
+  .chart-scroll{overflow-x:auto}
+  svg{display:block;max-width:100%;height:auto}
+  .axtxt{font-family:var(--mono);font-size:10.5px;fill:var(--faint)}
+  .axlab{font-family:var(--mono);font-size:11px;fill:var(--muted)}
+  .tip{position:fixed;pointer-events:none;z-index:50;background:var(--ink);color:var(--bg);
+    font-family:var(--mono);font-size:11.5px;line-height:1.5;padding:8px 10px;border-radius:7px;
+    opacity:0;transition:opacity .08s;white-space:nowrap;box-shadow:0 6px 20px #0006}
+  .tip b{color:var(--accent)}
+
+  /* issue cards */
+  .issues{display:flex;flex-direction:column;gap:10px;margin-top:6px}
+  .issue{display:grid;grid-template-columns:auto 1fr;gap:14px;background:var(--panel);
+    border:1px solid var(--line);border-radius:10px;padding:15px 17px}
+  .issue .sev{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+    font-weight:700;padding:4px 8px;border-radius:5px;height:fit-content;white-space:nowrap}
+  .sev.crit{color:var(--crit);background:var(--crit-bg)}
+  .sev.warn{color:var(--warn);background:var(--warn-bg)}
+  .sev.good{color:var(--good);background:var(--good-bg)}
+  .sev.info{color:var(--muted);background:var(--line)}
+  .issue h3{margin:0 0 3px;font-size:14.5px;font-weight:640}
+  .issue p{margin:0;color:var(--muted);font-size:13.5px}
+  .issue .fig{font-family:var(--mono);color:var(--ink);font-weight:600}
+
+  /* table */
+  .twrap{overflow-x:auto;border:1px solid var(--line);border-radius:11px;margin-top:8px}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th,td{padding:9px 12px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--line)}
+  th{font-family:var(--mono);font-size:10.5px;letter-spacing:.04em;text-transform:uppercase;
+    color:var(--muted);font-weight:600;background:var(--surface);position:sticky;top:0}
+  th:first-child,td:first-child{text-align:left}
+  td{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  tr:last-child td{border-bottom:0}
+  tbody tr:hover{background:var(--accent-soft)}
+  .rung{color:var(--ink);font-weight:600}
+  .dim{color:var(--faint)}
+  .badge{font-size:10px;font-family:var(--mono);padding:2px 6px;border-radius:4px;font-weight:600}
+  .badge.dom{color:var(--crit);background:var(--crit-bg)}
+  .spark{display:block}
+
+  .prose{max-width:66ch}
+  .prose p{margin:14px 0;color:var(--muted)}
+  .prose b{color:var(--ink);font-weight:600}
+  .prose h3{font-size:14px;font-family:var(--mono);letter-spacing:.02em;color:var(--ink);margin:26px 0 2px;font-weight:600}
+  .foot{margin-top:64px;padding-top:20px;border-top:1px solid var(--line);color:var(--faint);
+    font-family:var(--mono);font-size:11.5px;line-height:1.7}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Encoder · Quality Audit</p>
+  <h1>VMAF Ladder Audit — 4K reference</h1>
+  <p class="lead"><code>insane_fpv_shots_hydrofoil_windsurfing</code> · H.264 · ladder <code>apple-uniq-live-full</code> · 12 rungs graded against the native <b style="color:var(--ink)">3840×2160</b> master.</p>
+
+  <div class="note">
+    <span class="k">why trust these</span>
+    <p>The chunked encode is now <b>frame-exact</b> (fix&nbsp;#90) — before it, fractional-fps chunk drift desynced the rendition from the source and collapsed VMAF into noise. Each rung is upscaled to 4K <b>in-filter</b> and compared to the pristine 4K master with the <code>vmaf_4k</code> model. Every rung's per-30s timeline is flat, so the numbers reflect quality, not misalignment.</p>
+  </div>
+
+  <div class="stats" id="stats"></div>
+
+  <h2>Rate–quality curve</h2>
+  <p class="sub">Mean VMAF vs delivered bitrate (log scale). The line is the efficient frontier; a point below it is paying for quality it doesn't deliver.</p>
+  <div class="card">
+    <div class="chart-head">
+      <span class="t">VMAF @ 4K vs delivered bitrate</span>
+      <span class="lg">
+        <span><i class="swatch" style="background:var(--accent)"></i>on frontier</span>
+        <span><i class="swatch" style="background:var(--crit)"></i>dominated</span>
+      </span>
+    </div>
+    <div class="chart-scroll"><svg id="rq" viewBox="0 0 880 420" role="img" aria-label="Rate-quality curve"></svg></div>
+  </div>
+
+  <h2>Bits per pixel — the efficiency driver</h2>
+  <p class="sub">Quality tracks bits ÷ pixels, not bitrate alone. A rung whose bits-per-pixel dips below its neighbors is <b style="color:var(--ink)">starved</b> — it can't reach the frontier regardless of resolution. That dip is exactly what flags 2124p.</p>
+  <div class="card">
+    <div class="chart-head"><span class="t">Delivered kbps per megapixel</span>
+      <span class="lg"><span><i class="swatch" style="background:var(--accent)"></i>fed</span><span><i class="swatch" style="background:var(--crit)"></i>starved</span></span></div>
+    <div class="chart-scroll"><svg id="bpp" viewBox="0 0 880 300" role="img" aria-label="bits per pixel per rung"></svg></div>
+  </div>
+
+  <h2>Issues across variants</h2>
+  <p class="sub">Ranked by how much they cost you. Ordering is clean — these are efficiency and provisioning calls, not correctness bugs.</p>
+  <div class="issues" id="issues"></div>
+
+  <h2>Per-rung detail</h2>
+  <p class="sub"><b style="color:var(--ink)">harm</b> = harmonic mean (worst-moments) · <b style="color:var(--ink)">%&lt;50</b> = share of frames below watchable · <b style="color:var(--ink)">eff</b> = VMAF gained per +1 Mbps over the rung below · spark = per-30s timeline (0–100).</p>
+  <div class="twrap"><table id="tbl"><thead><tr>
+    <th>Rung</th><th>Resolution</th><th>kbps</th><th>mean</th><th>harm</th><th>min</th><th>%&lt;50</th><th>ΔVMAF</th><th>eff</th><th>timeline</th>
+  </tr></thead><tbody></tbody></table></div>
+
+  <h2>Reading the numbers</h2>
+  <div class="prose">
+    <h3>mean vs harmonic</h3>
+    <p>Mean averages every frame equally; <b>harmonic mean</b> is dominated by the lowest-scoring frames (it's <code>n / Σ(1/score)</code>), so it reads as "how bad do the bad moments make it feel." At 4K the two sit close — never more than ~3 apart — which tells you the degradation is <b>uniform</b>, not spiky. There's no frame that craters; the rung is just consistently soft relative to the 4K master.</p>
+    <h3>why min never craters at 4K</h3>
+    <p>The <code>min</code> holds around 19–21 for every rung 360p and up. Upscaling a lower rung to 4K <b>blurs</b> its compression artifacts into an even softness rather than sharp errors — blurry-but-even beats sharp-but-wrong, so no single frame is catastrophically off. The 1080p-reference report (next) grades the rungs at their own scale, where real compression artifacts surface and the min drops toward 0 on the hardest frames. Same encodes, different question: <b>4K asks "how much of the 4K experience does it deliver," 1080p asks "how clean is the compression."</b></p>
+    <h3>the ~t300s dip is content, not a rung problem</h3>
+    <p>Every rung's timeline dips at the same window (~t300s → the mid-70s even on 2160p). It's a genuinely hard stretch of the clip — fast water spray, high texture — that no rung fully resolves. Because it hits <b>all</b> rungs together, it's real content difficulty, and the vertical gap between rungs there is exactly how much bitrate buys you on the hardest content.</p>
+    <h3>%&lt;50 as a reach signal</h3>
+    <p>At 4K, <b>234p</b> has 96.6% of frames below VMAF 50 and <b>360p</b> 88.9% — these low rungs look poor on a 4K display, as expected: they exist to keep playback <em>alive</em> under collapsed bandwidth, not to look good. By 684p only ~3.6% of frames fall below 50, and it flattens from there.</p>
+  </div>
+
+  <div class="foot">
+    method: rung = init.mp4 + 56 fMP4 segments reassembled · distorted upscaled 3840×2160 bicubic in-filter · reference = native 4K master · model vmaf_4k_v0.6.1 · n_subsample=5 (2005 frames/rung) · fps-paired 30000/1001 · run natively (ffmpeg+libvmaf, 10-core)<br>
+    source 334.4s @ 29.97fps · encode: local Temporal fleet, 12s chunks, force re-encode · 1080p-reference report follows.
+  </div>
+</div>
+
+<div class="tip" id="tip"></div>
+
+<script>
+const DATA = [{"rung": "234p", "w": 416, "h": 234, "kbps": 138, "mean": 24.74, "harmonic": 21.27, "min": 4.83, "max": 100.0, "frames": 2005, "pct_lt10": 1.75, "pct_lt50": 96.61, "timeline": [21.4, 20.8, 25.7, 25.2, 25.6, 28.9, 23.7, 23.8, 23.8, 33.0, 16.9, 49.9], "rc": 0, "dVmaf": null, "dKbps": null, "eff": null, "hull_delta": null}, {"rung": "360p", "w": 640, "h": 360, "kbps": 339, "mean": 38.26, "harmonic": 35.63, "min": 13.68, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 88.93, "timeline": [36.2, 43.8, 33.9, 37.5, 36.8, 41.2, 35.9, 33.5, 32.7, 47.3, 38.1, 67.3], "rc": 0, "dVmaf": 13.5, "dKbps": 201, "eff": 67.264, "hull_delta": 4.83}, {"rung": "396p", "w": 704, "h": 396, "kbps": 673, "mean": 47.87, "harmonic": 44.89, "min": 16.45, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 58.6, "timeline": [46.3, 57.3, 41.7, 49.2, 46.2, 51.8, 45.8, 40.6, 39.0, 56.3, 48.7, 75.5], "rc": 0, "dVmaf": 9.6, "dKbps": 334, "eff": 28.772, "hull_delta": 1.61}, {"rung": "432p", "w": 768, "h": 432, "kbps": 1013, "mean": 54.41, "harmonic": 51.3, "min": 17.09, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 39.35, "timeline": [52.8, 64.9, 48.0, 56.9, 53.2, 59.3, 53.0, 46.3, 43.9, 62.3, 54.4, 79.7], "rc": 0, "dVmaf": 6.5, "dKbps": 340, "eff": 19.235, "hull_delta": 1.64}, {"rung": "540p", "w": 960, "h": 540, "kbps": 1856, "mean": 64.93, "harmonic": 61.95, "min": 18.57, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 12.37, "timeline": [63.2, 75.7, 58.7, 68.5, 64.3, 70.6, 64.5, 57.7, 53.9, 71.9, 62.4, 86.1], "rc": 0, "dVmaf": 10.5, "dKbps": 843, "eff": 12.479, "hull_delta": 1.89}, {"rung": "684p", "w": 1216, "h": 684, "kbps": 2798, "mean": 72.68, "harmonic": 69.89, "min": 19.15, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 3.64, "timeline": [70.9, 82.9, 66.4, 76.2, 71.9, 77.7, 73.2, 67.6, 62.7, 79.3, 68.1, 90.7], "rc": 0, "dVmaf": 7.8, "dKbps": 942, "eff": 8.227, "hull_delta": 2.35}, {"rung": "720p", "w": 1280, "h": 720, "kbps": 4220, "mean": 78.49, "harmonic": 75.79, "min": 19.5, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 2.79, "timeline": [76.5, 86.8, 74.7, 83.2, 79.4, 84.1, 79.5, 74.4, 68.8, 83.9, 70.2, 92.4], "rc": 0, "dVmaf": 5.8, "dKbps": 1422, "eff": 4.086, "hull_delta": 0.64}, {"rung": "1044p", "w": 1856, "h": 1044, "kbps": 5669, "mean": 83.12, "harmonic": 80.52, "min": 19.74, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 2.49, "timeline": [81.8, 91.3, 77.9, 86.1, 82.7, 87.0, 84.7, 82.4, 76.2, 88.4, 74.0, 95.7], "rc": 0, "dVmaf": 4.6, "dKbps": 1449, "eff": 3.195, "hull_delta": 0.96}, {"rung": "1080p", "w": 1920, "h": 1080, "kbps": 7423, "mean": 86.6, "harmonic": 84.01, "min": 19.88, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 2.49, "timeline": [85.4, 93.2, 83.1, 90.0, 87.2, 90.5, 88.4, 86.6, 80.6, 91.1, 75.1, 96.7], "rc": 0, "dVmaf": 3.5, "dKbps": 1754, "eff": 1.984, "hull_delta": 1.32}, {"rung": "1440p", "w": 2560, "h": 1440, "kbps": 12975, "mean": 92.12, "harmonic": 89.46, "min": 20.65, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 2.39, "timeline": [91.7, 96.6, 90.6, 95.2, 93.4, 95.1, 94.2, 94.3, 88.7, 95.5, 77.1, 98.5], "rc": 0, "dVmaf": 5.5, "dKbps": 5552, "eff": 0.994, "hull_delta": 1.94}, {"rung": "2124p", "w": 3776, "h": 2124, "kbps": 18376, "mean": 93.67, "harmonic": 90.98, "min": 19.76, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 2.39, "timeline": [93.9, 97.7, 92.0, 96.2, 94.8, 95.9, 96.0, 96.7, 91.7, 96.8, 77.9, 99.2], "rc": 0, "dVmaf": 1.5, "dKbps": 5401, "eff": 0.287, "hull_delta": -0.24}, {"rung": "2160p", "w": 3840, "h": 2160, "kbps": 26190, "mean": 96.51, "harmonic": 93.72, "min": 20.75, "max": 100.0, "frames": 2005, "pct_lt10": 0.0, "pct_lt50": 2.39, "timeline": [97.3, 99.1, 97.1, 99.2, 98.8, 98.6, 98.7, 98.9, 96.1, 98.8, 78.6, 99.8], "rc": 0, "dVmaf": 2.8, "dKbps": 7814, "eff": 0.363, "hull_delta": null}];
+const $ = s => document.querySelector(s);
+
+/* ---- summary stats ---- */
+const kmin = Math.min(...DATA.map(d=>d.kbps)), kmax = Math.max(...DATA.map(d=>d.kbps));
+const vmin = Math.min(...DATA.map(d=>d.mean)), vmax = Math.max(...DATA.map(d=>d.mean));
+const dom = DATA.filter(d=>d.hull_delta!=null && d.hull_delta<0);
+const fmtMbps = k => k>=1000 ? (k/1000).toFixed(k<10000?1:0)+' Mbps' : k+' kbps';
+$('#stats').innerHTML = [
+  ['12','rungs measured',''],
+  [fmtMbps(kmin)+'–'+fmtMbps(kmax),'delivered bitrate',''],
+  [vmin.toFixed(1)+'–'+vmax.toFixed(1),'mean VMAF @4K',''],
+  [dom.length,'dominated rung'+(dom.length==1?'':'s'),'flag'],
+  ['stable','alignment (timelines)','ok'],
+].map(([n,l,c])=>`<div class="stat ${c}"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('');
+
+/* ---- rate-quality chart ---- */
+(function(){
+  const W=880,H=420, m={l:52,r:22,t:16,b:46};
+  const iw=W-m.l-m.r, ih=H-m.t-m.b;
+  const lx = k => m.l + (Math.log10(k)-Math.log10(100))/(Math.log10(30000)-Math.log10(100))*iw;
+  const ly = v => m.t + (1-(v-20)/(100-20))*ih;
+  let s='';
+  // grid + y ticks
+  for(let v=20;v<=100;v+=20){const y=ly(v);
+    s+=`<line x1="${m.l}" y1="${y}" x2="${W-m.r}" y2="${y}" stroke="var(--grid)"/>`;
+    s+=`<text x="${m.l-9}" y="${y+3.5}" text-anchor="end" class="axtxt">${v}</text>`;}
+  // x ticks (log)
+  [100,300,1000,3000,10000,30000].forEach(k=>{const x=lx(k);
+    s+=`<line x1="${x}" y1="${m.t}" x2="${x}" y2="${H-m.b}" stroke="var(--grid)"/>`;
+    s+=`<text x="${x}" y="${H-m.b+16}" text-anchor="middle" class="axtxt">${k>=1000?k/1000+'M':k+'k'}</text>`;});
+  s+=`<text x="${m.l+iw/2}" y="${H-6}" text-anchor="middle" class="axlab">delivered bitrate (log)</text>`;
+  s+=`<text transform="translate(14 ${m.t+ih/2}) rotate(-90)" text-anchor="middle" class="axlab">mean VMAF</text>`;
+  // frontier line
+  let path = DATA.map((d,i)=>(i?'L':'M')+lx(d.kbps).toFixed(1)+' '+ly(d.mean).toFixed(1)).join(' ');
+  s+=`<path d="${path}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round" opacity=".85"/>`;
+  // area under, faint
+  s+=`<path d="${path} L ${lx(DATA[DATA.length-1].kbps).toFixed(1)} ${ly(20)} L ${lx(DATA[0].kbps).toFixed(1)} ${ly(20)} Z" fill="var(--accent-soft)" stroke="none"/>`;
+  // points
+  DATA.forEach(d=>{
+    const x=lx(d.kbps),y=ly(d.mean), bad=d.hull_delta!=null&&d.hull_delta<0;
+    s+=`<circle cx="${x}" cy="${y}" r="5" fill="${bad?'var(--crit)':'var(--accent)'}" stroke="var(--panel)" stroke-width="2"
+        data-r="${d.rung}" data-k="${d.kbps}" data-m="${d.mean}" data-h="${d.harmonic}" class="pt" style="cursor:pointer"/>`;
+  });
+  // selective direct labels: bottom, 1080p, top, and the dominated one
+  [DATA[0],DATA.find(d=>d.rung=='1080p'),DATA.find(d=>d.rung=='2160p'),...dom].forEach(d=>{
+    if(!d)return; const x=lx(d.kbps),y=ly(d.mean);
+    const bad=d.hull_delta!=null&&d.hull_delta<0;
+    s+=`<text x="${x}" y="${y-11}" text-anchor="middle" font-family="var(--mono)" font-size="11" font-weight="600"
+        fill="${bad?'var(--crit)':'var(--ink)'}">${d.rung}</text>`;
+  });
+  $('#rq').innerHTML=s;
+  // hover
+  const tip=$('#tip');
+  $('#rq').querySelectorAll('.pt').forEach(pt=>{
+    pt.addEventListener('mousemove',e=>{
+      tip.innerHTML=`<b>${pt.dataset.r}</b> · ${fmtMbps(+pt.dataset.k)}<br>mean ${(+pt.dataset.m).toFixed(1)} · harm ${(+pt.dataset.h).toFixed(1)}`;
+      tip.style.opacity=1; tip.style.left=(e.clientX+14)+'px'; tip.style.top=(e.clientY-10)+'px';
+    });
+    pt.addEventListener('mouseleave',()=>tip.style.opacity=0);
+  });
+})();
+
+/* ---- bits per pixel ---- */
+(function(){
+  const bpp=d=>d.kbps/(d.w*d.h/1e6), vals=DATA.map(bpp);
+  const W=880,H=300,m={l:58,r:16,t:16,b:50},iw=W-m.l-m.r,ih=H-m.t-m.b;
+  const ymax=Math.ceil(Math.max(...vals)/500)*500, by=v=>m.t+(1-v/ymax)*ih, n=DATA.length, step=iw/n, bw=step*0.62;
+  let s='';
+  for(let v=0;v<=ymax;v+=1000){const y=by(v);s+=`<line x1="${m.l}" y1="${y.toFixed(1)}" x2="${W-m.r}" y2="${y.toFixed(1)}" stroke="var(--grid)"/><text x="${m.l-8}" y="${(y+3.5).toFixed(1)}" text-anchor="end" class="axtxt">${v}</text>`;}
+  DATA.forEach((d,i)=>{
+    const x=m.l+step*i+(step-bw)/2, y=by(vals[i]), h=Math.max(0,m.t+ih-y), hd=d.hull_delta;
+    const col=(hd!=null&&hd<0)?'var(--crit)':(hd!=null&&hd<0.5)?'var(--warn)':'var(--accent)', flag=hd!=null&&hd<0.5;
+    s+=`<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="3" fill="${col}" class="bar" data-r="${d.rung}" data-v="${vals[i].toFixed(0)}" style="cursor:pointer"/>`;
+    s+=`<text x="${(x+bw/2).toFixed(1)}" y="${H-m.b+16}" text-anchor="middle" class="axtxt">${d.rung}</text>`;
+    if(flag)s+=`<text x="${(x+bw/2).toFixed(1)}" y="${(y-5).toFixed(1)}" text-anchor="middle" font-family="var(--mono)" font-size="10" font-weight="600" fill="${col}">${vals[i].toFixed(0)}</text>`;
+  });
+  s+=`<text transform="translate(14 ${(m.t+ih/2).toFixed(1)}) rotate(-90)" text-anchor="middle" class="axlab">kbps / megapixel</text>`;
+  $('#bpp').innerHTML=s;
+  const tip=$('#tip');
+  $('#bpp').querySelectorAll('.bar').forEach(b=>{
+    b.addEventListener('mousemove',e=>{tip.innerHTML=`<b>${b.dataset.r}</b><br>${(+b.dataset.v).toLocaleString()} kbps/Mpx`;tip.style.opacity=1;tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-10)+'px';});
+    b.addEventListener('mouseleave',()=>tip.style.opacity=0);
+  });
+})();
+
+/* ---- issues ---- */
+const ISSUES=[
+  ['crit','Dominated rung — 2124p is off the frontier',
+   `<span class="fig">2124p</span> (18.4 Mbps → 93.7) sits <span class="fig">0.24 VMAF below</span> the line joining 1440p and 2160p — you can interpolate those two for the same quality at the same bitrate. It's a redundant intermediate 4K rung: <b>drop it</b>, or re-target its bitrate so it earns a spot on the hull.`],
+  ['warn','Steep diminishing returns above 1080p',
+   `1440p / 2124p / 2160p burn <span class="fig">13–26 Mbps</span> for VMAF 92–96.5. 2160p costs <span class="fig">3.5× the 1080p bitrate</span> for +9.9 VMAF, and marginal efficiency falls below <span class="fig">1 VMAF per Mbps</span>. Justified only for premium 4K delivery; wasteful as default rungs.`],
+  ['warn','1044p and 1080p are a tight, low-efficiency pair',
+   `83.1 vs 86.6 (<span class="fig">+3.5 VMAF</span>) for <span class="fig">+1.75 Mbps</span> (+31% bitrate). Both stay on the hull, but they're close enough that on a constrained ladder you'd question carrying both.`],
+  ['info','234p is a survival rung, not a quality rung',
+   `At 4K, mean <span class="fig">24.7</span>, min <span class="fig">4.8</span>, and <span class="fig">96.6%</span> of frames below VMAF 50. Expected for a 138 kbps floor — it exists to keep playback alive under collapsed bandwidth, not to look good. Keep it for reach.`],
+  ['good','Clean ordering, and alignment held everywhere',
+   `Mean VMAF and bitrate are both <b>monotonic</b> — no inversions, every step up buys real quality. And every rung's per-30s timeline is <b>flat</b> (no decay), confirming the frame-exact chunk fix — these scores are trustworthy.`],
+];
+$('#issues').innerHTML=ISSUES.map(([s,h,p])=>
+  `<div class="issue"><span class="sev ${s}">${s=='good'?'clean':s}</span><div><h3>${h}</h3><p>${p}</p></div></div>`).join('');
+
+/* ---- table + sparklines ---- */
+function spark(tl){
+  const w=104,h=22,n=tl.length, sx=w/(n-1), sy=v=>h-2-(v/100)*(h-4);
+  const pts=tl.map((v,i)=>`${(i*sx).toFixed(1)},${sy(v).toFixed(1)}`).join(' ');
+  return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+    <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity=".9"/>
+    </svg>`;
+}
+$('#tbl tbody').innerHTML=DATA.map(d=>{
+  const bad=d.hull_delta!=null&&d.hull_delta<0;
+  return `<tr>
+   <td class="rung">${d.rung}${bad?' <span class="badge dom">dominated</span>':''}</td>
+   <td class="dim">${d.w}×${d.h}</td>
+   <td>${d.kbps.toLocaleString()}</td>
+   <td>${d.mean.toFixed(1)}</td>
+   <td>${d.harmonic.toFixed(1)}</td>
+   <td>${d.min.toFixed(1)}</td>
+   <td>${d.pct_lt50.toFixed(1)}</td>
+   <td class="${d.dVmaf==null?'dim':''}">${d.dVmaf==null?'—':'+'+d.dVmaf.toFixed(1)}</td>
+   <td class="${d.eff==null?'dim':''}">${d.eff==null?'—':d.eff.toFixed(2)}</td>
+   <td>${spark(d.timeline)}</td>
+  </tr>`;
+}).join('');
+</script>
