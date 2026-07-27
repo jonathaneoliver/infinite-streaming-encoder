@@ -936,7 +936,7 @@ def run_temporal(args: argparse.Namespace) -> int:
         two_pass["hevc"] = False
     plan = {
         "bucket": bucket, "job_prefix": prefix, "src_key": src_key,
-        "mezz_prefix": mezz_prefix,
+        "mezz_prefix": mezz_prefix, "job_rank": args.job_rank,
         "has_audio": info.has_audio, "chunk_duration_s": args.chunk_duration_s,
         "n_chunks": n_chunks, "burnin": args.burnin,
         "measure_vmaf": args.measure_vmaf,
@@ -1067,6 +1067,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--s3-bucket", required=True, dest="s3_bucket")
     p.add_argument("--job-prefix", required=True, dest="job_prefix",
                    help="MinIO key prefix for this job's objects")
+    p.add_argument("--job-rank", type=int, default=0, dest="job_rank",
+                   help="arrival rank among active local-dist jobs (0=oldest); "
+                        "folded into each chunk's Temporal priority_key so an "
+                        "older job's chunks outrank a younger job's (see #99)")
     p.add_argument("--keep-staging", action="store_true", dest="keep_staging",
                    help="don't delete this job's MinIO staging after the outputs "
                         "download (default: reclaim it — see dist_staging)")

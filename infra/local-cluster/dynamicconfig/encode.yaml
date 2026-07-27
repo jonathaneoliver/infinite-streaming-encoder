@@ -24,3 +24,24 @@ matching.numTaskqueueWritePartitions:
   - value: 1
     constraints:
       taskQueueName: encode
+
+# Raise the priority ceiling from the default 5 so the workflow can encode a
+# COMPOSITE priority_key = job_rank*5 + cost_band on each chunk (see #99 /
+# temporal_worker.PRIORITY_LEVELS). 50 = up to 10 concurrent local jobs × 5 cost
+# bands: an older job's whole ladder (ranks 1-5) outranks a younger job's (6-10),
+# and within a job the heaviest tiers lead. priority_key: 1 = highest.
+matching.priorityLevels:
+  - value: 50
+    constraints:
+      taskQueueName: encode
+
+# priority_key ordering is only honored by Temporal's NEW matcher, which is gated
+# behind this flag ("Enable fairness for task dispatching. Implies
+# matching.useNewMatcher."). Without it the server stores priority_key but the old
+# matcher dispatches ~FIFO and ignores it — so this is REQUIRED for #99 to work,
+# not optional. Scoped to the encode queue so the rest of the cluster keeps the
+# default matcher.
+matching.enableFairness:
+  - value: true
+    constraints:
+      taskQueueName: encode

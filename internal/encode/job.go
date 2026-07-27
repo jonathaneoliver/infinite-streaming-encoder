@@ -1446,6 +1446,34 @@ func (m *Manager) jobPriorityBase(job *Job) int {
 	return 9000 - older*1000
 }
 
+// localJobRank returns this local-dist job's arrival rank among currently-active
+// local-dist jobs — 0 for the oldest, 1 for the next, and so on. The Temporal
+// orchestrator folds it into every chunk's priority_key (rank*bands + costBand)
+// so ALL of an older job's chunks outrank any younger job's: the oldest job runs
+// to completion and a younger one only backfills spare slots. This is the local
+// mirror of jobPriorityBase's Batch bands. Job IDs are ascending timestamps, so a
+// smaller ID is older. Capped at 9 so rank*5+5 stays within matching.priorityLevels
+// (50); beyond 10 concurrent local jobs the extras share the lowest band.
+func (m *Manager) localJobRank(job *Job) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	older := 0
+	for _, j := range m.jobs {
+		if j == job {
+			continue
+		}
+		if (j.Status == StatusQueued || j.Status == StatusRunning) &&
+			j.Config.Target == TargetLocalDist &&
+			j.ID < job.ID {
+			older++
+		}
+	}
+	if older > 9 {
+		older = 9
+	}
+	return older
+}
+
 func (m *Manager) GetJob(id string) *Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2053,7 +2081,7 @@ func (cfg *JobConfig) localChunkSeconds() float64 {
 // picks it up unchanged. The S3 job-prefix embeds the unique job ID, so a
 // re-encode always writes a fresh MinIO prefix (no cross-job reuse); force is
 // implicit. MinIO endpoint/creds ride in as env (buildRunArgs).
-func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID string) []string {
+func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID string, jobRank int) []string {
 	stem := cfg.OutputStem(filename)
 	args := []string{
 		"--input", sourceDir + "/" + filename,
@@ -2089,6 +2117,9 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	if !cfg.BurninEnabled() {
 		args = append(args, "--no-burnin")
 	}
+	// Cross-job priority: an older local-dist job's chunks all outrank a younger
+	// job's on the shared Temporal fleet (see localJobRank). Always passed.
+	args = append(args, "--job-rank", strconv.Itoa(jobRank))
 	return args
 }
 
@@ -2223,7 +2254,7 @@ func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int)
 			// retired target that should have been rejected at submit.
 			return fmt.Errorf("unsupported target %q (use local or cloud)", job.Config.Target)
 		}
-		args := fileCfg.distArgsForFile(m.SourceDir, tmpDir, f, job.ID)
+		args := fileCfg.distArgsForFile(m.SourceDir, tmpDir, f, job.ID, m.localJobRank(job))
 		if err := m.runFileContainer(job, i, script, args); err != nil {
 			return fmt.Errorf("%s: %w", f, err)
 		}
