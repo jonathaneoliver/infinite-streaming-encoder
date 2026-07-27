@@ -2101,10 +2101,12 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	if cfg.MaxRes != "" {
 		args = append(args, "--max-res", cfg.MaxRes)
 	}
-	if chunk := cfg.localChunkSeconds(); chunk > 0 {
-		args = append(args, "--chunk-duration",
-			strconv.FormatFloat(chunk, 'f', -1, 64))
-	}
+	// Always pass it — including 0, which means "whole variant" (the UI's
+	// "whole" option). Omitting the flag would let cli_local_dist's argparse
+	// default (12s) silently re-chunk a "whole" request; cli_local_dist treats
+	// <=0 as one chunk spanning the clip.
+	args = append(args, "--chunk-duration",
+		strconv.FormatFloat(cfg.localChunkSeconds(), 'f', -1, 64))
 	if cfg.OutputTag != "" {
 		args = append(args, "--output-tag", cfg.OutputTag)
 	}

@@ -474,8 +474,8 @@ def _worker_loop(w: Worker, sh: _Shared, s3_mezz: str, s3_out: str) -> None:
                        env={"CHUNK_DURATION_S": f"{sh.chunk_duration_s:g}",
                             "TWO_PASS": "1" if task.two_pass else "0",
                             "EXTRA_ARGS": task.extra_args,
-                            "BURNIN": "1" if sh.burnin else "0",
-                            "MEASURE_VMAF": "1" if sh.measure_vmaf else "0"},
+                            "MEASURE_VMAF": "1" if sh.measure_vmaf else "0",
+                            "BURNIN": "1" if sh.burnin else "0"},
                        log_prefix=stage)
         if rc == 0 and _object_exists(sh.bucket, key):
             with sh.lock:
@@ -615,6 +615,10 @@ def run(args: argparse.Namespace) -> int:
     except ProbeError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    # Resolve "whole variant" (0) to a clip-spanning single chunk before the
+    # value fans out to plan_chunks / _Shared / worker env.
+    args.chunk_duration_s = _resolve_chunk_duration_s(
+        args.chunk_duration_s, info.duration_s)
 
     bucket = args.s3_bucket
     prefix = args.job_prefix.strip("/")
@@ -700,8 +704,8 @@ def run(args: argparse.Namespace) -> int:
     print(f"[dist] === {len(tasks)} chunk task(s) across "
           f"{sum(w.slots for w in pool)} slot(s) ===", flush=True)
     sh = _Shared(q=queue.Queue(), bucket=bucket, work_prefix=work_prefix,
-                 chunk_duration_s=args.chunk_duration_s, burnin=args.burnin,
-                 measure_vmaf=args.measure_vmaf)
+                 chunk_duration_s=args.chunk_duration_s,
+                 measure_vmaf=args.measure_vmaf, burnin=args.burnin)
     encode_chunks_distributed(pool, tasks, sh, mezz_prefix, s3_work)
     if sh.failed:
         print(f"[dist] FAILED chunks: {', '.join(sh.failed)}", file=sys.stderr)
@@ -738,6 +742,19 @@ def run(args: argparse.Namespace) -> int:
 
     print("[dist] done", flush=True)
     return 0
+
+
+def _resolve_chunk_duration_s(requested_s: float, content_duration_s: float) -> float:
+    """Resolve the requested --chunk-duration. A value <= 0 means "whole variant"
+    (the UI's "whole" option arrives as 0 from the Go control plane): return the
+    smallest whole-segment multiple that spans the clip, so plan_chunks yields
+    exactly ONE chunk per variant — no chunk boundaries, the variant is encoded
+    in a single continuous pass. A positive value is used verbatim."""
+    if requested_s > 0:
+        return requested_s
+    seg = _SEGMENT_DURATION_S
+    n_segments = int(content_duration_s // seg) + (1 if content_duration_s % seg else 0)
+    return max(1, n_segments) * seg
 
 
 def _resolve_plan(args, info):
@@ -898,6 +915,10 @@ def run_temporal(args: argparse.Namespace) -> int:
     except ProbeError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    # Resolve "whole variant" (0) to a clip-spanning single chunk before the
+    # value fans out to _resolve_plan / the workflow plan / worker env.
+    args.chunk_duration_s = _resolve_chunk_duration_s(
+        args.chunk_duration_s, info.duration_s)
 
     bucket = args.s3_bucket
     prefix = args.job_prefix.strip("/")
@@ -938,8 +959,8 @@ def run_temporal(args: argparse.Namespace) -> int:
         "bucket": bucket, "job_prefix": prefix, "src_key": src_key,
         "mezz_prefix": mezz_prefix, "job_rank": args.job_rank,
         "has_audio": info.has_audio, "chunk_duration_s": args.chunk_duration_s,
-        "n_chunks": n_chunks, "burnin": args.burnin,
-        "measure_vmaf": args.measure_vmaf,
+        "n_chunks": n_chunks,
+        "measure_vmaf": args.measure_vmaf, "burnin": args.burnin,
         "codecs": {c: {"two_pass": two_pass[c],
                        "extra_args": ladder_extra_args(ladder_def, c),
                        "rungs": [{"label": r.label, "width": r.width,
@@ -1052,11 +1073,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ladder", default="apple-uniq-live")
     p.add_argument("--max-res", default=None, dest="max_res")
     p.add_argument("--hevc-single-pass", action="store_true", dest="hevc_single_pass")
+    p.add_argument("--measure-vmaf", action="store_true", dest="measure_vmaf",
+                   help="per-rendition VMAF audit after each chunk encode (slow)")
     p.add_argument("--no-burnin", action="store_false", dest="burnin", default=True,
                    help="disable the burnt-in text overlay on every variant; "
                         "on by default")
-    p.add_argument("--measure-vmaf", action="store_true", dest="measure_vmaf",
-                   help="per-rendition VMAF audit after each chunk encode (slow)")
     p.add_argument("--bitrate-override-hevc", default=None, dest="bitrate_override_hevc")
     p.add_argument("--bitrate-override-h264", default=None, dest="bitrate_override_h264")
     p.add_argument("--chunk-duration", type=float, default=12.0,

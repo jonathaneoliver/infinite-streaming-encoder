@@ -386,15 +386,15 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="amd">AMD EPYC (c7a) — needs multi-arch image</option>
                 </select>
             </div>
-            <div class="control-group" id="chunk-dur-group" style="display:none">
-                <label title="How the cloud-batch target splits each variant. Dynamic sizes each variant's chunks by its learned encode speed — ~4 min of encode work per chunk (min 30s), so slow 4K HEVC splits into many chunks while cheap H264 runs whole and pays no join cost. Fixed sizes: smaller chunks = more parallel jobs (faster wall-clock, more fleet overhead); whole variant = one job per tier (most efficient, least parallel).">Chunking (cloud)</label>
+            <div class="control-group" id="chunk-dur-group">
+                <label title="How each variant is split into parallel chunks. CLOUD (AWS Batch): Dynamic sizes each variant's chunks by learned encode speed (~4 min work per chunk, min 30s) — slow 4K HEVC splits into many, cheap H264 runs whole. LOCAL (Temporal): Dynamic = a fixed 12s default (no per-variant model); fixed sizes and Whole behave the same as cloud. Fixed: smaller chunks = more parallelism, more join overhead. Whole variant = one continuous encode per tier, NO chunk boundaries (use this to rule out chunk-boundary effects).">Chunking</label>
                 <select id="chunk-duration">
-                    <option value="dynamic" selected>Dynamic (per-variant, learned)</option>
+                    <option value="dynamic" selected>Dynamic (cloud: learned · local: 12s)</option>
                     <option value="12">12s chunks (max parallelism)</option>
                     <option value="30">30s chunks</option>
                     <option value="60">60s chunks</option>
                     <option value="300">5m chunks</option>
-                    <option value="whole">Whole variant (max efficiency)</option>
+                    <option value="whole">Whole variant (no chunking)</option>
                 </select>
             </div>
             <div class="control-group" id="spot-group" style="display:none;align-self:center;padding-top:16px">
@@ -432,6 +432,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group">
                 <label>Duration (s)</label>
                 <input type="text" id="time-limit" placeholder="full clip">
+            </div>
+            <div class="control-group">
+                <label title="Optional suffix appended to the output dir name (<stem>_<suffix>_<codec>). Use it to keep comparison encodes of the same source side-by-side on disk instead of archiving each other — e.g. 'local12', 'localwhole'. Blank = the ladder's default (usually 'xs').">Output suffix</label>
+                <input type="text" id="output-tag" placeholder="ladder default" style="width:110px">
             </div>
             <div class="control-group">
                 <label>HLS Format</label>
@@ -1427,9 +1431,8 @@ function onTargetChange() {
     const isAnyCloud = target === 'cloud' || target === 'cloud-batch';
     document.getElementById('cloud-warning').style.display =
         isAnyCloud ? 'block' : 'none';
-    // Chunk granularity applies to the cloud (AWS Batch) target.
-    document.getElementById('chunk-dur-group').style.display =
-        isAnyCloud ? 'flex' : 'none';
+    // Chunk granularity applies to BOTH local (Temporal) and cloud (AWS Batch).
+    document.getElementById('chunk-dur-group').style.display = 'flex';
     // The legacy single-box EC2 cloud target — and its cpu-arch / spot /
     // simulate-interrupt knobs — has been retired, so these controls stay hidden.
     for (const id of ['legacy-cloud-warning', 'cpu-arch-group', 'spot-group', 'simulate-interrupt-group']) {
@@ -1514,6 +1517,7 @@ async function startEncode(force = false) {
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
         ladder: document.getElementById('ladder').value,
+        output_tag: document.getElementById('output-tag').value.trim(),
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
@@ -1845,6 +1849,8 @@ function _jobConfigHtml(c) {
     if (c.padding) chips.push(chip('padding', c.padding));
     if (c.time) chips.push(chip('time', c.time));
     if (c.force_reencode) chips.push(chip('force', 're-encode', '#d0883a'));
+    // VMAF audit is off by default; flag when on (it also forces overlay off).
+    if (c.measure_vmaf) chips.push(chip('vmaf', 'on', '#06d6a0'));
     // Overlay is on by default; only flag the exception (burnin === false).
     if (c.burnin === false) chips.push(chip('overlay', 'off', '#d0883a'));
     return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px">${chips.join('')}</div>`;
@@ -3703,6 +3709,7 @@ async function forceReencode(fileName) {
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
         ladder: document.getElementById('ladder').value,
+        output_tag: document.getElementById('output-tag').value.trim(),
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
