@@ -27,6 +27,7 @@ One Docker image plays three roles: the **server** (Go control plane, default
 ## Contents
 
 - [Why you might want this](#why-you-might-want-this)
+- [Prior art](#prior-art)
 - [Two run modes](#two-run-modes)
 - [What it does](#what-it-does)
 - [How it works](#how-it-works)
@@ -49,16 +50,9 @@ One Docker image plays three roles: the **server** (Go control plane, default
 
 Producing a full ABR ladder (multiple codecs × resolutions, LL-HLS **and** DASH,
 with burned-in QA overlays) for testing is fiddly, and doing it *fast* usually
-means renting big cloud boxes. The common options each fall short:
-
-- **Hand-rolled ffmpeg + packager scripts** get you one output at a time on one
-  machine, with no resumability — a crash or a laptop lid halfway through means
-  starting over — and no live progress.
-- **Managed services** (AWS MediaConvert, Bitmovin, Mux) are turnkey but a black
-  box: you don't control the exact ladder, GOP math, or overlays, you pay per
-  minute, and there's no "run it all locally for free" mode.
-- **Render-farm frameworks** (Nomad, Kubernetes Jobs) can fan out, but you're
-  wiring up the encode pipeline, chunk planning, and packaging yourself.
+means renting big cloud boxes. Hand-rolled scripts, managed services, and generic
+render-farm schedulers each solve part of that and leave the rest to you — see
+[Prior art](#prior-art) for the honest comparison.
 
 **What makes this different:**
 
@@ -81,6 +75,138 @@ means renting big cloud boxes. The common options each fall short:
 Pairs naturally with a player-testing setup — the output is exactly the kind of
 deterministic ABR content a tool like
 [infinite-streaming](https://github.com/jonathaneoliver/infinite-streaming) serves.
+
+## Prior art
+
+Almost none of the ideas here are new. Chunked parallel encoding, per-title
+ladders, and quality-targeted rate control are all well-trodden — Netflix has
+published on per-shot encoding and dynamic optimization for years. What follows
+is the landscape as of writing, including where each alternative is genuinely
+better than this project.
+
+### Chunked parallel encoders
+
+**[Av1an](https://github.com/rust-av/Av1an)** — the closest single analogue. A
+command-line framework that splits a source into chunks, encodes them in
+parallel across local processes, and concatenates the result. Originally
+AV1-focused, now covers AV1/VP9/HEVC/H.264.
+
+- **Better than this project at:** chunk boundaries. Av1an splits on *scene
+  changes* (via PySceneDetect or a libaom first pass), so a chunk rarely
+  straddles a cut and per-chunk rate control has a coherent scene to work with.
+  This project splits on fixed frame counts, which is simpler and keeps GOP math
+  exact, but means a chunk can span a hard cut. It's also a mature, widely used
+  tool with a real community.
+- **Doesn't cover:** packaging. Av1an produces an encoded file, not an ABR ladder
+  — no HLS/DASH manifests, no multi-rung ladder, no LL-HLS parts. It also
+  parallelizes across *cores on one machine*, not across machines, and has no
+  durable resume: a crash mid-run loses in-flight chunks.
+
+### Distributed library transcoders
+
+**[Tdarr](https://github.com/HaveAGitGat/Tdarr)**,
+**[Unmanic](https://docs.unmanic.app/)**,
+**[FileFlows](https://fileflows.com/)** — server-plus-node systems that watch a
+media library and fan transcodes out across machines. Structurally the closest
+thing to this project's local farm: a coordinator, workers you add by installing
+an agent and pointing it at the master, a queue, and a live worker dashboard.
+
+- **Better than this project at:** almost everything around the encode. Mature
+  web UIs, library scanning and watch folders, health-checks, plugin/flow editors
+  for expressing "if HEVC and >1080p then…" as a pipeline, GPU worker classes,
+  scheduling windows so encodes only run overnight, and communities orders of
+  magnitude larger. FileFlows' flow designer and Tdarr's plugin stack are far
+  beyond the fixed pipeline here.
+- **Different job, not a worse one:** their unit of work is a **whole file**, and
+  for their workload that's the right granularity — when you're normalizing 4,000
+  library files, per-file distribution saturates every node with no split/join
+  overhead, and chunking would be pure cost. It only becomes a limit in the case
+  this project targets: a *single* long 4K/HEVC source, where whole-file
+  granularity means one machine does the work and the rest of the farm idles. Here
+  the unit is one (codec, rung, chunk), so a single file saturates the farm.
+- **Doesn't cover:** ABR ladders or delivery packaging. These produce a
+  transcoded *file*, not a multi-rung ladder with LL-HLS and DASH manifests, so
+  nothing downstream of the encode overlaps. They also assume every node can
+  reach the media over a shared filesystem (SMB/NFS), or push the file over the
+  API; this project stages through an S3-compatible object store, so a worker box
+  needs no mounts — only outbound reach to the master.
+- **Failure granularity:** none of them document mid-file resume, so a node lost
+  at 90% re-runs the file from the start. A lost worker here costs one chunk,
+  because the workflow's event history knows exactly which chunks landed.
+
+**[PeerTube remote runners](https://docs.joinpeertube.org/admin/remote-runners)**
+— the closest of the four, and the only one in this section that produces an HLS
+ABR ladder. An instance offloads CPU-heavy work to runners that register with a
+token and pull jobs; job types cover VOD, live, studio edits, transcription and
+storyboards, and the job model has real dependencies ("waiting for parent job").
+
+- **Better than this project at:** being part of a complete federated video
+  platform — upload, moderation, federation, playback and transcoding in one
+  system, with live transcoding this project doesn't attempt at all.
+- **Where this project goes further:** granularity is per-*resolution*, so
+  resolutions spread across runners but each rung is one whole-file job on one
+  machine — the 4K rung still gates the job. Chunking splits that rung across the
+  fleet too. This project also targets multiple codecs per run with DASH beside
+  HLS, and burned-in QA overlays, none of which are PeerTube's concern.
+
+### Packaging orchestrators
+
+**[Shaka Streamer](https://github.com/shaka-project/shaka-streamer)** (Google) —
+a config-file-driven wrapper around FFmpeg + Shaka Packager, covering VOD and
+live.
+
+- **Better than this project at:** being the reference implementation for the
+  packager this project also shells out to. If your need is "turn this file into
+  DASH/HLS from a YAML config," it's simpler, better documented, and better
+  maintained than anything here.
+- **Doesn't cover:** distributed or chunked encoding. It runs FFmpeg
+  single-process on one box, so a long 4K/HEVC ladder takes as long as it takes,
+  with no fan-out, no resume, and no per-chunk progress.
+
+### Managed services
+
+**AWS MediaConvert, Bitmovin, Mux** — turnkey, SLA-backed encoding APIs.
+
+- **Better than this project at:** basically everything operational. Codec
+  licensing, per-title optimization, DRM, global scale, and someone to call when
+  it breaks. For production delivery these are the correct answer and this
+  project is not competing with them.
+- **Doesn't cover:** the specific need this was built for — total control of the
+  exact ladder, GOP math, and burned-in QA overlays, with a `$0` fully-local mode
+  for iterating on player-test content. You pay per minute, and the encode itself
+  is a black box you can't step into when a player misbehaves on one rung.
+
+### Generic schedulers
+
+**[Nomad](https://www.nomadproject.io/), Kubernetes Jobs** — the obvious way to
+fan work out across machines.
+
+- **Better than this project at:** scheduling, honestly. Both do real
+  resource-aware bin-packing across heterogeneous nodes. This project's
+  scheduling is `ENCODE_SLOTS` per worker plus a longest-processing-time sort in
+  the workflow, tuned by hand — a general scheduler wouldn't have needed the
+  task-queue partition fix this project did, and would handle P-core/E-core slot
+  sizing without manual pinning.
+- **Doesn't cover:** the DAG. Both schedule *tasks*; neither remembers where a
+  multi-phase pipeline got to. The encode is mezzanine → audio → fan out every
+  (codec, rung, chunk) → package → byteranges → HLS per codec, and something has
+  to durably track which phase completed and what to re-run after a crash. With
+  Nomad or K8s you write that state machine yourself. Temporal's event history
+  *is* that state machine, and it also carries the two things the UI depends on:
+  activity heartbeats with a payload (live per-chunk %, per-machine CPU) and
+  cancellation that rides the heartbeat response so a running FFmpeg can be
+  killed mid-encode. The operational cost matters too — adding a box here is one
+  container and two env vars, where a scheduler would be the largest moving part
+  in a two-machine farm.
+
+### Hand-rolled FFmpeg + packager scripts
+
+Where most people start, and where this project started.
+
+- **Better than this project at:** being 40 lines you fully understand.
+- **Doesn't cover:** one output at a time on one machine, no resumability — a
+  crash or a closed laptop lid halfway through a ladder means starting over — and
+  no live progress beyond FFmpeg's own stderr.
 
 ## Two run modes
 
