@@ -37,6 +37,7 @@ One Docker image plays three roles: the **server** (Go control plane, default
 - [What it does](#what-it-does)
 - [How it works](#how-it-works)
 - [Performance: single machine vs local farm vs cloud](#performance-single-machine-vs-local-farm-vs-cloud)
+- [Quality & VMAF](#quality--vmaf)
 - [Requirements](#requirements)
 - [Quickstart](#quickstart)
 - [Developing across the farm](#developing-across-the-farm)
@@ -308,6 +309,46 @@ make timing     EXEC=<execution-arn>   # per-phase where-did-the-time-go
 make cpu-report EXEC=<execution-arn>   # per-tier CPU utilization vs reserved vCPU
 ```
 
+## Quality & VMAF
+
+Perceptual quality (VMAF) is a first-class signal here, in two complementary
+forms — one **measured**, one **estimated**.
+
+**Measured — the per-chunk audit.** Tick **Measure VMAF** and each rendition is
+scored against the source with `libvmaf`, per chunk, on a shared CFR frame grid
+(the mezzanine is relabelled to the source's exact frame rate, so cadence jitter
+can't desync the comparison and crater the score). Per-chunk results fold into a
+frame-weighted mean, a correctly-recombined harmonic mean, and a min-of-mins, and
+surface per rendition in the job view. Don't pair it with the burn-in overlay —
+drawtext counts as distortion and biases the score.
+
+**Estimated — the quality curves.** The Ladders tab predicts each rung's VMAF at
+*design time* by interpolating a **rate-quality curve** (the built-in curves ship
+seeded on a 4K extreme-motion clip — see the reports linked below). This drives
+the ladder-design verdicts (*redundant / saturated / wide-gap*) and the optional
+**burn-in overlay**: a `VMAF~93` (interpolated) or `VMAF≥97` (rung above the
+measured range) row in the diagnostic text. It needs no second pass — a lookup is
+free — but it reflects the *curve's* content, not necessarily yours.
+
+**Calibrating to your own content (or a new ladder).** The estimate is only as
+good as its curves. To replace the seed curves with measurements of your content:
+
+```bash
+# 1. encode a representative clip with the ladder — burn-in OFF (it biases VMAF)
+# 2. measure its ladder into the curve store:
+make ladder-audit OUT=<output-dir> SRC=<source-file>   # or: make ladder-audit-all
+# 3. reload the curves into the running server:
+make restart
+```
+
+Afterwards the Ladders tab and the burn-in overlay show *your* content's measured
+VMAF per rung. Curves are content-keyed, additive across audits, and change only
+when you re-audit — a normal encode never touches them.
+
+The built-in curves come from a full ladder audit whose self-contained reports
+live under [`docs/vmaf-audit/`](docs/vmaf-audit/): rate-quality curves and
+three-codec BD-rate comparisons, graded at both 1080p and 4K.
+
 ## Requirements
 
 - Docker (with the daemon socket at `/var/run/docker.sock`).
@@ -524,6 +565,7 @@ docs/                design docs
 - [`infra/local-cluster/README.md`](infra/local-cluster/README.md) — the distributed-local cluster.
 - [`docs/chunked-encode-design.md`](docs/chunked-encode-design.md) — spot-resumable chunked encoding.
 - [`docs/apple-ladder-design.md`](docs/apple-ladder-design.md) — per-codec ABR ladder model.
+- [`docs/vmaf-audit/`](docs/vmaf-audit/) — VMAF ladder-audit reports (rate-quality curves + three-codec BD-rate, at 1080p and 4K).
 - [`CLAUDE.md`](CLAUDE.md) — orientation for working in this repo.
 
 ## Known limitations
