@@ -89,6 +89,37 @@ FARM_ENCODE_SLOTS := $(shell P=$$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/nul
 setup-hooks:
 	git config core.hooksPath scripts/git-hooks
 	@echo "git hooks active (scripts/git-hooks). Direct pushes to main are now blocked — use a PR."
+	@echo "'make check' now also runs on every push."
+
+.PHONY: check
+check:                ## run the same static checks CI runs (gofmt/vet/build, tofu fmt, py compile, page JS)
+	@fail=0; \
+	printf '  gofmt          '; \
+	unformatted=$$(gofmt -l . 2>/dev/null); \
+	if [ -n "$$unformatted" ]; then \
+	  echo "FAIL"; echo "$$unformatted" | sed 's/^/                 /'; \
+	  echo "                 fix: gofmt -w ."; fail=1; \
+	else echo "ok"; fi; \
+	printf '  go vet         '; \
+	if out=$$(go vet ./... 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  go build       '; \
+	if out=$$(go build ./... 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  tofu fmt       '; \
+	if ! command -v tofu >/dev/null 2>&1; then echo "skipped (tofu not installed)"; \
+	elif out=$$(tofu -chdir=infra/terraform fmt -check -recursive 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; \
+	  echo "                 fix: tofu -chdir=infra/terraform fmt -recursive"; fail=1; fi; \
+	printf '  python compile '; \
+	if out=$$(cd scripts && python3 -m compileall -q infinite_streaming_encoder 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  page JS syntax '; \
+	if ! command -v node >/dev/null 2>&1; then echo "skipped (node not installed)"; \
+	elif out=$$(python3 scripts/check_page_js.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	if [ $$fail -ne 0 ]; then echo; echo "make check: FAILED"; exit 1; fi; \
+	echo "make check: all passed"
 
 require-paths:
 	@: $${SOURCE_DIR:?SOURCE_DIR is not set — create a .env (see .env.example)}
@@ -236,6 +267,7 @@ STATE_MACHINE_ARN ?= $(shell cd $(TF_DIR) && tofu output -no-color -raw state_ma
 # (~$1.50/mo until cloud-clear/cloud-down). Default off: cold ECR pull (~60s).
 USE_AMI ?=
 
+.PHONY: ladder-audit ladder-audit-all
 .PHONY: ecr-login ecr-publish infra-init infra-plan infra-apply deploy deploy-review timing cpu-report cloud-up cloud-clear cloud-down cloud-check ami-up ami-down
 
 # Resolve the pre-baked worker AMI for the CURRENT image tag, if one exists.
@@ -444,6 +476,38 @@ dist-ps:              ## cluster + worker + server containers
 # MINIO_MAX_AGE_S is the idle-age floor: nothing newer is touched, so a running
 # encode is never reclaimed (the server's own sweep also passes a keep-list).
 MINIO_MAX_AGE_S ?= 86400
+
+# Measure a finished output's ladder into VMAF-vs-bitrate curve points, which
+# the Ladders tab uses for its design-time "is this rung earning its place?"
+# estimates. Replaces the built-in seed curves (measured on one 4K FPV clip)
+# with numbers from YOUR content. The output must have been encoded with
+# burn-in OFF — the overlay biases low rungs more than high ones, which is
+# exactly the comparison the curve is for.
+#
+#   make ladder-audit OUT=<dir under OUTPUT_DIR> SRC=<source file>
+#   make ladder-audit-all                      # every eligible output, skips the rest
+#   ... REFERENCE=1080 LIMIT_S=30
+#
+# Curves are kept PER CLIP: quality-vs-bitrate is content-dependent, so an
+# extreme-motion clip and a talking head give genuinely different curves and
+# pooling them would describe neither.
+LADDER_AUDIT_REFERENCE ?= 2160
+
+ladder-audit:         ## measure one output's ladder into the VMAF curve store (OUT=, SRC=)
+	@: $${OUT:?OUT is not set — the output directory name under OUTPUT_DIR}
+	@: $${SRC:?SRC is not set — the source file the output was encoded from}
+	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.ladder_audit \
+	  --output-dir "$(OUTPUT_DIR)/$(OUT)" --source "$(SRC)" \
+	  --reference $(LADDER_AUDIT_REFERENCE) \
+	  --store "$(TMP_DIR)/quality-curves.json" \
+	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)
+
+ladder-audit-all:     ## audit EVERY eligible output; skips burn-in/no-metadata ones
+	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.ladder_audit \
+	  --all "$(OUTPUT_DIR)" --source-dir "$(SOURCE_DIR)" \
+	  --reference $(LADDER_AUDIT_REFERENCE) \
+	  --store "$(TMP_DIR)/quality-curves.json" \
+	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)
 
 minio-usage:          ## what the local-dist MinIO staging is holding, per job prefix
 	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.dist_staging --usage
