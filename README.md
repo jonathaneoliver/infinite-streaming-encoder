@@ -5,6 +5,7 @@
 [![License](https://img.shields.io/badge/license-InfiniteStream-lightgrey)](LICENSE)
 [![GHCR](https://img.shields.io/badge/ghcr.io-infinite--streaming--encoder-2496ED?logo=docker&logoColor=white)](https://github.com/jonathaneoliver/infinite-streaming-encoder/pkgs/container/infinite-streaming-encoder)
 [![Stars](https://img.shields.io/github/stars/jonathaneoliver/infinite-streaming-encoder?style=flat&color=yellow)](https://github.com/jonathaneoliver/infinite-streaming-encoder/stargazers)
+[![Sponsor](https://img.shields.io/github/sponsors/jonathaneoliver?label=sponsor&logo=githubsponsors&color=ea4aaa)](https://github.com/sponsors/jonathaneoliver)
 
 ![The dashboard mid-encode: a cloud job fanned out across a 10-instance AWS Batch spot fleet, with the live per-instance chunk grid, cost/utilization sparklines, and the per-variant progress DAG.](docs/screenshots/dashboard.png)
 

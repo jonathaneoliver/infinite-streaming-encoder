@@ -1,0 +1,4 @@
+# Renders the "Sponsor" button at the top of the repo and in the sidebar.
+# Only takes effect from the DEFAULT branch — it does nothing on a feature
+# branch, so don't be alarmed if the button is absent before this merges.
+github: [jonathaneoliver]
