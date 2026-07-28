@@ -67,7 +67,7 @@ var maxResHeight = map[string]int{
 //
 // Parsed rather than table-driven because the UI derives its tier options from
 // the SELECTED LADDER's actual rung heights, and the Apple-uniq ladders carry
-// non-standard ones (1044p, 2124p, 684p...). A fixed table silently ignored
+// non-standard ones (954p, 1800p, 594p...). A fixed table silently ignored
 // every tier it didn't know about. Mirrors ladder.res_height.
 // ResHeight is resHeight for callers outside the package (the API's min/max
 // band validation).

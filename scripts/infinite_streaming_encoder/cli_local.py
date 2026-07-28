@@ -87,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="encoding ladder name (default: apple-uniq-live)")
     # No `choices=` on either bound: the UI derives its tier options from the
     # selected ladder's real rung heights, and the Apple-uniq ladders carry
-    # non-standard ones (1044p, 2124p, 684p...). Any "<height>p" is valid; an
+    # non-standard ones (954p, 1800p, 594p...). Any "<height>p" is valid; an
     # unparseable value means "no bound" (see ladder.res_height).
     p.add_argument("--max-res", default=None, dest="max_res",
                    help="drop rungs taller than this tier, e.g. 1080p")

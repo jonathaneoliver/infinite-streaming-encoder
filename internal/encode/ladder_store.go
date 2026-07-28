@@ -74,12 +74,12 @@ func defaultSeedLadders() map[string]LadderDef {
 	legacyHEVC := [][]int{{640, 360, 300}, {960, 540, 1001}, {1280, 720, 1662}, {1920, 1080, 4273}, {2560, 1440, 10547}, {3840, 2160, 16458}}
 	appleH264 := [][]int{{416, 234, 145}, {640, 360, 365}, {768, 432, 730}, {768, 432, 1100}, {960, 540, 2000}, {1280, 720, 3000}, {1280, 720, 4500}, {1920, 1080, 6000}, {1920, 1080, 7800}}
 	appleHEVC := [][]int{{640, 360, 145}, {768, 432, 300}, {960, 540, 600}, {960, 540, 900}, {960, 540, 1600}, {1280, 720, 2400}, {1280, 720, 3400}, {1920, 1080, 4500}, {1920, 1080, 5800}, {2560, 1440, 8100}, {3840, 2160, 11600}, {3840, 2160, 16800}}
-	appleUniqH264 := [][]int{{416, 234, 145}, {640, 360, 365}, {704, 396, 730}, {768, 432, 1100}, {960, 540, 2000}, {1216, 684, 3000}, {1280, 720, 4500}, {1856, 1044, 6000}, {1920, 1080, 7800}}
-	appleUniqHEVC := [][]int{{640, 360, 145}, {768, 432, 300}, {832, 468, 600}, {896, 504, 900}, {960, 540, 1600}, {1216, 684, 2400}, {1280, 720, 3400}, {1856, 1044, 4500}, {1920, 1080, 5800}, {2560, 1440, 8100}, {3776, 2124, 11600}, {3840, 2160, 16800}}
+	appleUniqH264 := [][]int{{416, 234, 145}, {640, 360, 365}, {704, 396, 730}, {768, 432, 1100}, {960, 540, 2000}, {1056, 594, 3000}, {1280, 720, 4500}, {1696, 954, 6000}, {1920, 1080, 7800}}
+	appleUniqHEVC := [][]int{{640, 360, 145}, {768, 432, 300}, {832, 468, 600}, {896, 504, 900}, {960, 540, 1600}, {1056, 594, 2400}, {1280, 720, 3400}, {1696, 954, 4500}, {1920, 1080, 5800}, {2560, 1440, 8100}, {3200, 1800, 11600}, {3840, 2160, 16800}}
 	// apple-uniq H.264 extended to 4K (max-compat high-bitrate H.264): the three
-	// extra tiers mirror the HEVC-uniq top resolutions (1440/2124/2160) with
+	// extra tiers mirror the HEVC-uniq top resolutions (1440/1800/2160) with
 	// H.264-appropriate (higher) bitrates. Keeps h264/hevc/av1 rung-parallel.
-	appleUniqH264Full := append(append([][]int{}, appleUniqH264...), []int{2560, 1440, 13500}, []int{3776, 2124, 19000}, []int{3840, 2160, 27000})
+	appleUniqH264Full := append(append([][]int{}, appleUniqH264...), []int{2560, 1440, 13500}, []int{3200, 1800, 19000}, []int{3840, 2160, 27000})
 	return map[string]LadderDef{
 		"legacy": {
 			Description: "Default distinct-height geometric ladder (one rung per resolution per codec).",
@@ -125,7 +125,7 @@ func defaultSeedLadders() map[string]LadderDef {
 			},
 		},
 		"apple-uniq-live-full": {
-			Description:       "apple-uniq-live, but H.264 climbs all the way to 4K (1440p/2124p/2160p) at high bitrates. Apple caps H.264 at 1080p (HEVC above), so this trades spec-compliance for max-compatibility high-bitrate 4K H.264. Same live/linear VBV (110%/0.10x, 0.2s parts, 1s GOP) and flexible _xs base as apple-uniq-live.",
+			Description:       "apple-uniq-live, but H.264 climbs all the way to 4K (1440p/1800p/2160p) at high bitrates. Apple caps H.264 at 1080p (HEVC above), so this trades spec-compliance for max-compatibility high-bitrate 4K H.264. Same live/linear VBV (110%/0.10x, 0.2s parts, 1s GOP) and flexible _xs base as apple-uniq-live.",
 			Seed:              true,
 			MaxratePercent:    110,
 			BufsizeMultiplier: 0.10,
@@ -483,7 +483,7 @@ func (s *LadderStore) codecHeightRange(ladderName, codec string) (lo, hi int, ok
 // source" failure, caught at submit time instead of one second into a launched
 // worker (issue #115). Codec-specific because the ladder's columns differ in
 // reach: apple-uniq-live's h264 tops at 1080p while hevc/av1 reach 2160p, so a
-// [2124p,2160p] band is fine for hevc but empty for h264.
+// [1800p,2160p] band is fine for hevc but empty for h264.
 //
 // Source-width (no-upscale) filtering is deliberately NOT applied here: the
 // probe isn't available at submit time, and a too-small source dropping a rung

@@ -939,11 +939,11 @@ function onCodecsChanged() {
 // These used to be five hardcoded <option>s (2160/1440/1080/720/540) that never
 // changed with the ladder — so they offered caps a ladder didn't have (Apple's
 // H.264 column stops at 1080p, making "2160p" a no-op) and hid the ones it did
-// (apple-uniq encodes at 1044p, 2124p, 684p...). Deriving them means every tier
+// (apple-uniq encodes at 954p, 1800p, 594p...). Deriving them means every tier
 // shown is a real boundary in the ladder you're about to encode.
 //
 // Codec-aware (issue #115): with only H.264 ticked the list stops at 1080p, so a
-// 2124p floor — which is HEVC/AV1-only and would select zero h264 rungs — simply
+// 1800p floor — which is HEVC/AV1-only and would select zero h264 rungs — simply
 // isn't offered. Re-runs on every codec-checkbox change.
 //
 // Also keeps the pair consistent: options above the chosen max are disabled in
@@ -984,7 +984,7 @@ function syncResTiers() {
 // Mirrors the server's ValidateResBand (issue #115): returns an error string if
 // the chosen min/max band selects zero rungs for any ticked codec on the chosen
 // ladder, else "". Codec-aware tiers make an impossible tier unpickable in the
-// first place, but a mixed selection (e.g. H.264 + HEVC with a 2124p floor) can
+// first place, but a mixed selection (e.g. H.264 + HEVC with a 1800p floor) can
 // still leave H.264 empty while HEVC is fine — this catches that before submit.
 function resBandError() {
     const d = laddersCache[document.getElementById('ladder')?.value];
@@ -1177,22 +1177,30 @@ function _stepColor(r) { return r < 1.25 ? '#d06666' : (r > 2.4 ? '#d0a24a' : '#
 // A rung is STARVED when its bits-per-pixel falls materially against the rung
 // below — it's covering far more pixels without the bitrate to match.
 //
-// This exists because the bitrate step alone hides it. H.264's 1044p rung takes
-// a healthy 1.33x more bitrate (green by _stepColor) while covering 2.10x the
-// pixels, so bits-per-pixel drops to 0.63x. HEVC's 2124p does the same at
-// 1.43x / 2.18x / 0.66x. Those are exactly the two rungs docs/vmaf-audit/ calls
-// dominated and the next drop candidate — so bits-per-pixel predicts the audit's
-// findings from ladder geometry alone, while the metric on screen shows green.
+// This exists because the bitrate step alone hides it. The motivating case was
+// apple-uniq's fill-in rungs: H.264's old 1044p took a healthy 1.33x more
+// bitrate (green by _stepColor) while covering 2.10x the pixels, so
+// bits-per-pixel fell to 0.63x; HEVC's old 2124p was 1.43x / 2.18x / 0.66x.
+// Those were exactly the two rungs docs/vmaf-audit/ called dominated and the
+// next drop candidate — bits-per-pixel predicted the audit's findings from
+// ladder geometry alone, while the metric on screen showed green.
+//
+// Those rungs were since re-sized (#91: 1044p -> 954p, 2124p -> 1800p), so the
+// flag no longer fires on any apple-uniq ladder. It still fires on `apple` and
+// `legacy`, whose duplicate-resolution rungs are starved by Apple's own design
+// rather than by ours.
 //
 // Only the STARVED direction is flagged. A rung with MORE bits per pixel than
 // its predecessor isn't a problem to fix, and flagging it would just add noise.
 //
 // 0.70 is taken from the shipped ladders' own distribution, not picked by feel.
 // Across the 183 rung-transitions whose BITRATE step reads green, the bpp ratios
-// cluster with a clean empty band between 0.70 and 0.75 (34 rungs below both).
-// 0.70 sits in that gap, and catches both rungs the audit independently found
-// (1044p at 0.63, 2124p at 0.66). At 0.80 the flag also fires on 12 rungs from
-// the far side of the gap and starts reading as noise.
+// leave a clean empty band between 0.70 and 0.75 — nothing lands in it. 0.70
+// sits in that gap. The band survived the #91 re-size: it held when 34 rungs
+// were below it and still holds now that 8 are, which is some evidence it's a
+// real feature of how these ladders are built rather than an artefact of one
+// ladder's mistakes. At 0.80 the flag fires on 27 more rungs from the far side
+// and starts reading as noise.
 const BPP_STARVED = 0.70;
 
 // Report a divergence only when the two metrics DISAGREE: bitrate step looks

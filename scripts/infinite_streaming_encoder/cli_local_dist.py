@@ -1143,7 +1143,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--codec", default="hevc")
     p.add_argument("--ladder", default="apple-uniq-live")
     # No `choices=`: tier options are derived from the selected ladder's real
-    # rung heights, which include non-standard ones (1044p, 2124p...).
+    # rung heights, which include non-standard ones (954p, 1800p...).
     p.add_argument("--max-res", default=None, dest="max_res")
     p.add_argument("--min-res", default=None, dest="min_res")
     p.add_argument("--hevc-single-pass", action="store_true", dest="hevc_single_pass")
