@@ -199,6 +199,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 /* reclaimed = AWS took the spot instance; red + pulse (encoding thrown away,
    waiting to restart on fresh capacity) until the retry begins encoding. */
 .chunk-cell-fill.chunk-reclaimed { background: #ef476f; animation: reclaimpulse 1s ease-in-out infinite; }
+/* Reused-from-staging chunk: neutral slate + diagonal hatch, so "came from cache"
+   reads at a glance and never blends with a machine colour or the flash-blue. */
+.chunk-cell-fill.chunk-reused { background-color: #55617a;
+    background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.13) 0 2px, transparent 2px 5px); }
 .stage-bar-fill.stage-fill-reclaimed { background: #ef476f; animation: reclaimpulse 1s ease-in-out infinite; }
 @keyframes reclaimpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
@@ -2332,17 +2336,22 @@ function updateStagesTable(row, stages) {
             const fill = cell.querySelector('.chunk-cell-fill');
             if (fill) {
                 const isRed = (st === 'failed' || st === 'reclaimed');
+                // A reused chunk (skipped, not re-encoded) gets a distinct neutral
+                // hatch so it never reads as a fresh machine colour or the transient
+                // no-instance blue — see .chunk-reused. Overrides the machine tint.
+                const reused = !!c.s.reused;
                 // reclaimed → fill red (waiting to restart); else show progress.
-                fill.style.width = (st === 'reclaimed' ? 100 : prog).toFixed(1) + '%';
+                fill.style.width = (reused || st === 'reclaimed' ? 100 : prog).toFixed(1) + '%';
                 fill.className = 'chunk-cell-fill'
                     + (st === 'failed' ? ' chunk-failed'
-                        : st === 'reclaimed' ? ' chunk-reclaimed' : '');
+                        : st === 'reclaimed' ? ' chunk-reclaimed'
+                            : reused ? ' chunk-reused' : '');
                 // The fill COLOUR is the machine this chunk ran on — bold and
-                // unmissable so co-located chunks pop; red states keep their
+                // unmissable so co-located chunks pop; red/reused states keep their
                 // class colour (clear the inline so the class wins).
-                fill.style.background = isRed ? '' : (instanceColor(c.s.instance) || '#4361ee');
+                fill.style.background = (isRed || reused) ? '' : (instanceColor(c.s.instance) || '#4361ee');
             }
-            cell.title = stageTooltip(c.s, 'chunk ' + c.index);
+            cell.title = stageTooltip(c.s, 'chunk ' + c.index) + (c.s.reused ? ' · reused from prior staging' : '');
         }
         // Aggregate % across chunks so a chunked row reads like a whole row
         // ("100%") instead of a chunk count — the join is implicit, not shown.

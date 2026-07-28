@@ -441,6 +441,31 @@ def _chunk_key(work_prefix: str, codec: str, label: str, index: int) -> str:
     return f"{work_prefix}/{codec}_{label}_chunk{index:03d}.mp4"
 
 
+# <codec>_<tier>_chunk<NNN>.mp4 — a staged chunk OUTPUT object (tier may carry an
+# ordinal suffix like 540p_2, hence the greedy middle group). Excludes .mp4.done.
+_CHUNK_OBJ_RE = re.compile(r"^([^_]+)_(.+)_chunk(\d+)\.mp4$")
+
+
+def _emit_reused(key: str) -> None:
+    print(f"[[ENCODER-REUSED key={key}]]", flush=True)
+
+
+def _emit_reused_chunks(bucket: str, work_prefix: str) -> None:
+    """Flag chunks a PRIOR run already staged under work_prefix as reused, so a
+    resume shows them distinctly instead of as fresh encodes. This run hasn't
+    produced any yet; cli_phase skips the encode when the output exists, so the
+    cell should read 'reused'. Best-effort; never breaks the run."""
+    try:
+        paginator = _s3().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=f"{work_prefix}/"):
+            for obj in page.get("Contents", []):
+                m = _CHUNK_OBJ_RE.match(obj["Key"].rsplit("/", 1)[-1])
+                if m:
+                    _emit_reused(f"encode:{m.group(1)}:{m.group(2)}:chunk{int(m.group(3))}")
+    except Exception:  # noqa: BLE001 — cosmetic; must never fail the run
+        return
+
+
 def _worker_loop(w: Worker, sh: _Shared, s3_mezz: str, s3_out: str) -> None:
     """One slot on one worker: pull chunk tasks until the queue drains. On
     failure, re-queue (unless retries exhausted or the host went unreachable)."""
@@ -934,6 +959,9 @@ def run_temporal(args: argparse.Namespace) -> int:
                info.has_audio)
     _emit_commercial_cost(rungs_by_codec, info, input_path,
                           hevc_two_pass=not args.hevc_single_pass)
+    # Flag chunks left over from a prior (cancelled/failed) run as reused, so a
+    # resume shows them distinctly instead of as fresh encodes.
+    _emit_reused_chunks(bucket, f"{prefix}/work")
 
     # Cross-job mezzanine cache. If this exact source already has a completed
     # mezzanine in MinIO, the mezzanine phase will reuse it — and since the
