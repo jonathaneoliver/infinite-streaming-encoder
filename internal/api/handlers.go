@@ -276,6 +276,14 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A non-inverted band can still select zero rungs for a chosen codec whose
+	// column doesn't reach that band (e.g. a 2124p floor on h264, which tops at
+	// 1080p). That used to fail deep in the worker as "no ladder rungs fit this
+	// source"; catch it here with a codec-specific message (issue #115).
+	if err := s.Manager.ValidateResBand(cfg); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	// Reject unknown targets up front with a clear message, rather than letting
 	// a bad target string fail cryptically deep in the encode path.
 	switch cfg.Target {

@@ -456,3 +456,66 @@ func (s *LadderStore) resolveRungs(ladderName, codec, maxRes, minRes string, sou
 	}
 	return out
 }
+
+// codecHeightRange returns the lowest and highest rung heights a codec has on a
+// ladder, ignoring any band or source-width filter (ok=false when the ladder or
+// codec has no rungs). Used to phrase an empty-band rejection precisely — e.g.
+// "this ladder's h264 tops at 1080p".
+func (s *LadderStore) codecHeightRange(ladderName, codec string) (lo, hi int, ok bool) {
+	rungs := s.resolveRungs(ladderName, codec, "", "", 0)
+	if len(rungs) == 0 {
+		return 0, 0, false
+	}
+	lo, hi = rungs[0].Height, rungs[0].Height
+	for _, r := range rungs {
+		if r.Height < lo {
+			lo = r.Height
+		}
+		if r.Height > hi {
+			hi = r.Height
+		}
+	}
+	return lo, hi, true
+}
+
+// ValidateResBand rejects a --min-res/--max-res band that would select zero
+// rungs for any of the config's chosen codecs — the "no ladder rungs fit this
+// source" failure, caught at submit time instead of one second into a launched
+// worker (issue #115). Codec-specific because the ladder's columns differ in
+// reach: apple-uniq-live's h264 tops at 1080p while hevc/av1 reach 2160p, so a
+// [2124p,2160p] band is fine for hevc but empty for h264.
+//
+// Source-width (no-upscale) filtering is deliberately NOT applied here: the
+// probe isn't available at submit time, and a too-small source dropping a rung
+// is a legitimate per-file skip, not a config error. Passing sourceWidth=0 to
+// resolveRungs disables that filter, so this checks the ladder+codec+band only.
+// Returns nil when the band is unset or every selected codec keeps ≥1 rung.
+func (m *Manager) ValidateResBand(cfg JobConfig) error {
+	if cfg.MinRes == "" && cfg.MaxRes == "" {
+		return nil
+	}
+	ladderName := cfg.Ladder
+	if ladderName == "" {
+		ladderName = "apple-uniq-live"
+	}
+	minH, minSet := resHeight(cfg.MinRes)
+	maxH, maxSet := resHeight(cfg.MaxRes)
+	for _, c := range parseCodecSel(cfg.Codec) {
+		if len(m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, 0)) > 0 {
+			continue
+		}
+		lo, hi, ok := m.Ladders.codecHeightRange(ladderName, c)
+		if !ok {
+			return fmt.Errorf("ladder %q defines no %s rungs", ladderName, c)
+		}
+		switch {
+		case minSet && minH > hi:
+			return fmt.Errorf("Min Res %s: this ladder's %s tops at %dp — no rung qualifies", cfg.MinRes, c, hi)
+		case maxSet && maxH < lo:
+			return fmt.Errorf("Max Res %s: this ladder's %s starts at %dp — no rung qualifies", cfg.MaxRes, c, lo)
+		default:
+			return fmt.Errorf("no %s rung falls in the selected resolution band — this ladder's %s spans %dp–%dp", c, c, lo, hi)
+		}
+	}
+	return nil
+}
