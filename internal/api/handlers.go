@@ -61,6 +61,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/sources", s.listSources)
 	s.Mux.HandleFunc("POST /api/sources/upload", s.uploadSource)
 	s.Mux.HandleFunc("GET /api/ladders", s.getLadders)
+	s.Mux.HandleFunc("GET /api/ladders/{name}/estimates", s.ladderEstimates)
 	s.Mux.HandleFunc("POST /api/ladders", s.putLadder)
 	s.Mux.HandleFunc("DELETE /api/ladders/{name}", s.deleteLadder)
 	s.Mux.HandleFunc("GET /api/outputs", s.listOutputs)
@@ -560,6 +561,40 @@ type outputDir struct {
 // this. Seed ladders carry "seed": true and are read-only.
 func (s *Server) getLadders(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.Manager.Ladders.List())
+}
+
+// ladderEstimates projects a ladder's rungs against the measured VMAF curve —
+// the design-time answer to "is every rung earning its place?", available
+// before anything is encoded.
+//
+// Kept OFF GET /api/ladders deliberately: that response round-trips through the
+// ladder editor's save, so adding derived fields to it risks writing estimates
+// back into the stored definition.
+func (s *Server) ladderEstimates(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if _, ok := s.Manager.Ladders.Get(name); !ok {
+		http.Error(w, "no such ladder", 404)
+		return
+	}
+	reference, _ := strconv.Atoi(r.URL.Query().Get("reference"))
+	if reference == 0 {
+		reference = encode.DefaultCurveReference
+	}
+	byCodec := map[string][]encode.RungEstimate{}
+	for _, c := range []string{"h264", "hevc", "av1"} {
+		if est := s.Manager.LadderEstimates(name, c, reference); len(est) > 0 {
+			byCodec[c] = est
+		}
+	}
+	writeJSON(w, map[string]any{
+		"ladder":    name,
+		"reference": reference,
+		// clip and estimated=true so the UI can never present these as a
+		// measurement of any particular encode.
+		"clip":      s.Manager.Curves.Clip,
+		"estimated": true,
+		"codecs":    byCodec,
+	})
 }
 
 // putLadder creates or replaces a user-defined ladder. Body is a LadderDef

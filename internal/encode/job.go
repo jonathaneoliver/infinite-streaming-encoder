@@ -1134,6 +1134,11 @@ type Manager struct {
 	// $TmpDir/ladders.json; resolves the concrete rungs for the cloud path.
 	Ladders *LadderStore
 
+	// Curves holds measured VMAF-vs-bitrate points used to ESTIMATE a ladder
+	// rung's quality without encoding ($TmpDir/quality-curves.json overlaying
+	// the built-in seed). Design-time only — never a claim about a real encode.
+	Curves *CurveStore
+
 	// Speeds learns per-variant encode speed (content/wall) from completed
 	// encodes ($TmpDir/encode_speeds.json); the dynamic chunk selector uses it.
 	Speeds *EncodeSpeedStore
@@ -1320,6 +1325,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 	os.MkdirAll(cfg.TmpDir, 0755)
 	m := &Manager{
 		Ladders:         LoadLadderStore(filepath.Join(cfg.TmpDir, "ladders.json")),
+		Curves:          LoadCurveStore(filepath.Join(cfg.TmpDir, "quality-curves.json")),
 		Speeds:          LoadEncodeSpeedStore(filepath.Join(cfg.TmpDir, "encode_speeds.json")),
 		SourceDir:       cfg.SourceDir,
 		OutputDir:       cfg.OutputDir,
