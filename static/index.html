@@ -26,7 +26,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .btn-play:hover { background: #1a2a4a; color: #4cc9f0; }
 .btn-promote { color: #2a9d8f; cursor: pointer; font-size: 0.95rem; padding: 4px 7px; border-radius: 4px; margin-left: 2px; }
 .btn-promote:hover { background: #14332c; color: #4ecdc4; }
-.file-size { color: #888; font-size: 0.85rem; margin-left: 12px; }
+.src-badge-slot { flex: 0 0 96px; display: inline-flex; align-items: center; }
+.file-size { color: #888; font-size: 0.85rem; width: 80px; text-align: right; }
 .file-count { color: #666; font-size: 0.8rem; margin-left: 12px; }
 
 .controls { display: flex; gap: 16px; flex-wrap: wrap; align-items: end; margin-top: 16px; }
@@ -101,6 +102,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .col-header span:hover { color: #aaa; }
 .col-header .sort-active { color: #4361ee; }
 .col-header .col-name { flex: 1; padding-left: 42px; }
+.col-header .col-status { width: 96px; text-align: left; cursor: default; }
+.col-header .col-status:hover { color: #666; }
 .col-header .col-size { width: 80px; text-align: right; }
 .col-header .col-date { width: 130px; text-align: right; margin-right: 40px; }
 .output-grid { display: grid !important; grid-template-columns: 24px 1fr 65px 110px 55px 70px 110px 30px; align-items: center; padding: 6px 12px; column-gap: 8px; }
@@ -108,7 +111,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .col-header-output { border-bottom: 1px solid #333; margin-bottom: 4px; font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
 .col-header-output span { cursor: pointer; user-select: none; }
 .col-header-output span:hover { color: #aaa; }
-.file-date { color: #666; font-size: 0.8rem; }
+.file-date { color: #666; font-size: 0.8rem; width: 130px; text-align: right; }
 .select-actions { display: flex; gap: 8px; margin-bottom: 8px; }
 
 .log-viewer { max-height: 400px; overflow-y: auto; background: #111; padding: 10px; border-radius: 4px; margin-top: 8px; font-family: 'SF Mono', Menlo, monospace; font-size: 0.75rem; color: #aaa; white-space: pre-wrap; display: none; }
@@ -1586,6 +1589,7 @@ function renderSources() {
     list.innerHTML = `
         <div class="col-header">
             <span class="col-name" onclick="toggleSourceSort('name')">Name${sortIndicator(sourceSort, 'name')}</span>
+            <span class="col-status">Encode</span>
             <span class="col-size" onclick="toggleSourceSort('size')">Size${sortIndicator(sourceSort, 'size')}</span>
             <span class="col-date" onclick="toggleSourceSort('mod_time')">Modified${sortIndicator(sourceSort, 'mod_time')}</span>
         </div>
