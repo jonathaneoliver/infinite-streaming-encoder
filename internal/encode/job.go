@@ -865,12 +865,6 @@ type JobConfig struct {
 	// so `omitempty` works and an unset value lets cli_cloud.py apply
 	// its env-var default (USE_SPOT=true). Ignored for local encodes.
 	UseSpot *bool `json:"use_spot,omitempty"`
-	// ResumeFromJobID points at a prior failed job whose S3 staging
-	// (inputs, mezzanines, completed variants) should be reused. The
-	// remote user-data pre-warms /work from that prefix, and
-	// cli_local.py --resume-package-from /work/output skips variants
-	// it already finds there.
-	ResumeFromJobID string `json:"resume_from_job_id,omitempty"`
 	// SimulateInterruptAfterS is a test hook: when >0, the remote
 	// user-data schedules a synthetic spot-interrupt after this many
 	// seconds. Lets us exercise the Retry flow without waiting for a
@@ -1043,8 +1037,7 @@ type Job struct {
 
 	// CloudJobID is the timestamp-based id cli_cloud.py uses for its
 	// S3 prefix (e.g. 20260420T203910Z-1). Captured from the plan
-	// header so the Retry flow can point resume_from_job_id at the
-	// right s3://.../jobs/<X>/ prefix. Empty for local or old jobs.
+	// header for cloud-job bookkeeping. Empty for local or old jobs.
 	CloudJobID string `json:"cloud_job_id,omitempty"`
 
 	// FailureReason categorises why a failed job failed, for UI
@@ -1754,6 +1747,71 @@ func (m *Manager) Cancel(id string) bool {
 		}
 	}()
 	return true
+}
+
+// Resume re-runs a failed or cancelled job IN PLACE — same *Job, same ID — so
+// the jobs list keeps ONE row that transitions cancelled/failed → running and
+// updates live, instead of spawning a fresh entry. This is Reconcile-on-demand:
+// run() is already re-entrant (startup calls it on rebuilt jobs), and a job's
+// cancel signal is a plain resettable bool, not a spent context.
+//
+// The payoff is automatic chunk reuse: because the ID is unchanged, so is
+// DistJobPrefix, so the orchestrator's own per-chunk _object_exists check (see
+// cli_local_dist.py) finds every chunk already staged in MinIO and skips
+// straight to the unfinished ones. No cross-job prefix plumbing needed. A
+// cancelled dist job never runs its own staging cleanup (the control plane
+// docker-stops it), so its completed chunks are still there to reuse.
+//
+// The original config is re-used unchanged: an interrupted job never moved
+// anything to OutputDir (that happens only on success), so there's nothing to
+// archive and resolveCodec has nothing to skip — no ForceReencode needed.
+// Returns false if no such job or it isn't failed/cancelled.
+func (m *Manager) Resume(id string) bool {
+	job := m.GetJob(id)
+	if job == nil || (job.Status != StatusFailed && job.Status != StatusCancelled) {
+		return false
+	}
+	// Cancel tears the worker container down asynchronously (stop + rm in a
+	// goroutine, up to 30s), and a failed run's container can briefly linger
+	// too. runFileContainer reattaches to any container of the deterministic
+	// name instead of starting fresh — so a leftover would make it drain the
+	// OLD run's exit code. Remove any container for this job id first.
+	m.removeJobContainers(id)
+
+	job.mu.Lock()
+	job.cancelled = false
+	job.Status = StatusQueued
+	job.Progress = "queued"
+	job.Error = ""
+	job.FailureReason = ""
+	job.EndedAt = nil
+	job.StartedAt = time.Now() // fresh timing baseline for progress/ETA
+	job.Stages = nil           // orchestrator re-emits; reused chunks report done
+	job.StagesHistory = nil
+	job.OverallProgress = 0
+	job.OutputProgress = 0
+	job.ETASeconds = 0
+	job.launchComplete = false
+	job.mu.Unlock()
+
+	m.persistState(job, 0)
+	m.notify(job)
+	go m.run(job, 0)
+	return true
+}
+
+// removeJobContainers force-removes any worker container(s) still labelled for
+// this job — defensive cleanup before an in-place Resume, since Cancel's stop+rm
+// runs asynchronously and may not have completed.
+func (m *Manager) removeJobContainers(id string) {
+	out, err := exec.Command("docker", "ps", "-a",
+		"--filter", "label=encoder.job_id="+id, "--format", "{{.Names}}").Output()
+	if err != nil {
+		return
+	}
+	for _, name := range strings.Fields(string(out)) {
+		exec.Command("docker", "rm", "-f", name).Run()
+	}
 }
 
 func (m *Manager) writeHistory(job *Job) {
