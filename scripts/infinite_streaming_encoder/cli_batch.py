@@ -101,6 +101,9 @@ def _ec2_for_container_instance(ci_arn: str) -> str:
 _CHUNK_JOBNAME_RE = re.compile(r"^var-([^-]+)-([^-]+)-c(\d+)-")
 # var-<codec>-<tier>-whole-<execName> — the whole-variant (single-chunk) job.
 _WHOLE_JOBNAME_RE = re.compile(r"^var-([^-]+)-([^-]+)-whole-")
+# <codec>_<tier>_chunk<NNN>.mp4 — a staged chunk OUTPUT object (tier may carry an
+# ordinal suffix like 540p_2, hence the greedy middle group). Excludes .mp4.done.
+_CHUNK_OBJ_RE = re.compile(r"^([^_]+)_(.+)_chunk(\d+)\.mp4$")
 
 
 def _reflect_batch_status(exec_name: str) -> None:
@@ -109,19 +112,9 @@ def _reflect_batch_status(exec_name: str) -> None:
     The SFN state-enter event only says 'submitted', which spans RUNNABLE →
     STARTING → RUNNING — so we ask Batch directly. Done chunks are SUCCEEDED
     and won't appear in these lists, so their 'done' state is left intact."""
-    batch = _batch()
-    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
-
     def _emit_for(status_filter: str, stage_status: str) -> None:
-        try:
-            jobs = batch.list_jobs(jobQueue=queue, jobStatus=status_filter
-                                   ).get("jobSummaryList", [])
-        except ClientError:
-            return
-        for j in jobs:
+        for j in _list_exec_jobs(exec_name, status_filter):
             name = j.get("jobName", "")
-            if exec_name not in name:
-                continue
             m = _CHUNK_JOBNAME_RE.match(name)
             if m:
                 c, t, ci = m.group(1), m.group(2), int(m.group(3))
@@ -182,26 +175,43 @@ def _tag_hosts_for_jobs(described_jobs: list, log_state: dict) -> None:
                 _emit_host(key, inst)
 
 
+def _list_exec_jobs(exec_name: str, status: str) -> list:
+    """Every Batch job summary in `status` whose name carries this execution,
+    following nextToken. list_jobs returns at most 100 summaries per page; the
+    host-tagging callers below used to read only the FIRST page, so on a ladder
+    with >100 jobs the chunks past it were never described and their cells stayed
+    the default blue. Paginating covers every chunk regardless of ladder size."""
+    batch = _batch()
+    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
+    out, tok = [], None
+    while True:
+        try:
+            kw = dict(jobQueue=queue, jobStatus=status, maxResults=100)
+            if tok:
+                kw["nextToken"] = tok
+            r = batch.list_jobs(**kw)
+        except ClientError:
+            break
+        out += [j for j in r.get("jobSummaryList", [])
+                if exec_name in j.get("jobName", "")]
+        tok = r.get("nextToken")
+        if not tok:
+            break
+    return out
+
+
 def _backfill_completed_hosts(exec_name: str, log_state: dict) -> None:
     """Colour chunks that completed BETWEEN polls. A short chunk (small H.264
     rung) can start and finish inside one poll interval, so it's never observed
     RUNNING and never tagged — its cell falls back to the default (blue). A
     SUCCEEDED job keeps its containerInstanceArn, so describe the ones whose stage
     keys aren't coloured yet and emit their host. Bounded: only untagged jobs are
-    described (via the name, no API call), so each is described at most once."""
+    described (via the name, no API call), so each is described at most once.
+    Paginates SUCCEEDED so no completed chunk is missed on a >100-job ladder."""
     batch = _batch()
-    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
-    try:
-        done = batch.list_jobs(jobQueue=queue, jobStatus="SUCCEEDED"
-                               ).get("jobSummaryList", [])
-    except ClientError:
-        return
     ids = []
-    for j in done:
-        name = j.get("jobName", "")
-        if exec_name not in name:
-            continue
-        keys = _host_stage_keys(name)
+    for j in _list_exec_jobs(exec_name, "SUCCEEDED"):
+        keys = _host_stage_keys(j.get("jobName", ""))
         if keys and any(log_state.get("_host:" + k) is None for k in keys):
             ids.append(j["jobId"])
     for i in range(0, len(ids), 100):
@@ -218,13 +228,7 @@ def _forward_running_logs(exec_name: str, log_state: dict) -> None:
     packaging, big S3 transfers) show live activity instead of a dark gap
     between 'submitted' and 'done'. Best-effort; never breaks polling."""
     batch = _batch()
-    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
-    try:
-        running = batch.list_jobs(jobQueue=queue, jobStatus="RUNNING"
-                                  ).get("jobSummaryList", [])
-    except ClientError:
-        return
-    ids = [j["jobId"] for j in running if exec_name in j.get("jobName", "")]
+    ids = [j["jobId"] for j in _list_exec_jobs(exec_name, "RUNNING")]
     for i in range(0, len(ids), 100):
         try:
             jobs = batch.describe_jobs(jobs=ids[i:i + 100]).get("jobs", [])
@@ -353,6 +357,35 @@ def _emit_stage(key: str, status: str, percent: float = 0.0) -> None:
           flush=True)
 
 
+def _emit_reused(key: str) -> None:
+    print(f"[[ENCODER-REUSED key={key}]]", flush=True)
+
+
+def _emit_reused_chunks(s3_prefix: str) -> None:
+    """At poll start, flag every chunk output a PRIOR run already staged as
+    reused. This execution hasn't produced any chunks yet, so anything under the
+    prefix now is left over from a cancelled/failed run — the SFN re-runs its
+    Batch job but cli_phase skips the encode when the output exists, so the UI
+    should mark the cell 'reused' rather than colour it as a fresh encode.
+    Best-effort; never breaks the poll."""
+    if not s3_prefix.startswith("s3://"):
+        return
+    rest = s3_prefix[len("s3://"):].rstrip("/")
+    bucket, _, key = rest.partition("/")
+    if not bucket:
+        return
+    prefix = f"{key}/" if key else ""
+    try:
+        paginator = _s3().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                m = _CHUNK_OBJ_RE.match(obj["Key"].rsplit("/", 1)[-1])
+                if m:
+                    _emit_reused(f"encode:{m.group(1)}:{m.group(2)}:chunk{int(m.group(3))}")
+    except Exception:  # noqa: BLE001 — cosmetic; must never fail the poll
+        return
+
+
 def _emit_host(key: str, instance: str) -> None:
     """Report the machine a stage's Batch job landed on, for the chunk plot's
     per-instance colouring. Emitted once per (key, instance) by the log poller."""
@@ -449,19 +482,15 @@ def _report_live_reclaims(exec_name: str, seen: dict) -> None:
     reclaims. Emit ENCODER-RECLAIM (per-stage cumulative count + wasted seconds)
     on change, and flag the stage 'reclaimed' (red) while it's waiting to
     restart (RUNNABLE/STARTING after a failed attempt). Best-effort/cosmetic."""
-    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
     batch = _batch()
     status_by_id, name_by_id, ids = {}, {}, []
     for status in ("RUNNABLE", "STARTING", "RUNNING"):
-        try:
-            for j in batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", []):
-                jn = j.get("jobName", "")
-                if exec_name in jn and jn.startswith("var-"):
-                    ids.append(j["jobId"])
-                    status_by_id[j["jobId"]] = status
-                    name_by_id[j["jobId"]] = jn
-        except ClientError:
-            return
+        for j in _list_exec_jobs(exec_name, status):
+            jn = j.get("jobName", "")
+            if jn.startswith("var-"):
+                ids.append(j["jobId"])
+                status_by_id[j["jobId"]] = status
+                name_by_id[j["jobId"]] = jn
     for i in range(0, len(ids), 100):
         try:
             jobs = batch.describe_jobs(jobs=ids[i:i + 100]).get("jobs", [])
@@ -944,6 +973,9 @@ def cmd_poll(args: argparse.Namespace) -> int:
     except (ClientError, ValueError, TypeError):
         pass
     _emit_plan(variants, do_h264, do_hevc)
+    # Flag chunks left over from a prior (cancelled/failed) run as reused, so a
+    # resume shows them distinctly instead of as fresh encodes.
+    _emit_reused_chunks(args.s3_prefix)
 
     seen: set[int] = set()
     log_state: dict[str, int] = {}  # stream -> last-forwarded timestamp

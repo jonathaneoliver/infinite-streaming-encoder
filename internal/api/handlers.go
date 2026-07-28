@@ -277,6 +277,14 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A non-inverted band can still select zero rungs for a chosen codec whose
+	// column doesn't reach that band (e.g. a 2124p floor on h264, which tops at
+	// 1080p). That used to fail deep in the worker as "no ladder rungs fit this
+	// source"; catch it here with a codec-specific message (issue #115).
+	if err := s.Manager.ValidateResBand(cfg); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	// Reject unknown targets up front with a clear message, rather than letting
 	// a bad target string fail cryptically deep in the encode path.
 	switch cfg.Target {
@@ -463,21 +471,22 @@ func (s *Server) retryJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "job is not in a retryable state", 400)
 		return
 	}
-	cfg := orig.Config
-	cfg.ForceReencode = true
-	// Local resume is automatic: cli_local.py's per-clip work dir
-	// lives at TMPDIR/encode_<stem>/ on the host filesystem, so
-	// variants + mezzanine from a prior partial run are still there
-	// when the new worker starts. No config plumbing needed.
-	job := s.Manager.Submit(cfg)
-	writeJSON(w, job)
+	// Resume re-runs this same job in place (same ID → same MinIO prefix), so
+	// the orchestrator reuses every chunk already staged and only encodes the
+	// unfinished ones — one job row, not a new entry. See Manager.Resume.
+	if !s.Manager.Resume(id) {
+		http.Error(w, "job is not in a resumable state", 400)
+		return
+	}
+	writeJSON(w, orig)
 }
 
-// redoJob submits a new job with the same config as `id` but re-encodes the WHOLE
-// thing from scratch — no reuse. Unlike Retry (which resumes from prior staging
-// and keeps already-completed variants), Redo sets ForceReencode and clears any
-// resume pointer, so every rendition is produced again. Works on any terminal
-// job (done, failed, or cancelled) — "do it all over."
+// redoJob submits a NEW job with the same config as `id` but re-encodes the WHOLE
+// thing from scratch — no reuse. Unlike Resume (which re-runs the same job in
+// place, reusing chunks already staged under its prefix), Redo mints a fresh job
+// id → a fresh MinIO prefix, and sets ForceReencode so every rendition is
+// produced again. Works on any terminal job (done, failed, or cancelled) —
+// "do it all over" as a brand-new entry.
 func (s *Server) redoJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	orig := s.Manager.GetJob(id)
@@ -493,7 +502,6 @@ func (s *Server) redoJob(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := orig.Config
 	cfg.ForceReencode = true // re-encode every rendition, ignore existing outputs
-	cfg.ResumeFromJobID = "" // no prior staging — start fresh
 	job := s.Manager.Submit(cfg)
 	writeJSON(w, job)
 }

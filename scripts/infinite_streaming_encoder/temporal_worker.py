@@ -141,6 +141,11 @@ def encode_phase(spec: dict) -> None:
     assert proc.stdout is not None
     last = ""
     progress = 0.0
+    # Rolling buffer of the last N raw output lines (ffmpeg/x265/Python errors
+    # included, not just [[ENCODER…]] markers) so a non-zero exit can surface the
+    # ACTUAL failure reason — otherwise the raise carries only the last line,
+    # which is often a progress marker and the real error is lost (#116).
+    tail: list[str] = []
     # Pump cli_phase stdout on a helper thread so the loop below wakes at least
     # once a second even when cli_phase is quiet for a long stretch — e.g. a
     # blocking VMAF-audit ffmpeg (subprocess.run) emits nothing to stdout. That
@@ -186,6 +191,9 @@ def encode_phase(spec: dict) -> None:
             if line is None:
                 break  # cli_phase closed stdout (exited)
             last = line.rstrip("\n")
+            tail.append(last)
+            if len(tail) > 60:
+                del tail[:-60]
             if last.startswith("[[ENCODER"):
                 print(last, flush=True)
                 # cli_phase's run_ffmpeg_with_progress emits ENCODER-STAGE with the
@@ -207,7 +215,15 @@ def encode_phase(spec: dict) -> None:
         _terminate(proc)  # guards the readline-EOF path; no-op if already exited
         shutil.rmtree(work_dir, ignore_errors=True)
     if rc != 0:
-        raise RuntimeError(f"cli_phase {spec['args'][:2]} exit {rc}: {last[:200]}")
+        # Surface the REAL failure reason (#116): print the captured output tail
+        # to the worker's stdout (so `docker logs` on this box shows the ffmpeg/
+        # x265/traceback), and carry it in the exception so it propagates to the
+        # Temporal activity failure -> workflow -> orchestrator log.
+        err_tail = "\n".join(tail)
+        print(f"[temporal-worker] cli_phase {spec['args'][:2]} FAILED (exit {rc}) — "
+              f"last output:\n{err_tail}", flush=True)
+        raise RuntimeError(
+            f"cli_phase {spec['args'][:2]} exit {rc}. last output:\n{err_tail[-1800:]}")
 
 
 # Minimal workflow to validate the Python side end-to-end (one activity).
@@ -281,6 +297,10 @@ class EncodeWorkflow:
         # underway from the start. Deterministic (pure plan math) → Temporal-safe.
         codec_cost = {"h264": 1.0, "hevc": 3.5, "av1": 8.0}
         measure_vmaf = bool(plan.get("measure_vmaf"))  # job-global VMAF audit flag
+        vmaf_prescale = bool(plan.get("vmaf_prescale"))  # #109 pre-scaled-ref toggle
+        # Total renditions doing VMAF — the chunk phase gates the #109 per-box ref
+        # build on this (build amortizes only across >= a few renditions).
+        num_variants = sum(len(ci["rungs"]) for ci in plan["codecs"].values())
         bn = plan.get("burnin", True)  # job-level text-overlay toggle (default on)
         specs = []
         for codec, ci in plan["codecs"].items():
@@ -322,6 +342,8 @@ class EncodeWorkflow:
             env = {"CHUNK_DURATION_S": str(cd), "COALESCE_RUNT_TAIL": "1",
                    "TWO_PASS": "1" if tp else "0", "EXTRA_ARGS": ea,
                    "MEASURE_VMAF": "1" if measure_vmaf else "0",
+                   "VMAF_PRESCALE": "1" if vmaf_prescale else "0",
+                   "NUM_VARIANTS": str(num_variants),
                    "BURNIN": "1" if bn else "0", "ENCODE_THREADS": "2"}
             key = min(PRIORITY_LEVELS, job_rank * PRIORITY_BANDS + _wband[_w])
             chunk_acts.append(self._phase(

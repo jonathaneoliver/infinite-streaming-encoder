@@ -144,6 +144,10 @@ var (
 	// a stage's Batch job landed on — used to colour the chunk plot by instance
 	// so co-located heavy chunks are visible. Emitted once per (stage, instance).
 	hostMarkerRe = regexp.MustCompile(`^\[\[ENCODER-HOST key=(\S+) instance=(\S+)\]\]$`)
+	// ENCODER-REUSED flags a chunk whose output a prior run already staged, so
+	// this run skips (not re-encodes) it — the orchestrator emits it once per
+	// reused chunk at startup. The UI styles those cells distinctly.
+	reusedMarkerRe = regexp.MustCompile(`^\[\[ENCODER-REUSED key=(\S+)\]\]$`)
 	// Cloud cli_cloud.py prints its computed S3 job id in the plan
 	// header (`  job_id:         20260420T203910Z-1`). That's the prefix
 	// under `s3://.../jobs/` — we capture it so the retry endpoint can
@@ -545,6 +549,26 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Unlock()
 		return true
 	}
+	if m := reusedMarkerRe.FindStringSubmatch(line); m != nil {
+		key := m[1]
+		j.mu.Lock()
+		found := false
+		for i := range j.Stages {
+			if j.Stages[i].Key == key {
+				j.Stages[i].Reused = true
+				found = true
+				break
+			}
+		}
+		// The reused marker fires at startup, usually BEFORE the chunk's first
+		// STAGE marker — seed the stage so the flag survives; the later STAGE
+		// updates status/percent in place without clearing it.
+		if !found {
+			j.Stages = append(j.Stages, StageProgress{Key: key, Label: key, Status: "pending", Reused: true})
+		}
+		j.mu.Unlock()
+		return true
+	}
 	if commercialMarkerRe.MatchString(line) {
 		// ALL cost baselines are now computed server-side from the ladder + probe
 		// (Manager.projectAndSetCosts) so cloud-batch and local-dist agree — the
@@ -851,6 +875,12 @@ type JobConfig struct {
 	// emits an [[ENCODER-VMAF …]] marker; the control plane aggregates per rung.
 	// Off by default (slow — see the cost notes on #24). Local only for now.
 	MeasureVmaf bool `json:"measure_vmaf,omitempty"`
+	// VmafPrescale (#109) builds a near-lossless pre-scaled VMAF reference once
+	// per worker box, so the audit decodes a small fast H.264 file instead of
+	// re-downscaling the native (4K/AV1) mezzanine on every chunk. Only helps
+	// when VMAF is on; gated per-source (>= a few renditions, source slower to
+	// decode+scale than the ref, fits locally) and falls back to the mezzanine.
+	VmafPrescale bool `json:"vmaf_prescale,omitempty"`
 	// CPU architecture for cloud encodes: "intel" | "amd" | "graviton".
 	// Empty defaults to intel. Ignored for local encodes (which always
 	// run on the host's native architecture).
@@ -859,12 +889,6 @@ type JobConfig struct {
 	// so `omitempty` works and an unset value lets cli_cloud.py apply
 	// its env-var default (USE_SPOT=true). Ignored for local encodes.
 	UseSpot *bool `json:"use_spot,omitempty"`
-	// ResumeFromJobID points at a prior failed job whose S3 staging
-	// (inputs, mezzanines, completed variants) should be reused. The
-	// remote user-data pre-warms /work from that prefix, and
-	// cli_local.py --resume-package-from /work/output skips variants
-	// it already finds there.
-	ResumeFromJobID string `json:"resume_from_job_id,omitempty"`
 	// SimulateInterruptAfterS is a test hook: when >0, the remote
 	// user-data schedules a synthetic spot-interrupt after this many
 	// seconds. Lets us exercise the Retry flow without waiting for a
@@ -881,6 +905,11 @@ type StageProgress struct {
 	// stage's Batch job ran on — set from ENCODER-HOST, used by the UI to
 	// colour the chunk plot by instance. Empty until the job is placed.
 	Instance string `json:"instance,omitempty"`
+	// Reused is true when this chunk's output was already staged from a prior
+	// run and got skipped (not re-encoded) — set from ENCODER-REUSED. The UI
+	// styles reused cells with a distinct neutral so they don't read as a
+	// freshly-encoded machine colour (or the transient no-instance blue).
+	Reused bool `json:"reused,omitempty"`
 	// Timestamps of state transitions. StartedAt is set the first time
 	// the stage sees `status=running`; EndedAt is set when it reaches
 	// a terminal state (done|failed). Used to build the end-of-job
@@ -1037,8 +1066,7 @@ type Job struct {
 
 	// CloudJobID is the timestamp-based id cli_cloud.py uses for its
 	// S3 prefix (e.g. 20260420T203910Z-1). Captured from the plan
-	// header so the Retry flow can point resume_from_job_id at the
-	// right s3://.../jobs/<X>/ prefix. Empty for local or old jobs.
+	// header for cloud-job bookkeeping. Empty for local or old jobs.
 	CloudJobID string `json:"cloud_job_id,omitempty"`
 
 	// FailureReason categorises why a failed job failed, for UI
@@ -1266,7 +1294,10 @@ func (m *Manager) signalLaunch() {
 func (m *Manager) waitForLaunchTurn(job *Job) {
 	m.launchMu.Lock()
 	defer m.launchMu.Unlock()
-	for m.olderStillLaunching(job) {
+	// Also break on cancel so a job queued behind a long-uploading older job
+	// doesn't sit here until its turn comes — Cancel broadcasts launchCond to
+	// wake us, and the caller re-checks IsCancelled() right after this returns.
+	for m.olderStillLaunching(job) && !job.IsCancelled() {
 		m.launchCond.Wait()
 	}
 }
@@ -1640,9 +1671,6 @@ func (m *Manager) persistSpotSample(job *Job) {
 // user can inspect user-data.log, half-encoded variant MP4s, etc. after
 // the job exits.
 func (m *Manager) preserveTmpForFailure(job *Job, jobTmpDir string) {
-	if _, err := os.Stat(jobTmpDir); os.IsNotExist(err) {
-		return
-	}
 	failedRoot := filepath.Join(m.TmpDir, "failed")
 	os.MkdirAll(failedRoot, 0755)
 	dst := filepath.Join(failedRoot, job.ID)
@@ -1651,11 +1679,25 @@ func (m *Manager) preserveTmpForFailure(job *Job, jobTmpDir string) {
 	if _, err := os.Stat(dst); err == nil {
 		_ = os.Rename(dst, dst+".old."+fmt.Sprint(time.Now().Unix()))
 	}
-	if err := os.Rename(jobTmpDir, dst); err != nil {
-		// Cross-device or permission issue — fall back to copy + remove.
-		if cpErr := copyDir(jobTmpDir, dst); cpErr == nil {
-			os.RemoveAll(jobTmpDir)
+	os.MkdirAll(dst, 0755)
+	// Move whatever local tmp artifacts exist (cloud user-data.log, partial local
+	// MP4s). For DIST jobs jobTmpDir is usually EMPTY — the work lives in MinIO +
+	// the workers' /tmp — which is why this dir was previously useless. The
+	// captured job log below is the real diagnostic in that case (#116).
+	if entries, err := os.ReadDir(jobTmpDir); err == nil {
+		for _, e := range entries {
+			src := filepath.Join(jobTmpDir, e.Name())
+			if os.Rename(src, filepath.Join(dst, e.Name())) != nil {
+				_ = copyDir(src, filepath.Join(dst, e.Name()))
+			}
 		}
+		os.RemoveAll(jobTmpDir)
+	}
+	// ALWAYS capture the job's log — orchestrator output plus the phase-failure
+	// tail relayed up from the worker — so the failed dir is never empty (#116).
+	if lines := job.LogLines(); len(lines) > 0 {
+		_ = os.WriteFile(filepath.Join(dst, "job.log"),
+			[]byte(strings.Join(lines, "\n")+"\n"), 0644)
 	}
 	job.AppendLog(fmt.Sprintf(
 		"[preserved failure artifacts] %s", dst))
@@ -1701,6 +1743,9 @@ func (m *Manager) Cancel(id string) bool {
 	}
 	job.MarkCancelled()
 	m.notify(job)
+	// Wake any cloud job blocked in waitForLaunchTurn so it re-checks and, if
+	// this is that job, exits the wait instead of holding until its turn.
+	m.signalLaunch()
 
 	// Discover worker containers for this job. The label filter matches
 	// every file-index container we might have spawned; there will only
@@ -1743,6 +1788,71 @@ func (m *Manager) Cancel(id string) bool {
 		}
 	}()
 	return true
+}
+
+// Resume re-runs a failed or cancelled job IN PLACE — same *Job, same ID — so
+// the jobs list keeps ONE row that transitions cancelled/failed → running and
+// updates live, instead of spawning a fresh entry. This is Reconcile-on-demand:
+// run() is already re-entrant (startup calls it on rebuilt jobs), and a job's
+// cancel signal is a plain resettable bool, not a spent context.
+//
+// The payoff is automatic chunk reuse: because the ID is unchanged, so is
+// DistJobPrefix, so the orchestrator's own per-chunk _object_exists check (see
+// cli_local_dist.py) finds every chunk already staged in MinIO and skips
+// straight to the unfinished ones. No cross-job prefix plumbing needed. A
+// cancelled dist job never runs its own staging cleanup (the control plane
+// docker-stops it), so its completed chunks are still there to reuse.
+//
+// The original config is re-used unchanged: an interrupted job never moved
+// anything to OutputDir (that happens only on success), so there's nothing to
+// archive and resolveCodec has nothing to skip — no ForceReencode needed.
+// Returns false if no such job or it isn't failed/cancelled.
+func (m *Manager) Resume(id string) bool {
+	job := m.GetJob(id)
+	if job == nil || (job.Status != StatusFailed && job.Status != StatusCancelled) {
+		return false
+	}
+	// Cancel tears the worker container down asynchronously (stop + rm in a
+	// goroutine, up to 30s), and a failed run's container can briefly linger
+	// too. runFileContainer reattaches to any container of the deterministic
+	// name instead of starting fresh — so a leftover would make it drain the
+	// OLD run's exit code. Remove any container for this job id first.
+	m.removeJobContainers(id)
+
+	job.mu.Lock()
+	job.cancelled = false
+	job.Status = StatusQueued
+	job.Progress = "queued"
+	job.Error = ""
+	job.FailureReason = ""
+	job.EndedAt = nil
+	job.StartedAt = time.Now() // fresh timing baseline for progress/ETA
+	job.Stages = nil           // orchestrator re-emits; reused chunks report done
+	job.StagesHistory = nil
+	job.OverallProgress = 0
+	job.OutputProgress = 0
+	job.ETASeconds = 0
+	job.launchComplete = false
+	job.mu.Unlock()
+
+	m.persistState(job, 0)
+	m.notify(job)
+	go m.run(job, 0)
+	return true
+}
+
+// removeJobContainers force-removes any worker container(s) still labelled for
+// this job — defensive cleanup before an in-place Resume, since Cancel's stop+rm
+// runs asynchronously and may not have completed.
+func (m *Manager) removeJobContainers(id string) {
+	out, err := exec.Command("docker", "ps", "-a",
+		"--filter", "label=encoder.job_id="+id, "--format", "{{.Names}}").Output()
+	if err != nil {
+		return
+	}
+	for _, name := range strings.Fields(string(out)) {
+		exec.Command("docker", "rm", "-f", name).Run()
+	}
 }
 
 func (m *Manager) writeHistory(job *Job) {
@@ -2131,6 +2241,9 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	if cfg.MeasureVmaf {
 		args = append(args, "--measure-vmaf")
 	}
+	if cfg.VmafPrescale {
+		args = append(args, "--vmaf-prescale")
+	}
 	if !cfg.BurninEnabled() {
 		args = append(args, "--no-burnin")
 	}
@@ -2423,6 +2536,26 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 				m.notify(job)
 				return fmt.Errorf("aws s3 cp start: %w", err)
 			}
+			// Cancel watcher: this upload is a bare subprocess with no worker
+			// container for Manager.Cancel to stop, so it watches the cancel flag
+			// and kills the copy. A multi-GB UHD source can upload for minutes;
+			// without this, Cancel is silently ignored until the copy finishes.
+			upStop := make(chan struct{})
+			go func() {
+				t := time.NewTicker(time.Second)
+				defer t.Stop()
+				for {
+					select {
+					case <-upStop:
+						return
+					case <-t.C:
+						if job.IsCancelled() && upload.Process != nil {
+							upload.Process.Kill()
+							return
+						}
+					}
+				}
+			}()
 			// aws s3 cp updates its progress in place with '\r'; split on both \r and \n
 			// so intermediate updates are seen, not just the final \n-terminated line.
 			upScanner := bufio.NewScanner(stdoutPipe)
@@ -2446,7 +2579,16 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 					m.notify(job)
 				}
 			}
+			close(upStop) // scan drained → stop the watcher before Wait
 			if err := upload.Wait(); err != nil {
+				// A cancel that killed the copy isn't a real failure — return
+				// clean so run() finalizes the job as cancelled (its deferred
+				// markLaunched still unblocks the queue).
+				if job.IsCancelled() {
+					job.upsertStage("upload:inputs", "upload inputs", "cancelled", 0)
+					m.notify(job)
+					return nil
+				}
 				job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
 				m.notify(job)
 				return fmt.Errorf("aws s3 cp: %w: %s", err, strings.TrimSpace(stderrBuf.String()))
