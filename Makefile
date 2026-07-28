@@ -491,7 +491,12 @@ MINIO_MAX_AGE_S ?= 86400
 # Curves are kept PER CLIP: quality-vs-bitrate is content-dependent, so an
 # extreme-motion clip and a talking head give genuinely different curves and
 # pooling them would describe neither.
-LADDER_AUDIT_REFERENCE ?= 2160
+# 1080 not 2160: an uncapped 4K comparison is ~1.5-2 GB per libvmaf and gets
+# OOM-killed (exit 137) in the server container, which is exactly what
+# vmaf_audit.py's header warns about. The seed reports used the 4K reference,
+# but were run NATIVELY on macOS with the whole machine's RAM. Override with
+# LADDER_AUDIT_REFERENCE=2160 only where there's headroom for it.
+LADDER_AUDIT_REFERENCE ?= 1080
 
 # Paths are resolved INSIDE the container from its own SOURCE_DIR/OUTPUT_DIR/
 # TMP_DIR, not from the Makefile's. The Makefile's are HOST paths
