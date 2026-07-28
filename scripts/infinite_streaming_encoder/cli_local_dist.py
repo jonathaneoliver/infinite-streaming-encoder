@@ -1041,7 +1041,22 @@ def run_temporal(args: argparse.Namespace) -> int:
     try:
         result = asyncio.run(go())
     except Exception as e:  # noqa: BLE001
+        # Surface the ROOT cause, not just the generic top-level "Workflow
+        # execution failed" (#116). Temporal wraps the real error:
+        # WorkflowFailureError -> ActivityError -> ApplicationError(the cli_phase
+        # output tail the worker relayed). Walk the chain (`.cause` on Temporal
+        # failures, `__cause__` otherwise) to the deepest message.
+        root, seen = e, set()
+        while id(root) not in seen:
+            seen.add(id(root))
+            nxt = getattr(root, "cause", None) or getattr(root, "__cause__", None)
+            if nxt is None:
+                break
+            root = nxt
         print(f"[dist] workflow failed: {e}", file=sys.stderr)
+        if root is not e:
+            print(f"[dist] root cause: {type(root).__name__}: {root}",
+                  file=sys.stderr)
         return 1
     if result == "cancelled":
         print("[dist] cancelled — skipping output download", flush=True)

@@ -1640,9 +1640,6 @@ func (m *Manager) persistSpotSample(job *Job) {
 // user can inspect user-data.log, half-encoded variant MP4s, etc. after
 // the job exits.
 func (m *Manager) preserveTmpForFailure(job *Job, jobTmpDir string) {
-	if _, err := os.Stat(jobTmpDir); os.IsNotExist(err) {
-		return
-	}
 	failedRoot := filepath.Join(m.TmpDir, "failed")
 	os.MkdirAll(failedRoot, 0755)
 	dst := filepath.Join(failedRoot, job.ID)
@@ -1651,11 +1648,25 @@ func (m *Manager) preserveTmpForFailure(job *Job, jobTmpDir string) {
 	if _, err := os.Stat(dst); err == nil {
 		_ = os.Rename(dst, dst+".old."+fmt.Sprint(time.Now().Unix()))
 	}
-	if err := os.Rename(jobTmpDir, dst); err != nil {
-		// Cross-device or permission issue — fall back to copy + remove.
-		if cpErr := copyDir(jobTmpDir, dst); cpErr == nil {
-			os.RemoveAll(jobTmpDir)
+	os.MkdirAll(dst, 0755)
+	// Move whatever local tmp artifacts exist (cloud user-data.log, partial local
+	// MP4s). For DIST jobs jobTmpDir is usually EMPTY — the work lives in MinIO +
+	// the workers' /tmp — which is why this dir was previously useless. The
+	// captured job log below is the real diagnostic in that case (#116).
+	if entries, err := os.ReadDir(jobTmpDir); err == nil {
+		for _, e := range entries {
+			src := filepath.Join(jobTmpDir, e.Name())
+			if os.Rename(src, filepath.Join(dst, e.Name())) != nil {
+				_ = copyDir(src, filepath.Join(dst, e.Name()))
+			}
 		}
+		os.RemoveAll(jobTmpDir)
+	}
+	// ALWAYS capture the job's log — orchestrator output plus the phase-failure
+	// tail relayed up from the worker — so the failed dir is never empty (#116).
+	if lines := job.LogLines(); len(lines) > 0 {
+		_ = os.WriteFile(filepath.Join(dst, "job.log"),
+			[]byte(strings.Join(lines, "\n")+"\n"), 0644)
 	}
 	job.AppendLog(fmt.Sprintf(
 		"[preserved failure artifacts] %s", dst))
