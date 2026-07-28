@@ -417,8 +417,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group" id="chunk-dur-group">
                 <label title="How each variant is split into parallel chunks. CLOUD (AWS Batch): Dynamic sizes each variant's chunks by learned encode speed (~4 min work per chunk, min 30s) — slow 4K HEVC splits into many, cheap H264 runs whole. LOCAL (Temporal): Dynamic = a fixed 12s default (no per-variant model); fixed sizes and Whole behave the same as cloud. Fixed: smaller chunks = more parallelism, more join overhead. Whole variant = one continuous encode per tier, NO chunk boundaries (use this to rule out chunk-boundary effects).">Chunking</label>
                 <select id="chunk-duration">
-                    <option value="dynamic" selected>Dynamic (cloud: learned · local: 12s)</option>
-                    <option value="12">12s chunks (max parallelism)</option>
+                    <option value="dynamic">Dynamic (cloud: learned · local: 12s)</option>
+                    <option value="12" selected>12s chunks (max parallelism)</option>
                     <option value="30">30s chunks</option>
                     <option value="60">60s chunks</option>
                     <option value="300">5m chunks</option>
