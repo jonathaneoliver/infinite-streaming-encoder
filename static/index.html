@@ -407,9 +407,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group">
                 <label>Codec</label>
                 <div id="codec" class="codec-checks">
-                    <label><input type="checkbox" class="codec-cb" value="h264" checked> H.264</label>
-                    <label><input type="checkbox" class="codec-cb" value="hevc" checked> HEVC</label>
-                    <label><input type="checkbox" class="codec-cb" value="av1"> AV1</label>
+                    <label><input type="checkbox" class="codec-cb" value="h264" checked onchange="syncResTiers()"> H.264</label>
+                    <label><input type="checkbox" class="codec-cb" value="hevc" checked onchange="syncResTiers()"> HEVC</label>
+                    <label><input type="checkbox" class="codec-cb" value="av1" onchange="syncResTiers()"> AV1</label>
                 </div>
             </div>
             <div class="control-group">
@@ -882,14 +882,27 @@ async function loadLadders() {
     syncResTiers();
 }
 
+// The codecs whose checkboxes are ticked, in canonical order. Falls back to all
+// codecs when none are ticked, so the res-tier list is never empty (the encode
+// itself falls back to h264+hevc in that case — see parseCodecSel/codecValue).
+function selectedCodecs() {
+    const on = _CODEC_ORDER.filter(c =>
+        document.querySelector(`.codec-cb[value="${c}"]`)?.checked);
+    return on.length ? on : _CODEC_ORDER.slice();
+}
+
 // Rebuild the Min/Max Resolution tiers from the SELECTED ladder's actual rung
-// heights, union'd across its codecs.
+// heights, union'd across only the SELECTED codecs.
 //
 // These used to be five hardcoded <option>s (2160/1440/1080/720/540) that never
 // changed with the ladder — so they offered caps a ladder didn't have (Apple's
 // H.264 column stops at 1080p, making "2160p" a no-op) and hid the ones it did
 // (apple-uniq encodes at 1044p, 2124p, 684p...). Deriving them means every tier
 // shown is a real boundary in the ladder you're about to encode.
+//
+// Codec-aware (issue #115): with only H.264 ticked the list stops at 1080p, so a
+// 2124p floor — which is HEVC/AV1-only and would select zero h264 rungs — simply
+// isn't offered. Re-runs on every codec-checkbox change.
 //
 // Also keeps the pair consistent: options above the chosen max are disabled in
 // the min list and vice versa, so an inverted band (which would encode nothing)
@@ -901,7 +914,7 @@ function syncResTiers() {
     if (!maxSel || !minSel) return;
 
     const heights = [...new Set(
-        _CODEC_ORDER.flatMap(c => (d && d.codecs && d.codecs[c] || []).map(r => r[1]))
+        selectedCodecs().flatMap(c => (d && d.codecs && d.codecs[c] || []).map(r => r[1]))
     )].sort((a, b) => b - a);
 
     // Preserve each selection across a ladder switch when the new ladder still
@@ -924,6 +937,35 @@ function syncResTiers() {
     [...maxSel.options].forEach(o => {
         o.disabled = !!o.value && !isNaN(minH) && parseInt(o.value, 10) < minH;
     });
+}
+
+// Mirrors the server's ValidateResBand (issue #115): returns an error string if
+// the chosen min/max band selects zero rungs for any ticked codec on the chosen
+// ladder, else "". Codec-aware tiers make an impossible tier unpickable in the
+// first place, but a mixed selection (e.g. H.264 + HEVC with a 2124p floor) can
+// still leave H.264 empty while HEVC is fine — this catches that before submit.
+function resBandError() {
+    const d = laddersCache[document.getElementById('ladder')?.value];
+    if (!d || !d.codecs) return '';
+    const minV = document.getElementById('min-res').value;
+    const maxV = document.getElementById('max-res').value;
+    if (!minV && !maxV) return '';
+    const minH = parseInt(minV, 10); // NaN when "No limit"
+    const maxH = parseInt(maxV, 10);
+    for (const c of selectedCodecs()) {
+        const hs = (d.codecs[c] || []).map(r => r[1]);
+        if (!hs.length) continue; // codec absent from this ladder — not a band error
+        const inBand = hs.some(h =>
+            (isNaN(minH) || h >= minH) && (isNaN(maxH) || h <= maxH));
+        if (inBand) continue;
+        const top = Math.max(...hs), bot = Math.min(...hs);
+        if (!isNaN(minH) && minH > top)
+            return `Min Res ${minV}: this ladder's ${c} tops at ${top}p — no rung qualifies.`;
+        if (!isNaN(maxH) && maxH < bot)
+            return `Max Res ${maxV}: this ladder's ${c} starts at ${bot}p — no rung qualifies.`;
+        return `No ${c} rung falls in the selected resolution band (${c} spans ${bot}p–${top}p).`;
+    }
+    return '';
 }
 
 // One table per ladder: rows are resolutions (highest first), columns are
@@ -1541,6 +1583,9 @@ async function confirmCloudIfBilling() {
 async function startEncode(force = false) {
     const selected = Array.from(document.querySelectorAll('#file-list input:checked')).map(cb => cb.value);
     if (selected.length === 0) return;
+
+    const bandErr = resBandError();
+    if (bandErr) { showToast(bandErr, 'error'); return; }
 
     const target = document.getElementById('target').value;
     if ((target === 'cloud' || target === 'cloud-batch') && !await confirmCloudIfBilling()) return;
@@ -3753,6 +3798,9 @@ function showSourceContextMenu(e, fileName) {
 }
 
 async function forceReencode(fileName) {
+    const bandErr = resBandError();
+    if (bandErr) { showToast(bandErr, 'error'); return; }
+
     const body = {
         files: [fileName],
         target: document.getElementById('target').value,
