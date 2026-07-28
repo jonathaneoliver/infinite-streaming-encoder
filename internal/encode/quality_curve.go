@@ -40,7 +40,18 @@ import (
 // rebuild.
 
 // CurvePoint is one measured (bitrate -> quality) sample for a codec.
+//
+// IDENTITY is (Clip, Codec, Reference, Height, Kbps) — all five. Height and
+// Kbps are both needed: two rungs can share a bitrate at different heights
+// (720p@3000 and 1080p@3000 are different quality), and two can share a height
+// at different bitrates (the Apple ladders carry two 1080p rungs). Dropping
+// either collapses distinct measurements onto one key and silently discards
+// samples. Clip is in the key because quality-vs-bitrate is CONTENT-dependent:
+// an extreme-motion clip and a talking head give genuinely different curves,
+// and pooling them describes neither.
 type CurvePoint struct {
+	// Clip is the content this was measured on. Empty means the built-in seed.
+	Clip      string  `json:"clip,omitempty"`
 	Codec     string  `json:"codec"`
 	Reference int     `json:"reference"` // grading reference height (2160 | 1080)
 	Height    int     `json:"height"`    // the rung's own encoded height
@@ -157,7 +168,11 @@ type curveFile struct {
 // seed set. Never returns nil — a missing or corrupt file just means seeds only,
 // since an estimate is a nicety and must never break ladder rendering.
 func LoadCurveStore(path string) *CurveStore {
-	s := &CurveStore{path: path, points: defaultSeedCurves(), Clip: SeedClip}
+	seed := defaultSeedCurves()
+	for i := range seed {
+		seed[i].Clip = SeedClip
+	}
+	s := &CurveStore{path: path, points: seed, Clip: SeedClip}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return s
@@ -170,7 +185,7 @@ func LoadCurveStore(path string) *CurveStore {
 	// their seed counterpart rather than appending a duplicate the interpolator
 	// would then average over.
 	key := func(p CurvePoint) string {
-		return fmt.Sprintf("%s/%d/%d", p.Codec, p.Reference, p.Height)
+		return fmt.Sprintf("%s/%s/%d/%d/%d", p.Clip, p.Codec, p.Reference, p.Height, p.Kbps)
 	}
 	merged := map[string]CurvePoint{}
 	for _, p := range s.points {
@@ -190,14 +205,44 @@ func LoadCurveStore(path string) *CurveStore {
 	return s
 }
 
-// Points returns every curve point for one codec at one grading reference,
-// sorted by bitrate.
-func (s *CurveStore) Points(codec string, reference int) []CurvePoint {
+// Clips lists the content the store holds curves for, seed first.
+func (s *CurveStore) Clips() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range s.points {
+		c := p.Clip
+		if c == "" {
+			c = SeedClip
+		}
+		if !seen[c] {
+			seen[c] = true
+			out = append(out, c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if (out[i] == SeedClip) != (out[j] == SeedClip) {
+			return out[i] == SeedClip
+		}
+		return out[i] < out[j]
+	})
+	return out
+}
+
+// Points returns curve points for one codec at one grading reference, measured
+// on one clip, sorted by bitrate. Curves are never pooled across clips — see
+// CurvePoint's identity note.
+func (s *CurveStore) Points(codec string, reference int, clip string) []CurvePoint {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var out []CurvePoint
 	for _, p := range s.points {
-		if p.Codec == codec && p.Reference == reference {
+		pc := p.Clip
+		if pc == "" {
+			pc = SeedClip
+		}
+		if p.Codec == codec && p.Reference == reference && pc == clip {
 			out = append(out, p)
 		}
 	}
@@ -223,11 +268,32 @@ func (s *CurveStore) Points(codec string, reference int) []CurvePoint {
 // rung is then meaningless and would otherwise read as a real verdict. Every
 // shipped ladder's top rung is currently above the measured maximum, so this is
 // the common case at the top of the table, not an edge case.
-func (s *CurveStore) EstimateVmaf(codec string, kbps int, reference int) (float64, bool, bool) {
-	pts := s.Points(codec, reference)
-	if len(pts) == 0 || kbps <= 0 {
+func (s *CurveStore) EstimateVmaf(codec string, height, kbps, reference int, clip string) (float64, bool, bool) {
+	all := s.Points(codec, reference, clip)
+	if len(all) == 0 || kbps <= 0 {
 		return 0, false, false
 	}
+	// Prefer points measured at THIS rung's height. With height in a point's
+	// identity the curve can hold two samples at one bitrate (720p@3000 and
+	// 1080p@3000 are different quality), so a bitrate-only walk would pick
+	// whichever the sort happened to order first. Same-height points remove the
+	// ambiguity; the codec-wide curve is the fallback when a height has never
+	// been measured, which is the normal case for a freshly authored ladder.
+	pts := all
+	var sameHeight []CurvePoint
+	for _, p := range all {
+		if p.Height == height {
+			sameHeight = append(sameHeight, p)
+		}
+	}
+	// One sample can't span a range, so it only helps as an exact hit; two or
+	// more can be interpolated between.
+	if len(sameHeight) >= 2 {
+		pts = sameHeight
+	} else if len(sameHeight) == 1 && sameHeight[0].Kbps == kbps {
+		return sameHeight[0].Vmaf, false, true
+	}
+
 	if kbps <= pts[0].Kbps {
 		return pts[0].Vmaf, kbps < pts[0].Kbps, true
 	}
@@ -287,19 +353,22 @@ const (
 // measured curve. sourceWidth 0 means "design time" — no upscale filtering, so
 // the whole ladder is shown as authored rather than as it would apply to some
 // particular file.
-func (m *Manager) LadderEstimates(ladderName, codec string, reference int) []RungEstimate {
+func (m *Manager) LadderEstimates(ladderName, codec string, reference int, clip string) []RungEstimate {
 	if m.Ladders == nil || m.Curves == nil {
 		return nil
 	}
 	if reference == 0 {
 		reference = DefaultCurveReference
 	}
+	if clip == "" {
+		clip = m.Curves.Clip
+	}
 	rungs := m.Ladders.resolveRungs(ladderName, codec, "", "", 0)
 	out := make([]RungEstimate, 0, len(rungs))
 	var prev *RungEstimate
 	for _, r := range rungs {
 		e := RungEstimate{Label: r.Label, Height: r.Height, Width: r.Width, Kbps: r.Bitrate}
-		if v, clamped, ok := m.Curves.EstimateVmaf(codec, r.Bitrate, reference); ok {
+		if v, clamped, ok := m.Curves.EstimateVmaf(codec, r.Height, r.Bitrate, reference, clip); ok {
 			e.Vmaf, e.Clamped = v, clamped
 			if clamped {
 				// Outside the measured curve: report the endpoint, judge nothing.

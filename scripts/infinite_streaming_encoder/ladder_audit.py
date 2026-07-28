@@ -44,6 +44,21 @@ class AuditError(RuntimeError):
     """The output can't be audited — missing metadata, or burn-in was on."""
 
 
+def _label_height(label: str) -> int:
+    """`"1080p"` -> 1080, `"1080p_2"` -> 1080. 0 when unreadable.
+
+    The ordinal suffix must be removed BEFORE the trailing "p": a ladder with
+    two rungs at one resolution labels them `1080p_1`/`1080p_2`, which don't end
+    in "p" at all. Stripping first left "1080p" and raised ValueError, so every
+    Apple (non-uniq) ladder — which carries two 432p, two 720p and two 1080p
+    rungs — crashed the audit.
+    """
+    head = label.split("_")[0]
+    if head.endswith("p") and head[:-1].isdigit():
+        return int(head[:-1])
+    return 0
+
+
 def _delivered_kbps(variant_dir: Path, duration_s: float) -> int:
     """Delivered bitrate = total segment bytes x 8 / duration.
 
@@ -91,7 +106,7 @@ def discover_rungs(output_dir: Path) -> tuple[str, list[tuple[str, Path]]]:
 
 def audit_output(output_dir: Path, source: Path, reference: int,
                  n_subsample: int = 5, limit_s: float | None = None,
-                 progress=print) -> list[dict]:
+                 clip: str | None = None, progress=print) -> list[dict]:
     """Measure every rung of `output_dir` against `source`. Returns curve points."""
     codec, rungs = discover_rungs(output_dir)
     info = probe(source)
@@ -122,14 +137,64 @@ def audit_output(output_dir: Path, source: Path, reference: int,
         except VmafError as e:
             progress(f"[audit]   {label}: FAILED — {e}")
             continue
-        height = int(label.rstrip("p").split("_")[0]) if label[0].isdigit() else 0
+        height = _label_height(label)
+        if height == 0:
+            progress(f"[audit]   {label}: skipped — can't read a height from the label")
+            continue
         points.append({
+            "clip": clip or source.name,
             "codec": codec, "reference": reference, "height": height,
             "kbps": kbps, "vmaf": round(r["mean"], 2),
             "harmonic": round(r["harmonic_mean"], 2),
         })
         progress(f"[audit]   {label}: {kbps} kbps  vmaf {r['mean']:.2f} "
                  f"(harmonic {r['harmonic_mean']:.2f}, {r['frames']} frames)")
+    return points
+
+
+def audit_tree(root: Path, source_dir: Path, reference: int,
+               n_subsample: int = 5, limit_s: float | None = None,
+               progress=print) -> list[dict]:
+    """Audit every eligible output under `root`, SKIPPING the rest with a reason.
+
+    Skipping rather than failing is the point of batch mode: most of a real
+    OUTPUT_DIR is ineligible (burn-in on, pre-dating encode.json, source since
+    deleted) and one bad directory must not abandon the rest. Naming a single
+    output explicitly still errors — there, you meant that one.
+
+    The source is matched by the `source` recorded in encode.json, looked up in
+    `source_dir`. An output whose source is gone can't be audited: there is
+    nothing to compare against, and quietly substituting another file would
+    produce confidently wrong numbers.
+    """
+    points: list[dict] = []
+    eligible = skipped = 0
+    for d in sorted(root.iterdir()):
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        try:
+            discover_rungs(d)
+        except AuditError as e:
+            skipped += 1
+            progress(f"[audit] SKIP {d.name}: {str(e).split(': ', 1)[-1]}")
+            continue
+        meta = json.loads((d / "encode.json").read_text())
+        src_name = meta.get("source") or ""
+        src = source_dir / Path(src_name).name if src_name else None
+        if not src or not src.is_file():
+            skipped += 1
+            progress(f"[audit] SKIP {d.name}: source {src_name!r} not found in {source_dir}")
+            continue
+        try:
+            got = audit_output(d, src, reference, n_subsample=n_subsample,
+                               limit_s=limit_s, progress=progress)
+        except (AuditError, ProbeError) as e:
+            skipped += 1
+            progress(f"[audit] SKIP {d.name}: {e}")
+            continue
+        points.extend(got)
+        eligible += 1
+    progress(f"[audit] {eligible} output(s) audited, {skipped} skipped")
     return points
 
 
@@ -149,13 +214,22 @@ def merge_into_store(store_path: Path, points: list[dict], clip: str) -> dict:
             pass  # unreadable store: start fresh rather than refuse to record
 
     def key(p):
-        return (p.get("codec"), p.get("reference"), p.get("height"))
+        # All five. Height and bitrate are BOTH needed — two rungs can share a
+        # bitrate at different heights, and two can share a height at different
+        # bitrates — and clip because quality-vs-bitrate is content-dependent.
+        # A narrower key silently drops real samples.
+        return (p.get("clip"), p.get("codec"), p.get("reference"),
+                p.get("height"), p.get("kbps"))
 
     merged = {key(p): p for p in doc.get("points", [])}
     for p in points:
         merged[key(p)] = p
-    doc["points"] = sorted(merged.values(),
-                           key=lambda p: (p["codec"], -p["reference"], p["kbps"]))
+    doc["points"] = sorted(
+        merged.values(),
+        key=lambda p: (p.get("clip", ""), p["codec"], -p["reference"], p["kbps"]))
+    # Top-level clip is the MOST RECENTLY audited content — a display default
+    # only. Points carry their own clip, so a store holding several clips is no
+    # longer mislabelled as all belonging to the last one.
     doc["clip"] = clip
     store_path.parent.mkdir(parents=True, exist_ok=True)
     store_path.write_text(json.dumps(doc, indent=2) + "\n")
@@ -167,10 +241,15 @@ def _main(argv=None) -> int:
         prog="ladder_audit",
         description="Measure a finished output's ladder into VMAF-vs-bitrate "
                     "curve points the Ladders tab uses for design-time estimates.")
-    ap.add_argument("--output-dir", required=True, type=Path,
-                    help="a directory under OUTPUT_DIR (must contain encode.json)")
-    ap.add_argument("--source", required=True, type=Path,
+    ap.add_argument("--output-dir", type=Path, default=None,
+                    help="a single directory under OUTPUT_DIR (must contain encode.json)")
+    ap.add_argument("--source", type=Path, default=None,
                     help="the original source the output was encoded from")
+    ap.add_argument("--all", type=Path, default=None, metavar="OUTPUT_DIR",
+                    help="audit every eligible output under this directory, "
+                         "skipping the rest (needs --source-dir)")
+    ap.add_argument("--source-dir", type=Path, default=None, dest="source_dir",
+                    help="where to find sources for --all (matched by encode.json's source)")
     ap.add_argument("--reference", type=int, default=2160, choices=REFERENCES,
                     help="grading reference height (default 2160)")
     ap.add_argument("--store", type=Path, default=None,
@@ -189,10 +268,27 @@ def _main(argv=None) -> int:
         if not quiet:
             print(msg, flush=True)
 
+    if bool(args.all) == bool(args.output_dir):
+        print("error: pass either --output-dir (one output) or --all (a tree), "
+              "not both", file=sys.stderr)
+        return 2
+    if args.all and not args.source_dir:
+        print("error: --all needs --source-dir to resolve each output's source",
+              file=sys.stderr)
+        return 2
+    if args.output_dir and not args.source:
+        print("error: --output-dir needs --source", file=sys.stderr)
+        return 2
+
     try:
-        points = audit_output(args.output_dir, args.source, args.reference,
-                              n_subsample=args.n_subsample, limit_s=args.limit_s,
-                              progress=progress)
+        if args.all:
+            points = audit_tree(args.all, args.source_dir, args.reference,
+                                n_subsample=args.n_subsample, limit_s=args.limit_s,
+                                progress=progress)
+        else:
+            points = audit_output(args.output_dir, args.source, args.reference,
+                                  n_subsample=args.n_subsample, limit_s=args.limit_s,
+                                  clip=args.clip, progress=progress)
     except (AuditError, ProbeError) as e:
         # A missing/unreadable source is a user error like an ineligible output
         # is — report it, don't traceback.
@@ -203,7 +299,7 @@ def _main(argv=None) -> int:
         print("error: no rung could be measured", file=sys.stderr)
         return 1
 
-    clip = args.clip or args.source.name
+    clip = args.clip or (args.source.name if args.source else "multiple")
     if args.store:
         merge_into_store(args.store, points, clip)
         progress(f"[audit] merged {len(points)} point(s) into {args.store}")

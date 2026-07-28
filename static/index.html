@@ -1098,6 +1098,11 @@ function _ladderSuffix(d) {
 // Kept separate from laddersCache because that object round-trips through the
 // editor's save — derived data must never ride along into a stored definition.
 let estimatesCache = {};
+// Which content the estimates are computed against. Curves are per-clip because
+// quality-vs-bitrate is content-dependent — a ladder that holds up on a talking
+// head can fall apart on extreme motion, and that difference is the whole point
+// of looking. Empty = the store's default (the seed until an audit replaces it).
+let _estimateClip = '';
 
 // Join key is CODEC + BITRATE, not the rung label: the table indexes rows by
 // (resolution, Nth rung at that resolution) while the API returns ladder order,
@@ -1124,9 +1129,15 @@ const _VERDICT_COLOR = {
 function _estimateLegend(name) {
     const doc = estimatesCache[name];
     if (!doc || !doc.codecs || !Object.keys(doc.codecs).length) return '';
+    const clips = doc.clips || [];
+    const picker = clips.length > 1
+        ? `<select onchange="setEstimateClip(this.value)" style="width:auto;min-width:auto;font-size:11px;padding:1px 4px;vertical-align:baseline">
+             ${clips.map(c => `<option value="${_escAttr(c)}"${c === doc.clip ? ' selected' : ''}>${escapeHtml(c)}</option>`).join('')}
+           </select>`
+        : `<span style="color:#aab">${escapeHtml(doc.clip)}</span>`;
     return `<div style="color:#8a93a5;font-size:11px;margin:0 0 4px">
         ~VMAF <b>estimated</b> (not measured) at the ${doc.reference}p grading reference, interpolated from
-        <span style="color:#aab">${escapeHtml(doc.clip)}</span> · second number is the gain over the rung below:
+        ${picker} · second number is the gain over the rung below:
         <span style="color:#6ab04c">ok</span> ·
         <span style="color:#d06666">redundant (&lt;2 VMAF for the extra bitrate)</span> ·
         <span style="color:#d0a24a">wide-gap (&gt;9, visible switch) / saturated (&gt;96)</span> ·
@@ -1134,12 +1145,21 @@ function _estimateLegend(name) {
       </div>`;
 }
 
+// Switch which content estimates are computed against. Refetches rather than
+// filtering client-side: the server owns the height-preferring interpolation,
+// so there is exactly one implementation of it.
+function setEstimateClip(clip) {
+    _estimateClip = clip;
+    loadLadderEstimates();
+}
+
 async function loadLadderEstimates() {
     const names = Object.keys(laddersCache);
     if (!names.length) return;
     await Promise.all(names.map(async n => {
         try {
-            const res = await fetch(`/api/ladders/${encodeURIComponent(n)}/estimates`);
+            const q = _estimateClip ? `?clip=${encodeURIComponent(_estimateClip)}` : '';
+            const res = await fetch(`/api/ladders/${encodeURIComponent(n)}/estimates${q}`);
             if (res.ok) estimatesCache[n] = await res.json();
         } catch (e) { /* leave this ladder without estimates */ }
     }));

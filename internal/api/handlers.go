@@ -580,18 +580,27 @@ func (s *Server) ladderEstimates(w http.ResponseWriter, r *http.Request) {
 	if reference == 0 {
 		reference = encode.DefaultCurveReference
 	}
+	// Curves are per-clip because quality-vs-bitrate is content-dependent. The
+	// caller picks which content to estimate against; default is the store's
+	// current clip (the seed until an audit overwrites it).
+	clip := r.URL.Query().Get("clip")
+	if clip == "" {
+		clip = s.Manager.Curves.Clip
+	}
 	byCodec := map[string][]encode.RungEstimate{}
 	for _, c := range []string{"h264", "hevc", "av1"} {
-		if est := s.Manager.LadderEstimates(name, c, reference); len(est) > 0 {
+		if est := s.Manager.LadderEstimates(name, c, reference, clip); len(est) > 0 {
 			byCodec[c] = est
 		}
 	}
 	writeJSON(w, map[string]any{
 		"ladder":    name,
 		"reference": reference,
-		// clip and estimated=true so the UI can never present these as a
-		// measurement of any particular encode.
-		"clip":      s.Manager.Curves.Clip,
+		// clip + the full list so the UI can name whose quality this is and
+		// offer the others; estimated=true so it's never read as a measurement
+		// of any particular encode.
+		"clip":      clip,
+		"clips":     s.Manager.Curves.Clips(),
 		"estimated": true,
 		"codecs":    byCodec,
 	})
