@@ -493,21 +493,28 @@ MINIO_MAX_AGE_S ?= 86400
 # pooling them would describe neither.
 LADDER_AUDIT_REFERENCE ?= 2160
 
+# Paths are resolved INSIDE the container from its own SOURCE_DIR/OUTPUT_DIR/
+# TMP_DIR, not from the Makefile's. The Makefile's are HOST paths
+# (/Volumes/4TB/...) while the container mounts them elsewhere (/media/...), so
+# passing them through docker exec looks right and fails with a missing
+# directory. OUT= is a directory NAME under OUTPUT_DIR; SRC= is a filename under
+# SOURCE_DIR — not full paths, for the same reason.
 ladder-audit:         ## measure one output's ladder into the VMAF curve store (OUT=, SRC=)
-	@: $${OUT:?OUT is not set — the output directory name under OUTPUT_DIR}
-	@: $${SRC:?SRC is not set — the source file the output was encoded from}
-	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.ladder_audit \
-	  --output-dir "$(OUTPUT_DIR)/$(OUT)" --source "$(SRC)" \
+	@: $${OUT:?OUT is not set — the output directory NAME under OUTPUT_DIR}
+	@: $${SRC:?SRC is not set — the source FILENAME under SOURCE_DIR}
+	docker exec $(CONTAINER_NAME) sh -c 'python3 -m infinite_streaming_encoder.ladder_audit \
+	  --output-dir "$$OUTPUT_DIR/$(OUT)" --source "$$SOURCE_DIR/$(SRC)" \
 	  --reference $(LADDER_AUDIT_REFERENCE) \
-	  --store "$(TMP_DIR)/quality-curves.json" \
-	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)
+	  --store "$$TMP_DIR/quality-curves.json" \
+	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)'
 
 ladder-audit-all:     ## audit EVERY eligible output; skips burn-in/no-metadata ones
-	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.ladder_audit \
-	  --all "$(OUTPUT_DIR)" --source-dir "$(SOURCE_DIR)" \
+	docker exec $(CONTAINER_NAME) sh -c 'python3 -m infinite_streaming_encoder.ladder_audit \
+	  --all "$$OUTPUT_DIR" --source-dir "$$SOURCE_DIR" \
 	  --reference $(LADDER_AUDIT_REFERENCE) \
-	  --store "$(TMP_DIR)/quality-curves.json" \
-	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)
+	  --store "$$TMP_DIR/quality-curves.json" \
+	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)'
+
 
 minio-usage:          ## what the local-dist MinIO staging is holding, per job prefix
 	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.dist_staging --usage

@@ -167,6 +167,12 @@ def audit_tree(root: Path, source_dir: Path, reference: int,
     nothing to compare against, and quietly substituting another file would
     produce confidently wrong numbers.
     """
+    if not root.is_dir():
+        raise AuditError(f"not a directory: {root} — note these paths are "
+                         "resolved inside the container, not on the host")
+    if not source_dir.is_dir():
+        raise AuditError(f"not a directory: {source_dir} — note these paths are "
+                         "resolved inside the container, not on the host")
     points: list[dict] = []
     eligible = skipped = 0
     for d in sorted(root.iterdir()):
