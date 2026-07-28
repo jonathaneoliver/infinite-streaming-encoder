@@ -441,6 +441,32 @@ def _chunk_key(work_prefix: str, codec: str, label: str, index: int) -> str:
     return f"{work_prefix}/{codec}_{label}_chunk{index:03d}.mp4"
 
 
+def _parse_vmaf_estimates(items: list) -> dict:
+    """Parse --vmaf-estimate 'CODEC/LABEL:VMAF:CLAMPED' items into a lookup keyed
+    by (codec, label) -> (vmaf: float, clamped: bool). Malformed entries are
+    skipped — this is cosmetic overlay data, never worth failing a run over."""
+    out: dict = {}
+    for it in items or []:
+        try:
+            key, vmaf, clamped = it.rsplit(":", 2)
+            codec, label = key.split("/", 1)
+            out[(codec, label)] = (float(vmaf), clamped == "1")
+        except (ValueError, AttributeError):
+            continue
+    return out
+
+
+def _rung_dict(codec: str, r, ests: dict) -> dict:
+    """Plan entry for one rung, with the design-time VMAF estimate attached when
+    Go supplied one for (codec, label). temporal_worker passes est_vmaf on to
+    cli_phase --est-vmaf so the worker burns it into the overlay."""
+    d = {"label": r.label, "width": r.width, "height": r.height, "bitrate": r.bitrate}
+    e = ests.get((codec, r.label))
+    if e:
+        d["est_vmaf"], d["est_vmaf_clamped"] = e
+    return d
+
+
 # <codec>_<tier>_chunk<NNN>.mp4 — a staged chunk OUTPUT object (tier may carry an
 # ordinal suffix like 540p_2, hence the greedy middle group). Excludes .mp4.done.
 _CHUNK_OBJ_RE = re.compile(r"^([^_]+)_(.+)_chunk(\d+)\.mp4$")
@@ -984,6 +1010,7 @@ def run_temporal(args: argparse.Namespace) -> int:
     two_pass = {c: ladder_passes(ladder_def, c) == 2 for c in ("h264", "hevc", "av1")}
     if args.hevc_single_pass:
         two_pass["hevc"] = False
+    _vmaf_ests = _parse_vmaf_estimates(getattr(args, "vmaf_estimate", []))
     plan = {
         "bucket": bucket, "job_prefix": prefix, "src_key": src_key,
         "mezz_prefix": mezz_prefix, "job_rank": args.job_rank,
@@ -993,8 +1020,7 @@ def run_temporal(args: argparse.Namespace) -> int:
         "vmaf_prescale": getattr(args, "vmaf_prescale", False),
         "codecs": {c: {"two_pass": two_pass[c],
                        "extra_args": ladder_extra_args(ladder_def, c),
-                       "rungs": [{"label": r.label, "width": r.width,
-                                  "height": r.height, "bitrate": r.bitrate} for r in rr]}
+                       "rungs": [_rung_dict(c, r, _vmaf_ests) for r in rr]}
                    for c, rr in rungs_by_codec.items()},
     }
 
@@ -1130,6 +1156,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-burnin", action="store_false", dest="burnin", default=True,
                    help="disable the burnt-in text overlay on every variant; "
                         "on by default")
+    p.add_argument("--vmaf-estimate", action="append", default=[], dest="vmaf_estimate",
+                   metavar="CODEC/LABEL:VMAF:CLAMPED",
+                   help="design-time VMAF estimate for a rung (from the Go quality "
+                        "curves) to burn into the overlay, e.g. hevc/2160p:82.4:1; "
+                        "repeatable, one per rung")
     p.add_argument("--bitrate-override-hevc", default=None, dest="bitrate_override_hevc")
     p.add_argument("--bitrate-override-h264", default=None, dest="bitrate_override_h264")
     p.add_argument("--chunk-duration", type=float, default=12.0,
