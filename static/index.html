@@ -1026,13 +1026,23 @@ function _alignedLadderTable(d, name) {
     // rung by bitrate.
     const cellByKey = {}, meta = {};
     present.forEach(c => {
-        const rungs = (d.codecs[c] || []).map(r => ({ h: r[1], res: r[1] + 'p', b: r[2] })).sort((a, b) => a.b - b.b);
+        const rungs = (d.codecs[c] || []).map(r => ({ w: r[0], h: r[1], res: r[1] + 'p', b: r[2] })).sort((a, b) => a.b - b.b);
         const ord = {};
         rungs.forEach((r, i) => {
             const n = (ord[r.res] = (ord[r.res] || 0) + 1);
             const key = r.res + '|' + n;
             meta[key] = { res: r.res, h: r.h, n };
-            (cellByKey[key] = cellByKey[key] || {})[c] = { b: r.b, step: i > 0 ? r.b / rungs[i - 1].b : null };
+            // bpp = kbps per megapixel. Its step is a SECOND opinion on the
+            // bitrate step: a rung can take a healthy 1.33x more bitrate while
+            // covering 2.1x the pixels, which leaves it starved even though the
+            // bitrate step reads green. See _bppDivergence.
+            const prev = i > 0 ? rungs[i - 1] : null;
+            const bpp = r.b / (r.w * r.h / 1e6);
+            (cellByKey[key] = cellByKey[key] || {})[c] = {
+                b: r.b, step: prev ? r.b / prev.b : null, bpp,
+                bppStep: prev ? bpp / (prev.b / (prev.w * prev.h / 1e6)) : null,
+                pxStep: prev ? (r.w * r.h) / (prev.w * prev.h) : null,
+            };
         });
     });
     // Descending: highest resolution first, and within the same resolution the
@@ -1041,9 +1051,10 @@ function _alignedLadderTable(d, name) {
     const keys = Object.keys(cellByKey).sort((a, b) => meta[b].h - meta[a].h || meta[b].n - meta[a].n);
     const th = `<th style="text-align:left;padding:4px 16px 6px 0">Resolution</th>`
         + present.map(c => `<th style="text-align:right;padding:4px 0 6px 18px">${c}</th>`).join('');
-    const cellHtml = (cell, codec) => {
+    const cellHtml = (cell, codec, cellByCodec) => {
         if (!cell) return '<span style="color:#666">—</span>';
         const s = cell.step ? ` <span style="color:${_stepColor(cell.step)};font-size:11px">×${cell.step.toFixed(2)}</span>` : '';
+        const cr = _codecRatio(cellByCodec, codec, present);
         // Estimated VMAF + gain over the rung below. The gain is the number that
         // decides whether a rung earns its slot — bitrate spacing alone can look
         // healthy while the quality it buys is nil.
@@ -1060,10 +1071,10 @@ function _alignedLadderTable(d, name) {
                 q = `<div style="font-size:10px;color:#8a93a5" title="Estimated VMAF ${e.vmaf.toFixed(1)}${e.verdict ? ' — ' + e.verdict : ''}. Interpolated from measured curves, NOT a measurement of any encode.">~${e.vmaf.toFixed(1)}${d}</div>`;
             }
         }
-        return `${cell.b}${s}${q}`;
+        return `${cell.b}${s}${cr}${q}${_bppDivergence(cell)}`;
     };
     const body = keys.map(k => {
-        const cells = present.map(c => `<td style="text-align:right;padding:3px 0 3px 18px;font-variant-numeric:tabular-nums">${cellHtml(cellByKey[k][c], c)}</td>`).join('');
+        const cells = present.map(c => `<td style="text-align:right;padding:3px 0 3px 18px;font-variant-numeric:tabular-nums">${cellHtml(cellByKey[k][c], c, cellByKey[k])}</td>`).join('');
         return `<tr><td style="padding:3px 16px 3px 0">${meta[k].res}</td>${cells}</tr>`;
     }).join('');
     const foot = `<tr style="color:#888;border-top:1px solid #333"><td style="padding-top:5px">kbps ×step · rungs</td>`
@@ -1162,6 +1173,50 @@ function _ladderBandsCharts(d) {
 // big jump (>2.4×, quality gap), green = healthy spacing. Used by the ladder
 // table, which merges each rung's step-from-previous into its bitrate cell.
 function _stepColor(r) { return r < 1.25 ? '#d06666' : (r > 2.4 ? '#d0a24a' : '#6ab04c'); }
+
+// A rung is STARVED when its bits-per-pixel falls materially against the rung
+// below — it's covering far more pixels without the bitrate to match.
+//
+// This exists because the bitrate step alone hides it. H.264's 1044p rung takes
+// a healthy 1.33x more bitrate (green by _stepColor) while covering 2.10x the
+// pixels, so bits-per-pixel drops to 0.63x. HEVC's 2124p does the same at
+// 1.43x / 2.18x / 0.66x. Those are exactly the two rungs docs/vmaf-audit/ calls
+// dominated and the next drop candidate — so bits-per-pixel predicts the audit's
+// findings from ladder geometry alone, while the metric on screen shows green.
+//
+// Only the STARVED direction is flagged. A rung with MORE bits per pixel than
+// its predecessor isn't a problem to fix, and flagging it would just add noise.
+//
+// 0.70 is taken from the shipped ladders' own distribution, not picked by feel.
+// Across the 183 rung-transitions whose BITRATE step reads green, the bpp ratios
+// cluster with a clean empty band between 0.70 and 0.75 (34 rungs below both).
+// 0.70 sits in that gap, and catches both rungs the audit independently found
+// (1044p at 0.63, 2124p at 0.66). At 0.80 the flag also fires on 12 rungs from
+// the far side of the gap and starts reading as noise.
+const BPP_STARVED = 0.70;
+
+// Report a divergence only when the two metrics DISAGREE: bitrate step looks
+// fine but bits-per-pixel collapsed. Where they agree the bitrate step already
+// says it, and repeating it on every row would bury the rows that matter.
+function _bppDivergence(cell) {
+    if (!cell || cell.bppStep === null || cell.step === null) return '';
+    const stepLooksOk = cell.step >= 1.25 && cell.step <= 2.4;
+    if (!stepLooksOk || cell.bppStep >= BPP_STARVED) return '';
+    return `<div style="font-size:10px;color:#d0a24a" title="Bitrate rose ${cell.step.toFixed(2)}x but pixels rose ${cell.pxStep.toFixed(2)}x, so bits-per-pixel fell to ${cell.bppStep.toFixed(2)}x of the rung below (${cell.bpp.toFixed(0)} kbps/Mpx). The bitrate step looks healthy while this rung is actually starved — give it more bitrate, or drop it.">⚠ bpp ×${cell.bppStep.toFixed(2)}</div>`;
+}
+
+// Cross-codec ratio: what this codec costs against the baseline at the SAME
+// rung. The absolute kbps are already side by side, but the ratio is the thing
+// you'd actually quote ("HEVC needs three-quarters the bitrate here"), and it's
+// the per-rung view of what docs/vmaf-audit/ reports as a single BD-rate.
+function _codecRatio(cellByCodec, codec, present) {
+    const base = present[0];                       // h264 when present (_CODEC_ORDER)
+    if (codec === base) return '';
+    const mine = cellByCodec[codec], theirs = cellByCodec[base];
+    if (!mine || !theirs || !theirs.b) return '';
+    const r = mine.b / theirs.b;
+    return ` <span style="color:#7fb3d5;font-size:10px" title="${(r * 100).toFixed(0)}% of ${base}'s bitrate at this rung — ${r < 1 ? (100 - r * 100).toFixed(0) + '% cheaper' : (r * 100 - 100).toFixed(0) + '% dearer'}. Per-rung ratio of target bitrates, not a measured BD-rate.">${r.toFixed(2)}×${base}</span>`;
+}
 
 // Colour a peak/avg multiplier against Apple's authoring ceilings: green =
 // within the live/linear limit (peak ≤ 1.25× avg), amber = within the VOD
@@ -1286,7 +1341,7 @@ function renderLaddersTab() {
           <p style="color:#888;margin:4px 0 10px">${d.description || ''}</p>
           <div style="color:#999;font-size:12px;margin:0 0 8px">encoding · ${encOpts}</div>
           ${_estimateLegend(name)}
-          <div style="color:#888;font-size:12px;margin:0 0 6px">table: kbps + step× to previous rung (<span style="color:#6ab04c">1.25–2.4× ok</span> · <span style="color:#d06666">&lt;1.25× close</span> · <span style="color:#d0a24a">&gt;2.4× jump</span>) · charts: avg→peak per 1s/2s/6s segment, peak×avg vs Apple <span style="color:#6ab04c">live ≤1.25×</span>/<span style="color:#d0a24a">VOD ≤2×</span></div>
+          <div style="color:#888;font-size:12px;margin:0 0 6px">table: kbps + step× to previous rung (<span style="color:#6ab04c">1.25–2.4× ok</span> · <span style="color:#d06666">&lt;1.25× close</span> · <span style="color:#d0a24a">&gt;2.4× jump</span>) · <span style="color:#7fb3d5">0.75×h264</span> = this codec's bitrate vs the baseline at the same rung · <span style="color:#d0a24a">⚠ bpp ×N</span> = bitrate step looks fine but pixels grew faster, so the rung is starved · charts: avg→peak per 1s/2s/6s segment, peak×avg vs Apple <span style="color:#6ab04c">live ≤1.25×</span>/<span style="color:#d0a24a">VOD ≤2×</span></div>
           <div style="display:flex;gap:20px;overflow-x:auto;align-items:flex-start">
             <div style="flex:0 0 auto">${_alignedLadderTable(d, name)}</div>
             <div style="display:flex;gap:16px;align-items:flex-start">${_ladderBandsCharts(d)}</div>
