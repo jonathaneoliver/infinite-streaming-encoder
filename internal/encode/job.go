@@ -144,6 +144,10 @@ var (
 	// a stage's Batch job landed on — used to colour the chunk plot by instance
 	// so co-located heavy chunks are visible. Emitted once per (stage, instance).
 	hostMarkerRe = regexp.MustCompile(`^\[\[ENCODER-HOST key=(\S+) instance=(\S+)\]\]$`)
+	// ENCODER-REUSED flags a chunk whose output a prior run already staged, so
+	// this run skips (not re-encodes) it — the orchestrator emits it once per
+	// reused chunk at startup. The UI styles those cells distinctly.
+	reusedMarkerRe = regexp.MustCompile(`^\[\[ENCODER-REUSED key=(\S+)\]\]$`)
 	// Cloud cli_cloud.py prints its computed S3 job id in the plan
 	// header (`  job_id:         20260420T203910Z-1`). That's the prefix
 	// under `s3://.../jobs/` — we capture it so the retry endpoint can
@@ -545,6 +549,26 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Unlock()
 		return true
 	}
+	if m := reusedMarkerRe.FindStringSubmatch(line); m != nil {
+		key := m[1]
+		j.mu.Lock()
+		found := false
+		for i := range j.Stages {
+			if j.Stages[i].Key == key {
+				j.Stages[i].Reused = true
+				found = true
+				break
+			}
+		}
+		// The reused marker fires at startup, usually BEFORE the chunk's first
+		// STAGE marker — seed the stage so the flag survives; the later STAGE
+		// updates status/percent in place without clearing it.
+		if !found {
+			j.Stages = append(j.Stages, StageProgress{Key: key, Label: key, Status: "pending", Reused: true})
+		}
+		j.mu.Unlock()
+		return true
+	}
 	if commercialMarkerRe.MatchString(line) {
 		// ALL cost baselines are now computed server-side from the ladder + probe
 		// (Manager.projectAndSetCosts) so cloud-batch and local-dist agree — the
@@ -887,6 +911,11 @@ type StageProgress struct {
 	// stage's Batch job ran on — set from ENCODER-HOST, used by the UI to
 	// colour the chunk plot by instance. Empty until the job is placed.
 	Instance string `json:"instance,omitempty"`
+	// Reused is true when this chunk's output was already staged from a prior
+	// run and got skipped (not re-encoded) — set from ENCODER-REUSED. The UI
+	// styles reused cells with a distinct neutral so they don't read as a
+	// freshly-encoded machine colour (or the transient no-instance blue).
+	Reused bool `json:"reused,omitempty"`
 	// Timestamps of state transitions. StartedAt is set the first time
 	// the stage sees `status=running`; EndedAt is set when it reaches
 	// a terminal state (done|failed). Used to build the end-of-job

@@ -101,6 +101,9 @@ def _ec2_for_container_instance(ci_arn: str) -> str:
 _CHUNK_JOBNAME_RE = re.compile(r"^var-([^-]+)-([^-]+)-c(\d+)-")
 # var-<codec>-<tier>-whole-<execName> — the whole-variant (single-chunk) job.
 _WHOLE_JOBNAME_RE = re.compile(r"^var-([^-]+)-([^-]+)-whole-")
+# <codec>_<tier>_chunk<NNN>.mp4 — a staged chunk OUTPUT object (tier may carry an
+# ordinal suffix like 540p_2, hence the greedy middle group). Excludes .mp4.done.
+_CHUNK_OBJ_RE = re.compile(r"^([^_]+)_(.+)_chunk(\d+)\.mp4$")
 
 
 def _reflect_batch_status(exec_name: str) -> None:
@@ -351,6 +354,35 @@ def _emit_plan(variants: "list | None" = None,
 def _emit_stage(key: str, status: str, percent: float = 0.0) -> None:
     print(f"[[ENCODER-STAGE key={key} status={status} percent={percent:.1f}]]",
           flush=True)
+
+
+def _emit_reused(key: str) -> None:
+    print(f"[[ENCODER-REUSED key={key}]]", flush=True)
+
+
+def _emit_reused_chunks(s3_prefix: str) -> None:
+    """At poll start, flag every chunk output a PRIOR run already staged as
+    reused. This execution hasn't produced any chunks yet, so anything under the
+    prefix now is left over from a cancelled/failed run — the SFN re-runs its
+    Batch job but cli_phase skips the encode when the output exists, so the UI
+    should mark the cell 'reused' rather than colour it as a fresh encode.
+    Best-effort; never breaks the poll."""
+    if not s3_prefix.startswith("s3://"):
+        return
+    rest = s3_prefix[len("s3://"):].rstrip("/")
+    bucket, _, key = rest.partition("/")
+    if not bucket:
+        return
+    prefix = f"{key}/" if key else ""
+    try:
+        paginator = _s3().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                m = _CHUNK_OBJ_RE.match(obj["Key"].rsplit("/", 1)[-1])
+                if m:
+                    _emit_reused(f"encode:{m.group(1)}:{m.group(2)}:chunk{int(m.group(3))}")
+    except Exception:  # noqa: BLE001 — cosmetic; must never fail the poll
+        return
 
 
 def _emit_host(key: str, instance: str) -> None:
@@ -944,6 +976,9 @@ def cmd_poll(args: argparse.Namespace) -> int:
     except (ClientError, ValueError, TypeError):
         pass
     _emit_plan(variants, do_h264, do_hevc)
+    # Flag chunks left over from a prior (cancelled/failed) run as reused, so a
+    # resume shows them distinctly instead of as fresh encodes.
+    _emit_reused_chunks(args.s3_prefix)
 
     seen: set[int] = set()
     log_state: dict[str, int] = {}  # stream -> last-forwarded timestamp
