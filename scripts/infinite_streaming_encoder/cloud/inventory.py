@@ -39,6 +39,7 @@ from botocore.exceptions import ClientError
 
 from infinite_streaming_encoder.cloud.aws import (
     APP_TAG_KEY, APP_TAG_VALUE, app_tag_filter, batch_client, cloudwatch_client,
+    list_jobs_paginated,
     ec2_client, ecs_client, region, s3_client, sfn_client,
 )
 
@@ -307,7 +308,7 @@ def _batch_jobs() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     try:
         for status in _ACTIVE_BATCH_STATUSES:
-            for j in batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", []):
+            for j in list_jobs_paginated(batch, queue, status):
                 created = j.get("createdAt")  # epoch millis
                 started = j.get("startedAt")
                 stopped = j.get("stoppedAt")
