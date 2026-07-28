@@ -84,7 +84,7 @@ class Rung:
 # ---------------------------------------------------------------------------
 # Anchor font/offset params per standard tier height. A rung's params are
 # the anchor for the smallest anchor-height >= the rung's height (ceil to
-# tier), so a distinct-height fill rung (e.g. 396p, 684p, 1044p) inherits
+# tier), so a distinct-height fill rung (e.g. 396p, 594p, 954p) inherits
 # the params of the standard tier it stands in for — reproducing the bash
 # ladder's hand-picked values for legacy AND apple/apple-uniq exactly.
 # (fontsize_tc, fontsize_label, x, y_tc, y_label)
@@ -132,7 +132,7 @@ def res_height(name: str | None) -> int | None:
 
     Parsed rather than looked up because the UI derives its min/max tier
     options from the SELECTED LADDER's actual rung heights, and the Apple-uniq
-    ladders carry non-standard ones (1044p, 2124p, 684p...). A fixed table
+    ladders carry non-standard ones (954p, 1800p, 594p...). A fixed table
     would silently ignore every tier it didn't know about.
     """
     if not name:
@@ -184,24 +184,24 @@ _SEED_APPLE_HEVC = [
 # in clean 16:9 increments (<= Apple's original). av1 mirrors hevc.
 _SEED_APPLE_H264_UNIQ = [
     [416, 234, 145], [640, 360, 365], [704, 396, 730], [768, 432, 1100],
-    [960, 540, 2000], [1216, 684, 3000], [1280, 720, 4500],
-    [1856, 1044, 6000], [1920, 1080, 7800],
+    [960, 540, 2000], [1056, 594, 3000], [1280, 720, 4500],
+    [1696, 954, 6000], [1920, 1080, 7800],
 ]
 _SEED_APPLE_HEVC_UNIQ = [
     [640, 360, 145], [768, 432, 300], [832, 468, 600], [896, 504, 900],
-    [960, 540, 1600], [1216, 684, 2400], [1280, 720, 3400],
-    [1856, 1044, 4500], [1920, 1080, 5800], [2560, 1440, 8100],
-    [3776, 2124, 11600], [3840, 2160, 16800],
+    [960, 540, 1600], [1056, 594, 2400], [1280, 720, 3400],
+    [1696, 954, 4500], [1920, 1080, 5800], [2560, 1440, 8100],
+    [3200, 1800, 11600], [3840, 2160, 16800],
 ]
 
 # apple-uniq H.264 extended to 4K. Apple's spec caps H.264 at 1080p (HEVC
 # above), but high-bitrate 4K H.264 is still wanted for maximum player
 # compatibility. The three extra tiers mirror the HEVC-uniq top RESOLUTIONS
-# (1440 / 2124 / 2160) with H.264-appropriate (higher) bitrates — roughly the
+# (1440 / 1800 / 2160) with H.264-appropriate (higher) bitrates — roughly the
 # legacy H.264 heights, so h264/hevc/av1 stay rung-count-parallel in this
 # ladder.
 _SEED_APPLE_H264_UNIQ_FULL = _SEED_APPLE_H264_UNIQ + [
-    [2560, 1440, 13500], [3776, 2124, 19000], [3840, 2160, 27000],
+    [2560, 1440, 13500], [3200, 1800, 19000], [3840, 2160, 27000],
 ]
 
 SEED_LADDERS: dict[str, dict] = {
@@ -255,7 +255,7 @@ SEED_LADDERS: dict[str, dict] = {
     },
     "apple-uniq-live-full": {
         "description": "apple-uniq-live, but H.264 climbs all the way to 4K "
-                       "(1440p/2124p/2160p) at high bitrates. Apple caps H.264 "
+                       "(1440p/1800p/2160p) at high bitrates. Apple caps H.264 "
                        "at 1080p (HEVC above), so this trades spec-compliance "
                        "for max-compatibility high-bitrate 4K H.264. Same "
                        "live/linear VBV (110%/0.10x, 0.2s parts, 1s GOP) and "

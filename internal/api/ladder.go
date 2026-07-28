@@ -193,7 +193,7 @@ func (s *Server) ladder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Enumerate the ACTUAL resolution dirs (<N>p) rather than a fixed standard
-	// list, so unique-resolution ladders (432p/468p/504p/684p …) show every rung.
+	// list, so unique-resolution ladders (432p/468p/504p/594p …) show every rung.
 	resDirRe := regexp.MustCompile(`^(\d+)p$`)
 	entries, _ := os.ReadDir(dirPath)
 	var tiers []ladderTier
@@ -353,7 +353,7 @@ func rungDurationS(resDir string) float64 {
 }
 
 // heightToRes names a rendition by its height ("<N>p") — for ANY height, so
-// apple-uniq's unique resolutions (432p/468p/504p/684p) map correctly, not just
+// apple-uniq's unique resolutions (432p/468p/504p/594p) map correctly, not just
 // the standard tiers.
 func heightToRes(h int) string {
 	if h <= 0 {
