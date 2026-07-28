@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -38,6 +39,22 @@ from infinite_streaming_encoder.vmaf_audit import (
 # same rung graded at 1080p ("how clean is its compression"); the two are not
 # interchangeable and are stored separately.
 REFERENCES = (2160, 1080)
+
+
+def ffmpeg_version() -> str:
+    """The ffmpeg banner line, recorded with every curve point set.
+
+    Scores from different ffmpeg/libvmaf builds are not strictly comparable, and
+    this repo has two measurement paths on different builds: the in-encode
+    per-chunk audit runs on workers with the image's pinned ffmpeg, while this
+    runs natively. Recording which produced a run makes that visible instead of
+    something a reader has to know.
+    """
+    try:
+        out = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
+        return out.stdout.splitlines()[0].strip() if out.stdout else "unknown"
+    except (OSError, IndexError):
+        return "unknown"
 
 
 class AuditError(RuntimeError):
@@ -119,6 +136,7 @@ def audit_output(output_dir: Path, source: Path, reference: int,
     common_w, common_h = common_dimensions(info.width, info.height, max_h=reference)
     model = pick_model(common_h)
 
+    progress(f"[audit] ffmpeg: {ffmpeg_version()}")
     progress(f"[audit] {output_dir.name} codec={codec} rungs={len(rungs)} "
              f"reference={reference}p common={common_w}x{common_h} model={model}")
 
@@ -237,6 +255,7 @@ def merge_into_store(store_path: Path, points: list[dict], clip: str) -> dict:
     # only. Points carry their own clip, so a store holding several clips is no
     # longer mislabelled as all belonging to the last one.
     doc["clip"] = clip
+    doc["ffmpeg"] = ffmpeg_version()
     store_path.parent.mkdir(parents=True, exist_ok=True)
     store_path.write_text(json.dumps(doc, indent=2) + "\n")
     return doc

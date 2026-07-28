@@ -486,40 +486,43 @@ MINIO_MAX_AGE_S ?= 86400
 #
 #   make ladder-audit OUT=<dir under OUTPUT_DIR> SRC=<source file>
 #   make ladder-audit-all                      # every eligible output, skips the rest
-#   ... REFERENCE=1080 LIMIT_S=30
+#   ... LADDER_AUDIT_REFERENCE=1080 LIMIT_S=30
+#
+# Runs NATIVELY on this machine, not in the container — deliberately:
+#   - the container's ffmpeg is a pinned BtbN static build with no macOS binary,
+#     so a native run can't match it either way
+#   - the seed curves in internal/encode/quality_curve.go were themselves
+#     produced natively (see docs/vmaf-audit/README.md), so measuring natively
+#     keeps new points consistent with the ones they extend
+#   - a 4K comparison is ~1.5-2 GB per libvmaf and OOM-killed the container
+#     (exit 137); natively it has the whole machine's RAM
+# CONSEQUENCE: these scores are NOT comparable with the in-encode per-chunk
+# audit, which runs on workers with the image's ffmpeg. The store records which
+# ffmpeg produced each run so the difference is visible rather than assumed.
 #
 # Curves are kept PER CLIP: quality-vs-bitrate is content-dependent, so an
 # extreme-motion clip and a talking head give genuinely different curves and
 # pooling them would describe neither.
-# 1080 not 2160: an uncapped 4K comparison is ~1.5-2 GB per libvmaf and gets
-# OOM-killed (exit 137) in the server container, which is exactly what
-# vmaf_audit.py's header warns about. The seed reports used the 4K reference,
-# but were run NATIVELY on macOS with the whole machine's RAM. Override with
-# LADDER_AUDIT_REFERENCE=2160 only where there's headroom for it.
-LADDER_AUDIT_REFERENCE ?= 1080
+LADDER_AUDIT_REFERENCE ?= 2160
+LADDER_AUDIT_PY = PYTHONPATH=scripts python3 -m infinite_streaming_encoder.ladder_audit
 
-# Paths are resolved INSIDE the container from its own SOURCE_DIR/OUTPUT_DIR/
-# TMP_DIR, not from the Makefile's. The Makefile's are HOST paths
-# (/Volumes/4TB/...) while the container mounts them elsewhere (/media/...), so
-# passing them through docker exec looks right and fails with a missing
-# directory. OUT= is a directory NAME under OUTPUT_DIR; SRC= is a filename under
-# SOURCE_DIR — not full paths, for the same reason.
 ladder-audit:         ## measure one output's ladder into the VMAF curve store (OUT=, SRC=)
-	@: $${OUT:?OUT is not set — the output directory NAME under OUTPUT_DIR}
-	@: $${SRC:?SRC is not set — the source FILENAME under SOURCE_DIR}
-	docker exec $(CONTAINER_NAME) sh -c 'python3 -m infinite_streaming_encoder.ladder_audit \
-	  --output-dir "$$OUTPUT_DIR/$(OUT)" --source "$$SOURCE_DIR/$(SRC)" \
+	@: $${OUT:?OUT is not set — the output directory name under OUTPUT_DIR}
+	@: $${SRC:?SRC is not set — the source file the output was encoded from}
+	@command -v ffmpeg >/dev/null || { echo "ffmpeg not found on PATH — this target runs natively"; exit 1; }
+	$(LADDER_AUDIT_PY) \
+	  --output-dir "$(OUTPUT_DIR)/$(OUT)" --source "$(SRC)" \
 	  --reference $(LADDER_AUDIT_REFERENCE) \
-	  --store "$$TMP_DIR/quality-curves.json" \
-	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)'
+	  --store "$(TMP_DIR)/quality-curves.json" \
+	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)
 
 ladder-audit-all:     ## audit EVERY eligible output; skips burn-in/no-metadata ones
-	docker exec $(CONTAINER_NAME) sh -c 'python3 -m infinite_streaming_encoder.ladder_audit \
-	  --all "$$OUTPUT_DIR" --source-dir "$$SOURCE_DIR" \
+	@command -v ffmpeg >/dev/null || { echo "ffmpeg not found on PATH — this target runs natively"; exit 1; }
+	$(LADDER_AUDIT_PY) \
+	  --all "$(OUTPUT_DIR)" --source-dir "$(SOURCE_DIR)" \
 	  --reference $(LADDER_AUDIT_REFERENCE) \
-	  --store "$$TMP_DIR/quality-curves.json" \
-	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)'
-
+	  --store "$(TMP_DIR)/quality-curves.json" \
+	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)
 
 minio-usage:          ## what the local-dist MinIO staging is holding, per job prefix
 	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.dist_staging --usage
