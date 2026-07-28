@@ -40,6 +40,11 @@ class BurninContext:
     # whole-clip encode; the chunk's start_s when encoding a single chunk, so
     # the burnt-in timecode stays continuous across concatenated chunks.
     timecode_start_s: float = 0.0
+    # Pre-formatted VMAF-estimate label for the overlay, e.g. "VMAF~93" (curve
+    # interpolation) or "VMAF≥97" (rung above the measured range → nearest
+    # endpoint). Empty → the row is omitted entirely. It's a DESIGN-TIME estimate
+    # from the quality curves, not the measured VMAF of this encode.
+    vmaf_label: str = ""
 
 
 def format_timecode(start_s: float, fps: Fraction) -> str:
@@ -115,10 +120,14 @@ def build_filter(ctx: BurninContext, burnin: bool = True) -> str:
         # No text overlay: keep only the scale (+ tpad) geometry.
         return ",".join(chain)
 
-    # Stack heights: timecode (tc), rate, codec/res/fps, encoder, watermark.
+    # Stack heights: timecode (tc), rate, [vmaf], codec/res/fps, encoder,
+    # watermark. The VMAF-estimate row sits right after the AVG-bandwidth (rate)
+    # row and pushes the rest down; when absent it's omitted with no gap.
+    has_vmaf = bool(ctx.vmaf_label)
     y_tc = tier.burnin_y_tc
     y_rate = y_tc + tier.fontsize_tc + 5
-    y_codec_res = y_rate + tier.fontsize_label + 5
+    y_vmaf = y_rate + tier.fontsize_label + 5
+    y_codec_res = (y_vmaf if has_vmaf else y_rate) + tier.fontsize_label + 5
     y_encoder = y_codec_res + tier.fontsize_label + 5
     y_watermark = y_encoder + tier.fontsize_label + 5
 
@@ -136,6 +145,13 @@ def build_filter(ctx: BurninContext, burnin: bool = True) -> str:
             ctx.rate_label, fontsize=tier.fontsize_label, color="cyan",
             x=tier.burnin_x, y=y_rate,
         ),
+    ]
+    if has_vmaf:
+        overlays.append(_drawtext(
+            ctx.vmaf_label, fontsize=tier.fontsize_label, color="lime",
+            x=tier.burnin_x, y=y_vmaf,
+        ))
+    overlays += [
         _drawtext(
             codec_res_label, fontsize=tier.fontsize_label, color="cyan",
             x=tier.burnin_x, y=y_codec_res,

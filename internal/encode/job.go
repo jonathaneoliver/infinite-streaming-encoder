@@ -2196,6 +2196,38 @@ func (cfg *JobConfig) localChunkSeconds() float64 {
 	}
 }
 
+// vmafEstimateArgs returns --vmaf-estimate args for cli_local_dist — one per
+// rung that has a design-time VMAF estimate in the quality curves, formatted
+// "<codec>/<label>:<vmaf>:<clamped01>". The worker keys off "<codec>/<label>"
+// and burns the value into the overlay; clamped=1 (rung above the measured
+// range → nearest endpoint, not an interpolation) makes it render as VMAF≥N.
+// Empty when there are no curves. clip="" → the store's current curve, so an
+// estimate is available for every job (seeded), matching the UI's Ladders tab.
+func (m *Manager) vmafEstimateArgs(cfg JobConfig) []string {
+	if m.Curves == nil || m.Ladders == nil {
+		return nil
+	}
+	ladderName := cfg.Ladder
+	if ladderName == "" {
+		ladderName = "apple-uniq-live"
+	}
+	var out []string
+	for _, codec := range parseCodecSel(cfg.Codec) {
+		for _, e := range m.LadderEstimates(ladderName, codec, 0, "") {
+			if e.Vmaf <= 0 {
+				continue
+			}
+			clamped := 0
+			if e.Clamped {
+				clamped = 1
+			}
+			out = append(out, "--vmaf-estimate",
+				fmt.Sprintf("%s/%s:%.1f:%d", codec, e.Label, e.Vmaf, clamped))
+		}
+	}
+	return out
+}
+
 // distArgsForFile builds the CLI for cli_local_dist.py (the TargetLocalDist
 // worker): plan + start the durable Temporal EncodeWorkflow, which fans the
 // file's chunks across the local worker pool and downloads output_<codec>/ to
@@ -2385,6 +2417,12 @@ func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int)
 			return fmt.Errorf("unsupported target %q (use local or cloud)", job.Config.Target)
 		}
 		args := fileCfg.distArgsForFile(m.SourceDir, tmpDir, f, job.ID, m.localJobRank(job))
+		// Per-rung design-time VMAF estimates for the burn-in overlay (only worth
+		// passing when the overlay is on). cli_local_dist attaches them to the plan
+		// rungs; the worker burns "VMAF~N"/"VMAF≥N" into each variant.
+		if fileCfg.BurninEnabled() {
+			args = append(args, m.vmafEstimateArgs(fileCfg)...)
+		}
 		if err := m.runFileContainer(job, i, script, args); err != nil {
 			return fmt.Errorf("%s: %w", f, err)
 		}

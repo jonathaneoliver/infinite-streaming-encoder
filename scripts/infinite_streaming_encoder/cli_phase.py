@@ -369,6 +369,24 @@ def _rung_from_args(args: argparse.Namespace) -> Rung:
     )
 
 
+def _vmaf_estimate_label(args: argparse.Namespace) -> str:
+    """Format the design-time VMAF estimate for the burn-in overlay, from the
+    --est-vmaf flag (local dist) or EST_VMAF env (cloud SFN). '≥' marks a rung
+    ABOVE the measured curve (a clamped nearest-endpoint, not an interpolation);
+    '~' an interpolation. Returns "" when no estimate was supplied."""
+    v = getattr(args, "est_vmaf", None)
+    if v is None:
+        ev = os.environ.get("EST_VMAF", "")
+        try:
+            v = float(ev) if ev else None
+        except ValueError:
+            v = None
+    if not v or v <= 0:
+        return ""
+    clamped = getattr(args, "est_vmaf_clamped", False) or _env_flag("EST_VMAF_CLAMPED")
+    return f"VMAF{'≥' if clamped else '~'}{round(v)}"
+
+
 # ---------------------------------------------------------------------------
 # mezzanine — stream-copy the source clip into a fragmented MP4 so
 # subsequent encode/audio phases share one normalised input.
@@ -643,6 +661,10 @@ def phase_variant(args: argparse.Namespace) -> int:
         # Text overlay, on by default. Disabled by EITHER the --no-burnin flag
         # (local-dist path) OR a falsy BURNIN env (cloud SFN containerOverrides).
         burnin=getattr(args, "burnin", True) and _env_flag_default_on("BURNIN"),
+        # Design-time VMAF estimate the Go control plane looked up per rung from
+        # the quality curves, passed via --est-vmaf (local dist) or EST_VMAF env
+        # (cloud SFN). Burned into the overlay as one row; "" omits it.
+        vmaf_label=_vmaf_estimate_label(args),
     )
 
     # Chunked mode: encode only chunk `--chunk-index` of the variant. The
@@ -1151,6 +1173,12 @@ def _build_parser() -> argparse.ArgumentParser:
     v.add_argument("--width", required=True, type=int)
     v.add_argument("--height", required=True, type=int)
     v.add_argument("--bitrate", required=True, type=int, help="target kbps")
+    v.add_argument("--est-vmaf", type=float, default=None, dest="est_vmaf",
+                   help="design-time VMAF estimate for this rung (from the quality "
+                        "curves) to burn into the overlay; also honors EST_VMAF env")
+    v.add_argument("--est-vmaf-clamped", action="store_true", dest="est_vmaf_clamped",
+                   help="the estimate is a clamped endpoint (rung above the measured "
+                        "range) → shown as VMAF≥N; also honors EST_VMAF_CLAMPED env")
     v.add_argument("--preset", default="medium")
     v.add_argument("--s3-mezz", required=True, dest="s3_mezz")
     v.add_argument("--s3-out", required=True, dest="s3_out")

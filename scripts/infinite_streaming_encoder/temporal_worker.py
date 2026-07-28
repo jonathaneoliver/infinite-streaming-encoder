@@ -339,6 +339,13 @@ class EncodeWorkflow:
                 args.append("--measure-vmaf")
             if not bn:
                 args.append("--no-burnin")
+            elif r.get("est_vmaf") is not None:
+                # Design-time VMAF estimate for the overlay (Go looked it up from
+                # the quality curves; cli_local_dist attached it to the rung). Only
+                # meaningful when the overlay is on.
+                args += ["--est-vmaf", str(r["est_vmaf"])]
+                if r.get("est_vmaf_clamped"):
+                    args.append("--est-vmaf-clamped")
             env = {"CHUNK_DURATION_S": str(cd), "COALESCE_RUNT_TAIL": "1",
                    "TWO_PASS": "1" if tp else "0", "EXTRA_ARGS": ea,
                    "MEASURE_VMAF": "1" if measure_vmaf else "0",
