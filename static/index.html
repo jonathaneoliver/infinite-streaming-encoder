@@ -151,6 +151,27 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .chunk-cell { position: relative; flex: 1 1 0; min-width: 3px; height: 10px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
 /* On-screen hint under Start Encode explaining the force-reencode gesture. */
 .encode-hint { margin-top: 10px; font-size: 12px; color: #8a9bb5; line-height: 1.5; }
+
+/* Split "Encode ▾" button: default click = safe Encode, caret opens Re-encode.
+   Replaces the hidden Alt/right-click force gesture (issue #114). */
+.split-btn { position: relative; display: inline-flex; }
+.split-btn #encode-btn { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.split-caret { padding: 10px 12px; border-left: 1px solid rgba(255,255,255,0.25);
+    border-top-left-radius: 0; border-bottom-left-radius: 0; font-size: 0.8rem; }
+.split-menu { position: absolute; top: calc(100% + 4px); right: 0; z-index: 1000;
+    background: #16213e; border: 1px solid #333; border-radius: 6px; padding: 4px 0;
+    min-width: 220px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+.split-menu-item { padding: 9px 16px; cursor: pointer; font-size: 0.9rem; color: #ffb3c1; }
+.split-menu-item:hover { background: #1a2a4a; }
+.split-menu-item small { display: block; color: #8a9bb5; font-size: 11px; margin-top: 2px; }
+
+/* Per-source encoded-state badge in the picker (issue #114): what Encode will do
+   before you click — ● complete (skipped) / ◐ n of m (fills missing) / ○ new. */
+.src-badge { font-size: 11px; padding: 1px 7px; border-radius: 10px; white-space: nowrap;
+    border: 1px solid transparent; }
+.src-new { color: #8a9bb5; border-color: #33415a; }
+.src-partial { color: #d0a24a; border-color: #6b5220; background: rgba(208,162,74,0.08); }
+.src-done { color: #6ac48a; border-color: #2e5f42; background: rgba(106,196,138,0.08); }
 .encode-hint b { color: #cdd6e6; font-weight: 600; }
 .encode-hint kbd { display: inline-block; padding: 1px 5px; font-size: 11px; font-family: inherit; color: #dfe6f2; background: #232b3d; border: 1px solid #3a4560; border-radius: 4px; }
 /* Drag-and-drop source upload. */
@@ -407,9 +428,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group">
                 <label>Codec</label>
                 <div id="codec" class="codec-checks">
-                    <label><input type="checkbox" class="codec-cb" value="h264" checked onchange="syncResTiers()"> H.264</label>
-                    <label><input type="checkbox" class="codec-cb" value="hevc" checked onchange="syncResTiers()"> HEVC</label>
-                    <label><input type="checkbox" class="codec-cb" value="av1" onchange="syncResTiers()"> AV1</label>
+                    <label><input type="checkbox" class="codec-cb" value="h264" checked onchange="onCodecsChanged()"> H.264</label>
+                    <label><input type="checkbox" class="codec-cb" value="hevc" checked onchange="onCodecsChanged()"> HEVC</label>
+                    <label><input type="checkbox" class="codec-cb" value="av1" onchange="onCodecsChanged()"> AV1</label>
                 </div>
             </div>
             <div class="control-group">
@@ -468,9 +489,15 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group" id="promote-group" style="display:none;align-self:center;padding-top:16px">
                 <label id="promote-after-label"><input type="checkbox" id="promote-after" style="width:auto;min-width:auto"> Promote after encode</label>
             </div>
-            <button class="btn btn-primary" id="encode-btn" onclick="startEncode(event.altKey)" oncontextmenu="event.preventDefault(); startEncode(true); return false;" title="Click: encode checked files (skips any already fully encoded). Alt/Option+click OR right-click: force re-encode all checked files (existing outputs are kept, renamed with their last-modified date)." disabled>Start Encode</button>
+            <div class="split-btn" id="encode-split">
+                <button class="btn btn-primary" id="encode-btn" onclick="startEncode(false)" title="Encode the checked files: fills in any missing variants and resumes an interrupted run; a brand-new source encodes fully. Already-complete files are skipped." disabled>Encode</button>
+                <button class="btn btn-primary split-caret" id="encode-caret" onclick="toggleEncodeMenu(event)" aria-haspopup="true" aria-expanded="false" title="More encode actions" disabled>&#9662;</button>
+                <div class="split-menu" id="encode-menu" style="display:none">
+                    <div class="split-menu-item" onclick="hideEncodeMenu(); startEncode(true)">Re-encode (replace existing)<small>Archive existing output, produce everything fresh</small></div>
+                </div>
             </div>
-            <div class="encode-hint">Skips files already fully encoded. To <b>force a re-encode</b>, <kbd>Alt</kbd>/<kbd>Option</kbd>+click (or right-click) Start Encode — existing outputs are kept, renamed with their last-modified date.</div>
+            </div>
+            <div class="encode-hint"><b>Encode</b> fills in whatever's missing and resumes an interrupted run — a brand-new source encodes fully, an already-complete one is skipped. Use <b>Re-encode</b> (the ▾ menu) to archive existing output and produce every variant fresh.</div>
         </fieldset>
     </div>
 </div>
@@ -889,6 +916,13 @@ function selectedCodecs() {
     const on = _CODEC_ORDER.filter(c =>
         document.querySelector(`.codec-cb[value="${c}"]`)?.checked);
     return on.length ? on : _CODEC_ORDER.slice();
+}
+
+// A codec checkbox toggled: re-derive the codec-aware res tiers (#115) and the
+// per-source picker badges (#114), both of which depend on the codec selection.
+function onCodecsChanged() {
+    syncResTiers();
+    refreshSourceBadges();
 }
 
 // Rebuild the Min/Max Resolution tiers from the SELECTED ladder's actual rung
@@ -1404,7 +1438,11 @@ function formatSize(bytes) {
 function updateSelectedCount() {
     const checked = document.querySelectorAll('#file-list input:checked').length;
     document.getElementById('selected-count').textContent = checked ? `${checked} selected` : '';
-    document.getElementById('encode-btn').disabled = checked === 0;
+    const none = checked === 0;
+    document.getElementById('encode-btn').disabled = none;
+    const caret = document.getElementById('encode-caret');
+    if (caret) caret.disabled = none;
+    if (none) hideEncodeMenu();
 }
 
 function selectAll() {
@@ -1486,6 +1524,52 @@ function uploadOneSource(file, onProgress) {
     });
 }
 
+// --- Per-source encoded-state badge (issue #114) ---------------------------
+// Best-effort hint for the picker: cross-references the loaded outputs against
+// each source by stem, at CODEC granularity — mirroring the server's
+// resolveCodec, which skips a codec whose <stem>…_<codec> output already exists.
+// It's advisory, not authoritative (the encode re-derives skip state on disk at
+// launch); when a name is prefix-ambiguous (foo vs foo_take2) it may over-count
+// "complete", never cause a silent skip of real work.
+function _sourceStem(fileName) {
+    return fileName.replace(/\.[^.]+$/, '');
+}
+// Distinct codecs already present on disk for a source, from outputDirs.
+function encodedCodecsFor(fileName) {
+    const stem = _sourceStem(fileName);
+    const have = new Set();
+    for (const d of (outputDirs || [])) {
+        if (!d.codec || !d.name) continue;
+        // Output dir is "<stem>_p<ms>[_pad…][_<tag>]_<codec>"; drop the trailing
+        // "_<codec>" and require the remainder to be (or start with) "<stem>".
+        const base = d.name.replace(new RegExp(`_${d.codec}$`), '');
+        if (base === stem || base.startsWith(stem + '_')) have.add(d.codec);
+    }
+    return have;
+}
+// ● complete / ◐ n of m / ○ new, relative to the currently SELECTED codecs.
+function sourceStatusBadge(fileName) {
+    const want = selectedCodecs();
+    const have = encodedCodecsFor(fileName);
+    const n = want.filter(c => have.has(c)).length;
+    if (n === 0) {
+        return `<span class="src-badge src-new" title="No matching output — Encode produces all ${want.length} selected codec(s)">&#9675; new</span>`;
+    }
+    if (n >= want.length) {
+        return `<span class="src-badge src-done" title="All selected codecs already on disk — Encode skips this file">&#9679; complete</span>`;
+    }
+    return `<span class="src-badge src-partial" title="${n} of ${want.length} selected codecs on disk — Encode fills in the missing ${want.length - n}">&#9680; ${n} of ${want.length}</span>`;
+}
+// Refresh badges in place without rebuilding the list (used on codec-checkbox
+// change and after outputs load), so selection/scroll are preserved.
+function refreshSourceBadges() {
+    document.querySelectorAll('#file-list .file-item').forEach(item => {
+        const cb = item.querySelector('input[type=checkbox]');
+        const slot = item.querySelector('.src-badge-slot');
+        if (cb && slot) slot.innerHTML = sourceStatusBadge(cb.value);
+    });
+}
+
 function renderSources() {
     const list = document.getElementById('file-list');
     // Preserve the current selection across re-renders (the 60s poll rebuilds this
@@ -1509,6 +1593,7 @@ function renderSources() {
         <div class="file-item" oncontextmenu="showSourceContextMenu(event, '${escapeAttr(f.name)}')">
             <input type="checkbox" value="${f.name}" ${checked.has(f.name) ? 'checked' : ''} onclick="event.stopPropagation(); updateSelectedCount()">
             <span class="file-name" onclick="this.parentElement.querySelector('input').click()">${f.name}</span>
+            <span class="src-badge-slot">${sourceStatusBadge(f.name)}</span>
             <span class="file-size">${formatSize(f.size)}</span>
             <span class="file-date">${formatDate(f.mod_time)}</span>
             <span class="btn-play" onclick="event.stopPropagation(); playSource('${escapeAttr(f.name)}')" title="Play source">&#9654;</span>
@@ -1558,27 +1643,24 @@ async function confirmCloudIfBilling() {
     }
 }
 
-// Alt/Option held → re-label Start Encode as Force Encode and switch to
-// the danger style, so the destructive-ish variant is visually distinct
-// before the user clicks. keyup + blur restore the normal state.
-(function wireAltModifier() {
-    const btn = document.getElementById('encode-btn');
-    if (!btn) return;
-    const setForceMode = (on) => {
-        if (on) {
-            btn.textContent = 'Start Force Encode';
-            btn.classList.remove('btn-primary');
-            btn.classList.add('btn-danger');
-        } else {
-            btn.textContent = 'Start Encode';
-            btn.classList.remove('btn-danger');
-            btn.classList.add('btn-primary');
-        }
-    };
-    window.addEventListener('keydown', (e) => { if (e.key === 'Alt') setForceMode(true); });
-    window.addEventListener('keyup',   (e) => { if (e.key === 'Alt') setForceMode(false); });
-    window.addEventListener('blur',    () => setForceMode(false));
-})();
+// The "Encode ▾" caret menu exposes Re-encode explicitly, replacing the old
+// hidden Alt/right-click force gesture (issue #114). A document click closes it.
+function toggleEncodeMenu(e) {
+    e.stopPropagation();
+    const menu = document.getElementById('encode-menu');
+    const open = menu.style.display === 'none';
+    menu.style.display = open ? 'block' : 'none';
+    document.getElementById('encode-caret').setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+function hideEncodeMenu() {
+    const menu = document.getElementById('encode-menu');
+    if (menu) menu.style.display = 'none';
+    const caret = document.getElementById('encode-caret');
+    if (caret) caret.setAttribute('aria-expanded', 'false');
+}
+document.addEventListener('click', (e) => {
+    if (!e.target.closest('#encode-split')) hideEncodeMenu();
+});
 
 async function startEncode(force = false) {
     const selected = Array.from(document.querySelectorAll('#file-list input:checked')).map(cb => cb.value);
@@ -1592,7 +1674,7 @@ async function startEncode(force = false) {
 
     if (force) {
         const confirmed = await showDialog(
-            'Force Re-encode',
+            'Re-encode (replace existing)',
             `Re-encode ${selected.length} file${selected.length === 1 ? '' : 's'} with current settings? Existing encodes will be moved to the archive directory.`,
             [
                 { label: 'Cancel', value: false, class: 'btn-secondary' },
@@ -1657,6 +1739,9 @@ async function loadOutputs() {
             max_res: d.resolutions && d.resolutions.length > 0 ? (resOrder[d.resolutions[0]] || 0) : 0
         }));
         renderOutputs();
+        // Outputs feed the per-source picker badges (issue #114) — refresh them
+        // once the list lands, whichever tab is showing.
+        refreshSourceBadges();
     } catch (e) {
         document.getElementById('outputs-list').innerHTML = '<div class="no-files">Failed to load outputs</div>';
     }
@@ -2380,33 +2465,37 @@ function updateJobRow(row, j) {
         cancelEl.remove();
     }
 
-    // Retry action — for both cloud and local failed/cancelled jobs.
-    // Cloud: resumes from S3 staging prefix. Local: picks up the
-    // per-clip work dir under TMPDIR, which survived the failure.
+    // Resume action (formerly "Retry") — for cloud and local failed/cancelled
+    // jobs. Cloud: resumes from S3 staging prefix. Local: picks up the per-clip
+    // work dir under TMPDIR, which survived the failure. Same intent as the
+    // form's Encode: reuse everything reusable (issue #114). Endpoint stays
+    // /retry; only the label is renamed to match the vocabulary.
     let retryEl = actions.querySelector('.job-retry');
     const retryable = (j.status === 'failed' || j.status === 'cancelled') &&
                       j.config && j.config.target;
     if (retryable && !retryEl) {
         retryEl = document.createElement('span');
         retryEl.className = 'job-retry';
-        retryEl.textContent = 'Retry';
-        retryEl.title = 'Resume from prior S3 staging — skips upload and already-completed variants.';
+        retryEl.textContent = 'Resume';
+        retryEl.title = 'Resume this job — skips upload and already-completed variants (reuses prior staging).';
         retryEl.setAttribute('onclick', `retryJob('${j.id}')`);
         actions.appendChild(retryEl);
     } else if (!retryable && retryEl) {
         retryEl.remove();
     }
 
-    // Redo action — re-encode the WHOLE job from scratch, reusing nothing. Shown
-    // on ANY terminal job (done/failed/cancelled), unlike Retry which resumes a
-    // partial. Own class so the Retry selector above doesn't grab it.
+    // Re-encode action (formerly "Redo") — re-encode the WHOLE job from scratch,
+    // reusing nothing. Shown on ANY terminal job (done/failed/cancelled), unlike
+    // Resume which continues a partial. Mirrors the form's Re-encode 1:1 (issue
+    // #114). Own class so the Resume selector above doesn't grab it; endpoint
+    // stays /redo.
     let redoEl = actions.querySelector('.job-redo');
     const redoable = (j.status === 'done' || j.status === 'failed' || j.status === 'cancelled') &&
                      j.config && j.config.target;
     if (redoable && !redoEl) {
         redoEl = document.createElement('span');
         redoEl.className = 'job-redo';
-        redoEl.textContent = 'Redo';
+        redoEl.textContent = 'Re-encode';
         redoEl.title = 'Re-encode the whole job from scratch — reuses nothing (forces re-encode of every rendition).';
         redoEl.setAttribute('onclick', `redoJob('${j.id}')`);
         actions.appendChild(redoEl);
@@ -3783,7 +3872,7 @@ function showSourceContextMenu(e, fileName) {
     ctxMenu.innerHTML = `
         <div class="ctx-menu-item" onclick="hideContextMenu(); playSource('${escapeAttr(fileName)}')">&#9654; Play source</div>
         <div class="ctx-menu-separator"></div>
-        <div class="ctx-menu-item" onclick="hideContextMenu(); forceReencode('${escapeAttr(fileName)}')">&#128260; Force re-encode</div>
+        <div class="ctx-menu-item" onclick="hideContextMenu(); forceReencode('${escapeAttr(fileName)}')">&#128260; Re-encode (replace existing)</div>
     `;
     ctxMenu.style.left = e.clientX + 'px';
     ctxMenu.style.top = e.clientY + 'px';
@@ -3824,7 +3913,7 @@ async function forceReencode(fileName) {
     };
 
     const result = await showDialog(
-        'Force Re-encode',
+        'Re-encode (replace existing)',
         `Re-encode ${fileName} with current settings? Existing encodes will be moved to the archive directory.`,
         [
             { label: 'Cancel', value: false, class: 'btn-secondary' },
@@ -4041,9 +4130,13 @@ function closePlayer(modal) {
 }
 
 loadSources();
+// Outputs power the encode tab's per-source status badges (#114), not just the
+// Outputs tab — load them at boot and keep them fresh alongside the source poll.
+loadOutputs();
 initDropUpload();
 connectSSE();
 setInterval(loadSources, 60000);
+setInterval(loadOutputs, 60000);
 startAwsAutoRefresh();
 loadVersion();
 loadLadders();
