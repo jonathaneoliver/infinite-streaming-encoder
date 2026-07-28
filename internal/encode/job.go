@@ -1267,7 +1267,10 @@ func (m *Manager) signalLaunch() {
 func (m *Manager) waitForLaunchTurn(job *Job) {
 	m.launchMu.Lock()
 	defer m.launchMu.Unlock()
-	for m.olderStillLaunching(job) {
+	// Also break on cancel so a job queued behind a long-uploading older job
+	// doesn't sit here until its turn comes — Cancel broadcasts launchCond to
+	// wake us, and the caller re-checks IsCancelled() right after this returns.
+	for m.olderStillLaunching(job) && !job.IsCancelled() {
 		m.launchCond.Wait()
 	}
 }
@@ -1712,6 +1715,9 @@ func (m *Manager) Cancel(id string) bool {
 	}
 	job.MarkCancelled()
 	m.notify(job)
+	// Wake any cloud job blocked in waitForLaunchTurn so it re-checks and, if
+	// this is that job, exits the wait instead of holding until its turn.
+	m.signalLaunch()
 
 	// Discover worker containers for this job. The label filter matches
 	// every file-index container we might have spawned; there will only
@@ -2437,6 +2443,26 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 				m.notify(job)
 				return fmt.Errorf("aws s3 cp start: %w", err)
 			}
+			// Cancel watcher: this upload is a bare subprocess with no worker
+			// container for Manager.Cancel to stop, so it watches the cancel flag
+			// and kills the copy. A multi-GB UHD source can upload for minutes;
+			// without this, Cancel is silently ignored until the copy finishes.
+			upStop := make(chan struct{})
+			go func() {
+				t := time.NewTicker(time.Second)
+				defer t.Stop()
+				for {
+					select {
+					case <-upStop:
+						return
+					case <-t.C:
+						if job.IsCancelled() && upload.Process != nil {
+							upload.Process.Kill()
+							return
+						}
+					}
+				}
+			}()
 			// aws s3 cp updates its progress in place with '\r'; split on both \r and \n
 			// so intermediate updates are seen, not just the final \n-terminated line.
 			upScanner := bufio.NewScanner(stdoutPipe)
@@ -2460,7 +2486,16 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 					m.notify(job)
 				}
 			}
+			close(upStop) // scan drained → stop the watcher before Wait
 			if err := upload.Wait(); err != nil {
+				// A cancel that killed the copy isn't a real failure — return
+				// clean so run() finalizes the job as cancelled (its deferred
+				// markLaunched still unblocks the queue).
+				if job.IsCancelled() {
+					job.upsertStage("upload:inputs", "upload inputs", "cancelled", 0)
+					m.notify(job)
+					return nil
+				}
 				job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
 				m.notify(job)
 				return fmt.Errorf("aws s3 cp: %w: %s", err, strings.TrimSpace(stderrBuf.String()))
