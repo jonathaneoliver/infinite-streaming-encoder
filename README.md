@@ -10,10 +10,15 @@
 
 <p align="center"><em>One HEVC/H.264 cloud encode fanned out over 10 spot instances (96/96 vCPU busy, 151 Batch jobs, $1.38/hr) — live chunk grid, cost tracking, and a per-variant progress DAG with an ETA and a MediaConvert/on-demand/spot cost comparison.</em></p>
 
-A Go HTTP server + single-page UI that drives adaptive-bitrate (ABR) video
-encoding. The Go code is a thin **control plane**; the actual encoding —
-ffmpeg, Shaka Packager, LL-HLS/DASH packaging — lives in a Python package and
-runs chunked, fanned out across workers.
+A **parallel, chunking video encoder**: it splits each source into chunks and
+fans the encode out — many chunks at once — across either **AWS Batch spot
+instances** or a **local farm of your own computers**. Same pipeline both ways;
+you pick cloud or farm per job.
+
+A thin Go HTTP **control plane** + single-page UI drives it all — planning the
+adaptive-bitrate (ABR) ladder, chunking each variant, and streaming live
+progress. The actual encoding — ffmpeg, Shaka Packager, LL-HLS/DASH packaging —
+lives in a Python package that runs on the workers, cloud or LAN alike.
 
 One Docker image plays three roles: the **server** (Go control plane, default
 `CMD`), the **worker** (Python pipeline, via entrypoint override), and the
