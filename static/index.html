@@ -879,6 +879,7 @@ async function loadLadders() {
         sel.value = names.includes(cur) ? cur : (names.includes(DEFAULT) ? DEFAULT : names[0] || '');
     }
     syncResTiers();
+    loadLadderEstimates();
 }
 
 // Rebuild the Min/Max Resolution tiers from the SELECTED ladder's actual rung
@@ -931,7 +932,7 @@ function syncResTiers() {
 // resolutions list all rungs, e.g. "600 / 900 / 1600").
 const _CODEC_ORDER = ['h264', 'hevc', 'av1'];
 
-function _alignedLadderTable(d) {
+function _alignedLadderTable(d, name) {
     const present = _CODEC_ORDER.filter(c => (d.codecs && d.codecs[c] || []).length);
     if (!present.length) return '<div style="color:#888">no rungs</div>';
     // Every variant gets its own row. Rows are keyed by (resolution, Nth rung
@@ -956,13 +957,29 @@ function _alignedLadderTable(d) {
     const keys = Object.keys(cellByKey).sort((a, b) => meta[b].h - meta[a].h || meta[b].n - meta[a].n);
     const th = `<th style="text-align:left;padding:4px 16px 6px 0">Resolution</th>`
         + present.map(c => `<th style="text-align:right;padding:4px 0 6px 18px">${c}</th>`).join('');
-    const cellHtml = cell => {
+    const cellHtml = (cell, codec) => {
         if (!cell) return '<span style="color:#666">—</span>';
         const s = cell.step ? ` <span style="color:${_stepColor(cell.step)};font-size:11px">×${cell.step.toFixed(2)}</span>` : '';
-        return `${cell.b}${s}`;
+        // Estimated VMAF + gain over the rung below. The gain is the number that
+        // decides whether a rung earns its slot — bitrate spacing alone can look
+        // healthy while the quality it buys is nil.
+        const e = _estFor(name, codec, cell.b);
+        let q = '';
+        if (e && e.vmaf > 0) {
+            if (e.clamped) {
+                // Off the end of the measured curve — show the bound, not a
+                // number that would read as an estimate, and issue no verdict.
+                q = `<div style="font-size:10px;color:#6b7280" title="This rung's bitrate is outside the measured range, so ${e.vmaf.toFixed(1)} is the nearest measured endpoint, not an estimate for this rung. Audit a ladder that reaches this bitrate to get a real value.">≥${e.vmaf.toFixed(1)} <span style="color:#6b7280">off-curve</span></div>`;
+            } else {
+                const d = (e.d_vmaf === undefined || e.d_vmaf === null)
+                    ? '' : ` <span style="color:${_VERDICT_COLOR[e.verdict] || '#888'}">${e.d_vmaf >= 0 ? '+' : ''}${e.d_vmaf.toFixed(1)}</span>`;
+                q = `<div style="font-size:10px;color:#8a93a5" title="Estimated VMAF ${e.vmaf.toFixed(1)}${e.verdict ? ' — ' + e.verdict : ''}. Interpolated from measured curves, NOT a measurement of any encode.">~${e.vmaf.toFixed(1)}${d}</div>`;
+            }
+        }
+        return `${cell.b}${s}${q}`;
     };
     const body = keys.map(k => {
-        const cells = present.map(c => `<td style="text-align:right;padding:3px 0 3px 18px;font-variant-numeric:tabular-nums">${cellHtml(cellByKey[k][c])}</td>`).join('');
+        const cells = present.map(c => `<td style="text-align:right;padding:3px 0 3px 18px;font-variant-numeric:tabular-nums">${cellHtml(cellByKey[k][c], c)}</td>`).join('');
         return `<tr><td style="padding:3px 16px 3px 0">${meta[k].res}</td>${cells}</tr>`;
     }).join('');
     const foot = `<tr style="color:#888;border-top:1px solid #333"><td style="padding-top:5px">kbps ×step · rungs</td>`
@@ -1076,6 +1093,79 @@ function _ladderSuffix(d) {
     return (parseFloat(d.segment_duration) > 0) ? '' : 'xs';
 }
 
+// Design-time VMAF estimates per ladder, from GET /api/ladders/{name}/estimates.
+// Keyed by ladder name; each value is {clip, reference, codecs:{codec:[rung...]}}.
+// Kept separate from laddersCache because that object round-trips through the
+// editor's save — derived data must never ride along into a stored definition.
+let estimatesCache = {};
+// Which content the estimates are computed against. Curves are per-clip because
+// quality-vs-bitrate is content-dependent — a ladder that holds up on a talking
+// head can fall apart on extreme motion, and that difference is the whole point
+// of looking. Empty = the store's default (the seed until an audit replaces it).
+let _estimateClip = '';
+
+// Join key is CODEC + BITRATE, not the rung label: the table indexes rows by
+// (resolution, Nth rung at that resolution) while the API returns ladder order,
+// and those orderings diverge on ladders with duplicate resolutions.
+function _estFor(name, codec, kbps) {
+    const doc = estimatesCache[name];
+    if (!doc || !doc.codecs || !doc.codecs[codec]) return null;
+    return doc.codecs[codec].find(r => r.kbps === kbps) || null;
+}
+
+const _VERDICT_COLOR = {
+    redundant: '#d06666',   // costs bitrate, returns no visible quality
+    saturated: '#d0a24a',   // already past the point more bitrate helps
+    'wide-gap': '#d0a24a',  // switch here is visible
+    ok: '#6ab04c',
+};
+
+// Fetch estimates for every ladder, then re-render once. Best-effort: a ladder
+// with no curve data for its codecs simply shows no VMAF column, and a failed
+// fetch leaves the table exactly as it was.
+// Provenance line. Deliberately verbose about what these numbers are NOT: they
+// are interpolated from one measured clip, so they answer "is this rung earning
+// its place on content like that?" and never "this encode scored X".
+function _estimateLegend(name) {
+    const doc = estimatesCache[name];
+    if (!doc || !doc.codecs || !Object.keys(doc.codecs).length) return '';
+    const clips = doc.clips || [];
+    const picker = clips.length > 1
+        ? `<select onchange="setEstimateClip(this.value)" style="width:auto;min-width:auto;font-size:11px;padding:1px 4px;vertical-align:baseline">
+             ${clips.map(c => `<option value="${_escAttr(c)}"${c === doc.clip ? ' selected' : ''}>${escapeHtml(c)}</option>`).join('')}
+           </select>`
+        : `<span style="color:#aab">${escapeHtml(doc.clip)}</span>`;
+    return `<div style="color:#8a93a5;font-size:11px;margin:0 0 4px">
+        ~VMAF <b>estimated</b> (not measured) at the ${doc.reference}p grading reference, interpolated from
+        ${picker} · second number is the gain over the rung below:
+        <span style="color:#6ab04c">ok</span> ·
+        <span style="color:#d06666">redundant (&lt;2 VMAF for the extra bitrate)</span> ·
+        <span style="color:#d0a24a">wide-gap (&gt;9, visible switch) / saturated (&gt;96)</span> ·
+        <span style="color:#6b7280">off-curve = bitrate beyond what's been measured; no verdict</span>
+      </div>`;
+}
+
+// Switch which content estimates are computed against. Refetches rather than
+// filtering client-side: the server owns the height-preferring interpolation,
+// so there is exactly one implementation of it.
+function setEstimateClip(clip) {
+    _estimateClip = clip;
+    loadLadderEstimates();
+}
+
+async function loadLadderEstimates() {
+    const names = Object.keys(laddersCache);
+    if (!names.length) return;
+    await Promise.all(names.map(async n => {
+        try {
+            const q = _estimateClip ? `?clip=${encodeURIComponent(_estimateClip)}` : '';
+            const res = await fetch(`/api/ladders/${encodeURIComponent(n)}/estimates${q}`);
+            if (res.ok) estimatesCache[n] = await res.json();
+        } catch (e) { /* leave this ladder without estimates */ }
+    }));
+    renderLaddersTab();
+}
+
 function renderLaddersTab() {
     const el = document.getElementById('ladders-list');
     if (!el) return;
@@ -1111,9 +1201,10 @@ function renderLaddersTab() {
           </div>
           <p style="color:#888;margin:4px 0 10px">${d.description || ''}</p>
           <div style="color:#999;font-size:12px;margin:0 0 8px">encoding · ${encOpts}</div>
+          ${_estimateLegend(name)}
           <div style="color:#888;font-size:12px;margin:0 0 6px">table: kbps + step× to previous rung (<span style="color:#6ab04c">1.25–2.4× ok</span> · <span style="color:#d06666">&lt;1.25× close</span> · <span style="color:#d0a24a">&gt;2.4× jump</span>) · charts: avg→peak per 1s/2s/6s segment, peak×avg vs Apple <span style="color:#6ab04c">live ≤1.25×</span>/<span style="color:#d0a24a">VOD ≤2×</span></div>
           <div style="display:flex;gap:20px;overflow-x:auto;align-items:flex-start">
-            <div style="flex:0 0 auto">${_alignedLadderTable(d)}</div>
+            <div style="flex:0 0 auto">${_alignedLadderTable(d, name)}</div>
             <div style="display:flex;gap:16px;align-items:flex-start">${_ladderBandsCharts(d)}</div>
           </div>
         </div>`;
@@ -1795,6 +1886,29 @@ async function loadOutputDetail(name) {
     } catch (e) {
         document.getElementById('outputs-list').innerHTML = '<div class="no-files">Failed to load directory</div>';
     }
+}
+
+// A VMAF score is only interpretable alongside the burn-in state of the encode
+// it came from: the overlay is drawn on the rendition but NOT on the mezzanine
+// reference, so libvmaf counts it as distortion and every score reads LOW. The
+// offset is roughly constant across rungs, so relative comparisons (inversion,
+// cliff, redundant rung) still hold — but absolute numbers aren't comparable
+// with a clean run's, and the two must never be mixed in one analysis.
+//
+// So the pairing lives in one helper rather than at each call site: any future
+// place that renders a score (outputs table, an audit queue view) should call
+// this and inherit the annotation instead of re-deciding whether to mention it.
+//
+// Both states are stated explicitly. Flagging only the biased case would make a
+// missing badge ambiguous — "clean" and "nobody recorded it" would look alike.
+function vmafBurninBadge(profile) {
+    // profile null = no encode.json. Absent burnin key = the old default, ON.
+    if (!profile) {
+        return `<span style="color:#d0a24a" title="No encode.json — the burn-in state of this encode is unknown, so the score's bias is unknown too.">(overlay ?)</span>`;
+    }
+    return profile.burnin === false
+        ? `<span style="color:#3aa76d" title="Burn-in overlay was OFF — clean comparison against the reference.">(clean)</span>`
+        : `<span style="color:#d0a24a" title="Burn-in overlay was ON. The overlay is on the rendition but not the reference, so libvmaf scores it as distortion and these values read LOW. Roughly constant across rungs, so relative comparisons still hold — but don't compare these against a clean run's scores.">(overlay on — biased low)</span>`;
 }
 
 // Ladder matrix: one row per rung with target vs peak/avg/ACTUAL bitrate,

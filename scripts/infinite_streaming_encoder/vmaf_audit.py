@@ -71,7 +71,8 @@ def measure_vmaf(distorted: Path, reference: Path, common_w: int, common_h: int,
                  model: str, ref_start_s: float = 0.0,
                  ref_duration_s: float | None = None,
                  n_subsample: int = 5, n_threads: int = 0,
-                 fps: str | None = None) -> dict:
+                 fps: str | None = None,
+                 dist_duration_s: float | None = None) -> dict:
     """Score `distorted` against a [ref_start_s, +ref_duration_s) window of
     `reference`, both bicubic-scaled to (common_w x common_h). Returns
     {mean, harmonic_mean, min, frames, inv_sum} — inv_sum = sum(1/frame_vmaf),
@@ -95,6 +96,12 @@ def measure_vmaf(distorted: Path, reference: Path, common_w: int, common_h: int,
         # align frame-for-frame regardless of source cadence quirks.
         ref_seek = ["-ss", f"{ref_start_s:.6f}"] if ref_start_s > 0 else []
         ref_dur = ["-t", f"{ref_duration_s:.6f}"] if ref_duration_s else []
+        # Trimming only the reference leaves the distorted stream running past
+        # the end of it; libvmaf then scores frames with nothing to compare
+        # against and the result collapses to noise. A windowed comparison MUST
+        # bound both inputs. (Chunk callers pass neither — a chunk's distorted
+        # file is already exactly its window.)
+        dist_dur = ["-t", f"{dist_duration_s:.6f}"] if dist_duration_s else []
         threads_opt = f":n_threads={n_threads}" if n_threads else ""
         fps_pre = f"fps={fps}," if fps else ""
         lavfi = (
@@ -106,7 +113,7 @@ def measure_vmaf(distorted: Path, reference: Path, common_w: int, common_h: int,
             f"{threads_opt}:log_fmt=json:log_path={log_path}"
         )
         cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-nostats",
-               "-i", str(distorted),
+               *dist_dur, "-i", str(distorted),
                *ref_seek, *ref_dur, "-i", str(reference),
                "-lavfi", lavfi, "-f", "null", "-"]
         proc = subprocess.run(cmd, capture_output=True, text=True)
