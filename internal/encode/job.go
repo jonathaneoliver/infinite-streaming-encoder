@@ -851,6 +851,12 @@ type JobConfig struct {
 	// emits an [[ENCODER-VMAF …]] marker; the control plane aggregates per rung.
 	// Off by default (slow — see the cost notes on #24). Local only for now.
 	MeasureVmaf bool `json:"measure_vmaf,omitempty"`
+	// VmafPrescale (#109) builds a near-lossless pre-scaled VMAF reference once
+	// per worker box, so the audit decodes a small fast H.264 file instead of
+	// re-downscaling the native (4K/AV1) mezzanine on every chunk. Only helps
+	// when VMAF is on; gated per-source (>= a few renditions, source slower to
+	// decode+scale than the ref, fits locally) and falls back to the mezzanine.
+	VmafPrescale bool `json:"vmaf_prescale,omitempty"`
 	// CPU architecture for cloud encodes: "intel" | "amd" | "graviton".
 	// Empty defaults to intel. Ignored for local encodes (which always
 	// run on the host's native architecture).
@@ -2124,6 +2130,9 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	}
 	if cfg.MeasureVmaf {
 		args = append(args, "--measure-vmaf")
+	}
+	if cfg.VmafPrescale {
+		args = append(args, "--vmaf-prescale")
 	}
 	if !cfg.BurninEnabled() {
 		args = append(args, "--no-burnin")

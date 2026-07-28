@@ -234,16 +234,18 @@ def _download_if_complete(s3_uri: str, dst: Path,
 def _prune_mezz_cache(cache_dir: Path, keep: int = 6) -> None:
     """Keep only the `keep` most-recent cached mezzanines — they're large. Recent
     ones (any active job's) survive, so this won't yank a symlink target from
-    under a running encode in practice."""
-    mezzes = sorted(cache_dir.glob("mezz-*.mp4"),
-                    key=lambda p: p.stat().st_mtime, reverse=True)
-    for old in mezzes[keep:]:
-        for f in (old, old.with_suffix(".mp4.done"),
-                  cache_dir / (old.name.rsplit(".", 1)[0] + ".lock")):
-            try:
-                f.unlink()
-            except OSError:
-                pass
+    under a running encode in practice. Covers both the mezzanines and #109's
+    per-box `vmafref-*` reference files, pruned independently."""
+    for pat in ("mezz-*.mp4", "vmafref-*.mp4"):
+        items = sorted(cache_dir.glob(pat),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in items[keep:]:
+            for f in (old, old.with_suffix(".mp4.done"),
+                      cache_dir / (old.name.rsplit(".", 1)[0] + ".lock")):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
 
 
 def _fetch_mezz_cached(mezz_uri: str, mezz_local: Path,
@@ -372,60 +374,109 @@ def _rung_from_args(args: argparse.Namespace) -> Rung:
 # subsequent encode/audio phases share one normalised input.
 # ---------------------------------------------------------------------------
 
-def _build_prescaled_ref(mezz_path: Path, ref_path: Path,
-                         cw: int, ch: int, fps: str) -> None:
-    """Downscale the mezzanine to (cw x ch) LOSSLESSLY (x264 -qp 0), applying the
-    SAME filter chain measure_vmaf uses on the reference (fps -> bicubic scale ->
-    yuv420p -> setsar). The decoded frames are therefore bit-identical to the
-    per-chunk downscale, so VMAF scores are unchanged — this is purely a
-    decode-cost optimization (#109). Video-only; input timestamps (CFR) are
-    preserved so per-chunk window seeks still land."""
+# #109 pre-scaled VMAF reference — a NEAR-LOSSLESS H.264 downscale of the
+# mezzanine, built PER BOX from the box's already-cached mezzanine so the (large)
+# reference never crosses the network. Gated (see _should_prescale): only pays
+# off with >= a few renditions AND when the source is genuinely slower to
+# decode+downscale than a fast H.264 ref. Off / gated out / build failed -> the
+# audit uses the STANDARD mezzanine.
+_VMAF_REF_CRF = int(os.environ.get("VMAF_PRESCALE_CRF", "8") or "8")
+# Rough per-codec software-decode cost, H.264 = 1.0 (only the ratio matters).
+_DECODE_FACTOR = {"h264": 1.0, "avc": 1.0, "hevc": 1.6, "h265": 1.6,
+                  "av1": 2.5, "vp9": 2.0, "vp8": 1.2, "mpeg2video": 0.6,
+                  "prores": 0.5, "mjpeg": 0.4}
+_REF_BPS_AT_1080 = 30_000_000  # ~30 Mbps near-lossless 1080p, for the size gate
+
+
+def _build_prescaled_ref(mezz_path: Path, ref_path: Path, cw: int, ch: int,
+                         fps: str, crf: int, keyint: int) -> None:
+    """Downscale the mezzanine to (cw x ch) as NEAR-LOSSLESS H.264 (#109), with the
+    SAME filter chain measure_vmaf applies to the reference (fps -> bicubic scale
+    -> yuv420p -> setsar). Near-lossless (crf~8) shifts VMAF <~0.4 vs lossless but
+    is far smaller and fast to decode. `keyint` aligns keyframes to chunk
+    boundaries so per-chunk -ss seeks land clean (minimal pre-roll). Video-only;
+    CFR timestamps preserved so window seeks stay aligned."""
     vf = f"fps={fps},scale={cw}:{ch}:flags=bicubic,format=yuv420p,setsar=1"
     subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
          "-i", str(mezz_path), "-map", "0:v:0", "-vf", vf,
-         "-c:v", "libx264", "-qp", "0", "-preset", "ultrafast", "-an",
-         str(ref_path)],
+         "-c:v", "libx264", "-crf", str(crf), "-preset", "ultrafast",
+         "-g", str(max(1, keyint)), "-keyint_min", str(max(1, keyint)),
+         "-an", str(ref_path)],
         check=True)
 
 
-def _ensure_prescaled_ref(args: argparse.Namespace, work: Path,
-                          mezz_uri: str, mezz_local: Path | None, info) -> None:
-    """#109 (Option B): stage, ONCE, a lossless reference pre-scaled to the VMAF
-    comparison resolution alongside the mezzanine, so per-chunk audits decode a
-    small file instead of re-downscaling the native (4K) mezzanine on every chunk.
-    ONLY called when VMAF is enabled. Idempotent via the .done sidecar; on a
-    mezzanine cache-hit (no local copy) it fetches the mezzanine only if the
-    reference is actually missing. Best-effort: on any failure the per-chunk audit
-    just falls back to the native mezzanine, so this can't break an encode."""
-    from infinite_streaming_encoder.vmaf_audit import common_dimensions
-    # [[ENCODER-VMAFREF …]] markers are relayed by the temporal worker to the
-    # orchestrator log (like ENCODER-VMAF), so the pre-scale is observable no
-    # matter which worker runs the mezzanine. A total ABSENCE of these means the
-    # mezzanine activity never got MEASURE_VMAF (so this fn wasn't called).
-    print("[[ENCODER-VMAFREF status=enter]]", flush=True)
-    max_h = int(os.environ.get("VMAF_MAX_HEIGHT", "1080") or "1080")
-    ref_uri = args.s3_out.rstrip("/") + f"/mezzanine_vmafref_cap{max_h}.mp4"
-    if not _env_flag("FORCE_REENCODE") and _s3_exists(ref_uri + ".done"):
-        print("[[ENCODER-VMAFREF status=cached]]", flush=True)
-        return
-    local, vinfo = mezz_local, info
-    if local is None or vinfo is None:  # mezzanine reuse path: fetch to build ref
-        local = work / "mezzanine.mp4"
-        if not _download_if_complete(mezz_uri, local):
-            print("[[ENCODER-VMAFREF status=skipped reason=mezz-unavailable]]", flush=True)
-            return
-        vinfo = probe(local)
-    cw, ch = common_dimensions(vinfo.width, vinfo.height, max_h)
-    ref_local = work / f"mezzanine_vmafref_cap{max_h}.mp4"
-    print(f"[[ENCODER-VMAFREF status=building dims={cw}x{ch}]]", flush=True)
-    try:
-        _build_prescaled_ref(local, ref_local, cw, ch, str(vinfo.fps))
-        _upload_with_done(ref_local, ref_uri)
-        print(f"[[ENCODER-VMAFREF status=staged dims={cw}x{ch}]]", flush=True)
-    except Exception as e:  # noqa: BLE001 — best-effort; per-chunk falls back
-        print(f"[[ENCODER-VMAFREF status=failed err={type(e).__name__}:{str(e)[:120]}]]",
-              flush=True)
+def _source_slower_than_ref(info, cw: int, ch: int) -> bool:
+    """True when decoding+downscaling the native mezzanine costs more than decoding
+    a fast H.264 ref at (cw x ch) — the necessary condition for the pre-scale to
+    save time. Proxy: source_pixels x codec_factor vs common_pixels (H.264 = 1.0),
+    +15% margin. A 4K AV1 source clears it easily; an already-1080p H.264 source
+    does not (nothing to gain)."""
+    src_px = max(1, info.width * info.height)
+    cmn_px = max(1, cw * ch)
+    factor = _DECODE_FACTOR.get((getattr(info, "video_codec", None) or "").lower(), 1.0)
+    return src_px * factor > cmn_px * 1.15
+
+
+def _est_ref_bytes(duration_s: float, ch: int) -> int:
+    """Rough near-lossless ref size for the size gate (scales with duration and
+    pixels, bitrate ~ (ch/1080)^2 of the 1080p rate)."""
+    return int(max(0.0, duration_s) * _REF_BPS_AT_1080 * (ch / 1080.0) ** 2 / 8.0)
+
+
+def _should_prescale(info, cw: int, ch: int, num_variants: int) -> bool:
+    """Gate for #109 (all must hold): the feature is ON (VMAF_PRESCALE); there are
+    enough renditions to amortize the one-time build (>= VMAF_PRESCALE_MIN_VARIANTS,
+    default 2 — break-even ~2.3 rungs); the source is genuinely slower to
+    decode+scale than a fast H.264 ref; and the estimated ref fits locally
+    (VMAF_PRESCALE_MAX_BYTES, default 4 GB)."""
+    if not _env_flag("VMAF_PRESCALE"):
+        return False
+    if num_variants < int(os.environ.get("VMAF_PRESCALE_MIN_VARIANTS", "2") or "2"):
+        return False
+    if not _source_slower_than_ref(info, cw, ch):
+        return False
+    max_bytes = int(os.environ.get("VMAF_PRESCALE_MAX_BYTES", "") or (4 * 1024**3))
+    return _est_ref_bytes(info.duration_s, ch) <= max_bytes
+
+
+def _get_or_build_prescaled_ref(mezz_local: Path, mezz_uri: str, info,
+                                cw: int, ch: int, keyint: int) -> Path | None:
+    """Get-or-build the near-lossless pre-scaled reference LOCALLY on this box from
+    its already-cached mezzanine (#109). Built once per box per (source, res, crf),
+    shared by every chunk + redo via MEZZ_CACHE_DIR + a file lock so concurrent
+    chunks share one build. The big ref never crosses the network. Returns the ref
+    path, or None => 'use the native mezzanine' (no cache dir / build failed)."""
+    cache_dir = os.environ.get("MEZZ_CACHE_DIR")
+    if not cache_dir:
+        return None  # AWS-Batch path: ephemeral per-chunk container, no reuse
+    import fcntl
+    import hashlib
+    os.makedirs(cache_dir, exist_ok=True)
+    key = hashlib.sha256(
+        f"{mezz_uri}|{cw}x{ch}|crf{_VMAF_REF_CRF}".encode()).hexdigest()[:16]
+    ref = Path(cache_dir) / f"vmafref-{key}.mp4"
+    done = ref.with_suffix(".mp4.done")
+    with open(Path(cache_dir) / f"vmafref-{key}.lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        if ref.is_file() and done.is_file():
+            print("[[ENCODER-VMAFREF status=cached]]", flush=True)
+        else:
+            print(f"[[ENCODER-VMAFREF status=building dims={cw}x{ch} crf={_VMAF_REF_CRF}]]",
+                  flush=True)
+            try:
+                tmp = ref.with_suffix(".building.mp4")
+                _build_prescaled_ref(mezz_local, tmp, cw, ch, str(info.fps),
+                                     _VMAF_REF_CRF, keyint)
+                tmp.replace(ref)
+                done.write_text(str(ref.stat().st_size))
+                _prune_mezz_cache(Path(cache_dir))
+                print(f"[[ENCODER-VMAFREF status=built dims={cw}x{ch}]]", flush=True)
+            except Exception as e:  # noqa: BLE001 — fall back to native mezz
+                print(f"[[ENCODER-VMAFREF status=failed err={type(e).__name__}:{str(e)[:120]}]]",
+                      flush=True)
+                return None
+    return ref
 
 
 def phase_mezzanine(args: argparse.Namespace) -> int:
@@ -441,8 +492,6 @@ def phase_mezzanine(args: argparse.Namespace) -> int:
     if not _env_flag("FORCE_REENCODE") and _s3_exists(out_uri + ".done"):
         print("[phase mezzanine] reusing mezzanine.mp4 — already in S3, "
               "skipping download + stream-copy", flush=True)
-        if _env_flag("MEASURE_VMAF") or getattr(args, "measure_vmaf", False):
-            _ensure_prescaled_ref(args, work, out_uri, None, None)
         emit_stage("mezzanine", "done", 100.0)
         return 0
 
@@ -479,8 +528,6 @@ def phase_mezzanine(args: argparse.Namespace) -> int:
     out_uri = args.s3_out.rstrip("/") + "/mezzanine.mp4"
     print(f"[phase mezzanine] uploading {out_uri}", flush=True)
     _upload_with_done(out_path, out_uri, stage=("mezzanine", 55.0, 100.0))
-    if _env_flag("MEASURE_VMAF") or getattr(args, "measure_vmaf", False):
-        _ensure_prescaled_ref(args, work, out_uri, out_path, info)
     emit_stage("mezzanine", "done", 100.0)
     return 0
 
@@ -667,26 +714,21 @@ def phase_variant(args: argparse.Namespace) -> int:
             # 1080p) — a 4K comparison OOM-kills on 8-10 GB Docker VMs and runs
             # ~2x slower; the model follows the capped height (#24).
             cmn_w, cmn_h = common_dimensions(info.width, info.height)
-            # #109: prefer the pre-scaled VMAF reference the mezzanine phase
-            # staged (already cmn_w x cmn_h) — decode a small lossless file
-            # instead of re-downscaling the native (4K) mezzanine on every chunk.
-            # measure_vmaf's fps+scale become no-ops on it (CFR + same dims), so
-            # scores are identical. Fall back to the mezzanine if it's absent
-            # (older job / build failed).
-            _max_h = int(os.environ.get("VMAF_MAX_HEIGHT", "1080") or "1080")
-            _vref_uri = args.s3_mezz.rstrip("/") + f"/mezzanine_vmafref_cap{_max_h}.mp4"
-            _vref_local = work / f"mezzanine_vmafref_cap{_max_h}.mp4"
-            # A missing reference (older job, build failure, or S3 404) must
-            # degrade to the native mezzanine — never fail the audit. _fetch_*
-            # raises ClientError on a 404, so catch broadly here.
-            try:
-                _has_ref = _fetch_mezz_cached(_vref_uri, _vref_local,
-                                              what="VMAF reference")
-            except Exception as _e:  # noqa: BLE001 — fall back to the mezzanine
-                print(f"[phase variant] no pre-scaled VMAF reference "
-                      f"({type(_e).__name__}); using native mezzanine", flush=True)
-                _has_ref = False
-            vmaf_ref = _vref_local if _has_ref else ctx.mezzanine_path
+            # #109: use a NEAR-LOSSLESS pre-scaled reference built ONCE PER BOX
+            # from this box's local mezzanine — decode a small fast H.264 file
+            # instead of re-downscaling the native (4K/AV1) mezzanine on every
+            # chunk. Gated (feature on + enough renditions + source genuinely
+            # slower to decode+scale + fits locally). In its ABSENCE (off / gated
+            # out / build failed) the audit uses the STANDARD mezzanine — the ref
+            # is a decode-cost optimization only, never a correctness dependency.
+            vmaf_ref = ctx.mezzanine_path
+            _nvar = int(os.environ.get("NUM_VARIANTS", "0") or "0")
+            if _should_prescale(info, cmn_w, cmn_h, _nvar):
+                _keyint = max(1, int(round(_chunk_duration_s() * float(info.fps))))
+                _built = _get_or_build_prescaled_ref(
+                    ctx.mezzanine_path, args.s3_mezz, info, cmn_w, cmn_h, _keyint)
+                if _built is not None:
+                    vmaf_ref = _built
             # This chunk's frame-exact length (same ceil(t*fps) math the encode
             # uses, #90) so the audit can clamp both streams to it — otherwise the
             # seeked reference window's ~1-frame seam drift injects a spurious

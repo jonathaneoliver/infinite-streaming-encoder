@@ -962,6 +962,7 @@ def run_temporal(args: argparse.Namespace) -> int:
         "has_audio": info.has_audio, "chunk_duration_s": args.chunk_duration_s,
         "n_chunks": n_chunks,
         "measure_vmaf": args.measure_vmaf, "burnin": args.burnin,
+        "vmaf_prescale": getattr(args, "vmaf_prescale", False),
         "codecs": {c: {"two_pass": two_pass[c],
                        "extra_args": ladder_extra_args(ladder_def, c),
                        "rungs": [{"label": r.label, "width": r.width,
@@ -1079,6 +1080,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hevc-single-pass", action="store_true", dest="hevc_single_pass")
     p.add_argument("--measure-vmaf", action="store_true", dest="measure_vmaf",
                    help="per-rendition VMAF audit after each chunk encode (slow)")
+    p.add_argument("--vmaf-prescale", action="store_true", dest="vmaf_prescale",
+                   help="#109: build a near-lossless pre-scaled VMAF reference "
+                        "once per box (speeds the audit on slow-to-decode sources; "
+                        "gated + falls back to the mezzanine)")
     p.add_argument("--no-burnin", action="store_false", dest="burnin", default=True,
                    help="disable the burnt-in text overlay on every variant; "
                         "on by default")

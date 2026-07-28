@@ -459,6 +459,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             </div>
             <div class="control-group" style="align-self:center;padding-top:16px">
                 <label title="Measure per-rendition VMAF quality after encoding (each rendition vs the source at source resolution). Slow — adds a post-encode pass per rung, fanned across the workers. Off by default. Scores show in the Outputs VMAF column. Ticking this clears Burn-in, since the overlay biases VMAF."><input type="checkbox" id="measure-vmaf" onchange="_vmafBurninSync(true)" style="width:auto;min-width:auto"> Measure VMAF</label>
+                <label title="#109: build a near-lossless pre-scaled VMAF reference ONCE PER WORKER BOX, so the audit decodes a small fast H.264 file instead of re-downscaling the native (4K/AV1) mezzanine on every chunk. VMAF-SPEED only — scores are identical within ~0.4 and it auto-skips when it wouldn't pay off (fewer than 2 renditions, source no slower than the ref, or too big). Needs Measure VMAF on." style="display:block;margin-top:4px"><input type="checkbox" id="vmaf-prescale" style="width:auto;min-width:auto"> VMAF pre-decode</label>
             </div>
             <div class="control-group" style="align-self:center;padding-top:16px">
                 <label title="Burn the diagnostic text overlay (timecode, bitrate, codec/resolution, encoder, watermark) into every variant. On by default; uncheck for clean output."><input type="checkbox" id="burnin" checked onchange="_vmafBurninSync(false)" style="width:auto;min-width:auto"> Burn-in text overlay</label>
@@ -1561,6 +1562,7 @@ async function startEncode(force = false) {
         target: target,
         codec: codecValue(),
         measure_vmaf: document.getElementById('measure-vmaf').checked,
+        vmaf_prescale: document.getElementById('vmaf-prescale').checked,
         max_res: document.getElementById('max-res').value,
         min_res: document.getElementById('min-res').value,
         time: document.getElementById('time-limit').value,
@@ -3756,6 +3758,7 @@ async function forceReencode(fileName) {
         target: document.getElementById('target').value,
         codec: codecValue(),
         measure_vmaf: document.getElementById('measure-vmaf').checked,
+        vmaf_prescale: document.getElementById('vmaf-prescale').checked,
         max_res: document.getElementById('max-res').value,
         min_res: document.getElementById('min-res').value,
         time: document.getElementById('time-limit').value,
