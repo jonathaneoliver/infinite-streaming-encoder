@@ -130,8 +130,8 @@ The state machine expects input JSON shaped like:
 
 ```json
 {
-  "s3_input": "s3://infinitestream-encoding-staging/jobs/<job-id>/input/clip.mp4",
-  "s3_prefix": "s3://infinitestream-encoding-staging/jobs/<job-id>",
+  "s3_input": "s3://<your-bucket>/jobs/<job-id>/input/clip.mp4",
+  "s3_prefix": "s3://<your-bucket>/jobs/<job-id>",
   "two_pass": "false",
   "chunk_indices": [0, 1, 2, 3],
   "variants": [

@@ -70,9 +70,28 @@ else
   ok "DIST_WORKERS empty (master-only local-dist — fine)"
 fi
 
+section "Image / registry (GHCR)"
+# These name resources in an account only its owner controls, so they ship with
+# no default (#149). Unset is caught here rather than at a push that fails
+# looking like a credentials problem.
+[ -n "${GHCR_ORG:-}" ]      && ok "GHCR_ORG=$GHCR_ORG"           || warn "GHCR_ORG unset — publish/farm-up/run-remote need it (e.g. ghcr.io/yourname); see .env.example"
+[ -n "${GHCR_USERNAME:-}" ] && ok "GHCR_USERNAME=$GHCR_USERNAME" || warn "GHCR_USERNAME unset — the GitHub account to docker-login with; see .env.example"
+# Copied someone else's .env? Cross-check the namespace against this clone's
+# own git remote. Same idea as the MASTER_IP placeholder check: a value that
+# looks configured but belongs to another account is the silent failure.
+if [ -n "${GHCR_ORG:-}" ]; then
+  ns="${GHCR_ORG##*/}"
+  origin=$(git remote get-url origin 2>/dev/null || true)
+  if [ -z "$origin" ]; then :                       # no git / no origin — nothing to compare
+  elif printf '%s' "$origin" | grep -qi "[:/]$ns/"; then ok "GHCR namespace '$ns' matches the git origin"
+  else warn "GHCR_ORG namespace '$ns' does not match this clone's origin ($origin) — if you forked, set GHCR_ORG/GHCR_USERNAME to YOUR namespace or 'make publish' pushes where you can't write"
+  fi
+fi
+
 section "Cloud (target cloud-batch)"
 [ -n "${STATE_MACHINE_ARN:-}" ] && ok "STATE_MACHINE_ARN set" || warn "STATE_MACHINE_ARN unset — cloud-batch is disabled (run 'make cloud-up' to configure AWS)"
-[ -n "${S3_BUCKET:-}" ]         && ok "S3_BUCKET=$S3_BUCKET"   || warn "S3_BUCKET unset — required for cloud-batch staging"
+[ -n "${S3_BUCKET:-}" ]         && ok "S3_BUCKET=$S3_BUCKET"   || warn "S3_BUCKET unset — job-I/O bucket you create yourself (S3 names are globally unique); required for cloud-batch staging"
+[ -n "${TFSTATE_BUCKET:-}" ]    && ok "TFSTATE_BUCKET=$TFSTATE_BUCKET" || warn "TFSTATE_BUCKET unset — 'make infra-init' needs it (versioned bucket holding Terraform state); see infra/terraform/README.md"
 [ -n "${AWS_REGION:-}" ]        && ok "AWS_REGION=$AWS_REGION" || warn "AWS_REGION unset (defaults us-west-2)"
 if [ -d "$HOME/.aws" ] || [ -n "${AWS_ACCESS_KEY_ID:-}" ]; then ok "AWS credentials present"; else warn "no ~/.aws and no AWS_ACCESS_KEY_ID — cloud-batch can't authenticate"; fi
 
