@@ -178,7 +178,8 @@ def audit_output(output_dir: Path, source: Path, reference: int,
 
 def audit_tree(root: Path, source_dir: Path, reference: int,
                n_subsample: int = 5, limit_s: float | None = None,
-               match: str | None = None, progress=print) -> list[dict]:
+               match: str | None = None, latest: bool = False,
+               progress=print) -> list[dict]:
     """Audit every eligible output under `root`, SKIPPING the rest with a reason.
 
     `match` (optional) restricts the sweep to output dirs whose NAME contains the
@@ -201,15 +202,16 @@ def audit_tree(root: Path, source_dir: Path, reference: int,
     if not source_dir.is_dir():
         raise AuditError(f"not a directory: {source_dir} — note these paths are "
                          "resolved inside the container, not on the host")
-    points: list[dict] = []
-    eligible = skipped = 0
+    # Gather eligible candidates first (needed so --latest can pick newest-per-codec).
+    candidates = []  # (mtime, codec, dir, src)
+    skipped = 0
     for d in sorted(root.iterdir()):
         if not d.is_dir() or d.name.startswith("."):
             continue
         if match and match not in d.name:
             continue
         try:
-            discover_rungs(d)
+            codec, _ = discover_rungs(d)
         except AuditError as e:
             skipped += 1
             progress(f"[audit] SKIP {d.name}: {str(e).split(': ', 1)[-1]}")
@@ -221,6 +223,27 @@ def audit_tree(root: Path, source_dir: Path, reference: int,
             skipped += 1
             progress(f"[audit] SKIP {d.name}: source {src_name!r} not found in {source_dir}")
             continue
+        candidates.append((d.stat().st_mtime, codec, d, src))
+
+    if latest:
+        # Keep only the NEWEST dir per codec — "the last encode" of a source that's
+        # been re-encoded many times, without auditing every archived copy. Pair
+        # with match=<source stem> to get one clip's current h264/hevc/av1.
+        newest: dict = {}
+        for mtime, codec, d, src in candidates:
+            if codec not in newest or mtime > newest[codec][0]:
+                newest[codec] = (mtime, d, src)
+        chosen = sorted(((d, src) for _, d, src in newest.values()),
+                        key=lambda ds: ds[0].name)
+        dropped = len(candidates) - len(chosen)
+        if dropped:
+            progress(f"[audit] --latest: newest per codec kept, {dropped} older copy(ies) dropped")
+    else:
+        chosen = [(d, src) for _, _, d, src in candidates]
+
+    points: list[dict] = []
+    eligible = 0
+    for d, src in chosen:
         try:
             got = audit_output(d, src, reference, n_subsample=n_subsample,
                                limit_s=limit_s, progress=progress)
@@ -290,6 +313,9 @@ def _main(argv=None) -> int:
     ap.add_argument("--match", default=None,
                     help="with --all, only audit output dirs whose NAME contains "
                          "this substring — e.g. 'insane_fpv' for one clip's 3 codecs")
+    ap.add_argument("--latest", action="store_true",
+                    help="with --all, audit only the NEWEST output per codec — the "
+                         "last encode, ignoring archived re-encodes. Pair with --match.")
     ap.add_argument("--reference", type=int, default=2160, choices=REFERENCES,
                     help="grading reference height (default 2160)")
     ap.add_argument("--store", type=Path, default=None,
@@ -324,7 +350,7 @@ def _main(argv=None) -> int:
         if args.all:
             points = audit_tree(args.all, args.source_dir, args.reference,
                                 n_subsample=args.n_subsample, limit_s=args.limit_s,
-                                match=args.match, progress=progress)
+                                match=args.match, latest=args.latest, progress=progress)
         else:
             points = audit_output(args.output_dir, args.source, args.reference,
                                   n_subsample=args.n_subsample, limit_s=args.limit_s,
