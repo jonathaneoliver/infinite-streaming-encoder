@@ -720,7 +720,7 @@ dist-deploy-ghcr: require-ghcr ## GHCR-pull workers on each DIST_WORKERS box (no
 # live into the server + worker — re-run after edits (Go/deps still need --build).
 # `make farm-down` / `farm-dev-down` are the inverse (local stack + remote workers);
 # teardown is mode-agnostic so they're the same operation.
-.PHONY: farm-up farm-dev-up farm-dev-down farm-down
+.PHONY: farm-up farm-test-up farm-dev-up farm-dev-down farm-down
 
 farm-up: require-paths require-ghcr ## bring the whole master farm up from GHCR (cluster + server + worker), + DIST_WORKERS
 	@echo ">>> [farm-up] pulling images + bringing up the master profile (cluster + server + worker) from GHCR..."
@@ -730,6 +730,29 @@ farm-up: require-paths require-ghcr ## bring the whole master farm up from GHCR 
 	@echo ">>> [farm-up] remote workers (from GHCR)..."
 	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-ghcr; else echo "    (no DIST_WORKERS — master-only farm)"; fi
 	@echo ">>> farm up:  UI http://localhost:$(PORT)   Temporal UI http://localhost:$${TEMPORAL_UI_PORT:-8233}"
+
+# Third farm mode, between farm-up (:latest, known-good) and farm-dev-up (local
+# build with the code bind-mounted). This builds your working tree, publishes it
+# under ONE throwaway tag, and runs the farm on that published image with NO code
+# mount — so it exercises the image as shipped and catches what farm-dev-up
+# structurally cannot: a file missing from the Dockerfile COPY set, or a
+# requirements.txt dep that only exists in your working tree.
+#
+# Same shape as cloud-dev-up: publish-tag then point one consumer at it, leaving
+# :latest serving the known-good image throughout (#144).
+#
+# ALWAYS republishes rather than reusing an existing tag. Reusing would mean a
+# re-run after an edit silently tests the previous build — the exact failure this
+# target exists to catch.
+farm-test-up: require-paths require-ghcr ## build+publish your WORKING TREE under one tag and run the farm on it (:latest untouched) (TAG=<name>)
+	@: $${TAG:?TAG is not set — pick a name that cannot be mistaken for a release, e.g. TAG=test-x}
+	$(MAKE) publish-tag TAG=$(TAG)
+	@ref="$(GHCR_IMAGE):$(TAG)"; \
+	  digest=$$(docker buildx imagetools inspect "$$ref" 2>/dev/null | awk '/^Digest:/{print $$2; exit}'); \
+	  echo ">>> [farm-test-up] $$ref"; \
+	  echo ">>> [farm-test-up] digest $$digest   (tags are mutable — this is what actually runs)"
+	$(MAKE) farm-up REMOTE_IMAGE=$(GHCR_IMAGE):$(TAG)
+	@echo ">>> farm-test-up complete on :$(TAG) — :latest UNCHANGED. Back to known-good:  make farm-up"
 
 farm-dev-up: require-paths   ## dev farm from your WORKING TREE (uncommitted): local build + live-mounted code
 	@echo ">>> [farm-dev-up] building from working tree + bringing up the master profile with live code..."
