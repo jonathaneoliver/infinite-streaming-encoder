@@ -241,7 +241,8 @@ publish-tag:          ## push a build under ONE explicit tag, leaving :latest al
 		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(GIT_SHA) --build-arg IMAGE_TAG=$(TAG) \
 		--tag $(GHCR_IMAGE):$(TAG) $$ecr_tags --push . ; \
 	echo "Published GHCR ($(GHCR_IMAGE)):$(TAG)$$ecr_note [$(PLATFORMS)] — :latest UNCHANGED"; \
-	echo "   cloud test:  cd ~/Projects/Encoder && make infra-apply TF_ARGS='-var image_tag=$(TAG)'"
+	echo "   cloud test:  cd ~/Projects/Encoder \\"; \
+	echo "                  && make infra-plan IMAGE_TAG=$(TAG) && make infra-apply"
 
 # ---------------------------------------------------------------------------
 # Cloud-batch deploy (AWS Batch + Step Functions). Replaces the manual
