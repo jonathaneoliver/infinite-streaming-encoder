@@ -10,6 +10,7 @@ Marker formats, each on its own line:
 
     [[ENCODER-PLAN <json-list-of-stage-descriptors>]]
     [[ENCODER-STAGE key=<id> status=<pending|running|done|failed> percent=<0-100>]]
+    [[ENCODER-FLEET machine=<id> busy=<cores> perf=<cores>]]
 
 A stage descriptor is a JSON object with at least `key` and `label`.
 The double brackets are deliberate — they're not produced by ffmpeg,
@@ -23,6 +24,7 @@ stream, and emits STAGE markers at a bounded rate.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -59,6 +61,93 @@ def emit_stage(key: str, status: str, percent: float = 0.0) -> None:
         f"[[ENCODER-STAGE key={key} status={status} percent={pct:.1f}]]",
         flush=True,
     )
+    # Piggyback the fleet CPU sample on the progress cadence (throttled inside)
+    # rather than running a timer thread: these already fire ~20x per chunk,
+    # which is a finer interval than the 15s throttle needs.
+    emit_fleet_cpu()
+
+
+# --- fleet CPU ---------------------------------------------------------------
+# The SAME marker the local-dist path already emits, so the cloud reuses the
+# whole existing pipeline: fleetMarkerRe in job.go, Manager.recordFleetCPU, and
+# the UI's "N / M cores busy (P%)" bar. No new contract, no new rendering.
+#
+# Read from /proc/stat, which Docker does NOT namespace — so a container sees
+# the HOST's counters. That is the point: the question is "am I using the CPU I
+# am renting?", which is the whole instance, exactly what `top` shows and what
+# the paid AWS/EC2 CPUUtilization metric reported. (The per-chunk question —
+# "did this chunk use its reserved vCPU?" — is answered separately and better by
+# cpu_s on ENCODER-TIMING, from getrusage.)
+_FLEET_PREV = {"t": 0.0, "total": 0, "idle": 0, "emitted": 0.0}
+_FLEET_INTERVAL_S = 15.0
+_INSTANCE_ID: str | None = None
+
+
+def _host_busy_cores() -> float | None:
+    """Logical cores busy on the HOST since the last call, or None if unknown.
+
+    None on the first call — there is no interval to difference against, and a
+    fabricated 0 would render as an idle box at the start of every chunk.
+    """
+    try:
+        v = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+        total, idle = sum(v), v[3] + (v[4] if len(v) > 4 else 0)
+    except (OSError, ValueError, IndexError):
+        return None
+    prev_t = _FLEET_PREV["t"]
+    prev_total, prev_idle = _FLEET_PREV["total"], _FLEET_PREV["idle"]
+    _FLEET_PREV["t"], _FLEET_PREV["total"], _FLEET_PREV["idle"] = (
+        time.monotonic(), total, idle)
+    if not prev_t or total <= prev_total:
+        return None
+    d_total, d_idle = total - prev_total, idle - prev_idle
+    return max(0.0, (1.0 - d_idle / d_total) * (os.cpu_count() or 1))
+
+
+def _instance_id() -> str:
+    """EC2 instance-id via IMDS, cached. Empty off-instance (local encodes).
+
+    Matches the identifier ENCODER-HOST reports, so the fleet row and the chunk
+    cells group under the same machine instead of splitting into two.
+    """
+    global _INSTANCE_ID
+    if _INSTANCE_ID is not None:
+        return _INSTANCE_ID
+    _INSTANCE_ID = ""
+    import urllib.request
+    try:
+        tok_req = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token", method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+        tok = urllib.request.urlopen(tok_req, timeout=1).read().decode()
+        req = urllib.request.Request(
+            "http://169.254.169.254/latest/meta-data/instance-id",
+            headers={"X-aws-ec2-metadata-token": tok})
+        _INSTANCE_ID = urllib.request.urlopen(req, timeout=1).read().decode().strip()
+    except Exception:  # noqa: BLE001 — off-instance, or IMDS disabled
+        pass
+    return _INSTANCE_ID
+
+
+def emit_fleet_cpu() -> None:
+    """Emit ENCODER-FLEET for this box, throttled. No-op off-instance.
+
+    Several chunks share an instance and each will call this; they all report
+    the same host figure and the control plane keys by machine, so the last one
+    per poll simply wins. Cheaper than electing a reporter.
+    """
+    now = time.monotonic()
+    if now - _FLEET_PREV["emitted"] < _FLEET_INTERVAL_S:
+        return
+    machine = _instance_id()
+    if not machine:
+        return
+    busy = _host_busy_cores()
+    if busy is None:
+        return
+    _FLEET_PREV["emitted"] = now
+    print(f"[[ENCODER-FLEET machine={machine} busy={busy:.2f} "
+          f"perf={os.cpu_count() or 0}]]", flush=True)
 
 
 def emit_boot_ami() -> None:
