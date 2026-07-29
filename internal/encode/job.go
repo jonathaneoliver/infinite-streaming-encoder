@@ -2810,6 +2810,16 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 			m.projectAndSetCosts(job) // refine cost + local-wall from the new sample
 			continue                  // telemetry for the dynamic chunk selector, not a log line
 		}
+		// Same fold as the local-dist scanner. Without it the cloud path emitted
+		// and forwarded ENCODER-FLEET correctly (#145) but nothing consumed it:
+		// the markers fell through to AppendLog, so the Cloud Fleet chart showed
+		// ALLOCATED vCPU from the AWS inventory and no ACTUAL CPU at all.
+		// Per-machine throttling (fleetMinSampleGap) lives inside recordFleetCPU,
+		// which matters here because every chunk container on an instance reports
+		// that instance's CPU independently.
+		if m.recordFleetCPU(line) {
+			continue // per-machine CPU sample for the fleet view, not a log line
+		}
 		if !job.parseMarker(line) {
 			job.AppendLog(line)
 		}
