@@ -477,7 +477,7 @@ farm and remote workers pull — never moves until you deliberately release.
 | --- | --- | --- |
 | 1. Iterate | `make farm-dev-up` | your code runs. Python is bind-mounted, so nothing is published |
 | 2. Test the image | `make farm-test-up` | the **image** runs. No mount, so packaging bugs surface |
-| 3. Test on cloud | `make cloud-dev-up` | Batch runs it. Only if the change affects cloud |
+| 3. Test on cloud | `make cloud-dev-up` | Batch runs it. Rebuilds the server too, since the Go control plane builds the Step Functions input |
 | 4. Commit | `git commit` | the tested contents are now the committed contents |
 | 5. Release | `make promote` | `:latest` and friends point at the image you tested |
 | 6. Deploy cloud | `make infra-plan IMAGE_TAG=<tag> && make infra-apply` | Batch job definitions re-pin |
