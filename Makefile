@@ -121,6 +121,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build, to
 	elif out=$$(tofu -chdir=infra/terraform fmt -check -recursive 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; \
 	  echo "                 fix: tofu -chdir=infra/terraform fmt -recursive"; fail=1; fi; \
+	printf '  sfn scopes     '; \
+	if out=$$(python3 scripts/check_sfn_scopes.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  python compile '; \
 	if out=$$(cd scripts && python3 -m compileall -q infinite_streaming_encoder 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \

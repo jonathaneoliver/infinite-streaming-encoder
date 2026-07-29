@@ -189,7 +189,9 @@
                       "bufsize_multiplier.$": "$.bufsize_multiplier",
                       "segment_duration.$": "$.segment_duration",
                       "gop_duration.$": "$.gop_duration",
-                      "burnin.$": "$.burnin"
+                      "burnin.$": "$.burnin",
+                      "est_vmaf.$": "$.est_vmaf",
+                      "est_vmaf_clamped.$": "$.est_vmaf_clamped"
                     },
                     "ItemProcessor": {
                       "StartAt": "EncodeChunk",
