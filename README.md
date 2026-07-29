@@ -440,6 +440,7 @@ farm and remote workers pull — never moves until you deliberately release.
 | 4. Commit | `git commit` | the tested contents are now the committed contents |
 | 5. Release | `make promote` | `:latest` and friends point at the image you tested |
 | 6. Deploy cloud | `make infra-plan IMAGE_TAG=<tag> && make infra-apply` | Batch job definitions re-pin |
+| 7. Re-bake AMI | `make ami-up && make infra-apply` | spot boxes cold-start fast again (optional) |
 
 **Why stage 2 exists.** `farm-dev-up` bind-mounts your working-tree
 `scripts/infinite_streaming_encoder` over the image's copy. That is what makes
@@ -480,8 +481,22 @@ running its pinned tag until you apply. It is only needed when the change
 touched what the image contains — `IMAGE_TAG` is derived from `Dockerfile`,
 `requirements.txt`, `scripts` and `static`, so a Go-only change never re-pins.
 
+**Why stage 7 is not optional if you use the AMI.** `make ami-up` bakes a worker
+AMI with the image pre-pulled, so spot instances skip a ~60s ECR pull on cold
+start. The AMI is tagged with the `image_tag` it was baked for, and `WORKER_AMI`
+looks one up by the *current* tag — so the moment you promote a new image, the
+baked AMI stops matching and cloud silently falls back to pull-on-boot. Nothing
+breaks; encodes just get slower with no warning. Re-bake and re-apply to wire
+the new one in, or `make ami-down` to clear it and accept pull-on-boot
+deliberately. `make cloud-up USE_AMI=1` does the bake, wait and second apply in
+one go.
+
 Rolling back is the same mechanism: `make cloud-dev-down` restores the tag cloud
 ran before, and `make promote FROM=<older-tag>` moves `:latest` back.
+
+While iterating in stage 1, the About tab flags that it is serving mounted
+working-tree code — the version, commit and image tag it shows describe the base
+image, not the Python actually running.
 
 ## Configuration
 

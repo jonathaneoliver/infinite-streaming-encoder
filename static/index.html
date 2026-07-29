@@ -726,6 +726,13 @@ make clear-costs  # this button's sweep AND the AMI, in one command</code></pre>
         <h2>About</h2>
 
         <h3 class="about-subhead">Local server <span id="about-drift-badge" style="display:none"></span></h3>
+        <div id="about-dev-mount" style="display:none;margin:6px 0 10px;padding:8px 10px;border-radius:6px;
+             background:rgba(230,160,30,.12);border:1px solid rgba(230,160,30,.45);font-size:13px;line-height:1.45">
+            <strong>Working-tree build (<code>make farm-dev-up</code>).</strong>
+            The Python encoder is bind-mounted from the checkout, so the version, commit and image
+            tag below describe the <em>base image</em> — not the code actually running, which may be
+            uncommitted. Use <code>make farm-test-up</code> to test a real published image.
+        </div>
         <dl class="about-list">
             <dt>Version</dt>
             <dd id="about-local-version">—</dd>
@@ -4419,6 +4426,11 @@ async function loadVersion() {
                 }
             }
         }
+
+        // Mounted working-tree code makes the stamps below describe the base image
+        // only, so flag it rather than letting them read as the running version.
+        const devBanner = document.getElementById('about-dev-mount');
+        if (devBanner) devBanner.style.display = j.dev_mount ? 'block' : 'none';
 
         document.getElementById('about-local-version').textContent = local.version || 'dev';
         document.getElementById('about-local-sha').textContent = local.revision || 'unknown';
