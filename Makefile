@@ -635,14 +635,28 @@ cloud-check:          ## live cloud readiness: AWS creds + state machine + S3 bu
 
 # Deploy stops at the plan on purpose — review it, then run `make infra-apply`.
 # (Keeping preview and apply as separate, deliberate steps for live IaC.)
-deploy:               ## push image + restart + plan + APPLY infra (one shot)
+# farm-up, not restart: it SUPERSEDES it. `restart` runs the server from a local
+# build, leaving remote workers on whatever they last pulled — so "one shot" was
+# never true for a farm. `farm-up` brings the server, the cluster, the local
+# worker AND every DIST_WORKERS box up on GHCR :latest, which `publish` has just
+# moved. Deploying then verifies the artifact you actually shipped rather than a
+# parallel local build of the same source.
+#
+# Heavier than restart: it also starts the master profile (postgres, temporal,
+# minio). On a cloud-only host that is more than you need — use
+# `make publish && make infra-plan && make infra-apply` there.
+#
+# NOTE no in-flight guard, unlike cloud-dev-up: infra-apply deregisters job-def
+# revisions and farm-up bounces workers, so running this mid-encode will break
+# it. Check `make status` / the UI first.
+deploy:               ## push image + bring the whole farm up + plan + APPLY infra (one shot)
 	@start=$$(date +%s); \
 	echo ">>> deploy started $$(date '+%H:%M:%S')  worker=$(IMAGE_TAG)"; \
-	if $(MAKE) publish && $(MAKE) restart && $(MAKE) infra-plan && $(MAKE) infra-apply; then \
+	if $(MAKE) publish && $(MAKE) farm-up && $(MAKE) infra-plan && $(MAKE) infra-apply; then \
 		el=$$(( $$(date +%s) - start )); \
 		printf '\a\n\033[1;32m==================================================\n'; \
 		printf '  DEPLOY COMPLETE  %dm %02ds   worker=%s\n' $$((el/60)) $$((el%60)) "$(IMAGE_TAG)"; \
-		printf '  image pushed - server restarted - infra applied\n'; \
+		printf '  image pushed - farm up on :latest - infra applied\n'; \
 		printf '==================================================\033[0m\n'; \
 	else \
 		el=$$(( $$(date +%s) - start )); \

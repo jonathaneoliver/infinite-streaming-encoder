@@ -375,7 +375,16 @@ drop a file in `SOURCE_DIR`, and submit a job.
 `make farm-up` pulls the published image from GHCR. To build from your **working
 tree** instead, use `make farm-dev-up` (below). `make run` / `make run-remote` bring
 up **just the server** (against an already-running cluster), which is what
-`make restart` / `make deploy` use to bounce it after an image change.
+`make restart` uses to bounce it after an image change.
+
+`make deploy` is the one-shot release: `publish` → `farm-up` → `infra-plan` →
+`infra-apply`. It uses `farm-up` rather than `restart` so **remote worker boxes
+follow the new image too** — bouncing only the server leaves them on whatever
+they last pulled, which is not a deploy. It has **no in-flight guard**
+(`infra-apply` deregisters job-def revisions and `farm-up` bounces workers), so
+check nothing is encoding first. On a cloud-only host, where the master profile
+isn't wanted, use `make publish && make infra-plan && make infra-apply`
+instead.
 
 ### From a clean checkout → running: three scenarios
 
