@@ -178,8 +178,12 @@ def audit_output(output_dir: Path, source: Path, reference: int,
 
 def audit_tree(root: Path, source_dir: Path, reference: int,
                n_subsample: int = 5, limit_s: float | None = None,
-               progress=print) -> list[dict]:
+               match: str | None = None, progress=print) -> list[dict]:
     """Audit every eligible output under `root`, SKIPPING the rest with a reason.
+
+    `match` (optional) restricts the sweep to output dirs whose NAME contains the
+    substring — e.g. match='insane_fpv' audits just that one clip's h264/hevc/av1
+    outputs (and still auto-matches each to its source + skips burn-in).
 
     Skipping rather than failing is the point of batch mode: most of a real
     OUTPUT_DIR is ineligible (burn-in on, pre-dating encode.json, source since
@@ -201,6 +205,8 @@ def audit_tree(root: Path, source_dir: Path, reference: int,
     eligible = skipped = 0
     for d in sorted(root.iterdir()):
         if not d.is_dir() or d.name.startswith("."):
+            continue
+        if match and match not in d.name:
             continue
         try:
             discover_rungs(d)
@@ -281,6 +287,9 @@ def _main(argv=None) -> int:
                          "skipping the rest (needs --source-dir)")
     ap.add_argument("--source-dir", type=Path, default=None, dest="source_dir",
                     help="where to find sources for --all (matched by encode.json's source)")
+    ap.add_argument("--match", default=None,
+                    help="with --all, only audit output dirs whose NAME contains "
+                         "this substring — e.g. 'insane_fpv' for one clip's 3 codecs")
     ap.add_argument("--reference", type=int, default=2160, choices=REFERENCES,
                     help="grading reference height (default 2160)")
     ap.add_argument("--store", type=Path, default=None,
@@ -315,7 +324,7 @@ def _main(argv=None) -> int:
         if args.all:
             points = audit_tree(args.all, args.source_dir, args.reference,
                                 n_subsample=args.n_subsample, limit_s=args.limit_s,
-                                progress=progress)
+                                match=args.match, progress=progress)
         else:
             points = audit_output(args.output_dir, args.source, args.reference,
                                   n_subsample=args.n_subsample, limit_s=args.limit_s,

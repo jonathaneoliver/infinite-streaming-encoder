@@ -516,12 +516,13 @@ ladder-audit:         ## measure one output's ladder into the VMAF curve store (
 	  --store "$(TMP_DIR)/quality-curves.json" \
 	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)
 
-ladder-audit-all:     ## audit EVERY eligible output; skips burn-in/no-metadata ones
+ladder-audit-all:     ## audit eligible outputs; skips burn-in/no-metadata. MATCH=<substr> scopes to one clip's h264/hevc/av1
 	@command -v ffmpeg >/dev/null || { echo "ffmpeg not found on PATH — this target runs natively"; exit 1; }
 	$(LADDER_AUDIT_PY) \
 	  --all "$(OUTPUT_DIR)" --source-dir "$(SOURCE_DIR)" \
 	  --reference $(LADDER_AUDIT_REFERENCE) \
 	  --store "$(TMP_DIR)/quality-curves.json" \
+	  $(if $(MATCH),--match "$(MATCH)",) \
 	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)
 
 minio-usage:          ## what the local-dist MinIO staging is holding, per job prefix
