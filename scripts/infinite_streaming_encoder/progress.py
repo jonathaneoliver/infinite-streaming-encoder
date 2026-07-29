@@ -85,6 +85,9 @@ _FLEET_PREV = {"t": 0.0, "total": 0, "idle": 0, "emitted": 0.0}
 # emitting often costs nothing — and the control plane throttles INGESTION per
 # machine anyway (fleetMinSampleGap), so more emissions cannot flood the history.
 _FLEET_INTERVAL_S = 5.0
+# Shortest /proc/stat delta that yields a meaningful ratio. Below this the idle
+# delta rounds to zero on a loaded box and every sample reads exactly 100%.
+_FLEET_MIN_WINDOW_S = 2.0
 _INSTANCE_ID: str | None = None
 
 
@@ -101,8 +104,17 @@ def _host_busy_cores() -> float | None:
         return None
     prev_t = _FLEET_PREV["t"]
     prev_total, prev_idle = _FLEET_PREV["total"], _FLEET_PREV["idle"]
-    _FLEET_PREV["t"], _FLEET_PREV["total"], _FLEET_PREV["idle"] = (
-        time.monotonic(), total, idle)
+    now = time.monotonic()
+    # Reject a too-short interval WITHOUT consuming the baseline, so the window
+    # keeps accumulating instead of restarting. Sub-second deltas are not merely
+    # noisy: on a busy box d_idle is 0 over them, so the ratio below returns
+    # exactly 1.0 and the box reports a flat, perfectly round 100%. That is what
+    # a fleet of instances all reading 100% actually means. It bites hardest
+    # right after prime_fleet_cpu() takes the baseline at phase start, and once
+    # per chunk container, since each is its own process with its own baseline.
+    if prev_t and now - prev_t < _FLEET_MIN_WINDOW_S:
+        return None
+    _FLEET_PREV["t"], _FLEET_PREV["total"], _FLEET_PREV["idle"] = (now, total, idle)
     if not prev_t or total <= prev_total:
         return None
     d_total, d_idle = total - prev_total, idle - prev_idle
