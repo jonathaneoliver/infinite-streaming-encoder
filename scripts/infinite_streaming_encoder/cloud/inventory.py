@@ -38,7 +38,8 @@ from typing import Any
 from botocore.exceptions import ClientError
 
 from infinite_streaming_encoder.cloud.aws import (
-    APP_TAG_KEY, APP_TAG_VALUE, app_tag_filter, batch_client, cloudwatch_client,
+    APP_TAG_KEY, APP_TAG_VALUE, app_tag_filter, batch_client,
+    list_jobs_paginated,
     ec2_client, ecs_client, region, s3_client, sfn_client,
 )
 
@@ -307,7 +308,7 @@ def _batch_jobs() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     try:
         for status in _ACTIVE_BATCH_STATUSES:
-            for j in batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", []):
+            for j in list_jobs_paginated(batch, queue, status):
                 created = j.get("createdAt")  # epoch millis
                 started = j.get("startedAt")
                 stopped = j.get("stoppedAt")
@@ -452,77 +453,27 @@ def _ecs_cluster_name() -> str | None:
         return None
 
 
-def _fleet_cw_series(cluster_name: str) -> dict:
-    """2h of ACTUAL fleet CPU (cores) + memory (GiB) from Container Insights, as
-    sparkline series — the real usage that complements the self-tracked
-    allocated-vCPU history (shows the allocated-vs-used gap live). Needs
-    Container Insights enabled on the cluster; best-effort, empty on any error.
-    CpuUtilized is in CPU units (1024 = 1 vCPU); MemoryUtilized is MiB."""
-    cw = cloudwatch_client()
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=2)
-    out: dict[str, list[float]] = {"cpu_cores": [], "mem_gib": []}
-    for metric, key, div in (("CpuUtilized", "cpu_cores", 1024.0),
-                             ("MemoryUtilized", "mem_gib", 1024.0)):
-        try:
-            dp = cw.get_metric_statistics(
-                Namespace="ECS/ContainerInsights", MetricName=metric,
-                Dimensions=[{"Name": "ClusterName", "Value": cluster_name}],
-                StartTime=start, EndTime=now, Period=300, Statistics=["Average"],
-            ).get("Datapoints", [])
-            dp.sort(key=lambda p: p["Timestamp"])
-            out[key] = [round(p["Average"] / div, 1) for p in dp]
-        except ClientError:
-            pass
-    return out
+# The ECS/ContainerInsights CpuUtilized/MemoryUtilized query was REMOVED (#137):
+# Container Insights was never enabled on the Batch cluster, so that namespace
+# holds 0 metrics and the calls always returned nothing behind
+# `except ClientError: pass` — a silent no-op since it was written.
 
 
-def _annotate_instance_cpu(instances: list[dict]) -> None:
-    """Attach a 2h CPU% sparkline series (cw_cpu) to each running instance from
-    EC2 CloudWatch, all in one batched GetMetricData call. Best-effort — no
-    datapoints (fresh box / basic-monitoring lag) just leaves it unset."""
-    running = [i for i in instances if i.get("state") == "running"]
-    if not running:
-        return
-    # Enable detailed (1-min) monitoring so a fresh box's CPU sparkline appears
-    # in ~2 min instead of ~10 (basic monitoring is 5-min). Idempotent + cheap
-    # (~$0.003/instance-hour, dies with the spot box).
-    try:
-        ec2_client().monitor_instances(InstanceIds=[i["id"] for i in running])
-    except ClientError:
-        pass
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=2)
-    by_qid = {}
-    queries = []
-    for n, inst in enumerate(running):
-        qid = f"c{n}"
-        by_qid[qid] = inst
-        queries.append({
-            "Id": qid,
-            "MetricStat": {
-                "Metric": {
-                    "Namespace": "AWS/EC2", "MetricName": "CPUUtilization",
-                    "Dimensions": [{"Name": "InstanceId", "Value": inst["id"]}],
-                },
-                "Period": 300, "Stat": "Average",
-            },
-            "ReturnData": True,
-        })
-    try:
-        cw = cloudwatch_client()
-        for i in range(0, len(queries), 500):  # GetMetricData caps at 500/call
-            resp = cw.get_metric_data(
-                MetricDataQueries=queries[i:i + 500], StartTime=start,
-                EndTime=now, ScanBy="TimestampAscending")
-            for r in resp.get("MetricDataResults", []):
-                inst = by_qid.get(r["Id"])
-                if inst is not None and r.get("Values"):
-                    inst["cw_cpu"] = [round(v) for v in r["Values"]]
-    except ClientError:
-        pass
-
-
+# _annotate_instance_cpu REMOVED (#137).
+#
+# It called ec2.monitor_instances() on every running instance every poll, which
+# enables EC2 detailed monitoring — billed at custom-metric rates, 7 metrics per
+# instance. On 21 July 2026 that made CloudWatch 44.8% of the day's AWS bill
+# ($2.18 vs $2.15 for the EC2 compute it was watching); across July, $4.25 on
+# $13.34 of compute. It then read the series back with GetMetricData at
+# Period=300 — 5-minute averages — so the 1-minute resolution it paid for was
+# never even requested.
+#
+# The same number now arrives free: workers emit [[ENCODER-FLEET machine=... 
+# busy=... perf=...]] from /proc/stat (the whole instance, exactly what
+# CPUUtilization reported and what `top` shows), the control plane folds it in
+# Manager.recordFleetCPU, and the Go inventory handler merges the per-machine
+# history into each instance as cw_cpu. No lag, no cost, same meaning.
 def _annotate_init_states(instances: list[dict]) -> None:
     """Tag each running EC2 box with its ECS lifecycle state so the fleet view
     shows what a box is doing *before* a job lands on it, not just "idle":
@@ -702,7 +653,6 @@ def collect() -> dict[str, Any]:
     # 24h spend. _enrich_fleet annotates `instances` in place.
     fleet = _enrich_fleet(batch_jobs, instances)
     _annotate_init_states(instances)  # booting / pulling / idle per box
-    _annotate_instance_cpu(instances)  # per-machine CPU% sparkline series
     fleet["estimated_hourly_usd"] = round(hourly_total, 4)
     _sampled = _record_fleet_samples(hourly_total, fleet)
     fleet["spend_24h_usd"] = _sampled["spend_24h_usd"]

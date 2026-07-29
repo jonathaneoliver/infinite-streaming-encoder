@@ -83,7 +83,9 @@ def _print_human(d: dict) -> None:
     rows = d["tiers"]
     if not rows:
         print("no per-tier cpu data found — was this run on an image with "
-              "cpu_s instrumentation? (encode jobs must emit cpu_s)")
+              "cpu_s instrumentation? (encode jobs must emit cpu_s)\n"
+              "  If `make timing` also reports 0 jobs, the fault is job "
+              "DISCOVERY, not instrumentation — see #138.")
         return
     print(f"Per-tier encode CPU utilization ({d['region']})\n")
     hdr = (f"{'tier':<7} {'chunks':>6} {'vCPU':>5} {'encode_s':>9} "

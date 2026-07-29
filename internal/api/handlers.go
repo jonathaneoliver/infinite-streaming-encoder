@@ -1017,8 +1017,39 @@ func (s *Server) awsInventory(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 502)
 		return
 	}
+	out = s.attachFleetCPU(out)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(out)
+}
+
+// attachFleetCPU adds the per-machine CPU history from ENCODER-FLEET markers to
+// the cloud inventory, under the SAME `fleet` key /api/dist/workers uses for
+// local machines — so both targets carry identical data in an identical shape
+// and the UI renders them with one code path.
+//
+// This replaces the `cw_cpu` field inventory.py used to fill from AWS/EC2
+// CPUUtilization, which was paid for by enabling detailed monitoring on every
+// instance: 44.8% of the AWS bill on a busy day, for a series then read at
+// 5-minute granularity anyway (#137). The marker carries the same quantity —
+// whole-instance busy %, from /proc/stat — with no lag and no cost.
+//
+// Best-effort: on any parse failure the inventory passes through untouched,
+// because a missing sparkline must never cost the fleet view.
+func (s *Server) attachFleetCPU(out []byte) []byte {
+	fleet := s.Manager.FleetCPU()
+	if len(fleet) == 0 {
+		return out
+	}
+	var doc map[string]any
+	if json.Unmarshal(out, &doc) != nil {
+		return out
+	}
+	doc["fleet"] = fleet
+	merged, err := json.Marshal(doc)
+	if err != nil {
+		return out
+	}
+	return merged
 }
 
 // awsImageState reports the cloud worker-image + AMI state for the About tab

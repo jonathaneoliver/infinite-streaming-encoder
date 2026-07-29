@@ -3023,6 +3023,7 @@ async function refreshAws() {
         const res = await fetch('/api/aws/inventory');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
+        _awsFleet = data.fleet || [];
         renderAws(data);
         if (lastEl) {
             lastEl.textContent = 'updated ' + new Date().toLocaleTimeString();
@@ -3251,13 +3252,8 @@ function _fleetInstanceRow(i, maxV) {
     // Per-machine CPU% (from EC2 CloudWatch) inline in the header. The % shows
     // with a single datapoint; the trend line needs ≥2 (CloudWatch is ~1–5 min
     // lagged, so a fresh box gets the number first, the line a poll later).
-    const cpuVals = i.cw_cpu || [];
-    let cpuSpark = '';
-    if (cpuVals.length >= 1) {
-        const spark = cpuVals.length >= 2
-            ? _sparkline(cpuVals, '#e0555a', { min: 0, max: 100, w: 54, h: 13 }) + ' ' : '';
-        cpuSpark = `<span title="this box's CPU% (CloudWatch)">CPU ${spark}<span style="color:#ccc">${cpuVals[cpuVals.length - 1]}%</span></span> · `;
-    }
+    // Same source and same renderer as the local fleet — see _cpuSparkHtml.
+    const cpuSpark = _cpuSparkHtml(_fleetEntry(_awsFleet, i.id), 120);
     // Swatch keyed by the SAME instanceColor() the chunk plot uses, so a box
     // here and its chunks below share one colour — the machine a chunk ran on is
     // traceable to this fleet row at a glance.
@@ -3589,6 +3585,38 @@ function _localFleetRow(inst, maxCores) {
 // Fed by _distMachines.fleet (live CPU via the Temporal heartbeat backchannel) +
 // the running local-dist job's stages (which chunk is on which machine). Hidden
 // when nothing local is active, so it only appears during a distributed encode.
+// Per-machine CPU from ENCODER-FLEET markers, shared by BOTH fleet views.
+//
+// Local and cloud now process this identically: workers on either target emit
+// the same marker, the control plane folds it in Manager.recordFleetCPU, and
+// both /api/dist/workers and /api/aws/inventory expose the same `fleet` array.
+// Previously the cloud path took a completely different route — paid
+// CloudWatch AWS/EC2 CPUUtilization, read into a `cw_cpu` field with its own
+// rendering — so the two views could disagree and only one cost money (#137).
+let _awsFleet = [];     // fleet[] from /api/aws/inventory, same shape as the local one
+
+function _fleetEntry(fleetArr, machine) {
+    if (!machine) return null;
+    return (fleetArr || []).find(f => f.machine === machine) || null;
+}
+
+// "CPU ▁▃▅ 45%" for one machine, or '' when it has no fresh samples. Staleness
+// is deliberate: a box that stopped reporting isn't at 0%, it's not encoding,
+// and showing a stale number as current would misread as an idle machine.
+function _cpuSparkHtml(entry, staleAfterS) {
+    if (!entry) return '';
+    const age = entry.age_s != null ? entry.age_s : 1e9;
+    if (age > (staleAfterS || 30)) return '';
+    const hist = entry.history || [];
+    if (!hist.length) return '';
+    const vals = hist.map(v => Math.round(v));
+    const spark = vals.length >= 2
+        ? _sparkline(vals, '#e0555a', { min: 0, max: 100, w: 54, h: 13 }) + ' ' : '';
+    const pct = vals[vals.length - 1];
+    return `<span title="this box's CPU% — whole instance, from the worker's /proc/stat (free; replaced paid CloudWatch)">`
+        + `CPU ${spark}<span style="color:#ccc">${pct}%</span></span> · `;
+}
+
 function renderLocalFleet() {
     const panel = document.getElementById('jobs-local-fleet-panel');
     const el = document.getElementById('jobs-local-fleet');

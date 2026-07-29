@@ -25,7 +25,7 @@ import sys
 
 from botocore.exceptions import ClientError
 
-from infinite_streaming_encoder.cloud.aws import batch_client, region
+from infinite_streaming_encoder.cloud.aws import batch_client, list_jobs_paginated, region
 
 try:
     import boto3
@@ -51,7 +51,7 @@ def _jobs_for_execution(exec_name: str) -> list[dict]:
     queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
     ids: list[str] = []
     for status in ("SUCCEEDED", "FAILED"):
-        for j in batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", []):
+        for j in list_jobs_paginated(batch, queue, status):
             if exec_name in j.get("jobName", ""):
                 ids.append(j["jobId"])
     out: list[dict] = []
@@ -107,6 +107,17 @@ def _secs(a, b) -> float | None:
 
 def collect(execution_arn: str) -> dict:
     jobs = _jobs_for_execution(_exec_name(execution_arn))
+    # An empty result is suspicious, not normal: every execution submits jobs,
+    # so finding none means discovery failed (wrong queue/region, a name that
+    # no longer carries the execution, or records aged out) — not that the run
+    # did no work. Printing a well-formed empty table instead made #138 invisible
+    # for as long as it existed, and sent the reader after the wrong cause.
+    if not jobs:
+        print(f"warning: no Batch jobs found whose name contains "
+              f"{_exec_name(execution_arn)!r} on queue "
+              f"{os.environ.get('BATCH_JOB_QUEUE', 'infinite-streaming-encoder-queue')!r} "
+              f"in {region()} — this is a DISCOVERY failure, not an idle run.",
+              file=sys.stderr)
     jobs.sort(key=lambda j: (j["instance"], j.get("started") or 0))
 
     # First job on each instance paid the image pull → "cold".

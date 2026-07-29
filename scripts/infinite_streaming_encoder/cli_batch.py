@@ -257,11 +257,16 @@ def _tail_progress(stream: str, label: str, log_state: dict) -> None:
     for e in events:
         log_state[stream] = max(log_state.get(stream, 0), e.get("timestamp", 0))
         msg = e.get("message", "").rstrip()
-        if msg.startswith("[[ENCODER-BOOT ") or msg.startswith("[[ENCODER-STAGE "):
-            # Verbatim so the Go scanner parses it — ENCODER-STAGE carries the
-            # live ffmpeg % for this chunk/variant, driving the progress bars.
-            # (ENCODER-SPEED is forwarded on exit by _forward_container_timing —
-            # it's emitted after the last live poll, so tailing misses it.)
+        if msg.startswith("[[ENCODER-"):
+            # Forward EVERY marker verbatim, not a whitelist. This used to pass
+            # only ENCODER-BOOT and ENCODER-STAGE, which meant each new marker
+            # was silently dropped until someone noticed — ENCODER-VMAF is
+            # computed per chunk and thrown away that way (#141), and adding
+            # ENCODER-FLEET would have been the next instance. The Go scanner
+            # ignores markers it has no regex for, so forwarding everything
+            # costs nothing and makes the next marker work by default.
+            # (ENCODER-SPEED still needs _forward_container_timing: it is
+            # emitted after the last live poll, so tailing misses it entirely.)
             print(msg, flush=True)
         elif _PROGRESS_RE.search(msg):
             _narrate(f"{label}: {msg}")

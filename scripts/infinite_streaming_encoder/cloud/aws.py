@@ -90,6 +90,33 @@ def ecs_client():
     return boto3.client("ecs", region_name=region())
 
 
+def list_jobs_paginated(batch, queue: str, status: str) -> list[dict]:
+    """Every Batch job summary in `status` on `queue`, following nextToken.
+
+    boto3's list_jobs returns ONE page and a nextToken; only the AWS CLI
+    auto-paginates. Reading page 1 alone looks like it works — right up to the
+    queue exceeding a page, after which older executions silently vanish from
+    every report built on it. That is #138: `make timing` reported "0 jobs" for
+    a run whose 254 jobs were all on page 2+, and `make cpu-report` then blamed
+    missing instrumentation that was present and correct.
+
+    cli_batch.py already learned this (#124) and paginates; four other call
+    sites did not. Centralised here so the next caller inherits the fix instead
+    of rediscovering it.
+    """
+    out: list[dict] = []
+    tok = None
+    while True:
+        kw = {"jobQueue": queue, "jobStatus": status, "maxResults": 100}
+        if tok:
+            kw["nextToken"] = tok
+        r = batch.list_jobs(**kw)
+        out += r.get("jobSummaryList", [])
+        tok = r.get("nextToken")
+        if not tok:
+            return out
+
+
 def cloudwatch_client():
     return boto3.client("cloudwatch", region_name=region())
 

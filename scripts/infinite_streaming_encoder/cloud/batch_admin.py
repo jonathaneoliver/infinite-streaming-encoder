@@ -21,7 +21,7 @@ import sys
 
 from botocore.exceptions import ClientError
 
-from infinite_streaming_encoder.cloud.aws import batch_client, sfn_client
+from infinite_streaming_encoder.cloud.aws import batch_client, list_jobs_paginated, sfn_client
 
 _ACTIVE_BATCH_STATUSES = ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING")
 _REASON = "released from encoder AWS tab"
@@ -43,7 +43,7 @@ def _stop_execution(arn: str, terminate_jobs: bool = False) -> dict:
         terminated, errors = [], []
         for status in _ACTIVE_BATCH_STATUSES:
             try:
-                for j in batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", []):
+                for j in list_jobs_paginated(batch, queue, status):
                     if name not in j.get("jobName", ""):
                         continue
                     try:
@@ -96,7 +96,7 @@ def _stop_all() -> dict:
     batch = batch_client()
     for status in _ACTIVE_BATCH_STATUSES:
         try:
-            for j in batch.list_jobs(jobQueue=queue, jobStatus=status).get("jobSummaryList", []):
+            for j in list_jobs_paginated(batch, queue, status):
                 try:
                     batch.terminate_job(jobId=j["jobId"], reason=_REASON)
                     terminated.append(j["jobId"])
