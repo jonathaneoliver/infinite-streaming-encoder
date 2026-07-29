@@ -31,8 +31,9 @@ thing lives in the **unified root `docker-compose.yml`** with two profiles:
 ```
 make farm-up          # master box: GHCR image -> cluster + server + one local worker (+ cloud configured)
 make farm-dev-up      # same, but build from your working tree + live-mount scripts/infinite_streaming_encoder
-make farm-test-up TAG=test-x   # publish the working tree under ONE tag and run the farm on that IMAGE
-                               # (no code mount, :latest untouched) — catches packaging bugs farm-dev-up hides
+make farm-test-up     # publish the working tree under a throwaway dev-<branch>-<sha> tag and run
+                      # the farm on that IMAGE (no code mount, :latest untouched) — catches packaging
+                      # bugs farm-dev-up hides. TAG=<name> to override.
 docker compose --profile worker up -d   # an EXTRA box: worker only (dials master's LAN Temporal/MinIO)
 ```
 `master` profile = postgres + temporal + temporal-ui + minio + server + worker;

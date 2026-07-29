@@ -42,8 +42,8 @@ On the **master box** — one command brings up cluster + server + a local worke
 ```
 make farm-up           # GHCR image (run `make push` first); or
 make farm-dev-up       # build from your working tree, live-mount the Python code; or
-make farm-test-up TAG=test-x   # publish the working tree under one throwaway tag
-                               # and run the farm on that published image
+make farm-test-up      # publish the working tree under a throwaway dev-<branch>-<sha>
+                       # tag and run the farm on that published image (TAG= to override)
 ```
 
 Prefer raw compose? `docker compose --profile master up -d` (set `SOURCE_DIR` /

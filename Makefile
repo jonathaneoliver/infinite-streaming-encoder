@@ -377,7 +377,14 @@ infra-apply:          ## apply the saved tf.plan (run only after reviewing the p
 # points ONLY the Batch job definitions at it, leaving :latest serving the
 # known-good image throughout. Rolling back is re-applying the previous tag;
 # nothing was overwritten, so there is nothing to restore.
-CLOUD_DEV_TAG ?= dev-$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null | tr -cd 'A-Za-z0-9-' | cut -c1-20)-$(GIT_SHA)
+# Throwaway tag for the testing lanes (cloud-dev-up, farm-test-up). Derived from
+# branch + sha so it is self-describing and cannot be mistaken for a release, and
+# shared so a farm test and a cloud test of the same tree name the same image.
+# Non-alphanumerics become '-' rather than being deleted, so `feat/x` reads as
+# `feat-x` instead of `featx`. (sed uses | as its delimiter, not the usual /,
+# because make treats an unescaped # as a comment even inside $(shell ...).)
+DEV_TAG ?= dev-$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null | sed 's|[^A-Za-z0-9-]|-|g' | cut -c1-20)-$(GIT_SHA)
+CLOUD_DEV_TAG ?= $(DEV_TAG)
 
 cloud-dev-up:         ## test cloud from your WORKING TREE under a throwaway tag (:latest untouched)
 	@# Guard 1: tofu state. State is shared in S3, so any checkout can drive it —
@@ -744,8 +751,9 @@ farm-up: require-paths require-ghcr ## bring the whole master farm up from GHCR 
 # ALWAYS republishes rather than reusing an existing tag. Reusing would mean a
 # re-run after an edit silently tests the previous build — the exact failure this
 # target exists to catch.
-farm-test-up: require-paths require-ghcr ## build+publish your WORKING TREE under one tag and run the farm on it (:latest untouched) (TAG=<name>)
-	@: $${TAG:?TAG is not set — pick a name that cannot be mistaken for a release, e.g. TAG=test-x}
+farm-test-up: TAG ?= $(DEV_TAG)
+farm-test-up: require-paths require-ghcr ## build+publish your WORKING TREE under one tag and run the farm on it (:latest untouched) (TAG=<name>, defaults to $(DEV_TAG))
+	@: $${TAG:?TAG resolved empty — pass TAG=<name> explicitly}
 	$(MAKE) publish-tag TAG=$(TAG)
 	@ref="$(GHCR_IMAGE):$(TAG)"; \
 	  digest=$$(docker buildx imagetools inspect "$$ref" 2>/dev/null | awk '/^Digest:/{print $$2; exit}'); \
