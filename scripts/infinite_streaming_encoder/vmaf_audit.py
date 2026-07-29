@@ -143,10 +143,22 @@ def _parse_vmaf_log(log_path: Path) -> dict:
     if frames:
         n = len(frames)
         inv_sum = sum(1.0 / s for s in frames if s > 0)
+        mean = sum(frames) / n
+        lo = min(frames)
+        srt = sorted(frames)
+        # 1st-percentile floor — a robust "hard frames" worst case. A single min
+        # frame can be a lone outlier (one bad cut); p1 is what actually drags
+        # perceived quality, and it's the standard low-percentile QA metric.
+        p1 = srt[min(n - 1, int(n * 0.01))]
+        std = (sum((s - mean) ** 2 for s in frames) / n) ** 0.5
         return {
-            "mean": sum(frames) / n,
+            "mean": mean,
             "harmonic_mean": (n / inv_sum) if inv_sum else 0.0,
-            "min": min(frames),
+            "min": lo,
+            "min_frame": frames.index(lo),  # index of the worst frame (seek to it)
+            "p1": p1,
+            "max": max(frames),
+            "std": std,
             "frames": n,
             "inv_sum": inv_sum,
         }
@@ -155,10 +167,15 @@ def _parse_vmaf_log(log_path: Path) -> dict:
     if not pooled:
         raise VmafError("VMAF log had no frames or pooled_metrics")
     mean = float(pooled.get("mean", 0.0))
+    lo = float(pooled.get("min", mean))
     return {
         "mean": mean,
         "harmonic_mean": float(pooled.get("harmonic_mean", mean)),
-        "min": float(pooled.get("min", mean)),
+        "min": lo,
+        "min_frame": -1,  # per-frame data absent — no index/percentile available
+        "p1": lo,
+        "max": float(pooled.get("max", mean)),
+        "std": 0.0,
         "frames": 0,
         "inv_sum": 0.0,
     }

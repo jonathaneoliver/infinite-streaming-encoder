@@ -164,9 +164,14 @@ def audit_output(output_dir: Path, source: Path, reference: int,
             "codec": codec, "reference": reference, "height": height,
             "kbps": kbps, "vmaf": round(r["mean"], 2),
             "harmonic": round(r["harmonic_mean"], 2),
+            "min": round(r["min"], 2), "p1": round(r.get("p1", r["min"]), 2),
         })
-        progress(f"[audit]   {label}: {kbps} kbps  vmaf {r['mean']:.2f} "
-                 f"(harmonic {r['harmonic_mean']:.2f}, {r['frames']} frames)")
+        progress(
+            f"[audit]   {label:>6}: {kbps:>6} kbps  vmaf {r['mean']:6.2f}  "
+            f"harmonic {r['harmonic_mean']:6.2f}  p1 {r.get('p1', 0):6.2f}  "
+            f"worst {r['min']:6.2f} @frame {r.get('min_frame', -1)}  "
+            f"max {r.get('max', 0):6.2f}  std {r.get('std', 0):5.2f}  "
+            f"({r['frames']} frames)")
     return points
 
 
