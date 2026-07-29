@@ -151,6 +151,10 @@ def _parse_vmaf_log(log_path: Path) -> dict:
         # perceived quality, and it's the standard low-percentile QA metric.
         p1 = srt[min(n - 1, int(n * 0.01))]
         std = (sum((s - mean) ** 2 for s in frames) / n) ** 0.5
+        # Fraction of essentially-unwatchable frames (VMAF < 10) and poor frames
+        # (< 50) — the "how much of the clip is broken" read that a mean hides.
+        pct_lt10 = 100.0 * sum(1 for s in frames if s < 10) / n
+        pct_lt50 = 100.0 * sum(1 for s in frames if s < 50) / n
         return {
             "mean": mean,
             "harmonic_mean": (n / inv_sum) if inv_sum else 0.0,
@@ -159,6 +163,8 @@ def _parse_vmaf_log(log_path: Path) -> dict:
             "p1": p1,
             "max": max(frames),
             "std": std,
+            "pct_lt10": pct_lt10,
+            "pct_lt50": pct_lt50,
             "frames": n,
             "inv_sum": inv_sum,
         }
@@ -176,6 +182,8 @@ def _parse_vmaf_log(log_path: Path) -> dict:
         "p1": lo,
         "max": float(pooled.get("max", mean)),
         "std": 0.0,
+        "pct_lt10": 0.0,  # unknown without per-frame data
+        "pct_lt50": 0.0,
         "frames": 0,
         "inv_sum": 0.0,
     }
