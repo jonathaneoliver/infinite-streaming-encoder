@@ -31,8 +31,13 @@ locals {
 }
 
 resource "aws_cloudwatch_log_group" "batch" {
-  name              = local.log_group_name
-  retention_in_days = 14
+  name = local.log_group_name
+  # 7 days: long enough to debug a failed run (the log tail is pulled into the
+  # job log at failure time anyway, so the group is a backstop rather than the
+  # primary record), short enough that stored bytes stay a rounding error
+  # against the 5 GB allowance. Ingestion, not storage, is what would ever cost
+  # money here — and that needs ~3,800 executions/month to reach the allowance.
+  retention_in_days = 7
 }
 
 # The definitions all share this retry-strategy block; keep it as a
