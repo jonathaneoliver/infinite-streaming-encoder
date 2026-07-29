@@ -41,9 +41,19 @@ GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 #    names itself. PROMOTE_SSH_IP is exported for that overlay to interpolate.
 PROMOTE_SSH_IP := $(if $(PROMOTE_SSH_HOST),$(shell dscacheutil -q host -a name $(PROMOTE_SSH_HOST) 2>/dev/null | awk '/^ip_address:/{print $$2; exit}'),)
 
-# GHCR publishing
-GHCR_IMAGE ?= ghcr.io/jonathaneoliver/infinite-streaming-encoder
-GHCR_USERNAME ?= jonathaneoliver
+# GHCR publishing. Both come from .env and have NO defaults on purpose: a
+# personal namespace baked in here silently misdirects every fork — `docker
+# login` succeeds with the forker's own PAT and the push then fails on a
+# namespace they can't write, which reads like a credentials problem rather
+# than a setting they were meant to change (#149).
+#
+# GHCR_ORG is the registry+namespace (e.g. ghcr.io/yourname). GHCR_USERNAME is
+# the GitHub account used for `docker login`. They are deliberately separate:
+# they coincide for a personal namespace but differ for an org, so deriving one
+# from the other would reintroduce exactly the silent misconfiguration above.
+GHCR_ORG ?=
+GHCR_USERNAME ?=
+GHCR_IMAGE ?= $(GHCR_ORG)/infinite-streaming-encoder
 PLATFORMS ?= linux/amd64,linux/arm64
 
 # Which image `run` / `run-remote` launch. RUN_IMAGE feeds BOTH the server
@@ -82,7 +92,7 @@ COMPOSE_DEV  := $(COMPOSE_BASE) -f docker-compose.dev.yml
 # compose as ENCODE_SLOTS (empty string is safe: compose ${ENCODE_SLOTS:-0}).
 FARM_ENCODE_SLOTS := $(shell P=$$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null); if [ -n "$$P" ] && [ "$$P" -gt 1 ]; then echo $$((P/2)); fi)
 
-.PHONY: require-paths build run run-remote down stop restart logs shell status clean publish version setup-hooks
+.PHONY: require-paths require-ghcr require-s3-bucket build run run-remote down stop restart logs shell status clean publish version setup-hooks
 
 # Point git at the committed hooks (scripts/git-hooks/) so the pre-push guard
 # that blocks direct pushes to main is active in this clone. Run once per clone.
@@ -126,6 +136,17 @@ require-paths:
 	@: $${OUTPUT_DIR:?OUTPUT_DIR is not set — create a .env (see .env.example)}
 	@: $${TMP_DIR:?TMP_DIR is not set — create a .env (see .env.example)}
 
+# Guards for values that CANNOT ship with a working default because they name
+# resources in an account only their owner controls (#149). Fail naming the
+# setting, rather than proceeding against somebody else's namespace/bucket.
+require-ghcr:
+	@: $${GHCR_ORG:?GHCR_ORG is not set — your GHCR namespace, e.g. ghcr.io/yourname (see .env.example)}
+	@: $${GHCR_USERNAME:?GHCR_USERNAME is not set — the GitHub account to docker-login with (see .env.example)}
+
+require-s3-bucket:
+	@: $${S3_BUCKET:?S3_BUCKET is not set — the job-I/O bucket is a prerequisite you create \
+	yourself (S3 names are globally unique). Set it in .env (see .env.example)}
+
 build:
 	docker build \
 		--build-arg VERSION=$(VERSION) \
@@ -154,7 +175,7 @@ run: require-paths
 # Logs into GHCR first only if GHCR_PAT is set (needed when the package is
 # private). Pairs with `make farm-up` for a fully no-local-build bring-up.
 run-remote: RUN_IMAGE = $(REMOTE_IMAGE)
-run-remote: require-paths
+run-remote: require-paths require-ghcr
 	@if [ -n "$$GHCR_PAT" ]; then \
 		echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin; \
 	fi
@@ -194,7 +215,7 @@ clean: stop
 # GHCR (+ ECR when used) and ensures the docker-container buildx builder exists.
 # Requires GHCR_PAT (write:packages). Supersedes the old GHCR-only publish and
 # the ECR-only ecr-publish (now a thin alias).
-publish:              ## build once (multi-arch) → GHCR always, ECR when cloud is configured
+publish: require-ghcr   ## build once (multi-arch) → GHCR always, ECR when cloud is configured
 	@: $${GHCR_PAT:?GHCR_PAT is not set — create a classic PAT with write:packages scope}
 	@echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin
 	@docker buildx inspect encoder-builder >/dev/null 2>&1 || \
@@ -217,7 +238,7 @@ publish:              ## build once (multi-arch) → GHCR always, ECR when cloud
 		$$ecr_tags --push . ; \
 	echo "Published GHCR ($(GHCR_IMAGE)) :latest :$(VERSION) :$(GIT_SHA) :$(IMAGE_TAG)$$ecr_note [$(PLATFORMS)]"
 
-publish-tag:          ## push a build under ONE explicit tag, leaving :latest alone (TAG=<name>)
+publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :latest alone (TAG=<name>)
 	@: $${TAG:?TAG is not set — e.g. TAG=test-145. Use a name that cannot be mistaken for a release}
 	@: $${GHCR_PAT:?GHCR_PAT is not set — create a classic PAT with write:packages scope}
 	@# Testing lane. `publish` moves :latest, which is public AND what remote
@@ -337,9 +358,10 @@ infra-init:           ## tofu init against the S3 backend (needs TFSTATE_BUCKET 
 		-backend-config="region=$(AWS_REGION)" \
 		-backend-config="dynamodb_table=$(TFSTATE_TABLE)"
 
-infra-plan:           ## tofu plan -> tf.plan (review before infra-apply)
+infra-plan: require-s3-bucket ## tofu plan -> tf.plan (review before infra-apply)
 	@echo ">>> image_tag=$(IMAGE_TAG)  worker_ami_id=$(if $(WORKER_AMI),$(WORKER_AMI),<none, pull-on-boot>)"
 	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu plan \
+		-var s3_bucket=$(S3_BUCKET) \
 		-var image_tag=$(IMAGE_TAG) \
 		-var worker_ami_id="$(WORKER_AMI)" \
 		-out=tf.plan
@@ -404,7 +426,7 @@ cloud-dev-down:       ## put cloud back on the image tag it ran before cloud-dev
 	  echo ">>> [cloud-dev-down] restoring cloud to :$$prev"; \
 	  $(MAKE) infra-plan IMAGE_TAG=$$prev && $(MAKE) infra-apply
 
-cloud-promote:        ## make a TESTED tag the one users get: re-tag it to :latest (FROM=<tag>)
+cloud-promote: require-ghcr ## make a TESTED tag the one users get: re-tag it to :latest (FROM=<tag>)
 	@: $${FROM:?FROM is not set — the tag you tested, e.g. FROM=dev-my-branch-abc1234}
 	@# RE-TAG, never rebuild. Rebuilding produces a different image from the one
 	@# that passed, which defeats the entire point of having tested it.
@@ -415,8 +437,9 @@ cloud-promote:        ## make a TESTED tag the one users get: re-tag it to :late
 	  if [ "$$a" = "$$b" ]; then echo ">>> :latest is now byte-identical to :$(FROM) ($$a)"; \
 	  else echo "!!! digest mismatch — :latest=$$a :$(FROM)=$$b"; exit 1; fi
 
-cloud-down:           ## FULL teardown -> $0/mo (no prompt): tofu destroy -auto-approve + remove AMI
-	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu destroy -auto-approve
+cloud-down: require-s3-bucket ## FULL teardown -> $0/mo (no prompt): tofu destroy -auto-approve + remove AMI
+	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu destroy -auto-approve \
+		-var s3_bucket=$(S3_BUCKET)
 	$(MAKE) ami-down   # AMI isn't tofu-managed; remove it too so nothing bills
 
 # Bring the cloud stack up to match the CURRENT code — the everyday cloud action
@@ -530,7 +553,7 @@ ami-down:           ## clear the compute-env AMI pointer, THEN delete the AMIs (
 	  echo ">>> clearing compute-env AMI pointer (-> pull-on-boot)..."; \
 	  AWS_REGION=$(AWS_REGION) tofu apply -auto-approve \
 	    -target=module.compute.aws_batch_compute_environment.spot_graviton \
-	    -var image_tag=$(IMAGE_TAG) -var worker_ami_id="" ; \
+	    -var s3_bucket=$(S3_BUCKET) -var image_tag=$(IMAGE_TAG) -var worker_ami_id="" ; \
 	else echo ">>> no compute env in state — skipping pointer clear"; fi
 	@ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
 	    --filters "Name=tag:Name,Values=infinite-streaming-encoder-worker" --query 'Images[].ImageId' --output text); \
@@ -552,7 +575,7 @@ ami-down:           ## clear the compute-env AMI pointer, THEN delete the AMIs (
 # the worker AMI + snapshot. For a TOTAL teardown (also drops ECR images, log
 # groups, VPC — next use needs a full re-deploy) use `make cloud-down`.
 
-cloud-clear:          ## kill every idle AWS cost: sweep tagged instances/volumes/spot/S3 + remove worker AMI
+cloud-clear: require-s3-bucket ## kill every idle AWS cost: sweep tagged instances/volumes/spot/S3 + remove worker AMI
 	@echo ">>> sweeping Application=infinite-streaming-encoder-app runtime resources (instances, volumes, spot, S3)..."
 	docker exec $(CONTAINER_NAME) python3 -m infinite_streaming_encoder.cloud.cleanup --sweep-all
 	@echo ">>> removing worker AMI(s)..."
@@ -651,7 +674,7 @@ DIST_WORKERS ?=
 MASTER_IP ?= 192.168.1.10
 .PHONY: dist-deploy-workers dist-deploy dist-deploy-ghcr
 
-dist-deploy-workers:  ## rsync code + rebuild image + (re)start worker on each DIST_WORKERS box
+dist-deploy-workers: require-ghcr ## rsync code + rebuild image + (re)start worker on each DIST_WORKERS box
 	@if [ -z "$(DIST_WORKERS)" ]; then echo "set DIST_WORKERS=label=ssh_target [..] (in .env)"; exit 1; fi
 	@for w in $(DIST_WORKERS); do \
 	  label=$${w%%=*}; host=$${w#*=}; \
@@ -675,7 +698,7 @@ dist-deploy: build dist-worker dist-deploy-workers  ## deploy distributed-local 
 # macmini onto the image-transfer path. Pair with `make run-remote` on the master
 # for a fully no-local-build bring-up. (Forked to a PRIVATE package? Log each
 # worker box into GHCR by hand first — not supported headlessly on macOS.)
-dist-deploy-ghcr:     ## GHCR-pull workers on each DIST_WORKERS box (no build/transfer, no auth)
+dist-deploy-ghcr: require-ghcr ## GHCR-pull workers on each DIST_WORKERS box (no build/transfer, no auth)
 	@if [ -z "$(DIST_WORKERS)" ]; then echo "set DIST_WORKERS=label=ssh_target [..] (in .env)"; exit 1; fi
 	@for w in $(DIST_WORKERS); do \
 	  label=$${w%%=*}; host=$${w#*=}; \
@@ -697,7 +720,7 @@ dist-deploy-ghcr:     ## GHCR-pull workers on each DIST_WORKERS box (no build/tr
 # teardown is mode-agnostic so they're the same operation.
 .PHONY: farm-up farm-dev-up farm-dev-down farm-down
 
-farm-up: require-paths   ## bring the whole master farm up from GHCR (cluster + server + worker), + DIST_WORKERS
+farm-up: require-paths require-ghcr ## bring the whole master farm up from GHCR (cluster + server + worker), + DIST_WORKERS
 	@echo ">>> [farm-up] pulling images + bringing up the master profile (cluster + server + worker) from GHCR..."
 	@if [ -n "$(GHCR_PAT)" ]; then echo "$(GHCR_PAT)" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin; fi
 	ENCODER_IMAGE=$(REMOTE_IMAGE) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) $(COMPOSE_BASE) --profile master pull
