@@ -41,6 +41,7 @@ One Docker image plays three roles: the **server** (Go control plane, default
 - [Requirements](#requirements)
 - [Quickstart](#quickstart)
 - [Developing across the farm](#developing-across-the-farm)
+  - [From edit to release](#from-edit-to-release)
 - [Configuration](#configuration)
 - [Programmatic use (HTTP API)](#programmatic-use-http-api)
 - [Images & registries](#images--registries)
@@ -426,6 +427,62 @@ make farm-dev-up DEV_BUILD=1     # also native-build uncommitted deps on cross-a
 The inner loop is a `compose up --build` (fast, layer-cached) plus rsync-diffs to
 remote boxes.
 
+### From edit to release
+
+Six stages. Each one narrows what can still be wrong, and `:latest` — what the
+farm and remote workers pull — never moves until you deliberately release.
+
+| | command | what it proves |
+| --- | --- | --- |
+| 1. Iterate | `make farm-dev-up` | your code runs. Python is bind-mounted, so nothing is published |
+| 2. Test the image | `make farm-test-up` | the **image** runs. No mount, so packaging bugs surface |
+| 3. Test on cloud | `make cloud-dev-up` | Batch runs it. Only if the change affects cloud |
+| 4. Commit | `git commit` | the tested contents are now the committed contents |
+| 5. Release | `make promote` | `:latest` and friends point at the image you tested |
+| 6. Deploy cloud | `make infra-plan IMAGE_TAG=<tag> && make infra-apply` | Batch job definitions re-pin |
+
+**Why stage 2 exists.** `farm-dev-up` bind-mounts your working-tree
+`scripts/infinite_streaming_encoder` over the image's copy. That is what makes
+iteration fast, and it also means the mount hides packaging bugs — a file
+missing from the Dockerfile's `COPY` set, or a `requirements.txt` dep that only
+exists on your machine. `farm-test-up` publishes the working tree under a
+throwaway `dev-<branch>-<sha>` tag and runs the farm on that **published image
+with no mount**, so those fail where you can see them.
+
+Tags carry their own provenance. The sha names the last *commit*, but these
+lanes build the *working tree*, so an uncommitted tree gets a `-dirty` suffix —
+`dev-feat-x-a1b2c3d-dirty`. `farm-test-up` also publishes a moving
+`dev-<branch>-test` alias so another box can pull your latest test build
+without being handed a sha, while the farm itself runs the immutable tag so the
+run stays reproducible. The alias is GHCR-only on purpose: a moving tag in ECR
+would let an already-registered Batch job definition change what it runs with
+no `infra-apply`.
+
+**Why stage 5 is not `make publish`.** `publish` rebuilds. Same source, but a
+new image — different base layers, freshly resolved deps — so it ships bits that
+were never tested. `promote` **re-tags** the image you actually validated and
+verifies every resulting tag is byte-identical to it:
+
+```bash
+make promote                     # FROM defaults to whatever was last published
+make promote FROM=<tag>          # or name it explicitly
+```
+
+It applies the same tag sets `publish` does — GHCR gets `:latest`, `:<version>`,
+`:<sha>`, `:<image-tag>`; ECR gets `:latest` and `:<image-tag>`, the tag
+Terraform pins by. If the build never reached ECR (`farm-test-up` publishes GHCR
+only) it **stops rather than half-promoting**, since moving `:latest` while
+cloud stays pinned to something older is worse than doing nothing. Pass
+`GHCR_ONLY=1` if that is genuinely what you want.
+
+Stage 6 stays separate so publishing and deploying are two acts: Batch keeps
+running its pinned tag until you apply. It is only needed when the change
+touched what the image contains — `IMAGE_TAG` is derived from `Dockerfile`,
+`requirements.txt`, `scripts` and `static`, so a Go-only change never re-pins.
+
+Rolling back is the same mechanism: `make cloud-dev-down` restores the tag cloud
+ran before, and `make promote FROM=<older-tag>` moves `:latest` back.
+
 ## Configuration
 
 `.env` at the repo root is auto-loaded by the Makefile. Only the host paths are
@@ -494,6 +551,8 @@ One `Dockerfile`, published/used four ways:
 | --- | --- | --- |
 | `make build` | local daemon (`infinite-streaming-encoder`) | server + local/same-arch workers |
 | `make publish` | GHCR always + ECR when cloud is configured (multi-arch) | all workers — farm (GHCR) + AWS Batch (ECR) + version display |
+| `make publish-tag TAG=` | one tag only, `:latest` untouched (`SKIP_ECR=1` for GHCR only) | testing a build without handing it to every consumer |
+| `make promote` | re-tags an existing image, never rebuilds | releasing the build you tested ([From edit to release](#from-edit-to-release)) |
 | `make ami-up` | AWS AMI | pre-pull the ECR image onto spot boxes |
 
 ## Repository layout
