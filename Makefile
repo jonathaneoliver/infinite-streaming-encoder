@@ -217,6 +217,32 @@ publish:              ## build once (multi-arch) → GHCR always, ECR when cloud
 		$$ecr_tags --push . ; \
 	echo "Published GHCR ($(GHCR_IMAGE)) :latest :$(VERSION) :$(GIT_SHA) :$(IMAGE_TAG)$$ecr_note [$(PLATFORMS)]"
 
+publish-tag:          ## push a build under ONE explicit tag, leaving :latest alone (TAG=<name>)
+	@: $${TAG:?TAG is not set — e.g. TAG=test-145. Use a name that cannot be mistaken for a release}
+	@: $${GHCR_PAT:?GHCR_PAT is not set — create a classic PAT with write:packages scope}
+	@# Testing lane. `publish` moves :latest, which is public AND what remote
+	@# workers pull via REMOTE_IMAGE — so publishing an unvalidated build there
+	@# hands it to every consumer at once. This pushes exactly one tag and
+	@# touches nothing else, so a cloud test can point at it (infra-apply with
+	@# -var image_tag=$$TAG) while :latest keeps serving the known-good image.
+	@# See #144: the durable fix is a :stable pointer; this is the safe lane
+	@# that makes testing possible before that lands.
+	@echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin
+	@docker buildx inspect encoder-builder >/dev/null 2>&1 || \
+		docker buildx create --name encoder-builder --driver docker-container >/dev/null
+	@set -e; ecr_tags=""; ecr_note=""; \
+	if echo "$(ECR_REPO)" | grep -qE '\.dkr\.ecr\.'; then \
+	  echo ">>> cloud configured — pushing ECR ($(ECR_REPO)):$(TAG) too, so a Batch job def can point at it"; \
+	  aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(ECR_REGISTRY); \
+	  ecr_tags="--tag $(ECR_REPO):$(TAG)"; \
+	  ecr_note=" + ECR ($(ECR_REPO)):$(TAG)"; \
+	fi; \
+	docker buildx build --builder encoder-builder --platform $(PLATFORMS) \
+		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(GIT_SHA) --build-arg IMAGE_TAG=$(TAG) \
+		--tag $(GHCR_IMAGE):$(TAG) $$ecr_tags --push . ; \
+	echo "Published GHCR ($(GHCR_IMAGE)):$(TAG)$$ecr_note [$(PLATFORMS)] — :latest UNCHANGED"; \
+	echo "   cloud test:  cd ~/Projects/Encoder && make infra-apply TF_ARGS='-var image_tag=$(TAG)'"
+
 # ---------------------------------------------------------------------------
 # Cloud-batch deploy (AWS Batch + Step Functions). Replaces the manual
 # "build → ECR push → tofu plan/apply → restart" dance we were doing by hand.
@@ -268,6 +294,7 @@ STATE_MACHINE_ARN ?= $(shell cd $(TF_DIR) && tofu output -no-color -raw state_ma
 USE_AMI ?=
 
 .PHONY: ladder-audit ladder-audit-all
+.PHONY: publish-tag
 .PHONY: ecr-login ecr-publish infra-init infra-plan infra-apply deploy deploy-review timing cpu-report cloud-up cloud-clear cloud-down cloud-check ami-up ami-down
 
 # Resolve the pre-baked worker AMI for the CURRENT image tag, if one exists.
