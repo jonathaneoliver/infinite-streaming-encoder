@@ -241,6 +241,13 @@ publish: require-ghcr   ## build once (multi-arch) → GHCR always, ECR when clo
 publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :latest alone (TAG=<name>)
 	@: $${TAG:?TAG is not set — e.g. TAG=test-145. Use a name that cannot be mistaken for a release}
 	@: $${GHCR_PAT:?GHCR_PAT is not set — create a classic PAT with write:packages scope}
+	@# Validate here rather than at each caller: this is the single choke point
+	@# for every tagged push (GHCR + ECR), so it also catches a hand-passed TAG.
+	@# An invalid tag otherwise fails deep inside buildx, after the build.
+	@printf '%s' '$(TAG)' | grep -qE '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$$' || { \
+	  echo "!!! TAG='$(TAG)' is not a valid Docker tag."; \
+	  echo "    Must match [A-Za-z0-9_][A-Za-z0-9._-]{0,127} — no '/', no leading '.' or '-'."; \
+	  exit 1; }
 	@# Testing lane. `publish` moves :latest, which is public AND what remote
 	@# workers pull via REMOTE_IMAGE — so publishing an unvalidated build there
 	@# hands it to every consumer at once. This pushes exactly one tag and
@@ -383,7 +390,24 @@ infra-apply:          ## apply the saved tf.plan (run only after reviewing the p
 # Non-alphanumerics become '-' rather than being deleted, so `feat/x` reads as
 # `feat-x` instead of `featx`. (sed uses | as its delimiter, not the usual /,
 # because make treats an unescaped # as a comment even inside $(shell ...).)
-DEV_TAG ?= dev-$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null | sed 's|[^A-Za-z0-9-]|-|g' | cut -c1-20)-$(GIT_SHA)
+# Branch slug: lowercase, every non-alphanumeric becomes '-', runs of '-'
+# collapsed, leading/trailing '-' trimmed (before AND after the length cut, so a
+# truncation landing on a separator can't leave one dangling). Empty (detached
+# HEAD, no git) falls back to 'nobranch' so the tag never contains an empty
+# segment. Result feeds a Docker tag, which must match
+# [A-Za-z0-9_][A-Za-z0-9._-]{0,127} — publish-tag enforces that on every tag.
+DEV_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null \
+	| tr 'A-Z' 'a-z' \
+	| sed -e 's|[^a-z0-9]|-|g' -e 's|--*|-|g' -e 's|^-||' -e 's|-$$||' \
+	| cut -c1-20 | sed 's|-$$||')
+# The sha names the last COMMIT, but these lanes build the WORKING TREE — so a
+# tag can otherwise claim a commit whose contents it doesn't carry, and two
+# different trees at the same HEAD collide on one tag (farm-test-up always
+# republishes, so the second silently overwrites the first). The -dirty suffix
+# keeps the tag honest without forcing a commit. Ignored files don't count;
+# `git status --porcelain` lists tracked edits + untracked-but-not-ignored.
+DEV_DIRTY := $(shell git status --porcelain 2>/dev/null | grep -q . && echo dirty)
+DEV_TAG ?= dev-$(if $(DEV_BRANCH),$(DEV_BRANCH),nobranch)-$(GIT_SHA)$(if $(DEV_DIRTY),-dirty)
 CLOUD_DEV_TAG ?= $(DEV_TAG)
 
 cloud-dev-up:         ## test cloud from your WORKING TREE under a throwaway tag (:latest untouched)
