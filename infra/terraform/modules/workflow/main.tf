@@ -27,8 +27,13 @@ locals {
 }
 
 resource "aws_cloudwatch_log_group" "state_machine" {
-  name              = "/aws/states/infinite-streaming-encoder"
-  retention_in_days = 14
+  name = "/aws/states/infinite-streaming-encoder"
+  # 7 days: long enough to debug a failed run (the log tail is pulled into the
+  # job log at failure time anyway, so the group is a backstop rather than the
+  # primary record), short enough that stored bytes stay a rounding error
+  # against the 5 GB allowance. Ingestion, not storage, is what would ever cost
+  # money here — and that needs ~3,800 executions/month to reach the allowance.
+  retention_in_days = 7
 }
 
 resource "aws_sfn_state_machine" "encoder" {
