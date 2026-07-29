@@ -238,7 +238,7 @@ publish: require-ghcr   ## build once (multi-arch) → GHCR always, ECR when clo
 		$$ecr_tags --push . ; \
 	echo "Published GHCR ($(GHCR_IMAGE)) :latest :$(VERSION) :$(GIT_SHA) :$(IMAGE_TAG)$$ecr_note [$(PLATFORMS)]"
 
-publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :latest alone (TAG=<name>)
+publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :latest alone (TAG=<name>, SKIP_ECR=1 for GHCR only)
 	@: $${TAG:?TAG is not set — e.g. TAG=test-145. Use a name that cannot be mistaken for a release}
 	@: $${GHCR_PAT:?GHCR_PAT is not set — create a classic PAT with write:packages scope}
 	@# Validate here rather than at each caller: this is the single choke point
@@ -259,7 +259,10 @@ publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :lates
 	@docker buildx inspect encoder-builder >/dev/null 2>&1 || \
 		docker buildx create --name encoder-builder --driver docker-container >/dev/null
 	@set -e; ecr_tags=""; ecr_note=""; \
-	if echo "$(ECR_REPO)" | grep -qE '\.dkr\.ecr\.'; then \
+	if [ -n "$(SKIP_ECR)" ]; then \
+	  echo ">>> SKIP_ECR — GHCR only (ECR untouched)"; \
+	  ecr_note=" (ECR skipped)"; \
+	elif echo "$(ECR_REPO)" | grep -qE '\.dkr\.ecr\.'; then \
 	  echo ">>> cloud configured — pushing ECR ($(ECR_REPO)):$(TAG) too, so a Batch job def can point at it"; \
 	  aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(ECR_REGISTRY); \
 	  ecr_tags="--tag $(ECR_REPO):$(TAG)"; \
@@ -778,7 +781,10 @@ farm-up: require-paths require-ghcr ## bring the whole master farm up from GHCR 
 farm-test-up: TAG ?= $(DEV_TAG)
 farm-test-up: require-paths require-ghcr ## build+publish your WORKING TREE under one tag and run the farm on it (:latest untouched) (TAG=<name>, defaults to $(DEV_TAG))
 	@: $${TAG:?TAG resolved empty — pass TAG=<name> explicitly}
-	$(MAKE) publish-tag TAG=$(TAG)
+	@# SKIP_ECR: the farm pulls GHCR exclusively. Pushing ECR here would spend
+	@# slots in its `keep last 10` lifecycle rule — enough farm iterations would
+	@# expire images cloud still has history in, for an image cloud never runs.
+	$(MAKE) publish-tag TAG=$(TAG) SKIP_ECR=1
 	@ref="$(GHCR_IMAGE):$(TAG)"; \
 	  digest=$$(docker buildx imagetools inspect "$$ref" 2>/dev/null | awk '/^Digest:/{print $$2; exit}'); \
 	  echo ">>> [farm-test-up] $$ref"; \
