@@ -4,10 +4,15 @@ variable "region" {
   default     = "us-west-2"
 }
 
+# No default, deliberately (#149). S3 bucket names are globally unique across
+# all of AWS, so any name here would exist in exactly one account and silently
+# point every other user at a bucket they cannot write. `make infra-plan` and
+# friends supply this from S3_BUCKET in .env and fail loudly when it's unset —
+# never rely on a bare `tofu plan`, which would sit waiting on an interactive
+# prompt for it instead.
 variable "s3_bucket" {
-  description = "Existing S3 bucket for job I/O staging. Created outside of this stack."
+  description = "Existing S3 bucket for job I/O staging. Created outside of this stack; set S3_BUCKET in .env."
   type        = string
-  default     = "infinitestream-encoding-staging"
 }
 
 variable "image_tag" {

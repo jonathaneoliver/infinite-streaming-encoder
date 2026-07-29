@@ -204,7 +204,7 @@ services:
       STATE_MACHINE_ARN: ${STATE_MACHINE_ARN:-}
       GHCR_PAT: ${GHCR_PAT:-}
       # GHCR twin of the ECR worker image — About reads its version labels from GHCR.
-      GHCR_IMAGE: ${GHCR_IMAGE:-ghcr.io/jonathaneoliver/infinite-streaming-encoder}
+      GHCR_IMAGE: ${GHCR_IMAGE:-}
 
   # ---- Encode worker (master AND worker profiles) --------------------------
   # One per box; each contributes its cores. Polls Temporal (outbound only) and

@@ -26,7 +26,9 @@ SSH_TARGET="${1:?usage: deploy-worker.sh <ssh_target> <label> [remote_code_dir]}
 LABEL="${2:?label (e.g. macmini) required}"
 REMOTE_CODE="${3:-/tmp/encoder-src/encoder}"
 MASTER_IP="${MASTER_IP:-192.168.1.10}"
-BASE_IMAGE="${BASE_IMAGE:-ghcr.io/jonathaneoliver/infinite-streaming-encoder:latest}"
+# Derived from GHCR_ORG, never a personal namespace (#149). The Makefile
+# exports GHCR_ORG from .env; standalone callers can pass BASE_IMAGE directly.
+BASE_IMAGE="${BASE_IMAGE:-${GHCR_ORG:?GHCR_ORG is not set — set it in .env (e.g. ghcr.io/yourname) or pass BASE_IMAGE}/infinite-streaming-encoder:latest}"
 MASTER_IMAGE="${MASTER_IMAGE:-encoder:latest}"
 
 master_arch="$(docker image inspect "$MASTER_IMAGE" --format '{{.Architecture}}' 2>/dev/null || true)"

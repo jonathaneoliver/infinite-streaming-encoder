@@ -13,17 +13,19 @@
 #
 # Env:
 #   MASTER_IP            LAN IP the worker dials for Temporal + MinIO (default 192.168.1.10)
-#   IMAGE                GHCR ref to pull (default ghcr.io/jonathaneoliver/infinite-streaming-encoder:latest)
+#   IMAGE                GHCR ref to pull (default $GHCR_ORG/infinite-streaming-encoder:latest)
 #   GHCR_PAT             set only if the package is private (piped over ssh stdin)
-#   GHCR_USERNAME        GHCR user for the login (default jonathaneoliver)
+#   GHCR_USERNAME        GHCR user for the login (required; from .env)
 #   MINIO_ROOT_USER / MINIO_ROOT_PASSWORD   MinIO creds (default encoder / encoder-secret)
 set -euo pipefail
 
 SSH_TARGET="${1:?usage: deploy-worker-ghcr.sh <ssh_target> <label>}"
 LABEL="${2:?label (e.g. ubuntu) required}"
 MASTER_IP="${MASTER_IP:-192.168.1.10}"
-IMAGE="${IMAGE:-ghcr.io/jonathaneoliver/infinite-streaming-encoder:latest}"
-GHCR_USERNAME="${GHCR_USERNAME:-jonathaneoliver}"
+# Both derive from .env rather than a personal namespace (#149) — a fork that
+# inherited these would pull/login against an account it does not own.
+IMAGE="${IMAGE:-${GHCR_ORG:?GHCR_ORG is not set — set it in .env (e.g. ghcr.io/yourname) or pass IMAGE}/infinite-streaming-encoder:latest}"
+GHCR_USERNAME="${GHCR_USERNAME:?GHCR_USERNAME is not set — the GitHub account to docker-login with (see .env.example)}"
 
 echo ">>> [$LABEL] $SSH_TARGET — pull $IMAGE from GHCR"
 # Log in only when a PAT is provided (private package); public needs none. Pipe
