@@ -12,6 +12,12 @@
 # spawns. Re-run after edits to pick up changes (Go/deps still need --build).
 services:
   server:
+    # Tells the server it is running mounted working-tree code, so the About tab
+    # can say so. Without it the build-time version/revision/image_tag stamps
+    # describe the BASE IMAGE while the Python actually encoding is whatever is
+    # on disk — committed or not. Only this overlay sets it.
+    environment:
+      DEV_MOUNT: "1"
     volumes:
       - ./scripts/infinite_streaming_encoder:/app/scripts/infinite_streaming_encoder:ro
       - ./static:/app/static:ro

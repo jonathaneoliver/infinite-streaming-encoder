@@ -14,6 +14,10 @@ __pycache__/
 # Playwright MCP browser-automation console logs — local only, not source.
 .playwright-mcp/
 
+# Written by publish-tag: the tag it last pushed, so `make promote` needs no
+# argument. Local state about a local action.
+.last-published-tag
+
 # transient Claude worktrees
 .claude/worktrees/
 # untracked comparison doc — never commit

@@ -173,6 +173,7 @@ func main() {
 	srv.ImageTag = imageTag
 	srv.CloudImage = *dockerImage
 	srv.GHCRImage = *ghcrImage
+	srv.DevMount = os.Getenv("DEV_MOUNT") == "1"
 
 	log.Printf("encoder server %s (%s, image %s) listening on %s", version, gitSha, imageTag, *addr)
 	log.Printf("  source: %s", *sourceDir)

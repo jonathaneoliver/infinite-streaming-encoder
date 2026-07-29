@@ -238,9 +238,18 @@ publish: require-ghcr   ## build once (multi-arch) → GHCR always, ECR when clo
 		$$ecr_tags --push . ; \
 	echo "Published GHCR ($(GHCR_IMAGE)) :latest :$(VERSION) :$(GIT_SHA) :$(IMAGE_TAG)$$ecr_note [$(PLATFORMS)]"
 
-publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :latest alone (TAG=<name>)
+publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :latest alone (TAG=<name>, SKIP_ECR=1, ALSO_TAG=<alias> GHCR-only)
 	@: $${TAG:?TAG is not set — e.g. TAG=test-145. Use a name that cannot be mistaken for a release}
 	@: $${GHCR_PAT:?GHCR_PAT is not set — create a classic PAT with write:packages scope}
+	@# Validate here rather than at each caller: this is the single choke point
+	@# for every tagged push (GHCR + ECR), so it also catches a hand-passed TAG.
+	@# An invalid tag otherwise fails deep inside buildx, after the build.
+	@for t in '$(TAG)' $(if $(ALSO_TAG),'$(ALSO_TAG)'); do \
+	  printf '%s' "$$t" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$$' || { \
+	    echo "!!! TAG='$$t' is not a valid Docker tag."; \
+	    echo "    Must match [A-Za-z0-9_][A-Za-z0-9._-]{0,127} — no '/', no leading '.' or '-'."; \
+	    exit 1; }; \
+	done
 	@# Testing lane. `publish` moves :latest, which is public AND what remote
 	@# workers pull via REMOTE_IMAGE — so publishing an unvalidated build there
 	@# hands it to every consumer at once. This pushes exactly one tag and
@@ -252,7 +261,10 @@ publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :lates
 	@docker buildx inspect encoder-builder >/dev/null 2>&1 || \
 		docker buildx create --name encoder-builder --driver docker-container >/dev/null
 	@set -e; ecr_tags=""; ecr_note=""; \
-	if echo "$(ECR_REPO)" | grep -qE '\.dkr\.ecr\.'; then \
+	if [ -n "$(SKIP_ECR)" ]; then \
+	  echo ">>> SKIP_ECR — GHCR only (ECR untouched)"; \
+	  ecr_note=" (ECR skipped)"; \
+	elif echo "$(ECR_REPO)" | grep -qE '\.dkr\.ecr\.'; then \
 	  echo ">>> cloud configured — pushing ECR ($(ECR_REPO)):$(TAG) too, so a Batch job def can point at it"; \
 	  aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(ECR_REGISTRY); \
 	  ecr_tags="--tag $(ECR_REPO):$(TAG)"; \
@@ -260,8 +272,9 @@ publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :lates
 	fi; \
 	docker buildx build --builder encoder-builder --platform $(PLATFORMS) \
 		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(GIT_SHA) --build-arg IMAGE_TAG=$(TAG) \
-		--tag $(GHCR_IMAGE):$(TAG) $$ecr_tags --push . ; \
-	echo "Published GHCR ($(GHCR_IMAGE)):$(TAG)$$ecr_note [$(PLATFORMS)] — :latest UNCHANGED"; \
+		--tag $(GHCR_IMAGE):$(TAG) $(if $(ALSO_TAG),--tag $(GHCR_IMAGE):$(ALSO_TAG)) $$ecr_tags --push . ; \
+	printf '%s' '$(TAG)' > $(LAST_TAG_FILE); \
+	echo "Published GHCR ($(GHCR_IMAGE)):$(TAG)$(if $(ALSO_TAG), + alias :$(ALSO_TAG) [GHCR only])$$ecr_note [$(PLATFORMS)] — :latest UNCHANGED"; \
 	echo "   cloud test:  cd ~/Projects/Encoder \\"; \
 	echo "                  && make infra-plan IMAGE_TAG=$(TAG) && make infra-apply"
 
@@ -339,7 +352,7 @@ STATE_MACHINE_ARN ?= $(shell cd $(TF_DIR) && tofu output -no-color -raw state_ma
 USE_AMI ?=
 
 .PHONY: ladder-audit ladder-audit-all
-.PHONY: publish-tag cloud-dev-up cloud-dev-down cloud-promote
+.PHONY: publish-tag promote cloud-dev-up cloud-dev-down cloud-promote
 .PHONY: ecr-login ecr-publish infra-init infra-plan infra-apply deploy deploy-review timing cpu-report cloud-up cloud-clear cloud-down cloud-check ami-up ami-down
 
 # Resolve the pre-baked worker AMI for the CURRENT image tag, if one exists.
@@ -389,7 +402,44 @@ infra-apply:          ## apply the saved tf.plan (run only after reviewing the p
 # points ONLY the Batch job definitions at it, leaving :latest serving the
 # known-good image throughout. Rolling back is re-applying the previous tag;
 # nothing was overwritten, so there is nothing to restore.
-CLOUD_DEV_TAG ?= dev-$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null | tr -cd 'A-Za-z0-9-' | cut -c1-20)-$(GIT_SHA)
+# Throwaway tag for the testing lanes (cloud-dev-up, farm-test-up). Derived from
+# branch + sha so it is self-describing and cannot be mistaken for a release, and
+# shared so a farm test and a cloud test of the same tree name the same image.
+# Non-alphanumerics become '-' rather than being deleted, so `feat/x` reads as
+# `feat-x` instead of `featx`. (sed uses | as its delimiter, not the usual /,
+# because make treats an unescaped # as a comment even inside $(shell ...).)
+# Branch slug: lowercase, every non-alphanumeric becomes '-', runs of '-'
+# collapsed, leading/trailing '-' trimmed (before AND after the length cut, so a
+# truncation landing on a separator can't leave one dangling). Empty (detached
+# HEAD, no git) falls back to 'nobranch' so the tag never contains an empty
+# segment. Result feeds a Docker tag, which must match
+# [A-Za-z0-9_][A-Za-z0-9._-]{0,127} — publish-tag enforces that on every tag.
+DEV_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null \
+	| tr 'A-Z' 'a-z' \
+	| sed -e 's|[^a-z0-9]|-|g' -e 's|--*|-|g' -e 's|^-||' -e 's|-$$||' \
+	| cut -c1-20 | sed 's|-$$||')
+# The sha names the last COMMIT, but these lanes build the WORKING TREE — so a
+# tag can otherwise claim a commit whose contents it doesn't carry, and two
+# different trees at the same HEAD collide on one tag (farm-test-up always
+# republishes, so the second silently overwrites the first). The -dirty suffix
+# keeps the tag honest without forcing a commit. Ignored files don't count;
+# `git status --porcelain` lists tracked edits + untracked-but-not-ignored.
+DEV_DIRTY := $(shell git status --porcelain 2>/dev/null | grep -q . && echo dirty)
+DEV_TAG ?= dev-$(if $(DEV_BRANCH),$(DEV_BRANCH),nobranch)-$(GIT_SHA)$(if $(DEV_DIRTY),-dirty)
+
+# Moving alias for the branch's most recent test build, so a second box can pull
+# without being handed a sha. Costs no storage: an extra tag on the SAME manifest
+# is not an extra image, and registries expire by image. GHCR ONLY, deliberately
+# (see ALSO_TAG in publish-tag) — a moving tag in ECR would let an already-
+# registered Batch job definition change what it runs with no infra-apply,
+# collapsing publish and deploy back into one act (#144).
+DEV_TEST_TAG ?= dev-$(if $(DEV_BRANCH),$(DEV_BRANCH),nobranch)-test
+
+# What publish-tag last pushed, so `make promote` needs no argument. DEV_TAG is
+# NOT a usable default: you test dirty, then COMMIT, which changes the sha and
+# drops -dirty — so by promote time DEV_TAG names a tag that was never pushed.
+LAST_TAG_FILE := .last-published-tag
+CLOUD_DEV_TAG ?= $(DEV_TAG)
 
 cloud-dev-up:         ## test cloud from your WORKING TREE under a throwaway tag (:latest untouched)
 	@# Guard 1: tofu state. State is shared in S3, so any checkout can drive it —
@@ -438,16 +488,85 @@ cloud-dev-down:       ## put cloud back on the image tag it ran before cloud-dev
 	  echo ">>> [cloud-dev-down] restoring cloud to :$$prev"; \
 	  $(MAKE) infra-plan IMAGE_TAG=$$prev && $(MAKE) infra-apply
 
-cloud-promote: require-ghcr ## make a TESTED tag the one users get: re-tag it to :latest (FROM=<tag>)
-	@: $${FROM:?FROM is not set — the tag you tested, e.g. FROM=dev-my-branch-abc1234}
-	@# RE-TAG, never rebuild. Rebuilding produces a different image from the one
-	@# that passed, which defeats the entire point of having tested it.
-	@echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin
-	docker buildx imagetools create --tag $(GHCR_IMAGE):latest $(GHCR_IMAGE):$(FROM)
-	@a=$$(docker buildx imagetools inspect $(GHCR_IMAGE):latest --raw | shasum -a 256 | cut -c1-16); \
-	  b=$$(docker buildx imagetools inspect $(GHCR_IMAGE):$(FROM) --raw | shasum -a 256 | cut -c1-16); \
-	  if [ "$$a" = "$$b" ]; then echo ">>> :latest is now byte-identical to :$(FROM) ($$a)"; \
-	  else echo "!!! digest mismatch — :latest=$$a :$(FROM)=$$b"; exit 1; fi
+# Make a TESTED image the released one. RE-TAG, never rebuild: rebuilding
+# produces a different image from the one that passed, which defeats the point
+# of having tested it (#144).
+#
+# FROM defaults to whatever publish-tag last pushed. Mirrors `publish`'s tag
+# sets exactly, so a promoted image is indistinguishable from a published one —
+# GHCR carries :latest :$(VERSION) :<sha> :<IMAGE_TAG>, ECR only :latest and
+# :<IMAGE_TAG> (the tag Terraform pins by; VERSION/sha are for humans reading
+# the public package).
+#
+# Refuses to half-promote. publish-tag skips ECR when cloud is unconfigured or
+# SKIP_ECR=1 (farm-test-up), so FROM may exist on GHCR alone — moving GHCR
+# :latest while cloud stayed pinned to something older is the worst outcome, so
+# that case stops and asks for GHCR_ONLY=1.
+promote: require-ghcr ## release a TESTED tag: re-tag it (never rebuild) on GHCR + ECR (FROM=<tag>, default: last publish-tag)
+	@# dg() must distinguish "missing" from "empty": `imagetools inspect` on an
+	@# absent tag prints nothing, and shasum of empty input is a perfectly valid
+	@# hash (e3b0c442...), so hashing first silently turns "not found" into a
+	@# digest that simply never matches. Test the raw manifest, then hash it.
+	@dg() { r=$$(docker buildx imagetools inspect "$$1" --raw 2>/dev/null); \
+	        [ -n "$$r" ] || return 1; printf '%s' "$$r" | shasum -a 256 | cut -c1-16; }; \
+	  from="$(FROM)"; src="explicit FROM="; \
+	  if [ -z "$$from" ] && [ -f $(LAST_TAG_FILE) ]; then from=$$(cat $(LAST_TAG_FILE)); src="$(LAST_TAG_FILE)"; fi; \
+	  if [ -z "$$from" ]; then \
+	    echo "!!! FROM is not set and $(LAST_TAG_FILE) is missing."; \
+	    echo "    Pass FROM=<tag>, or publish one first (make publish-tag / farm-test-up / cloud-dev-up)."; \
+	    exit 1; fi; \
+	  echo ">>> promoting FROM=$$from   (source: $$src)"; \
+	  echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin >/dev/null; \
+	  gsrc=$$(dg $(GHCR_IMAGE):$$from) || { echo "!!! $(GHCR_IMAGE):$$from not found in GHCR"; exit 1; }; \
+	  gold=$$(dg $(GHCR_IMAGE):latest || echo "<none>"); \
+	  echo "    GHCR :latest  $$gold -> $$gsrc"; \
+	  do_ecr=""; esrc=""; \
+	  if [ -z "$(GHCR_ONLY)" ] && echo "$(ECR_REPO)" | grep -qE '\.dkr\.ecr\.'; then \
+	    aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(ECR_REGISTRY) >/dev/null; \
+	    esrc=$$(dg $(ECR_REPO):$$from) || { \
+	      echo "!!! cloud is configured but $(ECR_REPO):$$from does NOT exist."; \
+	      echo "    That build never reached ECR — farm-test-up and SKIP_ECR=1 publish GHCR only."; \
+	      echo "    Validate it for cloud with 'make cloud-dev-up', or promote GHCR alone:"; \
+	      echo "      make promote FROM=$$from GHCR_ONLY=1"; \
+	      exit 1; }; \
+	    eold=$$(dg $(ECR_REPO):latest || echo "<none>"); \
+	    echo "    ECR  :latest  $$eold -> $$esrc"; \
+	    do_ecr=1; \
+	  else echo "    ECR  skipped$(if $(GHCR_ONLY), (GHCR_ONLY=1), (cloud not configured))"; fi; \
+	  docker buildx imagetools create \
+	    --tag $(GHCR_IMAGE):latest --tag $(GHCR_IMAGE):$(VERSION) \
+	    --tag $(GHCR_IMAGE):$(GIT_SHA) --tag $(GHCR_IMAGE):$(IMAGE_TAG) \
+	    $(GHCR_IMAGE):$$from; \
+	  if [ -n "$$do_ecr" ]; then \
+	    docker buildx imagetools create \
+	      --tag $(ECR_REPO):latest --tag $(ECR_REPO):$(IMAGE_TAG) $(ECR_REPO):$$from; \
+	  fi; \
+	  fail=0; \
+	  for t in latest $(VERSION) $(GIT_SHA) $(IMAGE_TAG); do \
+	    d=$$(dg $(GHCR_IMAGE):$$t || echo "<missing>"); \
+	    [ "$$d" = "$$gsrc" ] || { echo "!!! GHCR :$$t = $$d, expected $$gsrc"; fail=1; }; \
+	  done; \
+	  if [ -n "$$do_ecr" ]; then \
+	    for t in latest $(IMAGE_TAG); do \
+	      d=$$(dg $(ECR_REPO):$$t || echo "<missing>"); \
+	      [ "$$d" = "$$esrc" ] || { echo "!!! ECR :$$t = $$d, expected $$esrc"; fail=1; }; \
+	    done; \
+	  fi; \
+	  [ $$fail -eq 0 ] || { echo "!!! promotion did not verify — tags above may be inconsistent"; exit 1; }; \
+	  echo ">>> promoted :$$from -> GHCR :latest :$(VERSION) :$(GIT_SHA) :$(IMAGE_TAG)$$( [ -n "$$do_ecr" ] && echo "  + ECR :latest :$(IMAGE_TAG)" )"; \
+	  echo "    every tag verified byte-identical to the source ($$gsrc)"; \
+	  if [ -n "$$do_ecr" ]; then \
+	    echo ""; \
+	    echo "    cloud is a SEPARATE act — Batch still runs its pinned tag until:"; \
+	    echo "      make infra-plan IMAGE_TAG=$(IMAGE_TAG) && make infra-apply"; \
+	  fi
+
+# DEPRECATED: superseded by `promote`, which also covers ECR and the sha/VERSION
+# tags. The name was always a misnomer — it re-tags GHCR :latest, which is what
+# the FARM pulls; cloud is pinned via Terraform and unaffected by GHCR tags.
+cloud-promote: ## DEPRECATED alias for `promote` (FROM=<tag>)
+	@echo ">>> cloud-promote is deprecated — use 'make promote FROM=$(FROM)'"
+	@$(MAKE) promote FROM=$(FROM)
 
 cloud-down: require-s3-bucket ## FULL teardown -> $0/mo (no prompt): tofu destroy -auto-approve + remove AMI
 	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu destroy -auto-approve \
@@ -732,7 +851,7 @@ dist-deploy-ghcr: require-ghcr ## GHCR-pull workers on each DIST_WORKERS box (no
 # live into the server + worker — re-run after edits (Go/deps still need --build).
 # `make farm-down` / `farm-dev-down` are the inverse (local stack + remote workers);
 # teardown is mode-agnostic so they're the same operation.
-.PHONY: farm-up farm-dev-up farm-dev-down farm-down
+.PHONY: farm-up farm-test-up farm-dev-up farm-dev-down farm-down
 
 farm-up: require-paths require-ghcr ## bring the whole master farm up from GHCR (cluster + server + worker), + DIST_WORKERS
 	@echo ">>> [farm-up] pulling images + bringing up the master profile (cluster + server + worker) from GHCR..."
@@ -742,6 +861,35 @@ farm-up: require-paths require-ghcr ## bring the whole master farm up from GHCR 
 	@echo ">>> [farm-up] remote workers (from GHCR)..."
 	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-ghcr; else echo "    (no DIST_WORKERS — master-only farm)"; fi
 	@echo ">>> farm up:  UI http://localhost:$(PORT)   Temporal UI http://localhost:$${TEMPORAL_UI_PORT:-8233}"
+
+# Third farm mode, between farm-up (:latest, known-good) and farm-dev-up (local
+# build with the code bind-mounted). This builds your working tree, publishes it
+# under ONE throwaway tag, and runs the farm on that published image with NO code
+# mount — so it exercises the image as shipped and catches what farm-dev-up
+# structurally cannot: a file missing from the Dockerfile COPY set, or a
+# requirements.txt dep that only exists in your working tree.
+#
+# Same shape as cloud-dev-up: publish-tag then point one consumer at it, leaving
+# :latest serving the known-good image throughout (#144).
+#
+# ALWAYS republishes rather than reusing an existing tag. Reusing would mean a
+# re-run after an edit silently tests the previous build — the exact failure this
+# target exists to catch.
+farm-test-up: TAG ?= $(DEV_TAG)
+farm-test-up: require-paths require-ghcr ## build+publish your WORKING TREE under one tag and run the farm on it (:latest untouched) (TAG=<name>, defaults to $(DEV_TAG))
+	@: $${TAG:?TAG resolved empty — pass TAG=<name> explicitly}
+	@# SKIP_ECR: the farm pulls GHCR exclusively. Pushing ECR here would spend
+	@# slots in its `keep last 10` lifecycle rule — enough farm iterations would
+	@# expire images cloud still has history in, for an image cloud never runs.
+	$(MAKE) publish-tag TAG=$(TAG) SKIP_ECR=1 ALSO_TAG=$(DEV_TEST_TAG)
+	@ref="$(GHCR_IMAGE):$(TAG)"; \
+	  digest=$$(docker buildx imagetools inspect "$$ref" 2>/dev/null | awk '/^Digest:/{print $$2; exit}'); \
+	  echo ">>> [farm-test-up] $$ref"; \
+	  echo ">>> [farm-test-up] digest $$digest   (tags are mutable — this is what actually runs)"
+	$(MAKE) farm-up REMOTE_IMAGE=$(GHCR_IMAGE):$(TAG)
+	@echo ">>> farm-test-up complete on :$(TAG) — :latest UNCHANGED. Back to known-good:  make farm-up"
+	@echo "    alias :$(DEV_TEST_TAG) also points here — pull that from another box without a sha."
+	@echo "    (the farm RUNS the immutable :$(TAG), so this run stays reproducible)"
 
 farm-dev-up: require-paths   ## dev farm from your WORKING TREE (uncommitted): local build + live-mounted code
 	@echo ">>> [farm-dev-up] building from working tree + bringing up the master profile with live code..."

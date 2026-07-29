@@ -32,6 +32,11 @@ type Server struct {
 	// cloud worker image's — the worker image is an ECR ref imageinfo can't
 	// query, but publish keeps ECR + GHCR in sync by tag.
 	GHCRImage string
+	// DevMount is set when the compose dev overlay bind-mounts working-tree code
+	// over the image's copy (make farm-dev-up). The version stamps below then
+	// describe the base image only — the Python actually running is whatever is
+	// on disk, committed or not — so the About tab has to say so.
+	DevMount bool
 
 	imageInfo *imageinfo.Client
 
@@ -147,6 +152,9 @@ func (s *Server) getVersion(w http.ResponseWriter, r *http.Request) {
 		// the option when false — mirrors the submit-time guard in job.go so a
 		// local-only install doesn't offer a target that can't work.
 		"cloud_configured": s.Manager.StateMachineArn != "",
+		// Working-tree code is mounted over the image's: the stamps above
+		// describe the base image, not what is executing.
+		"dev_mount": s.DevMount,
 	}
 	if s.CloudImage != "" {
 		// imageinfo reads OCI labels only from GHCR. The cloud image is an ECR
