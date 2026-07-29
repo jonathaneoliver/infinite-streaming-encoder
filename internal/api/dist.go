@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/encode"
 )
 
 // distMachine is a distributed-local worker box the server knows how to control.
@@ -103,8 +105,26 @@ func (s *Server) distWorkers(w http.ResponseWriter, r *http.Request) {
 		on++
 		out = append(out, machineOut{Name: name, On: true})
 	}
-	writeJSON(w, map[string]any{"count": on, "machines": out,
-		"fleet": s.Manager.FleetCPU()})
+	// Filter the CPU history to LOCAL machines. Manager.FleetCPU is one map keyed
+	// by machine, shared with the cloud inventory on purpose (attachFleetCPU) so
+	// both targets carry identical data in an identical shape. It therefore also
+	// holds EC2 instance ids once a cloud encode is running, and returning it
+	// whole listed those instances as local boxes — 7 "machines", 72 "cores".
+	//
+	// Filtering on membership rather than an "i-" prefix: `local` is exactly the
+	// set this handler already built from configured machines plus active
+	// Temporal pollers, and a cloud instance is neither.
+	local := make(map[string]bool, len(out))
+	for _, mo := range out {
+		local[mo.Name] = true
+	}
+	fleet := []encode.FleetCPUEntry{}
+	for _, e := range s.Manager.FleetCPU() {
+		if local[e.Machine] {
+			fleet = append(fleet, e)
+		}
+	}
+	writeJSON(w, map[string]any{"count": on, "machines": out, "fleet": fleet})
 }
 
 // toggleDistWorker enables/disables a machine's worker. Disable HARD-stops the

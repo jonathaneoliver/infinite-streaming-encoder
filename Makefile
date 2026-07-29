@@ -308,9 +308,21 @@ IMAGE_TAG := $(shell git log -1 --format=%h -- Dockerfile requirements.txt scrip
 # local IMAGE_TAG would break the legacy target whenever a bare `make restart`
 # advanced it to a tag that was only built locally, never pushed. A sha (not
 # :latest) so the shared-AMI lookup, which keys on image_tag, still matches.
+#
+# Two guards against untagged images, which are common here: pushing a tag
+# untags its predecessor rather than deleting it, so the NEWEST image in the
+# repo is frequently untagged.
+#   [?imageTags]  - consider only images that still have a tag. Without it the
+#                   query returns the newest image whatever its state, and an
+#                   untagged one yields nothing usable.
+#   ^None$        - `--output text` prints the literal string None for an
+#                   image with no tags, which would otherwise pass through as
+#                   a tag name. DOCKER_IMAGE then became <repo>:None — a 404
+#                   in the About tab and an unpullable ref for the legacy
+#                   single-instance cloud target.
 ECR_PUSHED_TAG := $(shell aws ecr describe-images --repository-name infinite-streaming-encoder-worker \
-	--region $(AWS_REGION) --query 'reverse(sort_by(imageDetails,&imagePushedAt))[0].imageTags' \
-	--output text 2>/dev/null | tr '\t' '\n' | grep -v '^latest$$' | head -1)
+	--region $(AWS_REGION) --query 'reverse(sort_by(imageDetails[?imageTags],&imagePushedAt))[0].imageTags' \
+	--output text 2>/dev/null | tr '\t' '\n' | grep -v '^latest$$' | grep -v '^None$$' | head -1)
 
 # Image the LEGACY (single-instance) cloud target pulls on the remote — the
 # same ECR image the Batch target runs (PAT-free, apples-to-apples). Defaults
