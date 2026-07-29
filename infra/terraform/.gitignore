@@ -1,7 +1,16 @@
-# Terraform state lives in S3 (configured in versions.tf) — local
-# scratch files shouldn't be checked in.
+# Machine-local working files: provider binaries, state, crash dumps. State is
+# whatever the backend resolves to — the S3 block in versions.tf, or a local
+# backend if an (also ignored) backend_override.tf is present. Either way the
+# state itself never belongs in git.
+#
+# NOTE: .terraform.lock.hcl is deliberately NOT ignored — it's a dependency
+# manifest, not scratch (the go.sum of this directory). Tracking it pins the
+# exact provider build the stack was last validated against, rather than
+# letting every clone re-resolve the `~> 6.56` range to a different 6.x. It
+# also makes constraint/lock drift show up as a PR diff: dependabot bumps the
+# constraint in versions.tf but does not maintain the lock, and the two silently
+# disagreed for five days in Jul 2026 until a `tofu init` failed on it.
 .terraform/
-.terraform.lock.hcl
 *.tfstate
 *.tfstate.backup
 crash.log
