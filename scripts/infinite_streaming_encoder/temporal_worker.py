@@ -212,11 +212,24 @@ def encode_phase(spec: dict) -> list[str]:
                 del tail[:-60]
             if last.startswith("[[ENCODER"):
                 print(last, flush=True)
-                # Collect for the return value — everything EXCEPT STAGE, which
-                # the orchestrator already derives. Deliberately not a whitelist
-                # of known markers: the whole class of bug in #141 is that a new
-                # marker is silently dropped until someone notices.
-                if not last.startswith("[[ENCODER-STAGE "):
+                # Collect for the return value. Deliberately an EXCLUDE list,
+                # not a whitelist: the whole class of bug in #141 is that a new
+                # marker gets silently dropped until someone notices.
+                #
+                # Excluded because the orchestrator ALREADY produces these on
+                # the Temporal path, from channels that carry them live:
+                #   STAGE — reconstructed from workflow history, plus live % on
+                #           the heartbeat. A relayed copy would arrive at
+                #           completion and fight the live value with stale data.
+                #   FLEET — emitted by _emit_fleet_cpu from heartbeat details.
+                #           CPU is a GAUGE: it is only meaningful while the
+                #           activity runs, and recordFleetCPU stamps arrival
+                #           time, so a copy relayed at completion would register
+                #           a stale reading as current. Harmless today only
+                #           because IMDS is unavailable off-EC2 so local workers
+                #           never emit it — too fragile to rely on, since a
+                #           local-dist worker CAN run on an EC2 box.
+                if not last.startswith(("[[ENCODER-STAGE ", "[[ENCODER-FLEET ")):
                     relay.append(last)
                 # cli_phase's run_ffmpeg_with_progress emits ENCODER-STAGE with the
                 # live out_time/duration %. Capture it so the orchestrator can show
