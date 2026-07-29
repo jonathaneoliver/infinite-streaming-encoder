@@ -11,8 +11,11 @@ If the source is padded out to a segment boundary, we additionally
 draw a large red "PADDING" label in the top-right, only enabled for
 `t >= content_duration` (i.e. visible on padded frames only).
 
-VMAF burn-in is plumbed through for parity but currently unused — the
-reference bash script left the drawtext call commented out.
+The VMAF row shows a DESIGN-TIME estimate interpolated from the quality
+curves (`VMAF~93`), or the nearest measured endpoint when the rung sits above
+the curve (`VMAF>=97`) — not the measured VMAF of this encode. It is optional:
+`has_vmaf` gates the row and the layers below close the gap, so an absent
+estimate yields a valid overlay with one fewer line.
 """
 from __future__ import annotations
 

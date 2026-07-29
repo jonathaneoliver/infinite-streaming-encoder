@@ -30,16 +30,24 @@ type ladderRung struct {
 // wants a number) and is a banded, rank-of-predicted-wall priority — assigned in
 // buildSFNInput so the heaviest variant strictly outranks the merely-heavy.
 type sfnVariant struct {
-	Codec    string `json:"codec"`
-	Label    string `json:"label"`
-	Width    string `json:"width"`
-	Height   string `json:"height"`
-	Bitrate  string `json:"bitrate"`
-	Preset   string `json:"preset"`
-	VCPU     string `json:"vcpu"`
-	Memory   string `json:"memory"`
-	Priority int    `json:"priority"`
-	TwoPass  string `json:"two_pass"`
+	Codec   string `json:"codec"`
+	Label   string `json:"label"`
+	Width   string `json:"width"`
+	Height  string `json:"height"`
+	Bitrate string `json:"bitrate"`
+	Preset  string `json:"preset"`
+	VCPU    string `json:"vcpu"`
+	Memory  string `json:"memory"`
+	// Design-time VMAF estimate from the quality curves, for the burn-in overlay
+	// — the cloud twin of local-dist's --est-vmaf (see Manager.vmafEstimateArgs).
+	// Strings because Batch container-override Environment values must be, and
+	// NEVER omitempty: the state machine references $$.Map.Item.Value.est_vmaf
+	// unconditionally, so a missing key fails the execution rather than
+	// degrading. "" means no estimate, which cli_phase reads as no overlay row.
+	EstVmaf        string `json:"est_vmaf"`
+	EstVmafClamped string `json:"est_vmaf_clamped"`
+	Priority       int    `json:"priority"`
+	TwoPass        string `json:"two_pass"`
 	// ExtraArgs is the ladder profile's per-codec raw ffmpeg args for THIS
 	// variant's codec (resolved from LadderDef.ExtraArgs[codec]; "" = none).
 	// Travels to the worker as the EXTRA_ARGS container env, alongside TWO_PASS.
