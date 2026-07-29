@@ -251,6 +251,17 @@ publish-tag:          ## push a build under ONE explicit tag, leaving :latest al
 # ---------------------------------------------------------------------------
 AWS_REGION ?= us-west-2
 TF_DIR := infra/terraform
+
+# Terraform state backend (S3 + DynamoDB lock). TFSTATE_BUCKET has NO default on
+# purpose: S3 bucket names are globally unique across all of AWS, so a name baked
+# into this repo could only ever work for one account — everyone else would get a
+# bucket they don't own. Same reasoning as S3_BUCKET, and it lives in .env for the
+# same reason. The key and table names are namespaced under the bucket, so those
+# CAN have defaults. Bootstrap instructions: infra/terraform/README.md.
+TFSTATE_BUCKET ?=
+TFSTATE_KEY    ?= encoder/batch.tfstate
+TFSTATE_TABLE  ?= terraform-lock
+
 # ECR repo URL for the Batch worker image — resolved from tofu state, or set
 # in .env to override. ECR_REGISTRY is the host part (for docker login).
 # -no-color so a colorized tofu warning can never leak ANSI escapes into the
@@ -317,8 +328,14 @@ ecr-login:
 # existing muscle-memory and any external scripts keep working.
 ecr-publish: publish   ## DEPRECATED alias for `publish` (pushes ECR when cloud is configured)
 
-infra-init:           ## tofu init (local backend override, if present)
-	cd $(TF_DIR) && tofu init
+infra-init:           ## tofu init against the S3 backend (needs TFSTATE_BUCKET in .env)
+	@: $${TFSTATE_BUCKET:?TFSTATE_BUCKET is not set — create a state bucket you own \
+	(S3 names are globally unique) and set it in .env. See infra/terraform/README.md}
+	cd $(TF_DIR) && tofu init \
+		-backend-config="bucket=$(TFSTATE_BUCKET)" \
+		-backend-config="key=$(TFSTATE_KEY)" \
+		-backend-config="region=$(AWS_REGION)" \
+		-backend-config="dynamodb_table=$(TFSTATE_TABLE)"
 
 infra-plan:           ## tofu plan -> tf.plan (review before infra-apply)
 	@echo ">>> image_tag=$(IMAGE_TAG)  worker_ami_id=$(if $(WORKER_AMI),$(WORKER_AMI),<none, pull-on-boot>)"
@@ -341,13 +358,17 @@ infra-apply:          ## apply the saved tf.plan (run only after reviewing the p
 CLOUD_DEV_TAG ?= dev-$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null | tr -cd 'A-Za-z0-9-' | cut -c1-20)-$(GIT_SHA)
 
 cloud-dev-up:         ## test cloud from your WORKING TREE under a throwaway tag (:latest untouched)
-	@# Guard 1: tofu state. The backend is local and lives in the main checkout,
-	@# so running this from a worktree would init an EMPTY state and then try to
-	@# CREATE infrastructure that already exists — worse than failing outright.
-	@test -f $(TF_DIR)/terraform.tfstate || { \
-	  echo "!!! no tofu state in $(TF_DIR) — the backend is local and lives in the"; \
-	  echo "    MAIN checkout. Run this from ~/Projects/Encoder, not a worktree."; \
-	  exit 1; }
+	@# Guard 1: tofu state. State is shared in S3, so any checkout can drive it —
+	@# but only once THIS one has been `infra-init`ed (.terraform/ is per-checkout
+	@# and gitignored). Uninitialised, an apply would work from an EMPTY state and
+	@# try to CREATE infrastructure that already exists — worse than failing
+	@# outright. `state list` proves initialised AND non-empty in one call.
+	@n=$$(cd $(TF_DIR) && tofu state list 2>/dev/null | wc -l | tr -d ' '); \
+	  if [ "$$n" = "0" ]; then \
+	    echo "!!! tofu state is empty or the backend is not initialised in this checkout."; \
+	    echo "    Run: make infra-init   (needs TFSTATE_BUCKET in .env)"; \
+	    exit 1; \
+	  fi
 	@# Guard 2: in-flight executions. infra-apply deregisters the old job-def
 	@# revisions, which FAILS a running Step Functions execution mid-encode.
 	@running=$$(aws stepfunctions list-executions --region $(AWS_REGION) \

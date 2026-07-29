@@ -13,6 +13,10 @@ crash.*.log
 # Variable overrides with secrets
 *.auto.tfvars
 *.tfvars
+
+# Escape hatch: drop a `terraform { backend "local" {} }` here to bypass the S3
+# backend (bootstrapping a fresh account before the state bucket exists, or
+# recovering if S3 is unreachable). Local by definition — never committed.
 backend_override.tf
 
 # tofu plan artifact from `make infra-plan`
