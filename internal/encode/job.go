@@ -2226,6 +2226,35 @@ func (cfg *JobConfig) localChunkSeconds() float64 {
 // range → nearest endpoint, not an interpolation) makes it render as VMAF≥N.
 // Empty when there are no curves. clip="" → the store's current curve, so an
 // estimate is available for every job (seeded), matching the UI's Ladders tab.
+// vmafEstimates returns the design-time VMAF estimate per "<codec>/<label>",
+// as (value, clamped). One source for both targets: vmafEstimateArgs formats
+// these into cli_local_dist flags, and buildSFNInput copies them onto each
+// sfnVariant for the cloud path — so the two cannot report different numbers
+// for the same rung. Empty when there are no curves or no ladder.
+func (m *Manager) vmafEstimates(cfg JobConfig) map[string][2]string {
+	if m.Curves == nil || m.Ladders == nil {
+		return nil
+	}
+	ladderName := cfg.Ladder
+	if ladderName == "" {
+		ladderName = "apple-uniq-live"
+	}
+	out := map[string][2]string{}
+	for _, codec := range parseCodecSel(cfg.Codec) {
+		for _, e := range m.LadderEstimates(ladderName, codec, 0, "") {
+			if e.Vmaf <= 0 {
+				continue
+			}
+			clamped := "0"
+			if e.Clamped {
+				clamped = "1"
+			}
+			out[codec+"/"+e.Label] = [2]string{strconv.FormatFloat(e.Vmaf, 'f', 1, 64), clamped}
+		}
+	}
+	return out
+}
+
 func (m *Manager) vmafEstimateArgs(cfg JobConfig) []string {
 	if m.Curves == nil || m.Ladders == nil {
 		return nil
@@ -2679,7 +2708,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// Source fps: keys the speed model (encode time ∝ frame count), so chunk
 		// sizes/priorities match the graviton keys learned at the same rate.
 		srcFps := probeSourceFps(localSrc)
-		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), srcWidth, srcFps, durationS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), job.AppendLog)
+		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), srcWidth, srcFps, durationS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), m.vmafEstimates(job.Config), job.AppendLog)
 		expectedEncodes = expEnc
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
@@ -2958,7 +2987,7 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin bool, sourceWidth, sourceFps int, clipDurationS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, logf func(string)) (string, int) {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin bool, sourceWidth, sourceFps int, clipDurationS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int) {
 	if ladderName == "" {
 		ladderName = "apple-uniq-live"
 	}
@@ -3047,20 +3076,24 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 				logf(chunkPlanLine(chunkCfg, c, r.Label, r.Height, twoPass, r.Preset, sourceFps, speeds, cs, nc, clipDurationS))
 			}
 			variants = append(variants, sfnVariant{
-				Codec:         c,
-				Label:         r.Label,
-				Width:         strconv.Itoa(r.Width),
-				Height:        strconv.Itoa(r.Height),
-				Bitrate:       strconv.Itoa(r.Bitrate),
-				Preset:        r.Preset,
-				VCPU:          vcpu,
-				Memory:        mem,
-				Priority:      0, // assigned by rank below
-				TwoPass:       strconv.FormatBool(twoPass),
-				ExtraArgs:     ladderDef.extraArgsFor(c),
-				ChunkIndices:  idx,
-				ChunkDuration: strconv.FormatFloat(cs, 'f', -1, 64),
-				Chunked:       strconv.FormatBool(nc > 1),
+				Codec:   c,
+				Label:   r.Label,
+				Width:   strconv.Itoa(r.Width),
+				Height:  strconv.Itoa(r.Height),
+				Bitrate: strconv.Itoa(r.Bitrate),
+				Preset:  r.Preset,
+				VCPU:    vcpu,
+				Memory:  mem,
+				// "" when the curves have no estimate for this rung; cli_phase
+				// then omits the overlay row rather than failing.
+				EstVmaf:        vmafEst[c+"/"+r.Label][0],
+				EstVmafClamped: vmafEst[c+"/"+r.Label][1],
+				Priority:       0, // assigned by rank below
+				TwoPass:        strconv.FormatBool(twoPass),
+				ExtraArgs:      ladderDef.extraArgsFor(c),
+				ChunkIndices:   idx,
+				ChunkDuration:  strconv.FormatFloat(cs, 'f', -1, 64),
+				Chunked:        strconv.FormatBool(nc > 1),
 			})
 		}
 	}

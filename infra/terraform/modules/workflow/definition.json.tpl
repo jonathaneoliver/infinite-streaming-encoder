@@ -108,6 +108,8 @@
                 "partial_duration.$": "$.partial_duration",
                 "gop_duration.$": "$.gop_duration",
                 "burnin.$": "$.burnin",
+                "est_vmaf.$": "$$.Map.Item.Value.est_vmaf",
+                "est_vmaf_clamped.$": "$$.Map.Item.Value.est_vmaf_clamped",
                 "chunked.$": "$$.Map.Item.Value.chunked"
               },
               "ItemProcessor": {
@@ -150,7 +152,9 @@
                           { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" },
                           { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
                           { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" },
-                          { "Name": "BURNIN", "Value.$": "$.burnin" }
+                          { "Name": "BURNIN", "Value.$": "$.burnin" },
+                          { "Name": "EST_VMAF", "Value.$": "$.est_vmaf" },
+                          { "Name": "EST_VMAF_CLAMPED", "Value.$": "$.est_vmaf_clamped" }
                         ],
                         "ResourceRequirements": [
                           { "Type": "VCPU", "Value.$": "$.vcpu" },
@@ -219,7 +223,9 @@
                                 { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" },
                                 { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
                                 { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" },
-                                { "Name": "BURNIN", "Value.$": "$.burnin" }
+                                { "Name": "BURNIN", "Value.$": "$.burnin" },
+                                { "Name": "EST_VMAF", "Value.$": "$.est_vmaf" },
+                                { "Name": "EST_VMAF_CLAMPED", "Value.$": "$.est_vmaf_clamped" }
                               ],
                               "ResourceRequirements": [
                                 { "Type": "VCPU", "Value.$": "$.vcpu" },
