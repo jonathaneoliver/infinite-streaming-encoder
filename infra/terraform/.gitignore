@@ -17,3 +17,7 @@ backend_override.tf
 
 # tofu plan artifact from `make infra-plan`
 tf.plan
+
+# Written by cloud-dev-up: the image tag cloud ran BEFORE the test apply, so
+# cloud-dev-down can restore it exactly. Local state about a local experiment.
+.cloud-dev-prev-tag
