@@ -33,36 +33,76 @@ infra/terraform/
 
 ## One-time prerequisites
 
-1. An S3 bucket for Terraform state, and a DynamoDB table for state locking. Both must exist before `terraform init`:
+1. An S3 bucket for Terraform state, and a DynamoDB table for state locking. Both must exist before `make infra-init`.
+
+   Pick your own bucket name — S3 names are globally unique, so the one below is an example, not a default you can use. Substitute it throughout and put the result in the repo-root `.env` as `TFSTATE_BUCKET`.
 
    ```sh
-   aws s3 mb s3://infinitestream-tfstate --region us-west-2
+   BUCKET=your-tfstate-bucket        # must be globally unique; you own it
+   REGION=us-west-2
+
+   aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
+     --create-bucket-configuration LocationConstraint="$REGION"
+
+   # Versioning is THE recovery mechanism if state is deleted or corrupted.
+   # Not optional — without it, rebuilding state means `tofu import` × 55.
+   aws s3api put-bucket-versioning --bucket "$BUCKET" \
+     --versioning-configuration Status=Enabled
+
+   aws s3api put-public-access-block --bucket "$BUCKET" \
+     --public-access-block-configuration \
+     BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+   aws s3api put-bucket-encryption --bucket "$BUCKET" \
+     --server-side-encryption-configuration \
+     '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}'
+
    aws dynamodb create-table \
      --table-name terraform-lock \
      --attribute-definitions AttributeName=LockID,AttributeType=S \
      --key-schema AttributeName=LockID,KeyType=HASH \
      --billing-mode PAY_PER_REQUEST \
-     --region us-west-2
+     --region "$REGION"
    ```
 
-2. An S3 bucket for job I/O (the `s3_bucket` variable). Defaults to `infinitestream-encoding-staging` — the bucket the current cloud target already uses.
+   A **separate** bucket from the job-I/O one, deliberately. Job-I/O cleanup only sweeps `jobs/` and `mezz/`, so state stored alongside it would survive — but "safe by coincidence" is not how the file describing all your infrastructure should be protected.
+
+2. An S3 bucket for job I/O (the `s3_bucket` variable, `S3_BUCKET` in `.env`).
 
 ## Deploy
 
 ```sh
-cd infra/terraform
+make infra-init      # tofu init against the S3 backend (reads TFSTATE_* from .env)
+make infra-plan      # writes tf.plan — review it
+make infra-apply     # applies the saved plan
+```
 
-terraform init \
-  -backend-config="bucket=infinitestream-tfstate" \
+`infra-init` supplies the four `-backend-config` flags from `TFSTATE_BUCKET` / `TFSTATE_KEY` / `TFSTATE_TABLE` / `AWS_REGION`, so there is nothing to remember per checkout. It fails loudly if `TFSTATE_BUCKET` is unset.
+
+First apply creates all resources. Subsequent applies only touch what changed.
+
+### Working from a git worktree
+
+State is shared in S3, so **any** checkout can run infra commands — worktrees included. The one per-checkout step is `make infra-init`, because `.terraform/` (the backend handshake) is local and gitignored. Run it once in a new worktree and `infra-plan` / `infra-apply` / `cloud-dev-up` all work there.
+
+The DynamoDB lock means two checkouts applying at once is safe: the second blocks until the first releases, rather than both writing over each other.
+
+### Migrating an existing local state into S3
+
+Only relevant if you deployed before the S3 backend existed, i.e. you have a `backend_override.tf` and a `terraform.tfstate` in this directory. Do it with **no encode running**.
+
+```sh
+cd infra/terraform
+cp terraform.tfstate ~/tfstate-premigration-backup.json   # the escape hatch — take it
+rm backend_override.tf
+tofu init -migrate-state \
+  -backend-config="bucket=$TFSTATE_BUCKET" \
   -backend-config="key=encoder/batch.tfstate" \
   -backend-config="region=us-west-2" \
   -backend-config="dynamodb_table=terraform-lock"
-
-terraform plan
-terraform apply
 ```
 
-First apply creates all resources. Subsequent applies only touch what changed.
+Answer `yes` when it offers to copy the existing state to the new backend. Verify with `tofu state list` (should list every resource it did before) and `tofu plan` (should report no changes). If anything looks wrong, putting `backend_override.tf` and the copied state file back returns you exactly where you started.
 
 ## Push the encoder image into ECR
 
