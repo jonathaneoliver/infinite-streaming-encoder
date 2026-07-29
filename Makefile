@@ -238,16 +238,18 @@ publish: require-ghcr   ## build once (multi-arch) → GHCR always, ECR when clo
 		$$ecr_tags --push . ; \
 	echo "Published GHCR ($(GHCR_IMAGE)) :latest :$(VERSION) :$(GIT_SHA) :$(IMAGE_TAG)$$ecr_note [$(PLATFORMS)]"
 
-publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :latest alone (TAG=<name>, SKIP_ECR=1 for GHCR only)
+publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :latest alone (TAG=<name>, SKIP_ECR=1, ALSO_TAG=<alias> GHCR-only)
 	@: $${TAG:?TAG is not set — e.g. TAG=test-145. Use a name that cannot be mistaken for a release}
 	@: $${GHCR_PAT:?GHCR_PAT is not set — create a classic PAT with write:packages scope}
 	@# Validate here rather than at each caller: this is the single choke point
 	@# for every tagged push (GHCR + ECR), so it also catches a hand-passed TAG.
 	@# An invalid tag otherwise fails deep inside buildx, after the build.
-	@printf '%s' '$(TAG)' | grep -qE '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$$' || { \
-	  echo "!!! TAG='$(TAG)' is not a valid Docker tag."; \
-	  echo "    Must match [A-Za-z0-9_][A-Za-z0-9._-]{0,127} — no '/', no leading '.' or '-'."; \
-	  exit 1; }
+	@for t in '$(TAG)' $(if $(ALSO_TAG),'$(ALSO_TAG)'); do \
+	  printf '%s' "$$t" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$$' || { \
+	    echo "!!! TAG='$$t' is not a valid Docker tag."; \
+	    echo "    Must match [A-Za-z0-9_][A-Za-z0-9._-]{0,127} — no '/', no leading '.' or '-'."; \
+	    exit 1; }; \
+	done
 	@# Testing lane. `publish` moves :latest, which is public AND what remote
 	@# workers pull via REMOTE_IMAGE — so publishing an unvalidated build there
 	@# hands it to every consumer at once. This pushes exactly one tag and
@@ -270,8 +272,8 @@ publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :lates
 	fi; \
 	docker buildx build --builder encoder-builder --platform $(PLATFORMS) \
 		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(GIT_SHA) --build-arg IMAGE_TAG=$(TAG) \
-		--tag $(GHCR_IMAGE):$(TAG) $$ecr_tags --push . ; \
-	echo "Published GHCR ($(GHCR_IMAGE)):$(TAG)$$ecr_note [$(PLATFORMS)] — :latest UNCHANGED"; \
+		--tag $(GHCR_IMAGE):$(TAG) $(if $(ALSO_TAG),--tag $(GHCR_IMAGE):$(ALSO_TAG)) $$ecr_tags --push . ; \
+	echo "Published GHCR ($(GHCR_IMAGE)):$(TAG)$(if $(ALSO_TAG), + alias :$(ALSO_TAG) [GHCR only])$$ecr_note [$(PLATFORMS)] — :latest UNCHANGED"; \
 	echo "   cloud test:  cd ~/Projects/Encoder \\"; \
 	echo "                  && make infra-plan IMAGE_TAG=$(TAG) && make infra-apply"
 
@@ -411,6 +413,14 @@ DEV_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null \
 # `git status --porcelain` lists tracked edits + untracked-but-not-ignored.
 DEV_DIRTY := $(shell git status --porcelain 2>/dev/null | grep -q . && echo dirty)
 DEV_TAG ?= dev-$(if $(DEV_BRANCH),$(DEV_BRANCH),nobranch)-$(GIT_SHA)$(if $(DEV_DIRTY),-dirty)
+
+# Moving alias for the branch's most recent test build, so a second box can pull
+# without being handed a sha. Costs no storage: an extra tag on the SAME manifest
+# is not an extra image, and registries expire by image. GHCR ONLY, deliberately
+# (see ALSO_TAG in publish-tag) — a moving tag in ECR would let an already-
+# registered Batch job definition change what it runs with no infra-apply,
+# collapsing publish and deploy back into one act (#144).
+DEV_TEST_TAG ?= dev-$(if $(DEV_BRANCH),$(DEV_BRANCH),nobranch)-test
 CLOUD_DEV_TAG ?= $(DEV_TAG)
 
 cloud-dev-up:         ## test cloud from your WORKING TREE under a throwaway tag (:latest untouched)
@@ -784,13 +794,15 @@ farm-test-up: require-paths require-ghcr ## build+publish your WORKING TREE unde
 	@# SKIP_ECR: the farm pulls GHCR exclusively. Pushing ECR here would spend
 	@# slots in its `keep last 10` lifecycle rule — enough farm iterations would
 	@# expire images cloud still has history in, for an image cloud never runs.
-	$(MAKE) publish-tag TAG=$(TAG) SKIP_ECR=1
+	$(MAKE) publish-tag TAG=$(TAG) SKIP_ECR=1 ALSO_TAG=$(DEV_TEST_TAG)
 	@ref="$(GHCR_IMAGE):$(TAG)"; \
 	  digest=$$(docker buildx imagetools inspect "$$ref" 2>/dev/null | awk '/^Digest:/{print $$2; exit}'); \
 	  echo ">>> [farm-test-up] $$ref"; \
 	  echo ">>> [farm-test-up] digest $$digest   (tags are mutable — this is what actually runs)"
 	$(MAKE) farm-up REMOTE_IMAGE=$(GHCR_IMAGE):$(TAG)
 	@echo ">>> farm-test-up complete on :$(TAG) — :latest UNCHANGED. Back to known-good:  make farm-up"
+	@echo "    alias :$(DEV_TEST_TAG) also points here — pull that from another box without a sha."
+	@echo "    (the farm RUNS the immutable :$(TAG), so this run stays reproducible)"
 
 farm-dev-up: require-paths   ## dev farm from your WORKING TREE (uncommitted): local build + live-mounted code
 	@echo ">>> [farm-dev-up] building from working tree + bringing up the master profile with live code..."
