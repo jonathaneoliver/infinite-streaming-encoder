@@ -658,13 +658,14 @@ def collect() -> dict[str, Any]:
     fleet["spend_24h_usd"] = _sampled["spend_24h_usd"]
     fleet["history"] = _sampled["history"]
     fleet.update(_spot_and_reclaim_stats())  # saved_total_usd, reclaim_24h_pct, …
-    # Actual CPU (cores) + memory (GiB) from CloudWatch Container Insights, for
-    # the "real usage vs allocated" sparklines. Only when a box is up (else the
-    # cluster metrics are empty and it's a wasted call).
-    if any(i.get("state") == "running" for i in instances):
-        cluster = _ecs_cluster_name()
-        if cluster:
-            fleet["cw"] = _fleet_cw_series(cluster)
+    # NOTE: actual fleet CPU used to come from CloudWatch Container Insights here
+    # (_fleet_cw_series). That call outlived its function: #139 removed the
+    # definition as part of moving to custom CPU reporting on the worker
+    # heartbeat, but left the call site, so collect() raised NameError and the
+    # whole endpoint 502'd. Guarded behind "an instance is running", it only
+    # fired DURING a cloud encode — precisely when the panel is wanted.
+    # Deliberately not restored: CPU now arrives via the heartbeat, not
+    # CloudWatch. fleet["cw"] is simply absent and the UI omits those sparklines.
 
     _ce_vcpus = _current_vcpus()
     return {
