@@ -113,12 +113,26 @@ def _busy_cores() -> float:
 
 
 @activity.defn(name="EncodePhase")
-def encode_phase(spec: dict) -> None:
+def encode_phase(spec: dict) -> list[str]:
     """Run one `cli_phase` phase. spec = {"args": [...], "env": {...}}.
 
     Sync activity (runs in the worker's thread pool). Streams cli_phase output,
     heartbeating each line; raises on non-zero exit so Temporal retries. ENCODER
     markers are echoed to stdout so they show in the worker/Temporal logs.
+
+    RETURNS the markers the orchestrator must relay to the Go control plane.
+
+    Why the return value and not the heartbeat: the heartbeat is SDK-throttled
+    (not every call transmits) and its details are only readable while the
+    activity is still pending. The VMAF marker is emitted near the end of a
+    chunk, so a chunk finishing between orchestrator polls would lose it — which
+    is exactly how 465 computed scores were discarded on a 3-hour encode (#141).
+    An activity result lands in the workflow history exactly once and the
+    orchestrator already reads that history, so this route cannot race.
+
+    ENCODER-STAGE is excluded: the orchestrator reconstructs stage state from
+    history and carries live % on the heartbeat, so relaying it again would
+    fight the live progress with stale values.
     """
     env = dict(os.environ)
     env.update({k: str(v) for k, v in (spec.get("env") or {}).items()})
@@ -146,6 +160,8 @@ def encode_phase(spec: dict) -> None:
     # ACTUAL failure reason — otherwise the raise carries only the last line,
     # which is often a progress marker and the real error is lost (#116).
     tail: list[str] = []
+    # Markers to hand back for the orchestrator to relay (see the docstring).
+    relay: list[str] = []
     # Pump cli_phase stdout on a helper thread so the loop below wakes at least
     # once a second even when cli_phase is quiet for a long stretch — e.g. a
     # blocking VMAF-audit ffmpeg (subprocess.run) emits nothing to stdout. That
@@ -196,6 +212,25 @@ def encode_phase(spec: dict) -> None:
                 del tail[:-60]
             if last.startswith("[[ENCODER"):
                 print(last, flush=True)
+                # Collect for the return value. Deliberately an EXCLUDE list,
+                # not a whitelist: the whole class of bug in #141 is that a new
+                # marker gets silently dropped until someone notices.
+                #
+                # Excluded because the orchestrator ALREADY produces these on
+                # the Temporal path, from channels that carry them live:
+                #   STAGE — reconstructed from workflow history, plus live % on
+                #           the heartbeat. A relayed copy would arrive at
+                #           completion and fight the live value with stale data.
+                #   FLEET — emitted by _emit_fleet_cpu from heartbeat details.
+                #           CPU is a GAUGE: it is only meaningful while the
+                #           activity runs, and recordFleetCPU stamps arrival
+                #           time, so a copy relayed at completion would register
+                #           a stale reading as current. Harmless today only
+                #           because IMDS is unavailable off-EC2 so local workers
+                #           never emit it — too fragile to rely on, since a
+                #           local-dist worker CAN run on an EC2 box.
+                if not last.startswith(("[[ENCODER-STAGE ", "[[ENCODER-FLEET ")):
+                    relay.append(last)
                 # cli_phase's run_ffmpeg_with_progress emits ENCODER-STAGE with the
                 # live out_time/duration %. Capture it so the orchestrator can show
                 # real per-chunk progress instead of a binary 0→100 on completion.
@@ -224,6 +259,10 @@ def encode_phase(spec: dict) -> None:
               f"last output:\n{err_tail}", flush=True)
         raise RuntimeError(
             f"cli_phase {spec['args'][:2]} exit {rc}. last output:\n{err_tail[-1800:]}")
+    # Bounded: a chunk emits a handful (VMAF, VMAFREF, TIMING, SPEED). The cap
+    # stops a pathological phase from bloating the workflow history, which every
+    # subsequent history fetch would then have to carry.
+    return relay[-32:]
 
 
 # Minimal workflow to validate the Python side end-to-end (one activity).

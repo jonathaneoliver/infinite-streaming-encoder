@@ -1208,6 +1208,12 @@ type fleetSample struct {
 // ~2s emit cadence) — enough for a live sparkline without unbounded growth.
 const fleetHistoryLen = 90
 
+// fleetMinSampleGap is the minimum spacing between accepted samples for one
+// machine. See recordFleetCPU: without it, N chunks on a cloud instance each
+// report the same host CPU on their own timers and the history stops being a
+// uniform time series.
+const fleetMinSampleGap = 3 * time.Second
+
 // recordFleetCPU folds one ENCODER-FLEET marker into the per-machine CPU history.
 // Returns true when the line was such a marker (so the scanner suppresses it from
 // the log buffer, like the other structured markers).
@@ -1226,6 +1232,23 @@ func (m *Manager) recordFleetCPU(line string) bool {
 	if m.fleetCPU == nil {
 		m.fleetCPU = map[string][]fleetSample{}
 		m.fleetChunks = map[string][]string{}
+	}
+	// Throttle per machine. On the cloud path EVERY chunk container on a box
+	// emits this — /proc/stat is the host's, so 4 concurrent chunks all report
+	// the same instance figure, independently, on their own staggered timers.
+	// Each reading is valid, but appending all of them turns one machine's
+	// history into N interleaved series: clustered samples, then a gap, and
+	// consecutive points measured over different intervals. Keeping the first
+	// sample in each window makes the series uniform however many chunks are
+	// running, so the sparkline means the same thing on both targets.
+	//
+	// The local path is unaffected — its orchestrator is a single reporter per
+	// machine and emits slower than this window.
+	if prev := m.fleetCPU[mm[1]]; len(prev) > 0 &&
+		time.Since(prev[len(prev)-1].T) < fleetMinSampleGap {
+		m.fleetChunks[mm[1]] = chunks // chunk list still refreshes
+		m.fleetMu.Unlock()
+		return true
 	}
 	s := append(m.fleetCPU[mm[1]], fleetSample{T: time.Now(), Busy: busy, Perf: perf})
 	if len(s) > fleetHistoryLen {

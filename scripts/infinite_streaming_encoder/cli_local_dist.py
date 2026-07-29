@@ -847,7 +847,7 @@ def _stage_key_for(activity_id: str) -> str | None:
     return None
 
 
-async def _emit_temporal_progress(handle, EventType, emitted: dict) -> None:
+async def _emit_temporal_progress(handle, EventType, emitted: dict, client=None) -> None:
     """Read the workflow history and emit an ENCODER-STAGE marker for each
     activity that changed state (scheduled→running, completed→done). Cheap
     enough at our scale (tens of activities); the Go server scans these off the
@@ -871,9 +871,18 @@ async def _emit_temporal_progress(handle, EventType, emitted: dict) -> None:
             if aid and a.identity:
                 hosts[aid] = a.identity
         elif et == EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED:
-            aid = sched.get(e.activity_task_completed_event_attributes.scheduled_event_id)
+            a = e.activity_task_completed_event_attributes
+            aid = sched.get(a.scheduled_event_id)
             if aid:
                 states[aid] = "done"
+                # Relay the markers the worker collected (#141). Without this
+                # the VMAF audit runs on every chunk, costs real time, and is
+                # discarded — the Go scanner tails the ORCHESTRATOR, and workers
+                # print to their own stdout which nothing forwards.
+                if client is not None and emitted.get(f"relay:{aid}") is None:
+                    emitted[f"relay:{aid}"] = True
+                    for marker in _activity_markers(a, client):
+                        print(marker, flush=True)
     for aid, st in states.items():
         key = _stage_key_for(aid)
         if not key:
@@ -886,6 +895,31 @@ async def _emit_temporal_progress(handle, EventType, emitted: dict) -> None:
         if emitted.get(aid) != st:
             emitted[aid] = st
             emit_stage(key, st, 100.0 if st == "done" else 0.0)
+
+
+def _activity_markers(attrs, client) -> list[str]:
+    """Decode an ActivityTaskCompleted result into the markers to relay.
+
+    Best-effort and defensive: an activity from an older worker returns None,
+    and a decode failure must not stop progress reporting for the whole run.
+    Anything that isn't a plain [[ENCODER-…]] string is dropped rather than
+    printed, so a malformed result can't inject arbitrary lines into the job log
+    that the Go scanner would then try to parse.
+    """
+    try:
+        payloads = getattr(attrs, "result", None)
+        if not payloads or not payloads.payloads:
+            return []
+        vals = client.data_converter.payload_converter.from_payloads(
+            list(payloads.payloads))
+    except Exception:  # noqa: BLE001 — relaying is best-effort, never fail a run
+        return []
+    out: list[str] = []
+    for v in vals:
+        if isinstance(v, list):
+            out += [m for m in v
+                    if isinstance(m, str) and m.startswith("[[ENCODER-")]
+    return out
 
 
 # Temporal PendingActivityState.STARTED — an activity actually executing on a
@@ -1063,13 +1097,13 @@ def run_temporal(args: argparse.Namespace) -> int:
                         print(f"[dist] workflow cancel failed: {e}", flush=True)
                     result_task.cancel()
                     return "cancelled"
-                await _emit_temporal_progress(handle, EventType, emitted)
+                await _emit_temporal_progress(handle, EventType, emitted, client)
                 await _emit_fleet_cpu(handle, client)
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=1)  # 1s cadence
                 except asyncio.TimeoutError:
                     pass
-            await _emit_temporal_progress(handle, EventType, emitted)
+            await _emit_temporal_progress(handle, EventType, emitted, client)
             return await result_task
         finally:
             # ORPHAN GUARD. The only path above that cancels the workflow is the
