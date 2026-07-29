@@ -217,6 +217,33 @@ publish:              ## build once (multi-arch) → GHCR always, ECR when cloud
 		$$ecr_tags --push . ; \
 	echo "Published GHCR ($(GHCR_IMAGE)) :latest :$(VERSION) :$(GIT_SHA) :$(IMAGE_TAG)$$ecr_note [$(PLATFORMS)]"
 
+publish-tag:          ## push a build under ONE explicit tag, leaving :latest alone (TAG=<name>)
+	@: $${TAG:?TAG is not set — e.g. TAG=test-145. Use a name that cannot be mistaken for a release}
+	@: $${GHCR_PAT:?GHCR_PAT is not set — create a classic PAT with write:packages scope}
+	@# Testing lane. `publish` moves :latest, which is public AND what remote
+	@# workers pull via REMOTE_IMAGE — so publishing an unvalidated build there
+	@# hands it to every consumer at once. This pushes exactly one tag and
+	@# touches nothing else, so a cloud test can point at it (infra-apply with
+	@# -var image_tag=$$TAG) while :latest keeps serving the known-good image.
+	@# See #144: the durable fix is a :stable pointer; this is the safe lane
+	@# that makes testing possible before that lands.
+	@echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin
+	@docker buildx inspect encoder-builder >/dev/null 2>&1 || \
+		docker buildx create --name encoder-builder --driver docker-container >/dev/null
+	@set -e; ecr_tags=""; ecr_note=""; \
+	if echo "$(ECR_REPO)" | grep -qE '\.dkr\.ecr\.'; then \
+	  echo ">>> cloud configured — pushing ECR ($(ECR_REPO)):$(TAG) too, so a Batch job def can point at it"; \
+	  aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(ECR_REGISTRY); \
+	  ecr_tags="--tag $(ECR_REPO):$(TAG)"; \
+	  ecr_note=" + ECR ($(ECR_REPO)):$(TAG)"; \
+	fi; \
+	docker buildx build --builder encoder-builder --platform $(PLATFORMS) \
+		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(GIT_SHA) --build-arg IMAGE_TAG=$(TAG) \
+		--tag $(GHCR_IMAGE):$(TAG) $$ecr_tags --push . ; \
+	echo "Published GHCR ($(GHCR_IMAGE)):$(TAG)$$ecr_note [$(PLATFORMS)] — :latest UNCHANGED"; \
+	echo "   cloud test:  cd ~/Projects/Encoder \\"; \
+	echo "                  && make infra-plan IMAGE_TAG=$(TAG) && make infra-apply"
+
 # ---------------------------------------------------------------------------
 # Cloud-batch deploy (AWS Batch + Step Functions). Replaces the manual
 # "build → ECR push → tofu plan/apply → restart" dance we were doing by hand.
@@ -268,6 +295,7 @@ STATE_MACHINE_ARN ?= $(shell cd $(TF_DIR) && tofu output -no-color -raw state_ma
 USE_AMI ?=
 
 .PHONY: ladder-audit ladder-audit-all
+.PHONY: publish-tag cloud-dev-up cloud-dev-down cloud-promote
 .PHONY: ecr-login ecr-publish infra-init infra-plan infra-apply deploy deploy-review timing cpu-report cloud-up cloud-clear cloud-down cloud-check ami-up ami-down
 
 # Resolve the pre-baked worker AMI for the CURRENT image tag, if one exists.
@@ -301,6 +329,70 @@ infra-plan:           ## tofu plan -> tf.plan (review before infra-apply)
 
 infra-apply:          ## apply the saved tf.plan (run only after reviewing the plan)
 	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu apply tf.plan
+
+# Dev counterpart to cloud-up, named for the same reason farm-dev-up is: the
+# -dev- variant runs YOUR WORKING TREE instead of the published image.
+#
+# cloud-up publishes to :latest — public, and what remote workers pull — so it
+# cannot be used to try something out. This publishes under a throwaway tag and
+# points ONLY the Batch job definitions at it, leaving :latest serving the
+# known-good image throughout. Rolling back is re-applying the previous tag;
+# nothing was overwritten, so there is nothing to restore.
+CLOUD_DEV_TAG ?= dev-$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null | tr -cd 'A-Za-z0-9-' | cut -c1-20)-$(GIT_SHA)
+
+cloud-dev-up:         ## test cloud from your WORKING TREE under a throwaway tag (:latest untouched)
+	@# Guard 1: tofu state. The backend is local and lives in the main checkout,
+	@# so running this from a worktree would init an EMPTY state and then try to
+	@# CREATE infrastructure that already exists — worse than failing outright.
+	@test -f $(TF_DIR)/terraform.tfstate || { \
+	  echo "!!! no tofu state in $(TF_DIR) — the backend is local and lives in the"; \
+	  echo "    MAIN checkout. Run this from ~/Projects/Encoder, not a worktree."; \
+	  exit 1; }
+	@# Guard 2: in-flight executions. infra-apply deregisters the old job-def
+	@# revisions, which FAILS a running Step Functions execution mid-encode.
+	@running=$$(aws stepfunctions list-executions --region $(AWS_REGION) \
+	    --state-machine-arn "$(STATE_MACHINE_ARN)" --status-filter RUNNING \
+	    --query 'length(executions)' --output text 2>/dev/null || echo 0); \
+	  if [ "$$running" != "0" ] && [ -n "$$running" ]; then \
+	    echo "!!! $$running cloud execution(s) RUNNING — applying now would deregister"; \
+	    echo "    their job definitions and fail them. Wait for them to finish."; \
+	    exit 1; \
+	  fi
+	@# Capture what cloud runs NOW, so the rollback command below is exact.
+	@prev=$$(aws batch describe-job-definitions --region $(AWS_REGION) --status ACTIVE \
+	    --output json 2>/dev/null | python3 -c "import json,sys; ds=json.load(sys.stdin)['jobDefinitions']; print(sorted(ds,key=lambda x:-x['revision'])[0]['containerProperties']['image'].rsplit(':',1)[-1])" 2>/dev/null || echo unknown); \
+	  echo ">>> [cloud-dev-up] cloud currently runs :$$prev"; \
+	  echo "$$prev" > $(TF_DIR)/.cloud-dev-prev-tag
+	@echo ">>> [cloud-dev-up] publishing working tree as :$(CLOUD_DEV_TAG) (:latest NOT touched)"
+	$(MAKE) publish-tag TAG=$(CLOUD_DEV_TAG)
+	@echo ">>> [cloud-dev-up] pointing Batch job definitions at :$(CLOUD_DEV_TAG)"
+	$(MAKE) infra-plan IMAGE_TAG=$(CLOUD_DEV_TAG)
+	$(MAKE) infra-apply
+	@prev=$$(cat $(TF_DIR)/.cloud-dev-prev-tag 2>/dev/null || echo '<previous>'); \
+	  printf '\n\033[1;32m>>> cloud now runs :%s (working tree)\033[0m\n' "$(CLOUD_DEV_TAG)"; \
+	  echo "    :latest is UNCHANGED — users and remote workers are unaffected."; \
+	  echo ""; \
+	  echo "    now:       submit a cloud encode in the UI and verify it"; \
+	  echo "    rollback:  make cloud-dev-down"; \
+	  echo "    promote:   make cloud-promote FROM=$(CLOUD_DEV_TAG)   (after it passes)"
+
+cloud-dev-down:       ## put cloud back on the image tag it ran before cloud-dev-up
+	@prev=$$(cat $(TF_DIR)/.cloud-dev-prev-tag 2>/dev/null); \
+	  test -n "$$prev" || { echo "!!! no recorded previous tag ($(TF_DIR)/.cloud-dev-prev-tag)"; \
+	    echo "    pass one explicitly: make infra-plan IMAGE_TAG=<tag> && make infra-apply"; exit 1; }; \
+	  echo ">>> [cloud-dev-down] restoring cloud to :$$prev"; \
+	  $(MAKE) infra-plan IMAGE_TAG=$$prev && $(MAKE) infra-apply
+
+cloud-promote:        ## make a TESTED tag the one users get: re-tag it to :latest (FROM=<tag>)
+	@: $${FROM:?FROM is not set — the tag you tested, e.g. FROM=dev-my-branch-abc1234}
+	@# RE-TAG, never rebuild. Rebuilding produces a different image from the one
+	@# that passed, which defeats the entire point of having tested it.
+	@echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin
+	docker buildx imagetools create --tag $(GHCR_IMAGE):latest $(GHCR_IMAGE):$(FROM)
+	@a=$$(docker buildx imagetools inspect $(GHCR_IMAGE):latest --raw | shasum -a 256 | cut -c1-16); \
+	  b=$$(docker buildx imagetools inspect $(GHCR_IMAGE):$(FROM) --raw | shasum -a 256 | cut -c1-16); \
+	  if [ "$$a" = "$$b" ]; then echo ">>> :latest is now byte-identical to :$(FROM) ($$a)"; \
+	  else echo "!!! digest mismatch — :latest=$$a :$(FROM)=$$b"; exit 1; fi
 
 cloud-down:           ## FULL teardown -> $0/mo (no prompt): tofu destroy -auto-approve + remove AMI
 	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu destroy -auto-approve
