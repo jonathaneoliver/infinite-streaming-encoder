@@ -463,6 +463,23 @@ cloud-dev-up:         ## test cloud from your WORKING TREE under a throwaway tag
 	    echo "    their job definitions and fail them. Wait for them to finish."; \
 	    exit 1; \
 	  fi
+	@# Rebuild the SERVER from the working tree before publishing anything. The Go
+	@# control plane builds the Step Functions input, so a stale server can emit
+	@# input the freshly-applied state machine rejects — and because the variant
+	@# fields are non-omitempty on purpose, that FAILS the execution rather than
+	@# degrading. `restart` and not `farm-dev-up`: only the server matters here,
+	@# and rebuilding remote workers on every cloud test would be minutes of rsync
+	@# and cross-arch builds for nothing.
+	@#
+	@# A recipe step, NOT a prerequisite: prerequisites run before the recipe, so
+	@# it would bounce the server BEFORE the guards above could abort on an
+	@# in-flight execution.
+	@#
+	@# NOTE this drops the dev bind-mounts if you were mid-`farm-dev-up` — `run`
+	@# uses the base compose file, so the server ends up on its baked code. Re-run
+	@# `make farm-dev-up` to get the live mount back.
+	$(MAKE) restart
+
 	@# Capture what cloud runs NOW, so the rollback command below is exact.
 	@prev=$$(aws batch describe-job-definitions --region $(AWS_REGION) --status ACTIVE \
 	    --output json 2>/dev/null | python3 -c "import json,sys; ds=json.load(sys.stdin)['jobDefinitions']; print(sorted(ds,key=lambda x:-x['revision'])[0]['containerProperties']['image'].rsplit(':',1)[-1])" 2>/dev/null || echo unknown); \
