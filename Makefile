@@ -92,7 +92,7 @@ COMPOSE_DEV  := $(COMPOSE_BASE) -f docker-compose.dev.yml
 # compose as ENCODE_SLOTS (empty string is safe: compose ${ENCODE_SLOTS:-0}).
 FARM_ENCODE_SLOTS := $(shell P=$$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null); if [ -n "$$P" ] && [ "$$P" -gt 1 ]; then echo $$((P/2)); fi)
 
-.PHONY: require-paths require-ghcr require-s3-bucket build run run-remote down stop restart logs shell status clean publish version setup-hooks
+.PHONY: require-paths require-ghcr require-s3-bucket require-idle build run run-remote down stop restart logs shell status clean publish version setup-hooks
 
 # Point git at the committed hooks (scripts/git-hooks/) so the pre-push guard
 # that blocks direct pushes to main is active in this clone. Run once per clone.
@@ -142,6 +142,31 @@ require-paths:
 # Guards for values that CANNOT ship with a working default because they name
 # resources in an account only their owner controls (#149). Fail naming the
 # setting, rather than proceeding against somebody else's namespace/bucket.
+# Refuse to disturb work in flight. Both halves matter: infra-apply deregisters
+# job-def revisions, which FAILS a running Step Functions execution mid-encode,
+# and farm-up/restart bounce workers and the server out from under a local one.
+# cloud-batch reattaches to its execution after a server bounce, so a local
+# encode is the more fragile of the two.
+#
+# Degrades open, deliberately: no AWS creds or no server running means nothing to
+# protect, and a guard that blocks when it cannot see is worse than no guard.
+require-idle:
+	@running=$$(aws stepfunctions list-executions --region $(AWS_REGION) \
+	    --state-machine-arn "$(STATE_MACHINE_ARN)" --status-filter RUNNING \
+	    --query 'length(executions)' --output text 2>/dev/null || echo 0); \
+	  if [ "$$running" != "0" ] && [ -n "$$running" ] && [ "$$running" != "None" ]; then \
+	    echo "!!! $$running cloud execution(s) RUNNING — applying now would deregister"; \
+	    echo "    their job definitions and fail them. Wait for them to finish."; \
+	    exit 1; \
+	  fi
+	@n=$$(curl -fsS --max-time 3 http://localhost:$(PORT)/api/jobs 2>/dev/null \
+	    | python3 -c "import json,sys; print(sum(1 for j in json.load(sys.stdin) if j.get('status')=='running'))" 2>/dev/null || echo 0); \
+	  if [ "$$n" != "0" ]; then \
+	    echo "!!! $$n local encode(s) RUNNING — this bounces the server and workers"; \
+	    echo "    out from under them. Wait, or cancel them in the UI."; \
+	    exit 1; \
+	  fi
+
 require-ghcr:
 	@: $${GHCR_ORG:?GHCR_ORG is not set — your GHCR namespace, e.g. ghcr.io/yourname (see .env.example)}
 	@: $${GHCR_USERNAME:?GHCR_USERNAME is not set — the GitHub account to docker-login with (see .env.example)}
@@ -204,8 +229,9 @@ logs:
 shell:
 	docker exec -it $(CONTAINER_NAME) /bin/sh
 
-status:
+status:               ## what is deployed where, vs what this tree says it should be
 	@docker ps --filter name=$(CONTAINER_NAME) --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || echo "not running"
+	@bash scripts/status.sh
 
 clean: stop
 	docker rmi $(IMAGE_NAME) 2>/dev/null || true
@@ -444,7 +470,7 @@ DEV_TEST_TAG ?= dev-$(if $(DEV_BRANCH),$(DEV_BRANCH),nobranch)-test
 LAST_TAG_FILE := .last-published-tag
 CLOUD_DEV_TAG ?= $(DEV_TAG)
 
-cloud-dev-up:         ## test cloud from your WORKING TREE under a throwaway tag (:latest untouched)
+cloud-dev-up: require-idle ## test cloud from your WORKING TREE under a throwaway tag (:latest untouched)
 	@# Guard 1: tofu state. State is shared in S3, so any checkout can drive it —
 	@# but only once THIS one has been `infra-init`ed (.terraform/ is per-checkout
 	@# and gitignored). Uninitialised, an apply would work from an EMPTY state and
@@ -454,16 +480,6 @@ cloud-dev-up:         ## test cloud from your WORKING TREE under a throwaway tag
 	  if [ "$$n" = "0" ]; then \
 	    echo "!!! tofu state is empty or the backend is not initialised in this checkout."; \
 	    echo "    Run: make infra-init   (needs TFSTATE_BUCKET in .env)"; \
-	    exit 1; \
-	  fi
-	@# Guard 2: in-flight executions. infra-apply deregisters the old job-def
-	@# revisions, which FAILS a running Step Functions execution mid-encode.
-	@running=$$(aws stepfunctions list-executions --region $(AWS_REGION) \
-	    --state-machine-arn "$(STATE_MACHINE_ARN)" --status-filter RUNNING \
-	    --query 'length(executions)' --output text 2>/dev/null || echo 0); \
-	  if [ "$$running" != "0" ] && [ -n "$$running" ]; then \
-	    echo "!!! $$running cloud execution(s) RUNNING — applying now would deregister"; \
-	    echo "    their job definitions and fail them. Wait for them to finish."; \
 	    exit 1; \
 	  fi
 	@# Rebuild the SERVER from the working tree before publishing anything. The Go
@@ -649,7 +665,7 @@ cloud-check:          ## live cloud readiness: AWS creds + state machine + S3 bu
 # NOTE no in-flight guard, unlike cloud-dev-up: infra-apply deregisters job-def
 # revisions and farm-up bounces workers, so running this mid-encode will break
 # it. Check `make status` / the UI first.
-deploy:               ## push image + bring the whole farm up + plan + APPLY infra (one shot)
+deploy: require-idle  ## push image + bring the whole farm up + plan + APPLY infra (one shot)
 	@start=$$(date +%s); \
 	echo ">>> deploy started $$(date '+%H:%M:%S')  worker=$(IMAGE_TAG)"; \
 	if $(MAKE) publish && $(MAKE) farm-up && $(MAKE) infra-plan && $(MAKE) infra-apply; then \
