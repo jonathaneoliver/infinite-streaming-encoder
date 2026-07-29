@@ -79,7 +79,12 @@ def emit_stage(key: str, status: str, percent: float = 0.0) -> None:
 # "did this chunk use its reserved vCPU?" — is answered separately and better by
 # cpu_s on ENCODER-TIMING, from getrusage.)
 _FLEET_PREV = {"t": 0.0, "total": 0, "idle": 0, "emitted": 0.0}
-_FLEET_INTERVAL_S = 15.0
+# 5s, not 15: cloud chunks are SHORT. A 396p chunk measured on a real run encoded
+# in 0.66s and produced 1.3s of log output in total, so a 15s throttle meant such
+# a job emitted nothing at all. The sample itself is a single /proc/stat read, so
+# emitting often costs nothing — and the control plane throttles INGESTION per
+# machine anyway (fleetMinSampleGap), so more emissions cannot flood the history.
+_FLEET_INTERVAL_S = 5.0
 _INSTANCE_ID: str | None = None
 
 
@@ -127,6 +132,17 @@ def _instance_id() -> str:
     except Exception:  # noqa: BLE001 — off-instance, or IMDS disabled
         pass
     return _INSTANCE_ID
+
+
+def prime_fleet_cpu() -> None:
+    """Take the baseline /proc/stat sample so the FIRST emit can produce a value.
+
+    Without this, _host_busy_cores() returns None on its first call (nothing to
+    difference against) and the first heartbeat emits nothing — which on a
+    sub-second chunk means the job emits no CPU at all. Called once at phase
+    start, so the first heartbeat already has an interval behind it.
+    """
+    _host_busy_cores()
 
 
 def emit_fleet_cpu() -> None:

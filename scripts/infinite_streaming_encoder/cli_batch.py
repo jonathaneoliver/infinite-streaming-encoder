@@ -228,7 +228,26 @@ def _forward_running_logs(exec_name: str, log_state: dict) -> None:
     packaging, big S3 transfers) show live activity instead of a dark gap
     between 'submitted' and 'done'. Best-effort; never breaks polling."""
     batch = _batch()
-    ids = [j["jobId"] for j in _list_exec_jobs(exec_name, "RUNNING")]
+    # RUNNING *and* recently-SUCCEEDED. A job that starts and finishes inside one
+    # poll interval is never observed RUNNING, so tailing only that state misses
+    # its output entirely — and cloud chunks are short: a 396p chunk measured at
+    # 0.66s of encode against a 5s poll. Draining succeeded streams too means
+    # every job's markers are forwarded exactly once (log_state dedupes by
+    # timestamp per stream).
+    # RUNNING *and* not-yet-drained SUCCEEDED. A job that starts and finishes
+    # inside one poll interval is never observed RUNNING, so tailing only that
+    # state misses its output entirely — and cloud chunks are short: a 396p chunk
+    # measured at 0.66s of encode against a 5s poll.
+    #
+    # Completed streams are drained ONCE (tracked in _drained) rather than every
+    # poll: log_state dedupes lines by timestamp, but re-listing hundreds of
+    # finished jobs each poll would cost a GetLogEvents call apiece for nothing.
+    drained = log_state.setdefault("_drained", set())
+    live_ids = [j["jobId"] for j in _list_exec_jobs(exec_name, "RUNNING")]
+    done_ids = [j["jobId"] for j in _list_exec_jobs(exec_name, "SUCCEEDED")
+                if j["jobId"] not in drained]
+    ids = live_ids + done_ids
+    live = set(live_ids)
     for i in range(0, len(ids), 100):
         try:
             jobs = batch.describe_jobs(jobs=ids[i:i + 100]).get("jobs", [])
@@ -237,15 +256,28 @@ def _forward_running_logs(exec_name: str, log_state: dict) -> None:
         for j in jobs:
             stream = j.get("container", {}).get("logStreamName")
             if stream:
-                _tail_progress(stream, _short_label(j.get("jobName", "")), log_state)
+                is_live = j.get("jobId") in live
+                _tail_progress(stream, _short_label(j.get("jobName", "")),
+                               log_state, live=is_live)
+                if not is_live:
+                    drained.add(j.get("jobId"))
         # Colour every running job's rows (encode chunks + mezzanine / audio /
         # package / fragments / hls) by the instance it landed on. Best-effort.
         _tag_hosts_for_jobs(jobs, log_state)
 
 
-def _tail_progress(stream: str, label: str, log_state: dict) -> None:
-    """Forward new progress-marked lines from one running container's stream.
-    Tracks the last-seen timestamp per stream so each line is emitted once."""
+def _tail_progress(stream: str, label: str, log_state: dict,
+                   live: bool = True) -> None:
+    """Forward new progress-marked lines from one container's stream.
+    Tracks the last-seen timestamp per stream so each line is emitted once.
+
+    `live` False means the job has already finished and this is the one-shot
+    drain. That distinction matters for ENCODER-FLEET and only for it: CPU is a
+    GAUGE, and the control plane stamps arrival time, so replaying a finished
+    job's sample would register a reading from seconds ago as the machine's
+    current state. Every other marker is a RECORD — losing one loses data that
+    cannot be recovered without re-encoding — so those are forwarded either way.
+    """
     since = log_state.get(stream, 0)
     try:
         events = _logs().get_log_events(
@@ -257,6 +289,8 @@ def _tail_progress(stream: str, label: str, log_state: dict) -> None:
     for e in events:
         log_state[stream] = max(log_state.get(stream, 0), e.get("timestamp", 0))
         msg = e.get("message", "").rstrip()
+        if msg.startswith("[[ENCODER-FLEET ") and not live:
+            continue  # gauge: a finished job's sample is stale — see the docstring
         if msg.startswith("[[ENCODER-"):
             # Forward EVERY marker verbatim, not a whitelist. This used to pass
             # only ENCODER-BOOT and ENCODER-STAGE, which meant each new marker

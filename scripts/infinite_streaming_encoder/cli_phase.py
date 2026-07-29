@@ -56,7 +56,8 @@ from infinite_streaming_encoder.ladder import (
 from infinite_streaming_encoder.mezzanine import MezzanineSpec, create_mezzanine
 from infinite_streaming_encoder.packager import PackageSpec, package
 from infinite_streaming_encoder.padding import multi_duration_lcm, plan_padding
-from infinite_streaming_encoder.progress import emit_boot_ami, emit_stage
+from infinite_streaming_encoder.progress import (
+    emit_boot_ami, emit_stage, prime_fleet_cpu)
 
 try:
     import boto3
@@ -1240,6 +1241,11 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     emit_boot_ami()  # report which AMI this Batch worker booted from
+    # Take the CPU baseline now so the FIRST progress heartbeat can already carry
+    # a fleet sample. Without it the first call has nothing to difference against
+    # and emits nothing — which on a sub-second chunk means no CPU is reported at
+    # all for that job.
+    prime_fleet_cpu()
     return args.fn(args)
 
 
