@@ -80,6 +80,11 @@ type CurvePoint struct {
 
 // SeedClip names the content the built-in curves were measured on, so the UI can
 // say whose quality it is estimating.
+// The reference=2160 points were re-measured 2026-07-29 by `ladder_audit` on
+// ffmpeg 8.0.1 with vmaf_4k_v0.6.1 at common=3840x2160, and follow the CURRENT
+// apple-uniq-live rungs (594/954/1800 rather than the retired 684/1044/2124).
+// The reference=1080 points are older and their provenance was not recorded —
+// see #163, which is why curve points now carry model/common_w/common_h.
 const SeedClip = "insane_fpv_shots_hydrofoil_windsurfing.mkv (4K, extreme motion)"
 
 // DefaultCurveReference is the grading reference used when none is requested.
@@ -88,42 +93,41 @@ const DefaultCurveReference = 2160
 
 func defaultSeedCurves() []CurvePoint {
 	return []CurvePoint{
-		{Codec: "h264", Reference: 2160, Height: 234, Kbps: 138, Vmaf: 24.74, Harmonic: 21.27},
-		{Codec: "h264", Reference: 2160, Height: 360, Kbps: 339, Vmaf: 38.26, Harmonic: 35.63},
-		{Codec: "h264", Reference: 2160, Height: 396, Kbps: 673, Vmaf: 47.87, Harmonic: 44.89},
-		{Codec: "h264", Reference: 2160, Height: 432, Kbps: 1013, Vmaf: 54.41, Harmonic: 51.3},
-		{Codec: "h264", Reference: 2160, Height: 540, Kbps: 1856, Vmaf: 64.93, Harmonic: 61.95},
-		{Codec: "h264", Reference: 2160, Height: 684, Kbps: 2798, Vmaf: 72.68, Harmonic: 69.89},
-		{Codec: "h264", Reference: 2160, Height: 720, Kbps: 4220, Vmaf: 78.49, Harmonic: 75.79},
-		{Codec: "h264", Reference: 2160, Height: 1044, Kbps: 5669, Vmaf: 83.12, Harmonic: 80.52},
-		{Codec: "h264", Reference: 2160, Height: 1080, Kbps: 7423, Vmaf: 86.6, Harmonic: 84.01},
-		{Codec: "h264", Reference: 2160, Height: 1440, Kbps: 12975, Vmaf: 92.12, Harmonic: 89.46},
-		{Codec: "h264", Reference: 2160, Height: 2124, Kbps: 18376, Vmaf: 93.67, Harmonic: 90.98},
-		{Codec: "h264", Reference: 2160, Height: 2160, Kbps: 26190, Vmaf: 96.51, Harmonic: 93.72},
-		{Codec: "hevc", Reference: 2160, Height: 360, Kbps: 151, Vmaf: 32.34, Harmonic: 29.41},
-		{Codec: "hevc", Reference: 2160, Height: 432, Kbps: 301, Vmaf: 42.28, Harmonic: 39.06},
-		{Codec: "hevc", Reference: 2160, Height: 468, Kbps: 593, Vmaf: 51.23, Harmonic: 47.76},
-		{Codec: "hevc", Reference: 2160, Height: 504, Kbps: 886, Vmaf: 57.31, Harmonic: 53.87},
-		{Codec: "hevc", Reference: 2160, Height: 540, Kbps: 1566, Vmaf: 65.09, Harmonic: 61.86},
-		{Codec: "hevc", Reference: 2160, Height: 684, Kbps: 2345, Vmaf: 73.21, Harmonic: 70.25},
-		{Codec: "hevc", Reference: 2160, Height: 720, Kbps: 3330, Vmaf: 77.97, Harmonic: 75.14},
-		{Codec: "hevc", Reference: 2160, Height: 1044, Kbps: 4399, Vmaf: 83.72, Harmonic: 80.98},
-		{Codec: "hevc", Reference: 2160, Height: 1080, Kbps: 5670, Vmaf: 86.7, Harmonic: 84.02},
-		{Codec: "hevc", Reference: 2160, Height: 1440, Kbps: 7922, Vmaf: 90.69, Harmonic: 88.02},
-		{Codec: "hevc", Reference: 2160, Height: 2124, Kbps: 11352, Vmaf: 93.55, Harmonic: 90.82},
-		{Codec: "hevc", Reference: 2160, Height: 2160, Kbps: 16442, Vmaf: 96.23, Harmonic: 93.44},
-		{Codec: "av1", Reference: 2160, Height: 360, Kbps: 146, Vmaf: 35.42, Harmonic: 32.56},
-		{Codec: "av1", Reference: 2160, Height: 432, Kbps: 301, Vmaf: 46.02, Harmonic: 42.99},
-		{Codec: "av1", Reference: 2160, Height: 468, Kbps: 598, Vmaf: 54.46, Harmonic: 51.48},
-		{Codec: "av1", Reference: 2160, Height: 504, Kbps: 895, Vmaf: 60.46, Harmonic: 57.55},
-		{Codec: "av1", Reference: 2160, Height: 540, Kbps: 1583, Vmaf: 67.4, Harmonic: 64.6},
-		{Codec: "av1", Reference: 2160, Height: 684, Kbps: 2398, Vmaf: 75.45, Harmonic: 72.79},
-		{Codec: "av1", Reference: 2160, Height: 720, Kbps: 3388, Vmaf: 79.37, Harmonic: 76.76},
-		{Codec: "av1", Reference: 2160, Height: 1044, Kbps: 4492, Vmaf: 86.06, Harmonic: 83.48},
-		{Codec: "av1", Reference: 2160, Height: 1080, Kbps: 5801, Vmaf: 88.66, Harmonic: 86.04},
-		{Codec: "av1", Reference: 2160, Height: 1440, Kbps: 8095, Vmaf: 92.5, Harmonic: 89.83},
-		{Codec: "av1", Reference: 2160, Height: 2124, Kbps: 11557, Vmaf: 95.09, Harmonic: 92.35},
-		{Codec: "av1", Reference: 2160, Height: 2160, Kbps: 16639, Vmaf: 96.86, Harmonic: 94.06},
+		{Codec: "h264", Reference: 2160, Height: 234, Kbps: 138, Vmaf: 24.98, Harmonic: 21.55},
+		{Codec: "h264", Reference: 2160, Height: 360, Kbps: 339, Vmaf: 38.94, Harmonic: 36.4},
+		{Codec: "h264", Reference: 2160, Height: 396, Kbps: 672, Vmaf: 48.85, Harmonic: 46.02},
+		{Codec: "h264", Reference: 2160, Height: 432, Kbps: 1013, Vmaf: 55.56, Harmonic: 52.81},
+		{Codec: "h264", Reference: 2160, Height: 540, Kbps: 1855, Vmaf: 66.33, Harmonic: 64.09},
+		{Codec: "h264", Reference: 2160, Height: 594, Kbps: 2793, Vmaf: 72.8, Harmonic: 71.0},
+		{Codec: "h264", Reference: 2160, Height: 720, Kbps: 4221, Vmaf: 80.13, Harmonic: 78.9},
+		{Codec: "h264", Reference: 2160, Height: 954, Kbps: 5668, Vmaf: 84.95, Harmonic: 84.06},
+		{Codec: "h264", Reference: 2160, Height: 1080, Kbps: 7422, Vmaf: 88.41, Harmonic: 87.76},
+
+		{Codec: "hevc", Reference: 2160, Height: 360, Kbps: 151, Vmaf: 32.85, Harmonic: 29.93},
+		{Codec: "hevc", Reference: 2160, Height: 432, Kbps: 300, Vmaf: 43.17, Harmonic: 39.9},
+		{Codec: "hevc", Reference: 2160, Height: 468, Kbps: 592, Vmaf: 52.31, Harmonic: 49.02},
+		{Codec: "hevc", Reference: 2160, Height: 504, Kbps: 885, Vmaf: 58.56, Harmonic: 55.49},
+		{Codec: "hevc", Reference: 2160, Height: 540, Kbps: 1565, Vmaf: 66.48, Harmonic: 63.94},
+		{Codec: "hevc", Reference: 2160, Height: 594, Kbps: 2343, Vmaf: 72.74, Harmonic: 70.74},
+		{Codec: "hevc", Reference: 2160, Height: 720, Kbps: 3331, Vmaf: 79.56, Harmonic: 78.12},
+		{Codec: "hevc", Reference: 2160, Height: 954, Kbps: 4404, Vmaf: 85.07, Harmonic: 84.02},
+		{Codec: "hevc", Reference: 2160, Height: 1080, Kbps: 5669, Vmaf: 88.44, Harmonic: 87.69},
+		{Codec: "hevc", Reference: 2160, Height: 1440, Kbps: 7920, Vmaf: 92.54, Harmonic: 92.08},
+		{Codec: "hevc", Reference: 2160, Height: 1800, Kbps: 11351, Vmaf: 95.56, Harmonic: 95.32},
+		{Codec: "hevc", Reference: 2160, Height: 2160, Kbps: 16444, Vmaf: 98.16, Harmonic: 98.07},
+
+		{Codec: "av1", Reference: 2160, Height: 360, Kbps: 145, Vmaf: 36.12, Harmonic: 33.15},
+		{Codec: "av1", Reference: 2160, Height: 432, Kbps: 298, Vmaf: 46.95, Harmonic: 43.86},
+		{Codec: "av1", Reference: 2160, Height: 468, Kbps: 597, Vmaf: 55.63, Harmonic: 52.94},
+		{Codec: "av1", Reference: 2160, Height: 504, Kbps: 894, Vmaf: 61.73, Harmonic: 59.35},
+		{Codec: "av1", Reference: 2160, Height: 540, Kbps: 1582, Vmaf: 68.79, Harmonic: 66.89},
+		{Codec: "av1", Reference: 2160, Height: 594, Kbps: 2380, Vmaf: 74.88, Harmonic: 73.42},
+		{Codec: "av1", Reference: 2160, Height: 720, Kbps: 3389, Vmaf: 81.01, Harmonic: 79.94},
+		{Codec: "av1", Reference: 2160, Height: 954, Kbps: 4498, Vmaf: 87.15, Harmonic: 86.46},
+		{Codec: "av1", Reference: 2160, Height: 1080, Kbps: 5797, Vmaf: 90.42, Harmonic: 89.93},
+		{Codec: "av1", Reference: 2160, Height: 1440, Kbps: 8091, Vmaf: 94.34, Harmonic: 94.08},
+		{Codec: "av1", Reference: 2160, Height: 1800, Kbps: 11568, Vmaf: 96.89, Harmonic: 96.76},
+		{Codec: "av1", Reference: 2160, Height: 2160, Kbps: 16610, Vmaf: 98.77, Harmonic: 98.73},
 
 		{Codec: "h264", Reference: 1080, Height: 234, Kbps: 138, Vmaf: 13.28, Harmonic: 6.84},
 		{Codec: "h264", Reference: 1080, Height: 360, Kbps: 339, Vmaf: 32.5, Harmonic: 24.84},
