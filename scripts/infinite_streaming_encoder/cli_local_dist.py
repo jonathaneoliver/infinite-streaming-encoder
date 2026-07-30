@@ -25,11 +25,13 @@ DAG:
   5. download output_<codec>/ -> <output-dir>/<stem>_<codec>/ for the Go server
      to move into OUTPUT_DIR.
 
-Chunk-plan agreement: the worker (`cli_phase variant`) derives the chunk plan
-from the mezzanine's own duration; we set COALESCE_RUNT_TAIL=1 so both it and
-this orchestrator fold a sub-frame tail chunk the same way, and package-all
-globs whatever chunk files land — so all three agree without passing an
-explicit count.
+Chunk-plan authority: THIS orchestrator plans the chunks once (from the
+mezzanine it just built) and hands every worker its explicit
+(index, start, duration); `cli_phase variant` no longer derives a plan of its
+own. package-all still globs whatever chunk files land. Previously all three
+re-derived the plan independently and were kept in step by a COALESCE_RUNT_TAIL
+env flag — agreement by convention, which held only while every process probed
+the same duration.
 """
 from __future__ import annotations
 
@@ -61,7 +63,7 @@ from infinite_streaming_encoder.progress import Stage, emit_plan, emit_stage
 _SEGMENT_DURATION_S = 6.0
 # Fold a final chunk shorter than this into its predecessor (mirrors
 # encode_variants._MIN_TAIL_CHUNK_S; the worker does the same via
-# COALESCE_RUNT_TAIL, so the dispatched count matches what it encodes).
+# the plan it ships, so the dispatched spans are exactly what gets encoded).
 _MAX_RETRIES_PER_CHUNK = 3
 
 
@@ -361,7 +363,6 @@ def _phase_env(extra: dict[str, str]) -> list[str]:
         "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", ""),
         "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
         "AWS_REGION": os.environ.get("AWS_REGION", "us-east-1"),
-        "COALESCE_RUNT_TAIL": "1",
     }
     env.update(extra)
     out: list[str] = []
@@ -424,6 +425,10 @@ class ChunkTask:
     two_pass: bool
     extra_args: str = ""
     attempts: int = 0
+    # This chunk's boundaries, from the orchestrator's single plan. Passed to
+    # the worker rather than re-derived there; see cli_phase's variant phase.
+    start_s: float = 0.0
+    span_s: float = 0.0
 
 
 @dataclass
@@ -432,6 +437,9 @@ class _Shared:
     bucket: str
     work_prefix: str          # s3 key prefix holding mezzanine + chunk mp4s
     chunk_duration_s: float
+    # Clip duration the chunk plan was built against; the worker checks its own
+    # probe against it and fails rather than encoding a stale plan.
+    content_duration_s: float = 0.0
     burnin: bool = True       # job-level text-overlay toggle (on by default)
     lock: threading.Lock = field(default_factory=threading.Lock)
     failed: list[str] = field(default_factory=list)
@@ -516,6 +524,9 @@ def _worker_loop(w: Worker, sh: _Shared, s3_mezz: str, s3_out: str) -> None:
         args = ["variant", "--codec", task.codec, "--label", r.label,
                 "--width", str(r.width), "--height", str(r.height),
                 "--bitrate", str(r.bitrate), "--chunk-index", str(task.index),
+                "--chunk-start", f"{task.start_s:.6f}",
+                "--chunk-span", f"{task.span_s:.6f}",
+                "--content-duration", f"{sh.content_duration_s:.6f}",
                 "--s3-mezz", s3_mezz, "--s3-out", s3_out]
         if task.two_pass:
             args.append("--two-pass")
@@ -751,13 +762,15 @@ def run(args: argparse.Namespace) -> int:
     tasks: list[ChunkTask] = []
     for codec, rungs in rungs_by_codec.items():
         for rung in rungs:
-            for i in range(n_chunks):
-                tasks.append(ChunkTask(codec, rung, i, two_pass_for[codec],
-                                       extra_args_for[codec]))
+            for c in chunks:
+                tasks.append(ChunkTask(codec, rung, c.index, two_pass_for[codec],
+                                       extra_args_for[codec],
+                                       start_s=c.start_s, span_s=c.duration_s))
     print(f"[dist] === {len(tasks)} chunk task(s) across "
           f"{sum(w.slots for w in pool)} slot(s) ===", flush=True)
     sh = _Shared(q=queue.Queue(), bucket=bucket, work_prefix=work_prefix,
                  chunk_duration_s=args.chunk_duration_s,
+                 content_duration_s=info.duration_s,
                  measure_vmaf=args.measure_vmaf, burnin=args.burnin)
     encode_chunks_distributed(pool, tasks, sh, mezz_prefix, s3_work)
     if sh.failed:
@@ -811,8 +824,12 @@ def _resolve_chunk_duration_s(requested_s: float, content_duration_s: float) -> 
 
 
 def _resolve_plan(args, info):
-    """Shared prep: resolve rungs_by_codec + coalesced chunk count from the
-    source probe. Used by both the pool DAG and the Temporal plan."""
+    """Shared prep: resolve rungs_by_codec + the coalesced chunk PLAN from the
+    source probe. Used by both the pool DAG and the Temporal plan.
+
+    Returns the chunks themselves, not just how many: this orchestrator is the
+    sole authority on the boundaries and hands each worker its explicit span.
+    Workers no longer run plan_chunks, so a count alone is not enough."""
     ladder_def = get_ladder(args.ladder)
     overrides = {"hevc": parse_bitrate_override(args.bitrate_override_hevc),
                  "h264": parse_bitrate_override(args.bitrate_override_h264), "av1": {}}
@@ -826,7 +843,7 @@ def _resolve_plan(args, info):
             rungs_by_codec[codec] = rr
     chunks = _coalesce_runt_tail(
         plan_chunks(info.duration_s, args.chunk_duration_s, _SEGMENT_DURATION_S))
-    return rungs_by_codec, len(chunks)
+    return rungs_by_codec, chunks
 
 
 # Map a Temporal activity_id (set in EncodeWorkflow._phase) back to the UI stage
@@ -1011,7 +1028,8 @@ def run_temporal(args: argparse.Namespace) -> int:
     bucket = args.s3_bucket
     prefix = args.job_prefix.strip("/")
     src_key = f"{prefix}/input{input_path.suffix}"
-    rungs_by_codec, n_chunks = _resolve_plan(args, info)
+    rungs_by_codec, chunks = _resolve_plan(args, info)
+    n_chunks = len(chunks)
     if not rungs_by_codec:
         print("error: no ladder rungs fit this source", file=sys.stderr)
         return 1
@@ -1052,6 +1070,13 @@ def run_temporal(args: argparse.Namespace) -> int:
         "mezz_prefix": mezz_prefix, "job_rank": args.job_rank,
         "has_audio": info.has_audio, "chunk_duration_s": args.chunk_duration_s,
         "n_chunks": n_chunks,
+        # The boundaries themselves, so temporal_worker can hand each activity
+        # its explicit span instead of every worker re-deriving the plan from its
+        # own probe (agreement by contract, not by convention).
+        "chunks": [{"index": c.index, "start_s": c.start_s,
+                    "duration_s": c.duration_s} for c in chunks],
+        # What those boundaries were planned against, for the worker's check.
+        "content_duration_s": info.duration_s,
         "measure_vmaf": args.measure_vmaf, "burnin": args.burnin,
         "vmaf_prescale": getattr(args, "vmaf_prescale", False),
         # Ladder-level VBV. The workers read these as MAXRATE_PERCENT /

@@ -346,6 +346,11 @@ class EncodeWorkflow:
 
         cd = plan["chunk_duration_s"]
         n = plan["n_chunks"]
+        # Explicit boundaries from the orchestrator. Required — a plan without
+        # them comes from a pre-#176 orchestrator, and the worker it would reach
+        # no longer derives its own, so failing here beats encoding blind.
+        chunk_plan = plan["chunks"]
+        content_duration_s = float(plan["content_duration_s"])
         # Dispatch HIGHEST-COST chunks first (LPT scheduling): a chunk's expected
         # cost ~ height² × codec-factor × pass-factor, so the slow 4K HEVC 2-pass
         # work starts immediately and the tail is cheap chunks — better makespan
@@ -365,8 +370,8 @@ class EncodeWorkflow:
             for r in ci["rungs"]:
                 w = (r["height"] * r["height"] * codec_cost.get(codec, 1.0)
                      * (1.8 if tp else 1.0))
-                for i in range(n):
-                    specs.append((w, codec, r, tp, ea, i))
+                for c in chunk_plan:
+                    specs.append((w, codec, r, tp, ea, c))
         specs.sort(key=lambda s: s[0], reverse=True)  # most expensive first
         # Enqueue order alone doesn't hold — Temporal doesn't guarantee FIFO
         # dispatch even on a single partition (#96/#99), so cheap chunks leak
@@ -382,10 +387,16 @@ class EncodeWorkflow:
             for idx, wv in enumerate(distinct_w)
         }
         chunk_acts = []
-        for _w, codec, r, tp, ea, i in specs:
+        for _w, codec, r, tp, ea, c in specs:
+            i = c["index"]
             args = ["variant", "--codec", codec, "--label", r["label"],
                     "--width", str(r["width"]), "--height", str(r["height"]),
                     "--bitrate", str(r["bitrate"]), "--chunk-index", str(i),
+                    # The orchestrator's plan, passed through verbatim. The
+                    # worker does not re-derive boundaries from its own probe.
+                    "--chunk-start", f"{float(c['start_s']):.6f}",
+                    "--chunk-span", f"{float(c['duration_s']):.6f}",
+                    "--content-duration", f"{content_duration_s:.6f}",
                     "--s3-mezz", mezz, "--s3-out", s3_work]
             if tp:
                 args.append("--two-pass")
@@ -413,7 +424,7 @@ class EncodeWorkflow:
             # (124% / 0.25x), so local-dist encoded apple-uniq-live with a 2.5x
             # looser buffer than the profile specifies and delivered ~25% more
             # bits than the same rung on cloud (#167).
-            env = {"CHUNK_DURATION_S": str(cd), "COALESCE_RUNT_TAIL": "1",
+            env = {"CHUNK_DURATION_S": str(cd),
                    "TWO_PASS": "1" if tp else "0", "EXTRA_ARGS": ea,
                    "MEASURE_VMAF": "1" if measure_vmaf else "0",
                    "VMAF_PRESCALE": "1" if vmaf_prescale else "0",

@@ -100,7 +100,7 @@
                 "s3_mezz.$": "$.s3_mezz",
                 "two_pass.$": "$$.Map.Item.Value.two_pass",
                 "extra_args.$": "$$.Map.Item.Value.extra_args",
-                "chunk_indices.$": "$$.Map.Item.Value.chunk_indices",
+                "chunks.$": "$$.Map.Item.Value.chunks",
                 "chunk_duration.$": "$$.Map.Item.Value.chunk_duration",
                 "maxrate_percent.$": "$.maxrate_percent",
                 "bufsize_multiplier.$": "$.bufsize_multiplier",
@@ -110,7 +110,8 @@
                 "burnin.$": "$.burnin",
                 "est_vmaf.$": "$$.Map.Item.Value.est_vmaf",
                 "est_vmaf_clamped.$": "$$.Map.Item.Value.est_vmaf_clamped",
-                "chunked.$": "$$.Map.Item.Value.chunked"
+                "chunked.$": "$$.Map.Item.Value.chunked",
+                "content_duration.$": "$$.Map.Item.Value.content_duration"
               },
               "ItemProcessor": {
                 "StartAt": "Chunked",
@@ -168,7 +169,7 @@
                   "EncodeChunks": {
                     "Comment": "One encode job per chunk index, concurrent across chunks. A single-chunk clip runs one job (chunk 0 = whole clip).",
                     "Type": "Map",
-                    "ItemsPath": "$.chunk_indices",
+                    "ItemsPath": "$.chunks",
                     "ItemSelector": {
                       "codec.$": "$.codec",
                       "label.$": "$.label",
@@ -183,7 +184,10 @@
                       "s3_mezz.$": "$.s3_mezz",
                       "two_pass.$": "$.two_pass",
                       "extra_args.$": "$.extra_args",
-                      "chunk_index.$": "$$.Map.Item.Value",
+                      "chunk_index.$": "$$.Map.Item.Value.index",
+                      "chunk_start.$": "$$.Map.Item.Value.start_s",
+                      "chunk_span.$": "$$.Map.Item.Value.duration_s",
+                      "content_duration.$": "$.content_duration",
                       "chunk_duration.$": "$.chunk_duration",
                       "maxrate_percent.$": "$.maxrate_percent",
                       "bufsize_multiplier.$": "$.bufsize_multiplier",
@@ -213,6 +217,9 @@
                               "bitrate.$": "$.bitrate",
                               "preset.$": "$.preset",
                               "chunk_index.$": "States.Format('{}', $.chunk_index)",
+                              "chunk_start.$": "$.chunk_start",
+                              "chunk_span.$": "$.chunk_span",
+                              "content_duration.$": "$.content_duration",
                               "s3_mezz.$": "$.s3_mezz",
                               "s3_out.$": "$.s3_prefix"
                             },
