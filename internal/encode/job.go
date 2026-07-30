@@ -3030,6 +3030,13 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	segDur = effectiveTiming(segDur, ladderDef.SegmentDuration, "6")
 	partDur = effectiveTiming(partDur, ladderDef.PartialDuration, "0.2")
 	gopDur = effectiveTiming(gopDur, ladderDef.GopDuration, "1.0")
+	// Float form of the resolved segment duration, for planChunks. Chunk
+	// boundaries must land on whole segments, so the SAME value the workers are
+	// told to segment with has to drive the plan.
+	segS := 6.0
+	if v, err := strconv.ParseFloat(segDur, 64); err == nil && v > 0 {
+		segS = v
+	}
 	codecs := parseCodecSel(codecSel)
 	// Build the per-codec rung list from the ladder store. resolveLadderRungs
 	// caps each codec at the source width (no upscale) and --max-res, and
@@ -3076,11 +3083,11 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			// Per-variant chunking: size this variant's chunks (dynamic by
 			// complexity, or the job's fixed/whole config), then enumerate them.
 			cs := variantChunkSeconds(chunkCfg, clipDurationS, speeds, c, r.Height, twoPass, r.Preset, sourceFps)
-			nc := chunkCountForDuration(clipDurationS, cs)
-			idx := make([]int, nc)
-			for k := range idx {
-				idx[k] = k
-			}
+			// Plan the actual boundaries here, not just a count: the worker is
+			// handed (index, start, duration) and does not re-derive them. See
+			// chunkplan.go for why the authority moved.
+			spans := planChunks(clipDurationS, cs, segS)
+			nc := len(spans)
 			if logf != nil {
 				logf(chunkPlanLine(chunkCfg, c, r.Label, r.Height, twoPass, r.Preset, sourceFps, speeds, cs, nc, clipDurationS))
 			}
@@ -3100,9 +3107,13 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 				Priority:       0, // assigned by rank below
 				TwoPass:        strconv.FormatBool(twoPass),
 				ExtraArgs:      ladderDef.extraArgsFor(c),
-				ChunkIndices:   idx,
+				Chunks:         spans,
 				ChunkDuration:  strconv.FormatFloat(cs, 'f', -1, 64),
 				Chunked:        strconv.FormatBool(nc > 1),
+				// The duration the boundaries above were planned against. The
+				// worker checks its own mezzanine probe against this and fails
+				// rather than encoding a plan built for a different-length file.
+				ContentDuration: formatSeconds(clipDurationS),
 			})
 		}
 	}
@@ -3177,8 +3188,8 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	// all of them submitted — i.e. the job has fully fanned out.
 	expected := 0
 	for _, v := range variants {
-		if len(v.ChunkIndices) > 0 {
-			expected += len(v.ChunkIndices)
+		if len(v.Chunks) > 0 {
+			expected += len(v.Chunks)
 		} else {
 			expected++
 		}

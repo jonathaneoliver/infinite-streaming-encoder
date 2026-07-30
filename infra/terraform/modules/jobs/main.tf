@@ -162,6 +162,14 @@ resource "aws_batch_job_definition" "variant" {
       "--bitrate", "Ref::bitrate",
       "--preset", "Ref::preset",
       "--chunk-index", "Ref::chunk_index",
+      # Explicit chunk boundaries + the duration they were planned against. The
+      # control plane is the sole authority on the chunk plan; the worker is told
+      # its span rather than re-deriving it from its own probe of the mezzanine,
+      # and validates content-duration against that probe so a plan built for a
+      # different-length file fails loudly instead of silently shifting splits.
+      "--chunk-start", "Ref::chunk_start",
+      "--chunk-span", "Ref::chunk_span",
+      "--content-duration", "Ref::content_duration",
       "--s3-mezz", "Ref::s3_mezz",
       "--s3-out", "Ref::s3_out",
     ]

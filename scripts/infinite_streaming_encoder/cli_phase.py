@@ -40,9 +40,9 @@ import time
 from pathlib import Path
 
 from infinite_streaming_encoder.audio import AudioSpec, create_audio
-from infinite_streaming_encoder.chunking import DEFAULT_CHUNK_DURATION_S, plan_chunks
+from infinite_streaming_encoder.chunking import Chunk, DEFAULT_CHUNK_DURATION_S
 from infinite_streaming_encoder.encode_variants import (
-    EncodeContext, _coalesce_runt_tail, concat_chunks, encode_variant,
+    EncodeContext, concat_chunks, encode_variant,
 )
 from infinite_streaming_encoder.ffprobe import probe
 from infinite_streaming_encoder.hls import (
@@ -87,6 +87,20 @@ def _env_float(name: str, default: float) -> float:
 _SEGMENT_DURATION_S = _env_float("SEGMENT_DURATION", 6.0)
 _PARTIAL_DURATION_S = _env_float("PARTIAL_DURATION", 0.2)
 _GOP_DURATION_S = _env_float("GOP_DURATION", 1.0)
+# How far the mezzanine's probed duration may drift from the duration the
+# orchestrator planned chunk boundaries against. One frame at 24fps (~41.7ms) is
+# the smallest difference that can move a boundary onto a different frame; the
+# mezzanine is a pure stream copy, so a drift at this scale means the plan and
+# the file genuinely disagree.
+#
+# The tolerance has to be this tight because of one specific coupling: the
+# planned boundaries and the PROBED duration meet in build_ffmpeg_cmd, which
+# decides "is this the final chunk" as `chunk.end_s < content_duration_s`. An
+# interior chunk is capped to an exact frame count; the final one runs unbounded
+# to EOF. If the probe reads even slightly LONGER than the plan, the real final
+# chunk fails that test, gets treated as interior, and is truncated to the frame
+# grid — silently dropping the tail of the variant.
+_PLAN_DURATION_TOLERANCE_S = 1.0 / 24.0
 
 
 # ---------------------------------------------------------------------------
@@ -674,21 +688,38 @@ def phase_variant(args: argparse.Namespace) -> int:
     # mode (no --chunk-index) is unchanged.
     chunk = None
     if args.chunk_index is not None:
-        chunks = plan_chunks(info.duration_s, _chunk_duration_s(),
-                             _SEGMENT_DURATION_S)
-        # Distributed-local sets COALESCE_RUNT_TAIL: fold a sub-frame final
-        # chunk (clip a hair over an exact chunk multiple) into its
-        # predecessor so 2-pass x265 doesn't choke on an empty stats file.
-        # The orchestrator dispatches the same coalesced count, and package-all
-        # globs whatever chunks land, so the three stay consistent. Cloud never
-        # sets the flag, so its Go-computed chunk_count contract is unchanged.
-        if _env_flag("COALESCE_RUNT_TAIL"):
-            chunks = _coalesce_runt_tail(chunks)
-        if args.chunk_index >= len(chunks):
-            print(f"error: chunk-index {args.chunk_index} out of range "
-                  f"(clip has {len(chunks)} chunk(s))", file=sys.stderr)
+        # The ORCHESTRATOR owns the chunk plan and hands us our span. We do not
+        # re-derive it.
+        #
+        # Both paths used to plan independently here, from this worker's own
+        # probe of the mezzanine, with the orchestrator passing only a count (or,
+        # on local-dist, not even that — three processes each ran plan_chunks and
+        # were kept in step by a COALESCE_RUNT_TAIL env flag so they'd fold a
+        # short tail identically). Agreement by convention: it held only while
+        # every process saw the same duration, and a disagreement surfaced as
+        # "chunk-index out of range" or, worse, as silently shifted split points.
+        if args.chunk_start is None or args.chunk_span is None:
+            print("error: --chunk-index requires --chunk-start and --chunk-span "
+                  "(the orchestrator passes the chunk plan; this worker does not "
+                  "derive it). A pre-plan orchestrator is talking to a post-plan "
+                  "worker — redeploy both.", file=sys.stderr)
             return 1
-        chunk = chunks[args.chunk_index]
+        chunk = Chunk(index=args.chunk_index, start_s=args.chunk_start,
+                      duration_s=args.chunk_span)
+        # Validate rather than derive: the cloud control plane plans from the
+        # SOURCE probe, before the mezzanine job has run, so its boundaries
+        # assume the stream copy preserved the duration exactly. Fail loudly if
+        # it didn't — the alternative is every chunk boundary shifting by the
+        # drift and the concatenated variant silently gaining or losing frames.
+        if args.content_duration is not None:
+            drift = abs(info.duration_s - args.content_duration)
+            if drift > _PLAN_DURATION_TOLERANCE_S:
+                print(f"error: chunk plan was built for a "
+                      f"{args.content_duration:.6f}s clip but this mezzanine is "
+                      f"{info.duration_s:.6f}s ({drift:.6f}s drift, tolerance "
+                      f"{_PLAN_DURATION_TOLERANCE_S}s). Every chunk boundary "
+                      f"would be wrong.", file=sys.stderr)
+                return 1
         print(f"[phase variant] chunk {chunk.index}/{len(chunks)}: "
               f"[{chunk.start_s:.0f}s, {chunk.end_s:.0f}s)", flush=True)
 
@@ -1196,6 +1227,17 @@ def _build_parser() -> argparse.ArgumentParser:
     v.add_argument("--chunk-index", type=int, default=None, dest="chunk_index",
                    help="encode only this 0-based chunk of the variant "
                         "(Batch array index); omit for a whole-clip encode")
+    v.add_argument("--chunk-start", type=float, default=None, dest="chunk_start",
+                   help="absolute offset (s) of this chunk, from the "
+                        "orchestrator's plan; required with --chunk-index")
+    v.add_argument("--chunk-span", type=float, default=None, dest="chunk_span",
+                   help="duration (s) of this chunk, from the orchestrator's "
+                        "plan; required with --chunk-index")
+    v.add_argument("--content-duration", type=float, default=None,
+                   dest="content_duration",
+                   help="clip duration the chunk plan was built against; the "
+                        "worker fails if its own probe disagrees, rather than "
+                        "encoding a plan meant for a different-length file")
     v.add_argument("--no-burnin", action="store_false", dest="burnin",
                    help="disable the burnt-in text overlay (timecode/rate/codec/"
                         "watermark labels); on by default. Also honors BURNIN env "

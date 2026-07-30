@@ -55,12 +55,22 @@ type sfnVariant struct {
 	ExtraArgs string `json:"extra_args"`
 	// Per-variant chunking (dynamic chunk selector): each variant sizes its own
 	// chunks by complexity, so a slow 4K HEVC gets many 30s chunks while a cheap
-	// H264 runs whole. ChunkIndices is [0..n-1]; ChunkDuration is the chunk size
-	// in seconds (string, for the container env); Chunked is "true"/"false" for
-	// the SFN Choice. The SFN reads these off each Map item, not top-level.
-	ChunkIndices  []int  `json:"chunk_indices"`
-	ChunkDuration string `json:"chunk_duration"`
-	Chunked       string `json:"chunked"`
+	// H264 runs whole. ChunkDuration is the chunk size in seconds (string, for
+	// the container env); Chunked is "true"/"false" for the SFN Choice. The SFN
+	// reads these off each Map item, not top-level.
+	//
+	// Chunks carries the planned boundaries themselves, one object per chunk,
+	// and the chunk Map iterates it — so each worker is TOLD its (index, start,
+	// duration) instead of re-deriving the plan from its own probe. It replaced
+	// a bare []int of indices; see chunkplan.go for why the authority moved.
+	Chunks        []chunkSpan `json:"chunks"`
+	ChunkDuration string      `json:"chunk_duration"`
+	Chunked       string      `json:"chunked"`
+	// ContentDuration is the clip length the boundaries were planned against,
+	// for the worker's validation. Same for every variant; carried per-variant
+	// because the chunk Map's ItemSelector can only project what the variant
+	// item holds.
+	ContentDuration string `json:"content_duration"`
 }
 
 // maxResHeight maps a legacy tier name to its pixel height. Only a fallback
