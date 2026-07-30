@@ -403,6 +403,10 @@ class EncodeWorkflow:
                    "NUM_VARIANTS": str(num_variants),
                    "MAXRATE_PERCENT": str(plan.get("maxrate_percent", "")),
                    "BUFSIZE_MULT": str(plan.get("bufsize_multiplier", "")),
+                   # GOP sets keyint (= fps x gop_s). SEGMENT is read here too —
+                   # plan_chunks aligns chunk boundaries to it.
+                   "GOP_DURATION": str(plan.get("gop_duration", "")),
+                   "SEGMENT_DURATION": str(plan.get("segment_duration", "")),
                    "BURNIN": "1" if bn else "0", "ENCODE_THREADS": "2"}
             # An absent/blank value must not reach cli_phase as "" — _env_num
             # would read it as unset anyway, but dropping the key keeps the
@@ -417,12 +421,21 @@ class EncodeWorkflow:
         # codec. All ride job_top too, so an older job's packaging/manifests
         # outrank a younger job's chunk encoding and its outputs land first.
         for codec in plan["codecs"]:
+            # Packaging reads PARTIAL_DURATION (LL-HLS part length; 0 turns
+            # parts off for VOD) and SEGMENT_DURATION. These dispatches passed
+            # an empty env, so both silently defaulted to 0.2 / 6.0 — harmless
+            # for apple-uniq-live, wrong for apple-uniq-vod, which asks for
+            # partial=0 and would still have got LL-HLS parts (#172).
+            pkg_env = {k: v for k, v in (
+                ("PARTIAL_DURATION", str(plan.get("partial_duration", ""))),
+                ("SEGMENT_DURATION", str(plan.get("segment_duration", ""))),
+            ) if v != ""}
             await self._phase(["package-all", "--codec", codec, "--s3-variants",
                               s3_work, "--s3-audio", s3_work, "--s3-out", s3_out],
-                              {}, f"pkg-{codec}", priority_key=job_top)
+                              pkg_env, f"pkg-{codec}", priority_key=job_top)
             for ph in ("byteranges", "hls"):
                 await self._phase([ph, "--codec", codec, "--s3-package", s3_out,
-                                  "--s3-out", s3_out], {}, f"{ph}-{codec}",
+                                  "--s3-out", s3_out], pkg_env, f"{ph}-{codec}",
                                   priority_key=job_top)
         return "done"
 

@@ -418,6 +418,27 @@ def ladder_bufsize_multiplier(ladder_def: dict) -> float:
     return float(ladder_def.get("bufsize_multiplier") or BUFSIZE_MULTIPLIER)
 
 
+# Profile timing. These mirror cli_phase's env defaults exactly — SEGMENT 6.0,
+# GOP 1.0, PARTIAL 0.2 — because cli_phase is what consumes them and a
+# disagreement here would be the same silent-default trap these accessors exist
+# to close (#172). A ladder that omits one genuinely wants the default; "0" is a
+# real value (PARTIAL_DURATION=0 turns LL-HLS parts off for VOD), so these read
+# the key's presence rather than its truthiness.
+def ladder_segment_duration(ladder_def: dict) -> float:
+    v = ladder_def.get("segment_duration")
+    return 6.0 if v is None or v == "" else float(v)
+
+
+def ladder_gop_duration(ladder_def: dict) -> float:
+    v = ladder_def.get("gop_duration")
+    return 1.0 if v is None or v == "" else float(v)
+
+
+def ladder_partial_duration(ladder_def: dict) -> float:
+    v = ladder_def.get("partial_duration")
+    return 0.2 if v is None or v == "" else float(v)
+
+
 def ladder_extra_args(ladder_def: dict, codec: str) -> str:
     """Raw per-codec ffmpeg extra args for a codec on this ladder ("" when
     unset — the default). Mirrors LadderDef.extraArgsFor on the Go side."""
