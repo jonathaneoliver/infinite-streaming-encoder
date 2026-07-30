@@ -118,10 +118,10 @@ func variantResourcesFor(codec string, height int) (vcpu, memory string) {
 	// (An earlier 8-vCPU/whole-box setting was to measure uncontended speed and
 	// dodge c6g's much worse contention; c6g is now dropped from the fleet.)
 	if codec == "h264" {
-		return "4", "3072"
+		return "4", memForHeight(height)
 	}
 	if height <= 540 {
-		return "2", "3072" // small res is cheap for any codec
+		return "2", "3072" // small res is cheap for any codec (peak ~500 MiB)
 	}
 	switch codec {
 	case "hevc":
@@ -131,12 +131,39 @@ func variantResourcesFor(codec string, height int) (vcpu, memory string) {
 		// 4K chunk ~11.9 min vs the 8-vCPU's 10.9). x265 2-pass tops out ~2 cores
 		// even at 4K, so 2 vCPU is the efficient point → pack ~4 per box. Lower the
 		// makespan floor with smaller CHUNKS, not more vCPU.
-		return "2", "3072"
+		return "2", memForHeight(height)
 	case "av1":
 		return "8", "6144" // SVT-AV1 scales → give it a whole .2xlarge
 	default:
-		return "4", "3072"
+		return "4", memForHeight(height)
 	}
+}
+
+// memForHeight sizes a variant's container memory from its encoded height.
+//
+// Measured peaks (ENCODER-TIMING mem_mib, this clip, 2026-07-30):
+//
+//	h264  540p  502    h264 1080p  1112    h264 2160p  2271+
+//	hevc  720p  758                        hevc 2160p  2559
+//
+// The 4K figures are CENSORED: a chunk needing more than its limit is killed
+// before it emits a marker, so the true peak is above what we can see. h264
+// 2160p read 2271 and still OOM'd at 3072.
+//
+// A flat 3072 was safe only because apple-uniq-live stops h264 at 1080p. The
+// first apple-uniq-live-full run put x264 on 3840x2160 at 27 Mbps and Batch
+// killed every 2160p chunk twice. hevc 2160p was already within ~20% of the
+// same cliff without having crossed it.
+//
+// 6144 above 1080p is ~2.4x the highest observed peak — deliberate headroom,
+// because the ceiling is unobservable from this side and an OOM costs the whole
+// job while over-allocating only costs packing density. It matches what av1
+// already asks for.
+func memForHeight(height int) string {
+	if height > 1080 {
+		return "6144"
+	}
+	return "3072"
 }
 
 // sortRungsSlowestFirst orders variants by descending Priority (predicted
