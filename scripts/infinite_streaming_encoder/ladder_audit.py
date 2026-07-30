@@ -91,7 +91,7 @@ def _delivered_kbps(variant_dir: Path, duration_s: float) -> int:
 
 
 def discover_rungs(output_dir: Path) -> tuple[str, list[tuple[str, Path]]]:
-    """(codec, [(label, variant_dir)...]) for an output directory.
+    """(codec, profile, [(label, variant_dir)...]) for an output directory.
 
     A rung is any subdirectory holding a playlist.m3u8, except `audio`.
     """
@@ -109,6 +109,11 @@ def discover_rungs(output_dir: Path) -> tuple[str, list[tuple[str, Path]]]:
     codec = meta.get("codec") or ""
     if not codec:
         raise AuditError(f"{output_dir.name}: encode.json has no codec")
+    # The ladder this output was encoded from. Already in encode.json and
+    # already parsed here; recording it means a curve point can say WHICH
+    # ladder's rung it measured, so points from different profiles are
+    # distinguishable rather than merging on (codec, height, kbps) alone.
+    profile = meta.get("profile") or ""
 
     rungs = []
     for d in sorted(output_dir.iterdir()):
@@ -118,14 +123,14 @@ def discover_rungs(output_dir: Path) -> tuple[str, list[tuple[str, Path]]]:
             rungs.append((d.name, d))
     if not rungs:
         raise AuditError(f"{output_dir.name}: no variant directories with a playlist")
-    return codec, rungs
+    return codec, profile, rungs
 
 
 def audit_output(output_dir: Path, source: Path, reference: int,
                  n_subsample: int = 5, limit_s: float | None = None,
                  clip: str | None = None, progress=print) -> list[dict]:
     """Measure every rung of `output_dir` against `source`. Returns curve points."""
-    codec, rungs = discover_rungs(output_dir)
+    codec, profile, rungs = discover_rungs(output_dir)
     info = probe(source)
     fps = f"{info.fps.numerator}/{info.fps.denominator}" if info.fps else None
 
@@ -166,6 +171,16 @@ def audit_output(output_dir: Path, source: Path, reference: int,
             "harmonic": round(r["harmonic_mean"], 2),
             "min": round(r["min"], 2), "p1": round(r.get("p1", r["min"]), 2),
             "pct_lt10": round(r.get("pct_lt10", 0.0), 1),
+            # PROVENANCE. A VMAF number is only comparable against another
+            # measured the same way, and the two things that move it most are
+            # the model and the resolution both streams were scaled to. Neither
+            # was recorded before, which left a curve file unable to explain
+            # itself: a set of reference=1080 points measured on 2026-07-29 sat
+            # up to +15 VMAF above the seed at mid rungs with no way to tell
+            # from the file what had differed. `profile` names the ladder, so
+            # rungs from different ladders stay distinguishable.
+            "model": model, "common_w": common_w, "common_h": common_h,
+            "profile": profile,
         })
         progress(
             f"[audit]   {label:>6}: {kbps:>6} kbps  vmaf {r['mean']:6.2f}  "
@@ -211,7 +226,7 @@ def audit_tree(root: Path, source_dir: Path, reference: int,
         if match and match not in d.name:
             continue
         try:
-            codec, _ = discover_rungs(d)
+            codec, _, _ = discover_rungs(d)
         except AuditError as e:
             skipped += 1
             progress(f"[audit] SKIP {d.name}: {str(e).split(': ', 1)[-1]}")

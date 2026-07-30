@@ -58,6 +58,24 @@ type CurvePoint struct {
 	Kbps      int     `json:"kbps"`      // DELIVERED bitrate, not the target
 	Vmaf      float64 `json:"vmaf"`      // pooled mean
 	Harmonic  float64 `json:"harmonic"`  // harmonic mean — punishes bad frames
+
+	// PROVENANCE — not part of the identity above, but what makes a number
+	// interpretable. A VMAF score is only comparable against another measured
+	// the same way, and the two things that move it most are the model and the
+	// resolution both streams were scaled to. Model follows CommonH
+	// (vmaf_4k_v0.6.1 at >=1440p, else vmaf_v0.6.1), which is itself the source
+	// height capped at Reference — so all rungs in one audit share both, which
+	// is what makes a ladder internally comparable.
+	//
+	// Recorded because a set of measured points once sat up to +15 VMAF above
+	// the seed at mid rungs with nothing in the file able to explain why.
+	// Empty on seed points and on files written before this was added.
+	Model   string `json:"model,omitempty"`
+	CommonW int    `json:"common_w,omitempty"`
+	CommonH int    `json:"common_h,omitempty"`
+	// Profile is the ladder this rung came from (encode.json "profile"), so
+	// points measured from different ladders stay distinguishable.
+	Profile string `json:"profile,omitempty"`
 }
 
 // SeedClip names the content the built-in curves were measured on, so the UI can
