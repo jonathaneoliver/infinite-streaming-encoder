@@ -196,7 +196,7 @@ doctor:               ## preflight: check .env / host tools / per-target config,
 # ENCODER_IMAGE feeds BOTH this service's image and the image it spawns workers
 # from, so `run` (local build) and `run-remote` (GHCR) differ only in that value.
 run: require-paths
-	ENCODER_IMAGE=$(RUN_IMAGE) $(COMPOSE_BASE) up -d --build --no-deps server
+	ENCODER_IMAGE=$(RUN_IMAGE) DOCKER_IMAGE=$(DOCKER_IMAGE) $(COMPOSE_BASE) up -d --build --no-deps server
 	@echo "Encoder running at http://localhost:$(PORT)"
 
 # Fire up the server from the published GHCR image instead of a local build.
@@ -208,7 +208,7 @@ run-remote: require-paths require-ghcr
 		echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin; \
 	fi
 	ENCODER_IMAGE=$(REMOTE_IMAGE) $(COMPOSE_BASE) pull server
-	ENCODER_IMAGE=$(REMOTE_IMAGE) $(COMPOSE_BASE) up -d --no-build --no-deps server
+	ENCODER_IMAGE=$(REMOTE_IMAGE) DOCKER_IMAGE=$(DOCKER_IMAGE) $(COMPOSE_BASE) up -d --no-build --no-deps server
 	@echo "Encoder running at http://localhost:$(PORT)"
 
 # Bring the whole master stack down (cluster + server + worker). ARGS=-v wipes
@@ -371,6 +371,24 @@ ECR_PUSHED_TAG := $(shell aws ecr describe-images --repository-name infinite-str
 # to the last-pushed sha so it's always pullable; falls back to IMAGE_TAG only
 # if ECR can't be reached. Override in .env to pin a specific tag.
 DOCKER_IMAGE ?= $(ECR_REPO):$(if $(ECR_PUSHED_TAG),$(ECR_PUSHED_TAG),$(IMAGE_TAG))
+
+# NOT exported, deliberately — and every recipe that needs it passes it
+# explicitly on the compose command line instead.
+#
+# The Makefile `export`s everything, and `?=` keeps a value already present in
+# the ENVIRONMENT. So a parent make that resolved DOCKER_IMAGE before publishing
+# handed the stale tag to every sub-make, which then kept it rather than
+# re-querying ECR. `make deploy` does exactly that: it parses (resolving
+# ECR_PUSHED_TAG against ECR as it was), THEN publishes a new image, THEN calls
+# $(MAKE) farm-up — which inherited the pre-publish tag and started the server
+# with it. The About tab then reported "drifted — cloud is <old sha>" straight
+# after a clean deploy, which is worse than showing nothing.
+#
+# ECR_PUSHED_TAG itself is fine: `:=` overrides the environment, so a sub-make
+# re-evaluates it. Only this `?=` needed protecting. Unexporting keeps the .env
+# override working — that arrives via `-include .env` as a make variable, which
+# `?=` still respects.
+unexport DOCKER_IMAGE
 
 # Step Functions ARN — auto-resolved from Terraform state (like ECR_REPO) so a
 # fresh `cloud-up` needs nothing hand-copied into .env. A value in .env wins (?=).
@@ -907,7 +925,7 @@ farm-up: require-paths require-ghcr ## bring the whole master farm up from GHCR 
 	@echo ">>> [farm-up] pulling images + bringing up the master profile (cluster + server + worker) from GHCR..."
 	@if [ -n "$(GHCR_PAT)" ]; then echo "$(GHCR_PAT)" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin; fi
 	ENCODER_IMAGE=$(REMOTE_IMAGE) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) $(COMPOSE_BASE) --profile master pull
-	ENCODER_IMAGE=$(REMOTE_IMAGE) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) $(COMPOSE_BASE) --profile master up -d --no-build
+	ENCODER_IMAGE=$(REMOTE_IMAGE) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) DOCKER_IMAGE=$(DOCKER_IMAGE) $(COMPOSE_BASE) --profile master up -d --no-build
 	@echo ">>> [farm-up] remote workers (from GHCR)..."
 	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-ghcr; else echo "    (no DIST_WORKERS — master-only farm)"; fi
 	@echo ">>> farm up:  UI http://localhost:$(PORT)   Temporal UI http://localhost:$${TEMPORAL_UI_PORT:-8233}"
@@ -945,6 +963,7 @@ farm-dev-up: require-paths   ## dev farm from your WORKING TREE (uncommitted): l
 	@echo ">>> [farm-dev-up] building from working tree + bringing up the master profile with live code..."
 	ENCODER_IMAGE=$(IMAGE_NAME) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) \
 	  HOST_SCRIPTS_DIR=$(CURDIR)/scripts/infinite_streaming_encoder \
+	  DOCKER_IMAGE=$(DOCKER_IMAGE) \
 	  $(COMPOSE_DEV) --profile master up -d --build
 	@echo ">>> [farm-dev-up] remote workers (rsync code + transfer/build image)..."
 	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-workers; else echo "    (no DIST_WORKERS — master-only)"; fi
