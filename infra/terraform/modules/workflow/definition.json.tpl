@@ -141,6 +141,9 @@
                         "bitrate.$": "$.bitrate",
                         "preset.$": "$.preset",
                         "chunk_index": "-1",
+                        "chunk_start": "-1",
+                        "chunk_span": "-1",
+                        "content_duration.$": "$.content_duration",
                         "s3_mezz.$": "$.s3_mezz",
                         "s3_out.$": "$.s3_prefix"
                       },

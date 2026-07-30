@@ -720,8 +720,10 @@ def phase_variant(args: argparse.Namespace) -> int:
                       f"{_PLAN_DURATION_TOLERANCE_S}s). Every chunk boundary "
                       f"would be wrong.", file=sys.stderr)
                 return 1
-        print(f"[phase variant] chunk {chunk.index}/{len(chunks)}: "
-              f"[{chunk.start_s:.0f}s, {chunk.end_s:.0f}s)", flush=True)
+        # No total to report: this worker is handed one span and never builds
+        # the full plan, so it does not know how many chunks there are.
+        print(f"[phase variant] chunk {chunk.index}: "
+              f"[{chunk.start_s:.3f}s, {chunk.end_s:.3f}s)", flush=True)
 
     # CPU-seconds actually consumed by the ffmpeg child(ren) during the
     # encode (both passes, if two-pass). Divided by (reserved vCPU x encode
