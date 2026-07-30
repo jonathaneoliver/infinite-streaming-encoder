@@ -620,6 +620,30 @@ One `Dockerfile`, published/used four ways:
 | `make promote` | re-tags an existing image, never rebuilds | releasing the build you tested ([From edit to release](#from-edit-to-release)) |
 | `make ami-up` | AWS AMI | pre-pull the ECR image onto spot boxes |
 
+### Comparing what actually reached ffmpeg
+
+Every ffmpeg invocation logs its exact argv, shell-quoted, as a single
+`[ffmpeg] …` line — copy it out of the log and it re-runs verbatim. It is written
+where the encode ran, which differs per path: the job log (`$TMP_DIR/logs/`) for
+a local encode, `docker logs encode-worker` on the box that took the chunk for
+local-dist, and CloudWatch `/aws/batch/infinite-streaming-encoder` for cloud
+(**7-day retention** — past that the evidence is gone).
+
+`make ffmpeg-cmds` collects all three and groups them by rung, comparing
+*settings* rather than raw argv: work-dir and staging paths legitimately differ
+between local and cloud, so it masks path-valued arguments and keeps the rate
+control, preset, GOP and filter chain. Two entries under one rung means the paths
+disagreed about how to encode it.
+
+```
+make ffmpeg-cmds                       # all rungs, last 24h of CloudWatch
+make ffmpeg-cmds ARGS="--rung h264_1080 --hours 72"
+make ffmpeg-cmds ARGS="--raw"          # full argv, no masking
+```
+
+This is the evidence that was missing when a local and a cloud encode of the same
+rung came out 25% apart (#167) and the settings had to be reconstructed by hand.
+
 ## Repository layout
 
 ```

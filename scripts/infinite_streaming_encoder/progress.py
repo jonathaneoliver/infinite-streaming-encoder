@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -245,6 +246,24 @@ def run_ffmpeg_with_progress(
     Raises `subprocess.CalledProcessError` if ffmpeg exits non-zero.
     """
     full_cmd = [*cmd, "-progress", "pipe:1", "-stats_period", _FFMPEG_STATS_PERIOD]
+
+    # Log the EXACT argv, shell-quoted so it can be pasted and re-run verbatim.
+    #
+    # Written because a local and a cloud encode of the same rung delivered 25%
+    # different bitrates (#167) and there was no record of what either had
+    # actually been asked to do — the settings had to be reconstructed by
+    # reading three files and inferring which env vars each path passed. The
+    # command line is the ground truth that ends that class of argument in one
+    # diff, and it cannot be recovered after the fact.
+    #
+    # `full_cmd`, not `cmd`: -progress and -stats_period are appended here, so
+    # logging `cmd` would print something that is not what ran. Emitted for
+    # every invocation, so a two-pass encode logs both passes separately.
+    #
+    # One line per encode against ffmpeg's own per-second stats output, so the
+    # volume is negligible. Deliberately NOT gated behind a debug flag: it is
+    # only useful if it was already on when the run happened.
+    print(f"[ffmpeg] {shlex.join(full_cmd)}", flush=True)
 
     # Map ffmpeg's own 0-100% onto the caller's [pct_lo, pct_hi] band, so a
     # phase whose ffmpeg step is only the middle of the stage (mezzanine/audio:

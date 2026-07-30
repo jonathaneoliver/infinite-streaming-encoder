@@ -233,6 +233,9 @@ status:               ## what is deployed where, vs what this tree says it shoul
 	@docker ps --filter name=$(CONTAINER_NAME) --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || echo "not running"
 	@bash scripts/status.sh
 
+ffmpeg-cmds:          ## the exact ffmpeg argv from every encode path, diffed by rung
+	@python3 scripts/ffmpeg_cmds.py $(ARGS)
+
 clean: stop
 	docker rmi $(IMAGE_NAME) 2>/dev/null || true
 
