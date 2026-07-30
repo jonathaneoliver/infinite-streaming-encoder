@@ -124,6 +124,10 @@ check:                ## run the same static checks CI runs (gofmt/vet/build, to
 	printf '  sfn scopes     '; \
 	if out=$$(python3 scripts/check_sfn_scopes.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py undefined   '; \
+	if ! command -v ruff >/dev/null 2>&1; then echo "skipped (pip install ruff)"; \
+	elif out=$$(ruff check --select F821 scripts/ 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  python compile '; \
 	if out=$$(cd scripts && python3 -m compileall -q infinite_streaming_encoder 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \

@@ -192,6 +192,67 @@ def _check_item_shape(doc: dict) -> list[str]:
     return problems
 
 
+JOBS_TF = Path("infra/terraform/modules/jobs/main.tf")
+_REF = re.compile(r'"Ref::([A-Za-z0-9_]+)"')
+# Job definition resource name -> the ${...} the state machine interpolates for it.
+_JOB_DEFS = {
+    "variant": "variant_def",
+    "mezzanine": "mezzanine_def",
+    "audio": "audio_def",
+    "package_all": "package_all_def",
+}
+
+
+def _jobdef_refs() -> dict[str, set[str]]:
+    """Ref:: parameter names each job definition's command requires."""
+    try:
+        src = JOBS_TF.read_text()
+    except OSError:
+        return {}
+    out: dict[str, set[str]] = {}
+    for res, tf_var in _JOB_DEFS.items():
+        m = re.search(rf'resource "aws_batch_job_definition" "{res}".*?\n\}}\n',
+                      src, re.S)
+        if m:
+            out[tf_var] = set(_REF.findall(m.group(0)))
+    return out
+
+
+def _check_jobdef_params(raw: str) -> list[str]:
+    """Every Ref:: a job definition's command uses must be supplied by EVERY
+    state that submits to it.
+
+    Batch substitutes Ref:: against the submitting call's `parameters` map, so a
+    job definition shared by two states needs BOTH to supply every reference.
+    Adding one to the command and to only one caller fails at submit time with
+    "Unable to substitute value. No parameter found for reference X" — which is
+    what shipping --chunk-start without updating EncodeWhole did: the chunked
+    path worked and every whole-variant encode died.
+
+    Parsed off the raw template (not the JSON-stubbed copy) because the
+    JobDefinition value is a Terraform interpolation naming which job def it is.
+    """
+    required = _jobdef_refs()
+    if not required:
+        return [f"  could not read job definitions from {JOBS_TF}"]
+
+    problems: list[str] = []
+    # Each submitJob state: the ${job_def} it targets + the parameter names it
+    # supplies. Matched textually so the ${...} survives.
+    for block in re.finditer(
+            r'"Resource":\s*"arn:aws:states:::batch:submitJob\.sync".*?'
+            r'"JobDefinition":\s*"\$\{(\w+)\}".*?'
+            r'"Parameters":\s*\{(.*?)\n(\s*)\},',
+            raw, re.S):
+        tf_var, params_body = block.group(1), block.group(2)
+        supplied = {k.rstrip(".$") for k in re.findall(r'"([A-Za-z0-9_]+)(?:\.\$)?"\s*:', params_body)}
+        missing = sorted(required.get(tf_var, set()) - supplied)
+        if missing:
+            problems.append(f"  a state submitting to ${{{tf_var}}} does not supply: "
+                            f"{', '.join(missing)}")
+    return problems
+
+
 def main() -> int:
     if not TEMPLATE.exists():
         print(f"{TEMPLATE}: not found (run from the repo root)", file=sys.stderr)
@@ -200,6 +261,17 @@ def main() -> int:
     # ${job_queue_arn} etc. are Terraform interpolations, not JSON. Stub them to
     # a literal so the document parses; their values are irrelevant here.
     doc = json.loads(re.sub(r"\$\{[^}]*\}", "TF", raw))
+
+    jd = _check_jobdef_params(raw)
+    if jd:
+        print(f"{TEMPLATE}: Batch Ref:: parameters a submitting state does not supply:",
+              file=sys.stderr)
+        for line in jd:
+            print(line, file=sys.stderr)
+        print("  Batch resolves Ref:: against the SUBMITTING call's parameters, so "
+              "every state sharing a job definition must supply all of them.",
+              file=sys.stderr)
+        return 1
 
     shape = _check_item_shape(doc)
     if shape:
