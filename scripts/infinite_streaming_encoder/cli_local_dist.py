@@ -54,6 +54,7 @@ from infinite_streaming_encoder.ladder import (
     Rung, get_ladder, ladder_extra_args, ladder_passes,
     parse_bitrate_override, select_rungs,
     ladder_maxrate_percent, ladder_bufsize_multiplier,
+    ladder_segment_duration, ladder_gop_duration, ladder_partial_duration,
 )
 from infinite_streaming_encoder.progress import Stage, emit_plan, emit_stage
 
@@ -1061,6 +1062,19 @@ def run_temporal(args: argparse.Namespace) -> int:
         # same rung on cloud.
         "maxrate_percent": ladder_maxrate_percent(ladder_def),
         "bufsize_multiplier": ladder_bufsize_multiplier(ladder_def),
+        # Profile timing, same reasoning as the VBV knobs above. GOP sets keyint
+        # on the variant encode; PARTIAL drives LL-HLS parts in packaging and 0
+        # turns them off entirely (VOD); SEGMENT is read by BOTH. A job-level
+        # override wins over the ladder when the control plane sent one.
+        "segment_duration": (float(args.segment_duration)
+                             if args.segment_duration not in (None, "")
+                             else ladder_segment_duration(ladder_def)),
+        "gop_duration": (float(args.gop_duration)
+                         if args.gop_duration not in (None, "")
+                         else ladder_gop_duration(ladder_def)),
+        "partial_duration": (float(args.partial_duration)
+                             if args.partial_duration not in (None, "")
+                             else ladder_partial_duration(ladder_def)),
         "codecs": {c: {"two_pass": two_pass[c],
                        "extra_args": ladder_extra_args(ladder_def, c),
                        "rungs": [_rung_dict(c, r, _vmaf_ests) for r in rr]}
@@ -1185,6 +1199,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", required=True, dest="output_dir")
     p.add_argument("--codec", default="hevc")
     p.add_argument("--ladder", default="apple-uniq-live")
+    # Job-level overrides of the ladder's profile timing. Absent -> the ladder's
+    # value. Strings, not floats, so "" and "0" stay distinguishable ("0" is a
+    # real setting: PARTIAL_DURATION=0 disables LL-HLS parts).
+    p.add_argument("--segment-duration", default=None, dest="segment_duration")
+    p.add_argument("--gop-duration", default=None, dest="gop_duration")
+    p.add_argument("--partial-duration", default=None, dest="partial_duration")
     # No `choices=`: tier options are derived from the selected ladder's real
     # rung heights, which include non-standard ones (954p, 1800p...).
     p.add_argument("--max-res", default=None, dest="max_res")

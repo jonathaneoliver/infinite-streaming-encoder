@@ -2311,6 +2311,20 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	// <=0 as one chunk spanning the clip.
 	args = append(args, "--chunk-duration",
 		strconv.FormatFloat(cfg.localChunkSeconds(), 'f', -1, 64))
+	// Profile timing overrides. Sent ONLY when the job set one — absent means
+	// "use the ladder's", which cli_local_dist resolves. Cloud gets the same
+	// three through the SFN container overrides; local had no route for them at
+	// all until #172, so a ladder's gop/partial were silently replaced by
+	// cli_phase's defaults.
+	if cfg.SegmentDuration != "" {
+		args = append(args, "--segment-duration", cfg.SegmentDuration)
+	}
+	if cfg.GopDuration != "" {
+		args = append(args, "--gop-duration", cfg.GopDuration)
+	}
+	if cfg.PartialDuration != "" {
+		args = append(args, "--partial-duration", cfg.PartialDuration)
+	}
 	if cfg.OutputTag != "" {
 		args = append(args, "--output-tag", cfg.OutputTag)
 	}
