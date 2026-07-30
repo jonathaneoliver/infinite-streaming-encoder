@@ -889,11 +889,6 @@ type JobConfig struct {
 	// so `omitempty` works and an unset value lets cli_cloud.py apply
 	// its env-var default (USE_SPOT=true). Ignored for local encodes.
 	UseSpot *bool `json:"use_spot,omitempty"`
-	// SimulateInterruptAfterS is a test hook: when >0, the remote
-	// user-data schedules a synthetic spot-interrupt after this many
-	// seconds. Lets us exercise the Retry flow without waiting for a
-	// real AWS reclaim.
-	SimulateInterruptAfterS int `json:"simulate_interrupt_after_s,omitempty"`
 }
 
 type StageProgress struct {
