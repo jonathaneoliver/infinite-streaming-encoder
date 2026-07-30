@@ -210,8 +210,25 @@ def encode_phase(spec: dict) -> list[str]:
             tail.append(last)
             if len(tail) > 60:
                 del tail[:-60]
-            if last.startswith("[[ENCODER"):
+            # Echo to THIS worker's stdout, i.e. `docker logs encode-worker` on
+            # the box that ran the chunk.
+            #
+            # `[ffmpeg] ` rides along with the markers because otherwise it is
+            # swallowed: only [[ENCODER lines are echoed, and everything else
+            # surfaces solely in the 60-line tail printed when a phase FAILS —
+            # which is the exact opposite of what a post-mortem needs, since the
+            # comparison that motivated this (#167, local vs cloud bitrate drift)
+            # is between two runs that both SUCCEEDED.
+            #
+            # Echoed but deliberately NOT added to `relay`: an argv line is
+            # ~0.5-1.5 KB and every chunk emits one, so relaying would push
+            # hundreds of KB into the workflow history that every subsequent
+            # history fetch then carries. The cloud path's copy lands in
+            # CloudWatch rather than the job log too, so container logs are the
+            # symmetric place to diff the two.
+            if last.startswith(("[[ENCODER", "[ffmpeg] ")):
                 print(last, flush=True)
+            if last.startswith("[[ENCODER"):
                 # Collect for the return value. Deliberately an EXCLUDE list,
                 # not a whitelist: the whole class of bug in #141 is that a new
                 # marker gets silently dropped until someone notices.
