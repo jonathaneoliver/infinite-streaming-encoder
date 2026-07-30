@@ -489,11 +489,27 @@ func (s *Server) streamJobs(w http.ResponseWriter, r *http.Request) {
 	ch := s.Manager.Subscribe()
 	defer s.Manager.Unsubscribe(ch)
 
-	// Send current state immediately
-	for _, j := range s.Manager.Jobs() {
-		data, _ := json.Marshal(j)
-		fmt.Fprintf(w, "data: %s\n\n", data)
+	// Send current state immediately, as ONE named "snapshot" event carrying the
+	// whole list — not as individual job events.
+	//
+	// The client keys off the name to REPLACE its job map rather than merge into
+	// it. Merging is what it used to do, and there was no way to stop: a job the
+	// server has dropped simply stops being mentioned, so the browser kept
+	// rendering rows for jobs that no longer existed and every action on them
+	// 404'd (#169). Terminal jobs do not survive a restart, and restarts are
+	// frequent, so that was the normal state after any deploy.
+	//
+	// This also re-syncs on reconnect: EventSource retries on its own, and each
+	// reconnect delivers a fresh snapshot that discards whatever drifted.
+	//
+	// An explicitly empty slice, never nil — `null` would deserialise to a falsy
+	// value the client would have to special-case.
+	jobs := s.Manager.Jobs()
+	if jobs == nil {
+		jobs = []*encode.Job{}
 	}
+	snap, _ := json.Marshal(jobs)
+	fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n", snap)
 	flusher.Flush()
 
 	for {

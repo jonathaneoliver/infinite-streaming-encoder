@@ -2938,6 +2938,21 @@ async function refreshLog(id) {
 
 function connectSSE() {
     const es = new EventSource('/api/jobs/stream');
+    // The server opens with a named "snapshot" event holding the whole list.
+    // REPLACE on it, never merge: a job the server has dropped stops being
+    // mentioned, so merging left ghost rows whose actions 404'd (#169).
+    // Terminal jobs do not survive a restart, so that was the normal state
+    // after any deploy. Fires again on every reconnect, discarding drift.
+    es.addEventListener('snapshot', (e) => {
+        try {
+            const list = JSON.parse(e.data) || [];
+            jobs = {};
+            for (const j of list) jobs[j.id] = j;
+            renderJobs();
+            renderLocalFleet();
+        } catch (err) {}
+    });
+    // Per-job updates after the snapshot — merge, since each carries one job.
     es.onmessage = (e) => {
         try {
             const job = JSON.parse(e.data);
