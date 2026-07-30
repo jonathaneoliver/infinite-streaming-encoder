@@ -53,6 +53,7 @@ from infinite_streaming_encoder.ffprobe import ProbeError, probe
 from infinite_streaming_encoder.ladder import (
     Rung, get_ladder, ladder_extra_args, ladder_passes,
     parse_bitrate_override, select_rungs,
+    ladder_maxrate_percent, ladder_bufsize_multiplier,
 )
 from infinite_streaming_encoder.progress import Stage, emit_plan, emit_stage
 
@@ -1052,6 +1053,14 @@ def run_temporal(args: argparse.Namespace) -> int:
         "n_chunks": n_chunks,
         "measure_vmaf": args.measure_vmaf, "burnin": args.burnin,
         "vmaf_prescale": getattr(args, "vmaf_prescale", False),
+        # Ladder-level VBV. The workers read these as MAXRATE_PERCENT /
+        # BUFSIZE_MULT; without them cli_phase falls back to the module defaults
+        # (124% / 0.25x) and the ladder's shaping is silently discarded — which
+        # is what local-dist did until #167, encoding apple-uniq-live with a 2.5x
+        # looser buffer than it specifies and delivering ~25% more bits than the
+        # same rung on cloud.
+        "maxrate_percent": ladder_maxrate_percent(ladder_def),
+        "bufsize_multiplier": ladder_bufsize_multiplier(ladder_def),
         "codecs": {c: {"two_pass": two_pass[c],
                        "extra_args": ladder_extra_args(ladder_def, c),
                        "rungs": [_rung_dict(c, r, _vmaf_ests) for r in rr]}

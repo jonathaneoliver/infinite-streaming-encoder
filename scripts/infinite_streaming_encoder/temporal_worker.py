@@ -385,12 +385,29 @@ class EncodeWorkflow:
                 args += ["--est-vmaf", str(r["est_vmaf"])]
                 if r.get("est_vmaf_clamped"):
                     args.append("--est-vmaf-clamped")
+            # ENCODE_THREADS is 2 and NOT per-codec on purpose: _default_slots
+            # sizes concurrency as physical-cores/2 precisely so 2 threads each
+            # fills the physical cores without spilling onto SMT. Cloud can
+            # vary it per codec because Batch packs by vCPU RESERVATION; here
+            # the box is shared and a bigger number oversubscribes it.
+            #
+            # MAXRATE_PERCENT / BUFSIZE_MULT come from the ladder via the plan.
+            # Omitting them let cli_phase fall back to its module defaults
+            # (124% / 0.25x), so local-dist encoded apple-uniq-live with a 2.5x
+            # looser buffer than the profile specifies and delivered ~25% more
+            # bits than the same rung on cloud (#167).
             env = {"CHUNK_DURATION_S": str(cd), "COALESCE_RUNT_TAIL": "1",
                    "TWO_PASS": "1" if tp else "0", "EXTRA_ARGS": ea,
                    "MEASURE_VMAF": "1" if measure_vmaf else "0",
                    "VMAF_PRESCALE": "1" if vmaf_prescale else "0",
                    "NUM_VARIANTS": str(num_variants),
+                   "MAXRATE_PERCENT": str(plan.get("maxrate_percent", "")),
+                   "BUFSIZE_MULT": str(plan.get("bufsize_multiplier", "")),
                    "BURNIN": "1" if bn else "0", "ENCODE_THREADS": "2"}
+            # An absent/blank value must not reach cli_phase as "" — _env_num
+            # would read it as unset anyway, but dropping the key keeps the
+            # worker's env honest about what the ladder actually specified.
+            env = {k: v for k, v in env.items() if v != ""}
             key = min(PRIORITY_LEVELS, job_rank * PRIORITY_BANDS + _wband[_w])
             chunk_acts.append(self._phase(
                 args, env, f"enc-{codec}-{r['label']}-c{i}", priority_key=key))
