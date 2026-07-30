@@ -83,7 +83,6 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("POST /api/jobs/{id}/cancel", s.cancelJob)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/retry", s.retryJob)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/redo", s.redoJob)
-	s.Mux.HandleFunc("POST /api/jobs/{id}/simulate-interrupt", s.simulateInterrupt)
 	s.Mux.HandleFunc("GET /api/jobs/{id}/workdir", s.jobWorkdir)
 	// AWS inventory + cleanup (issue #5)
 	s.Mux.HandleFunc("GET /api/aws/inventory", s.awsInventory)
@@ -420,54 +419,6 @@ func (s *Server) jobWorkdir(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp)
 }
 
-// simulateInterrupt fakes a mid-encode failure so the Retry flow
-// can be exercised without waiting for a real interrupt.
-//
-// Cloud jobs: writes an empty _SIMULATE_INTERRUPT sentinel to the
-// job's S3 prefix. The remote user-data polls for it every 5s and,
-// on seeing it, invokes the same trigger_interrupt bash path a real
-// spot reclaim hits — writes SPOT INTERRUPTION: to _FAILED, rsyncs
-// /work/tmp + /work/output, exits.
-//
-// Local jobs: docker kill on the worker container. SIGKILLs the
-// Python process before it can clean up, so any in-flight variant
-// has no .done sidecar written (exactly what happens on spot
-// interrupt) — cli_local.py's preflight sweep deletes those on
-// retry, leaving only the fully-complete files for reuse.
-func (s *Server) simulateInterrupt(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	job := s.Manager.GetJob(id)
-	if job == nil {
-		http.Error(w, "job not found", 404)
-		return
-	}
-	if job.Status != encode.StatusRunning {
-		http.Error(w, "job is not running", 400)
-		return
-	}
-	// Find and SIGKILL the worker container(s) for this job.
-	out, err := exec.Command("docker", "ps",
-		"--filter", "label=encoder.job_id="+id,
-		"--format", "{{.Names}}").Output()
-	if err != nil {
-		http.Error(w, "docker ps failed: "+err.Error(), 500)
-		return
-	}
-	names := strings.Fields(string(out))
-	if len(names) == 0 {
-		http.Error(w, "no running worker container for this job", 404)
-		return
-	}
-	for _, name := range names {
-		exec.Command("docker", "kill", name).Run()
-	}
-	w.WriteHeader(204)
-}
-
-// retryJob submits a new job with the same config as `id`, wired to
-// resume from that job's S3 staging (inputs, mezzanines, completed
-// variants). Only meaningful for cloud failures — local encodes have
-// no shared staging to reuse.
 func (s *Server) retryJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	orig := s.Manager.GetJob(id)
