@@ -327,6 +327,7 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
     yet, or that were never observed RUNNING at all — are filled in.
     """
     seen = log_state.setdefault("_stage_status", {})
+    newly_running: list[str] = []
     for status, stage_status in _BATCH_STAGE_STATUS.items():
         for j in _list_exec_jobs(exec_name, status):
             key = _stage_key_for_job(j.get("jobName", ""))
@@ -335,9 +336,31 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
             if seen.get(key) == stage_status or seen.get(key) in _TERMINAL_STAGE:
                 continue
             seen[key] = stage_status
+            if stage_status == "running" and j.get("jobId"):
+                newly_running.append(j["jobId"])
             pct = 100.0 if stage_status == "done" else 0.0
             print(f"[[ENCODER-STAGE key={key} status={stage_status} "
                   f"percent={pct:.1f}]]", flush=True)
+
+    # Colour the chunks we just announced, in the same pass.
+    #
+    # _forward_running_logs already tags hosts, but off its OWN describe_jobs
+    # earlier in the poll — so a job that entered the RUNNING census after that
+    # call is announced here with no host yet and renders as an uncoloured (blue)
+    # cell until a later poll. That window widened when stage state moved to
+    # Batch status, because chunks now surface as running sooner than they did
+    # when we waited for their log marker. Describing just the newly-announced
+    # ids keeps the host no later than the status it belongs to. Bounded by the
+    # number of NEW jobs per poll, not the ladder size.
+    if newly_running:
+        batch = _batch()
+        for i in range(0, len(newly_running), 100):
+            try:
+                described = batch.describe_jobs(
+                    jobs=newly_running[i:i + 100]).get("jobs", [])
+            except ClientError:
+                continue
+            _tag_hosts_for_jobs(described, log_state)
 
 
 def _tail_progress(stream: str, label: str, log_state: dict,

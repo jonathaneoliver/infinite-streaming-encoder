@@ -1019,7 +1019,18 @@ func (s *Server) attachFleetCPU(out []byte) []byte {
 	if json.Unmarshal(out, &doc) != nil {
 		return out
 	}
-	doc["fleet"] = filterToLiveInstances(fleet, doc["instances"])
+	// Under fleet_cpu, NOT fleet. The cloud inventory already uses "fleet" for its
+	// summary object (total_vcpus, utilization, history, spend_24h_usd), which the
+	// UI's _fleetSparks reads for the utilisation/jobs/cost sparklines. Writing the
+	// per-machine array over that key clobbered the summary whenever any machine
+	// had reported — so the sparklines vanished exactly while an encode was
+	// running — and left _awsFleet holding a dict when nothing had reported.
+	// Either way one of the two consumers got the wrong shape.
+	//
+	// The local endpoint (/api/dist/workers) has no summary and keeps "fleet" for
+	// its array, so the shared-shape intent still holds: both targets expose the
+	// same per-machine array, just under the key that is free on each.
+	doc["fleet_cpu"] = filterToLiveInstances(fleet, doc["instances"])
 	merged, err := json.Marshal(doc)
 	if err != nil {
 		return out

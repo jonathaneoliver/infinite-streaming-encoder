@@ -2993,7 +2993,10 @@ async function refreshAws() {
         const res = await fetch('/api/aws/inventory');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
-        _awsFleet = data.fleet || [];
+        // fleet_cpu = per-machine CPU array; data.fleet stays the summary object
+        // that renderFleet/_fleetSparks read. They used to share one key, so
+        // whichever arrived last won and the other rendered blank.
+        _awsFleet = data.fleet_cpu || [];
         renderAws(data);
         if (lastEl) {
             lastEl.textContent = 'updated ' + new Date().toLocaleTimeString();
@@ -3220,6 +3223,11 @@ const _FLEET_STATE = {
     booting: { c: '#d0a24a', t: '◦ booting', tip: 'EC2 up — OS boot + ECS agent register + first image pull happen here' },
     pulling: { c: '#4a90d9', t: '⋯ pulling image', tip: 'task placed — pulling image / starting container' },
     idle:    { c: '#d0a24a', t: '◦ idle', tip: 'running but no jobs — a scale-down candidate' },
+    // A box on its way OUT. Both used to render as "booting", because an
+    // instance that has left the ECS cluster looks identical to one that has not
+    // joined it yet — so scale-down was displayed as scale-up.
+    draining: { c: '#8a94a2', t: '↓ draining', tip: 'ECS is draining this box — finishing work, no new tasks placed' },
+    leaving:  { c: '#8a94a2', t: '↓ leaving', tip: 'deregistered from ECS and being scaled down — EC2 shutdown pending' },
 };
 function _fleetInstanceRow(i, maxV) {
     const cap = i.vcpus || 0;
@@ -3249,6 +3257,8 @@ function _fleetInstanceRow(i, maxV) {
     const S = _FLEET_STATE[st];
     const badge = (S && !jobs.length) ? ` <span style="color:${S.c};font-size:11px" title="${S.tip}">${S.t}</span>` : '';
 
+    // Only warming-up states get the striped bar; draining/leaving are winding
+    // down and would read as starting up.
     if ((st === 'booting' || st === 'pulling') && !jobs.length && cap) {
         // Warming-up box with no job yet: striped full-width bar, not flat idle.
         parts = seg(100, '#20252f', S.tip, stripe(S.c + '55'));
@@ -3258,7 +3268,9 @@ function _fleetInstanceRow(i, maxV) {
 
     const rightLabel = jobs.length
         ? `${used}/${cap} vCPU · ${jobs.length} job${jobs.length > 1 ? 's' : ''}`
-        : (st === 'booting' ? 'booting' : st === 'pulling' ? 'pulling image' : `idle (${cap} vCPU)`);
+        : (st === 'booting' ? 'booting' : st === 'pulling' ? 'pulling image'
+           : st === 'draining' ? 'draining' : st === 'leaving' ? 'leaving'
+           : `idle (${cap} vCPU)`);
     // Inline list of what this box is running right now (friendly names + dot).
     const jobList = jobs.length
         ? `<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:#9aa;margin-top:3px">`

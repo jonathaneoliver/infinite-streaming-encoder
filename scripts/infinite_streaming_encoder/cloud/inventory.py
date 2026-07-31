@@ -474,6 +474,12 @@ def _ecs_cluster_name() -> str | None:
 # CPUUtilization reported and what `top` shows), the control plane folds it in
 # Manager.recordFleetCPU, and the Go inventory handler merges the per-machine
 # history into each instance as cw_cpu. No lag, no cost, same meaning.
+# How long a running EC2 box may be absent from the ECS cluster listing before we
+# stop calling it "booting". OS boot + ECS agent registration is well under this;
+# past it, absence means the instance was deregistered on scale-down.
+_ECS_JOIN_GRACE_S = 300
+
+
 def _annotate_init_states(instances: list[dict]) -> None:
     """Tag each running EC2 box with its ECS lifecycle state so the fleet view
     shows what a box is doing *before* a job lands on it, not just "idle":
@@ -500,9 +506,20 @@ def _annotate_init_states(instances: list[dict]) -> None:
         if not cluster:
             return
         ecs = ecs_client()
+        # ACTIVE *and* DRAINING. list_container_instances filters to ACTIVE by
+        # default, so a box Batch is scaling down disappears from the listing the
+        # moment it starts draining — and the `ci is None` branch below then
+        # labelled it "booting", i.e. a machine on its way OUT was reported as one
+        # on its way IN, right before it vanished.
         arns: list[str] = []
-        for page in ecs.get_paginator("list_container_instances").paginate(cluster=cluster):
-            arns.extend(page.get("containerInstanceArns", []))
+        draining: set[str] = set()
+        for status in ("ACTIVE", "DRAINING"):
+            for page in ecs.get_paginator("list_container_instances").paginate(
+                    cluster=cluster, status=status):
+                got = page.get("containerInstanceArns", [])
+                arns.extend(got)
+                if status == "DRAINING":
+                    draining.update(got)
         by_ec2: dict[str, dict] = {}
         for i in range(0, len(arns), 100):
             for ci in ecs.describe_container_instances(
@@ -515,7 +532,15 @@ def _annotate_init_states(instances: list[dict]) -> None:
     for inst in running:
         ci = by_ec2.get(inst["id"])
         if ci is None:
-            inst["init_state"] = "booting"
+            # Not an ECS member. That means "hasn't joined yet" only while the box
+            # is young — boot + agent register is a couple of minutes. An older box
+            # that is not a member has been DEREGISTERED, i.e. it is going away.
+            # Calling both "booting" made scale-down look like scale-up.
+            inst["init_state"] = ("booting"
+                                  if inst.get("age_seconds", 0) < _ECS_JOIN_GRACE_S
+                                  else "leaving")
+        elif ci.get("containerInstanceArn") in draining:
+            inst["init_state"] = "draining"
         elif not ci.get("agentConnected") or ci.get("status") == "REGISTERING":
             inst["init_state"] = "booting"
         elif ci.get("pendingTasksCount", 0) > 0:
