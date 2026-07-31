@@ -203,8 +203,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
     background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.13) 0 2px, transparent 2px 5px); }
 /* Placed on a box, pulling the image / starting the container — not encoding
    yet. Same 45deg hatch the fleet view uses for a booting/pulling box, so the
-   two displays read alike, but over the MACHINE's colour: Batch has already
-   placed the job, so we know which box it landed on. */
+   two displays read alike. Usually over the MACHINE's colour, though Batch
+   records placement around the same moment it flips to STARTING, so for a poll
+   or two the hatch can be neutral before the host arrives. */
 .chunk-cell-fill.chunk-starting {
     background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.35) 0 6px, transparent 6px 12px);
     opacity: 0.65; }
@@ -2804,41 +2805,37 @@ function renderJobs() {
     }
     if (list.querySelector('.no-files')) list.innerHTML = '';
 
-    // Group by fleet so cloud and local jobs cluster under the sections above.
-    // Headers appear only when BOTH fleets have jobs (a single-target run reads
-    // like the old flat list). Reordering uses appendChild, which MOVES existing
-    // rows — preserving each row's DOM and its open log viewer.
-    const groups = [
-        { key: 'cloud', label: '☁ Cloud (AWS Batch)', jobs: all.filter(_isCloudJob) },
-        { key: 'local', label: '🖥 Local (all machines)', jobs: all.filter(j => !_isCloudJob(j)) },
-    ];
-    const showHeaders = groups.every(g => g.jobs.length > 0);
+    // ONE chronological list, newest first — cloud and local interleaved rather
+    // than clustered into per-fleet sections. Grouping split a single session's
+    // work into two piles ordered independently, so the job you just started
+    // could sit below older ones from the other fleet. What you almost always
+    // want is "what happened most recently", regardless of where it ran; the
+    // per-row target badge already says which fleet each job is on.
+    //
+    // Reordering uses appendChild, which MOVES existing rows — preserving each
+    // row's DOM and its open log viewer.
+    for (const stale of [...list.querySelectorAll('.jobs-group-hdr')]) stale.remove();
+
+    const ordered = all.slice().sort((a, b) => {
+        const ta = new Date(a.started_at).getTime() || 0;
+        const tb = new Date(b.started_at).getTime() || 0;
+        // Ties broken by id (a monotonic ms timestamp) so equal start times —
+        // two targets submitted in the same request — keep a stable order
+        // instead of swapping on every poll.
+        return tb - ta || String(b.id).localeCompare(String(a.id));
+    });
+
     const seen = new Set();
-    for (const g of groups) {
-        let hdr = document.getElementById('jobs-group-' + g.key);
-        if (!g.jobs.length || !showHeaders) {
-            if (hdr) hdr.remove();
-        } else {
-            if (!hdr) {
-                hdr = document.createElement('div');
-                hdr.id = 'jobs-group-' + g.key;
-                hdr.className = 'jobs-group-hdr';
-            }
-            hdr.textContent = `${g.label} · ${g.jobs.length}`;
-            list.appendChild(hdr); // move into position
+    for (const j of ordered) {
+        seen.add(j.id);
+        let row = document.getElementById('job-' + j.id);
+        if (!row) {
+            const tmp = document.createElement('div');
+            tmp.innerHTML = jobRowHtml(j);
+            row = tmp.firstElementChild;
         }
-        g.jobs.sort((a, b) => new Date(b.started_at) - new Date(a.started_at));
-        for (const j of g.jobs) {
-            seen.add(j.id);
-            let row = document.getElementById('job-' + j.id);
-            if (!row) {
-                const tmp = document.createElement('div');
-                tmp.innerHTML = jobRowHtml(j);
-                row = tmp.firstElementChild;
-            }
-            list.appendChild(row); // move into grouped order (preserves DOM/logs)
-            updateJobRow(row, j);
-        }
+        list.appendChild(row); // move into chronological order (preserves DOM/logs)
+        updateJobRow(row, j);
     }
 
     // Drop any rows whose job is no longer in the set.

@@ -332,8 +332,14 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
                 continue
             seen[key] = stage_status
             if stage_status in ("running", "starting") and j.get("jobId"):
-                # STARTING is already placed, so containerInstanceArn exists and
-                # the hatch can carry the machine's colour from the outset.
+                # Try STARTING as well as RUNNING. Measured, a STARTING job
+                # carries containerInstanceArn only SOMETIMES — the status flips
+                # around the same time placement is recorded, so it is a race.
+                # Attempting it costs one describe we were making anyway, and
+                # when the arn is absent _tag_hosts_for_jobs simply skips it and
+                # the host lands on the RUNNING transition instead. So a hatched
+                # cell is usually machine-coloured, occasionally neutral for a
+                # poll — never wrong, just sometimes late.
                 newly_running.append(j["jobId"])
             pct = 100.0 if stage_status == "done" else 0.0
             print(f"[[ENCODER-STAGE key={key} status={stage_status} "
