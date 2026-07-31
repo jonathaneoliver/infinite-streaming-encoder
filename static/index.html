@@ -2450,8 +2450,15 @@ function updateStagesTable(row, stages) {
     // exactly: rows:19 delta:0 with the 2160p row going ":12" -> ":16" -> ":17"
     // -> ":23" in 23 milliseconds, i.e. four full-table rebuilds for four new
     // cells. Cell counts are now reconciled per row, in place, below.
+    // Nor the concat flag. A variant's concat stage gets absorbed into its group
+    // near the end of that variant, flipping r.concat and — while it was in the
+    // signature — rebuilding the entire table at exactly the moment the encode
+    // finished, blanking every settled cell. It has no structural effect: the row
+    // template never reads it, because the join is drawn as a solid bar with no
+    // separate glyph. A signature exists to answer "did the DOM shape change",
+    // and this never changed it.
     const sig = rows.map(r => r.kind === 'chunks'
-        ? 'c:' + r.codec + ':' + r.tier + (r.concat ? ':j' : '')
+        ? 'c:' + r.codec + ':' + r.tier
         : r.s.key).join(',');
     if (tbody.dataset.sig !== sig) {
         // Rebuilding destroys every cell and recreates it at width:0, so each one
@@ -2583,8 +2590,17 @@ function updateStagesTable(row, stages) {
                 // reclaimed → fill red (waiting to restart); else show progress.
                 // 'starting' has no meaningful progress yet, so fill the cell and
                 // let the hatch carry the meaning rather than showing a 0% sliver.
-                fill.style.width = (reused || st === 'reclaimed' || st === 'starting'
+                const _wantW = (reused || st === 'reclaimed' || st === 'starting'
                     ? 100 : prog).toFixed(1) + '%';
+                // Only touch the DOM when the value actually changes. Writing the
+                // same width every tick is not free — it invalidates style on a
+                // cell that has not moved, and on a settled chunk there is nothing
+                // to redraw. Counted so a redraw someone SEES can be checked
+                // against whether we wrote anything at all.
+                if (fill.style.width !== _wantW) {
+                    fill.style.width = _wantW;
+                    window.__cellWrites = (window.__cellWrites || 0) + 1;
+                }
                 fill.className = 'chunk-cell-fill'
                     + (st === 'failed' ? ' chunk-failed'
                         : st === 'reclaimed' ? ' chunk-reclaimed'
@@ -2593,7 +2609,11 @@ function updateStagesTable(row, stages) {
                 // The fill COLOUR is the machine this chunk ran on — bold and
                 // unmissable so co-located chunks pop; red/reused states keep their
                 // class colour (clear the inline so the class wins).
-                fill.style.background = (isRed || reused) ? '' : (instanceColor(c.s.instance) || '#4361ee');
+                const _wantBg = (isRed || reused) ? '' : (instanceColor(c.s.instance) || '#4361ee');
+                if (fill.style.background !== _wantBg) {
+                    fill.style.background = _wantBg;
+                    window.__cellPaints = (window.__cellPaints || 0) + 1;
+                }
                 // A cell's FIRST paint must not animate. .chunk-cell-fill starts
                 // at width:0 with a 0.3s transition, so a cell that is recreated
                 // — by any rebuild — sweeps from nothing to its real width, and
@@ -3318,7 +3338,13 @@ let _uiLogTimer = null;
 let _uiLogDropped = 0;
 function uiLog(kind, data) {
     if (_uiLogQueue.length >= 20) { _uiLogDropped++; return; }
-    _uiLogQueue.push({ kind, ...data });
+    // Stamp the build THIS PAGE loaded. A tab open across a deploy keeps running
+    // the JavaScript it already has — no-cache governs new requests, not a live
+    // tab — so a stale page reports symptoms the deployed code no longer has.
+    // That happened: rebuild events still carried the old signature format after
+    // the fix shipped, which reads as "the fix did not work" rather than "this
+    // tab predates it". The stamp makes the difference visible in the log.
+    _uiLogQueue.push({ kind, rev: (window.__buildRev || 'unknown'), ...data });
     if (_uiLogTimer) return;
     _uiLogTimer = setTimeout(() => {
         const batch = _uiLogQueue; _uiLogQueue = []; _uiLogTimer = null;
@@ -4525,6 +4551,13 @@ async function loadVersion() {
         const j = await res.json();
         const local = j.local || {};
         const cloud = j.cloud || {};
+        // Which build the SERVER is on, versus which this page loaded with. They
+        // differ whenever a tab stays open across a deploy, and that difference
+        // has already been mistaken for a fix not working.
+        if (!window.__buildRev) window.__buildRev = local.revision || 'unknown';
+        else if (local.revision && local.revision !== window.__buildRev) {
+            uiLog('stale-page', { pageRev: window.__buildRev, serverRev: local.revision });
+        }
 
         // Gate the cloud-batch target: if this host has no cloud config
         // (STATE_MACHINE_ARN), disable the option and explain via hover, so the

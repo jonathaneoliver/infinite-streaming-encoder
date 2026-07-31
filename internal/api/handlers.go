@@ -1002,13 +1002,18 @@ func runPythonCloud(module string, args ...string) ([]byte, error) {
 	cmd.Env = os.Environ()
 	out, err := cmd.Output()
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("python3 -m infinite_streaming_encoder.cloud.%s exited %d: %s",
-				module, ee.ExitCode(), strings.TrimSpace(string(ee.Stderr)))
-		}
+		// Timeout FIRST. CommandContext KILLS the process on deadline, which
+		// surfaces as an ExitError with code -1 and empty stderr — so testing
+		// ExitError first reported a real timeout as `exited -1:` with nothing
+		// after the colon, reading like an unexplained crash. Observed exactly
+		// that in the log before this was reordered.
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("python3 -m infinite_streaming_encoder.cloud.%s timed out after %s",
 				module, runPythonCloudTimeout)
+		}
+		if ee, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("python3 -m infinite_streaming_encoder.cloud.%s exited %d: %s",
+				module, ee.ExitCode(), strings.TrimSpace(string(ee.Stderr)))
 		}
 		return nil, fmt.Errorf("python3 -m infinite_streaming_encoder.cloud.%s: %w", module, err)
 	}
