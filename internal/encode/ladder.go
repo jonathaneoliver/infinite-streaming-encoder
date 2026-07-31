@@ -121,14 +121,45 @@ func resHeight(name string) (int, bool) {
 // even 4K HEVC peaked at ~2.2 GiB and h264 1080p at ~0.9 GiB (measured via
 // ru_maxrss), so 3 GiB is generous and never the binding constraint.
 func variantResourcesFor(codec string, height int) (vcpu, memory string) {
-	// h264: 4 vCPU so two encodes pack per 8-vCPU .2xlarge. On Graviton3/4 a
-	// single x264 encode only drives ~4-5 cores (a dedicated 8-vCPU box idles at
-	// 50-60%), so isolating one per box wastes half the machine. Packing two
-	// fills it with only mild contention — each encode wanted ~4 cores anyway.
-	// (An earlier 8-vCPU/whole-box setting was to measure uncontended speed and
-	// dodge c6g's much worse contention; c6g is now dropped from the fleet.)
+	// h264 is sized PER RUNG because ENCODE_THREADS=2 (#182, pinned so cloud and
+	// local deliver the same bitrate) caps the encoder at two threads. What a
+	// container actually draws then depends on where the work sits: at low rungs
+	// the encode is cheap and ffmpeg's decode + scale threads dominate, pushing
+	// total demand to ~4 cores; at 4K the encoder dominates, stays capped at 2,
+	// and the rest of the reservation is dead space.
+	//
+	// Measured over a 366-chunk run at ENCODE_THREADS=2 (cpu_s/encode_s, median):
+	//
+	//   234p 4.23  360p 4.00  396p 4.12  432p 3.94  540p 4.17  594p 3.91
+	//   720p 3.47  954p 3.00  1080p 2.80  1440p 2.51  1800p 2.38  2160p 2.24
+	//
+	// A flat 4 was right at the bottom (98-106% of reservation) and ~2x too
+	// generous at the top (56% at 2160p) — a c8g.4xlarge ran four 4K chunks at
+	// 58% CPU with all 16 vCPU "allocated". Sizing by rung lets Batch pack ~8
+	// 4K chunks per 16-vCPU box instead of 4.
+	//
+	// Bands are chosen to land slightly OVER-subscribed rather than under, which
+	// is the right side to err on for encoding: an oversubscribed box time-shares
+	// and still finishes more chunks per hour, whereas an undersubscribed one
+	// simply idles. Projected demand on a 16-vCPU box: 98-106% at <=594p,
+	// 88-108% at 720-1080p, 112-125% at >=1440p. The 720p boundary sits at 594
+	// rather than 720 precisely so 720p lands at 108% instead of 87%.
+	//
+	// Memory likewise: peak RSS was 337 MiB at 234p rising to 1562 MiB at 2160p,
+	// against reservations of 3072/6144 — 3.9x to 9.1x headroom. Halving it is
+	// what makes the denser vCPU packing reachable, since Batch packs on BOTH
+	// dimensions and 8x6144 would exceed a 32 GiB box before vCPU ever bound.
+	// Kept at ~2x measured peak, and h264-only: hevc (x265) and av1 (SVT) have
+	// their own, larger footprints and are not covered by these measurements.
 	if codec == "h264" {
-		return "4", memForHeight(height)
+		switch {
+		case height > 1080:
+			return "2", "3072" // 2.24-2.51 cores, 1562 MiB peak
+		case height > 594:
+			return "3", "2048" // 2.80-3.47 cores, 641 MiB peak
+		default:
+			return "4", "2048" // 3.91-4.23 cores, 425 MiB peak
+		}
 	}
 	if height <= 540 {
 		return "2", "3072" // small res is cheap for any codec (peak ~500 MiB)
