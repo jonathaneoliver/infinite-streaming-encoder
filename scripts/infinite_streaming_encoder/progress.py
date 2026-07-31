@@ -216,14 +216,17 @@ def emit_boot_ami() -> None:
 # Nothing downstream can use that resolution. The UI renders a bar and polls on
 # a multi-second cadence, so ~8 of every 9 markers were paid for and discarded.
 #
-# 2s matches what the local-dist path already settled on independently for the
-# same data (`default_heartbeat_throttle_interval` in temporal_worker.py), so
-# both paths now report progress at the same cadence.
+# 5s, not the 2s first tried. A heartbeat is the ONE thing here that may lag:
+# chunk start and chunk end are events the grid is really showing and they now
+# bypass the publisher's buffer entirely (telemetry.is_heartbeat), so slowing
+# the ticks between them costs nothing anyone can see. It halves the dominant
+# term in message volume, and volume is what the consumer is limited by — SQS
+# caps a receive at 10 messages, so throughput is round trips, not bytes.
 #
 # Dropping ticks is the intended behaviour, not a tolerated side effect: percent
 # is a GAUGE, so the newest value is the only one that matters and a missed one
 # costs nothing. Records (TIMING/SPEED/VMAF) are emitted unthrottled elsewhere.
-_MIN_EMIT_INTERVAL_S = float(os.environ.get("ENCODER_PROGRESS_INTERVAL_S", "2.0"))
+_MIN_EMIT_INTERVAL_S = float(os.environ.get("ENCODER_PROGRESS_INTERVAL_S", "5.0"))
 
 # How often to ask ffmpeg to emit -progress output. Default is 0.5s,
 # which on fast encodes (several × realtime on short clips) means

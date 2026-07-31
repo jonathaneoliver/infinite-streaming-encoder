@@ -51,11 +51,16 @@ class FakeSink(telemetry._Sink):
             return [s for b in self.batches for s, _ in b]
 
 
+def hb(i):
+    """A HEARTBEAT marker — mid-progress, so it is allowed to wait in the buffer."""
+    return f"[[ENCODER-STAGE key=encode:h264:1080p:chunk{i} status=running percent=41.0]]"
+
+
 def test_batches_at_max_size():
     sink = FakeSink()
     p = telemetry._Publisher(sink)
     for i in range(telemetry._BATCH_MAX):
-        p.add(f"m{i}")
+        p.add(hb(i))
     # The size bound must fire on add, without waiting for the timer — otherwise
     # a fast-emitting chunk buys latency it did not need to.
     assert sink.batches, "full batch was not flushed on add"
@@ -63,19 +68,55 @@ def test_batches_at_max_size():
     p.close()
 
 
-def test_flushes_on_age_without_a_full_batch():
-    """The case that actually matters: a chunk emits ONE final record and stops.
+def test_an_event_flushes_immediately_but_a_heartbeat_waits():
+    """Chunk start and chunk end must be prompt; the ticks between them may lag.
 
-    With an emit-driven flush this marker would sit in the buffer until process
-    exit, which on a spot reclaim never arrives.
+    That is the whole latency budget: events are what the grid is really
+    showing, heartbeats are cosmetic. Buffering events would mean a finished
+    chunk sitting in a worker's buffer for seconds.
     """
     sink = FakeSink()
     p = telemetry._Publisher(sink)
-    p.add("[[ENCODER-SPEED ...]]")
+    p.add(hb(0))
+    assert not sink.flat(), "a heartbeat should have waited for the timer"
+
+    p.add("[[ENCODER-STAGE key=encode:h264:1080p:chunk0 status=done percent=100.0]]")
+    # The event flushes, and carries the waiting heartbeat out with it.
+    assert len(sink.flat()) == 2, f"event did not flush promptly: {sink.flat()}"
+    assert sink.flat()[-1].endswith("status=done percent=100.0]]")
+
+    p.add("[[ENCODER-TIMING phase=variant key=x total_s=12.00]]")
+    assert len(sink.flat()) == 3, "a record must not wait in the buffer"
+    p.close()
+
+
+def test_start_of_a_chunk_is_an_event_not_a_heartbeat():
+    """percent=0.0 is the chunk STARTING — the moment a cell should light up."""
+    assert not telemetry.is_heartbeat(
+        "[[ENCODER-STAGE key=k status=running percent=0.0]]")
+    assert not telemetry.is_heartbeat(
+        "[[ENCODER-STAGE key=k status=running percent=100.0]]")
+    assert telemetry.is_heartbeat(
+        "[[ENCODER-STAGE key=k status=running percent=0.4]]")
+    assert telemetry.is_heartbeat(
+        "[[ENCODER-STAGE key=k status=running percent=99.9]]")
+
+
+def test_flushes_on_age_without_a_full_batch():
+    """A lone heartbeat must still leave on the timer, with nothing to pack with.
+
+    Events flush themselves, so the timer is what a heartbeat depends on
+    entirely. Without it a chunk that ticks once and then goes quiet — a short
+    rung, or one stalled on a slow S3 read — shows no progress at all until its
+    next event, and on a spot reclaim never at all.
+    """
+    sink = FakeSink()
+    p = telemetry._Publisher(sink)
+    p.add(hb(0))
     deadline = time.monotonic() + telemetry._BATCH_MAX_AGE_S * 6
     while not sink.flat() and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert sink.flat() == ["[[ENCODER-SPEED ...]]"], (
+    assert sink.flat() == [hb(0)], (
         f"age-based flush did not fire within "
         f"{telemetry._BATCH_MAX_AGE_S * 6:.1f}s; got {sink.flat()}")
     p.close()
@@ -100,9 +141,9 @@ def test_order_is_preserved():
     p = telemetry._Publisher(sink)
     n = telemetry._BATCH_MAX * 2 + 3
     for i in range(n):
-        p.add(f"m{i}")
+        p.add(hb(i))
     p.close()
-    assert sink.flat() == [f"m{i}" for i in range(n)], "markers were reordered"
+    assert sink.flat() == [hb(i) for i in range(n)], "markers were reordered"
 
 
 def test_a_failing_sink_never_breaks_the_encode():
@@ -111,7 +152,7 @@ def test_a_failing_sink_never_breaks_the_encode():
     sink = FakeSink(fail=True)
     p = telemetry._Publisher(sink)
     for i in range(telemetry._BATCH_MAX + 1):
-        p.add(f"m{i}")           # would raise if send() were unguarded
+        p.add(hb(i))             # would raise if send() were unguarded
     p.close()
 
 
@@ -184,6 +225,34 @@ def test_non_markers_are_not_markers():
     for line in ("[ffmpeg] ffmpeg -i in.mp4", "frame= 120 fps=30", "",
                  "[[ENCODERISH something]]"):
         assert not telemetry.is_marker(line), f"misidentified as a marker: {line!r}"
+
+
+def test_terminal_stage_is_not_walked_back():
+    """A stale queued marker must never un-finish a chunk.
+
+    The queue competes with _sync_stages_from_batch, which reads Batch status
+    directly and is faster. When the drain runs behind, a worker's old
+    "running 18%" surfaces after Batch has reported SUCCEEDED — and
+    internal/encode/job.go assigns Status and Percent unconditionally, so the
+    cell visibly goes done -> running and the global percentage drops. Measured
+    live: 30 reversals in 150 seconds.
+
+    This pins the rule the drain applies. Kept here rather than in cli_batch so
+    it runs without boto3.
+    """
+    TERMINAL = {"done", "failed"}
+
+    def forwards(prev, incoming):
+        return not (prev in TERMINAL and incoming not in TERMINAL)
+
+    assert not forwards("done", "running"), "a stale marker would un-finish a chunk"
+    assert not forwards("failed", "running")
+    assert forwards("running", "done"), "a real completion must get through"
+    assert forwards("running", "running")
+    assert forwards(None, "running"), "first sighting must get through"
+    # done -> done is allowed: a repeat is harmless and blocking it would drop a
+    # legitimate re-announcement carrying a corrected percent.
+    assert forwards("done", "done")
 
 
 def test_queue_name_fits_sqs_limit_and_stays_unique():

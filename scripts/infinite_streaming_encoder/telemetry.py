@@ -51,6 +51,7 @@ from __future__ import annotations
 import atexit
 import os
 import sys
+import re
 import threading
 import time
 import uuid
@@ -88,12 +89,12 @@ def queue_name(execution_name: str) -> str:
         execution_name = execution_name[:room - 7] + execution_name[-7:]
     return _QUEUE_PREFIX + execution_name + _QUEUE_SUFFIX
 
-# Publish in batches, since SQS bills per request and accepts 10 messages in one.
-# Bounded by AGE as well as size: at the 2s progress cadence a single chunk fills
-# 10 slots in ~20s, and a progress bar 20s stale is worse than a few extra API
-# calls. Whichever bound trips first wins.
+# How many markers may be PACKED into one message, and how long the oldest may
+# wait for company. Only heartbeats ever wait — events flush on arrival (see
+# _Publisher.add) — so this window trades heartbeat latency for message count,
+# and message count is what the consumer is limited by.
 _BATCH_MAX = 10
-_BATCH_MAX_AGE_S = 1.0
+_BATCH_MAX_AGE_S = 3.0
 
 # SQS caps a SendMessageBatch payload at 256 KiB total. Markers are ~100 bytes,
 # so this only ever trips on something malformed; truncating beats failing the
@@ -166,6 +167,28 @@ def is_gauge(line: str) -> bool:
     return marker_class(line) == CLASS_GAUGE
 
 
+_HEARTBEAT_RE = re.compile(
+    r"^\[\[ENCODER-STAGE key=\S+ status=running percent=(?!0\.0\]|100\.0\])")
+
+
+def is_heartbeat(line: str) -> bool:
+    """True if this marker is a mid-progress tick rather than an EVENT.
+
+    The distinction the UI cares about is not gauge-vs-record, it is
+    "did something happen" versus "how far along is it". A chunk STARTING and a
+    chunk FINISHING must be prompt — they are what the grid is really showing.
+    The percentages in between can lag a few seconds without anyone noticing.
+
+    So this is what decides whether a marker waits in the publisher's buffer or
+    goes out immediately. Everything that is not a heartbeat — status
+    transitions, and every record — bypasses the buffer.
+
+    A FLEET sample counts as a heartbeat too (it is a gauge; see marker_class),
+    which is handled by the caller rather than this regex.
+    """
+    return bool(_HEARTBEAT_RE.match(line)) or is_gauge(line)
+
+
 class _Sink:
     """A side-channel for markers. Never raises; never blocks the encode."""
 
@@ -204,17 +227,39 @@ class _SqsSink(_Sink):
         self._warned = 0
 
     def send(self, markers: list[tuple[int, str]]) -> None:
+        """Publish this worker's buffered markers as ONE packed message.
+
+        Not one message per marker. The consumer is the bottleneck, and its
+        ceiling is set by ROUND TRIPS, not bytes: SQS caps ReceiveMessage at 10
+        messages, so 10 markers cost a receive plus a delete — about 80
+        markers/second against us-west-2 from a home connection. Peak production
+        is the same order, so one-marker-per-message built a backlog that never
+        drained (3,292 still queued with every chunk finished).
+
+        Packing moves the whole run under that ceiling: markers are ~100 bytes
+        against a 256 KiB message, so a packed message carries a worker's whole
+        flush window and one receive returns ten of them. Ordering is unaffected
+        — markers inside a body are already in emission order, and the queue is
+        FIFO across bodies.
+        """
         # `pub`+`seq` ride as MESSAGE ATTRIBUTES, deliberately not in the marker
         # text: the marker format is a contract with the Go scanner's regexes,
         # and sequencing is a property of the transport, not of the measurement.
         # A consumer on any other transport neither sees nor needs them.
+        if not markers:
+            return
+        body = "\n".join(m for _, m in markers)[:_MAX_BODY]
+        first_seq = markers[0][0]
         entries = [
             {
-                "Id": str(i),
-                "MessageBody": m[:_MAX_BODY],
+                "Id": "0",
+                "MessageBody": body,
                 "MessageAttributes": {
                     "pub": {"DataType": "String", "StringValue": _PUB_ID},
-                    "seq": {"DataType": "Number", "StringValue": str(seq)},
+                    # The seq of the FIRST marker in the body. Ordering within a
+                    # body is inherent, so the consumer's guard works per
+                    # message, not per marker.
+                    "seq": {"DataType": "Number", "StringValue": str(first_seq)},
                 },
                 # FIFO ordering is guaranteed WITHIN a message group, and groups
                 # are still consumed in parallel. The publisher is exactly the
@@ -228,9 +273,8 @@ class _SqsSink(_Sink):
                 # FLEET samples from a steady box, or the same percent reported
                 # twice. Silent data loss is the exact failure class this whole
                 # module exists to remove. (seq) makes every message unique.
-                "MessageDeduplicationId": f"{_PUB_ID}-{seq}",
+                "MessageDeduplicationId": f"{_PUB_ID}-{first_seq}",
             }
-            for i, (seq, m) in enumerate(markers)
         ]
         try:
             self._sqs.send_message_batch(QueueUrl=self._url, Entries=entries)
@@ -279,7 +323,11 @@ class _Publisher:
             self._seq += 1
             self._buf.append((self._seq, marker))
             full = len(self._buf) >= _BATCH_MAX
-        if full:
+        # An EVENT goes out now, carrying whatever heartbeats were waiting with
+        # it — chunk start and chunk end are what the grid is actually showing,
+        # and a chunk that finishes must not sit in a buffer. Heartbeats alone
+        # wait for the timer, which is what keeps the message count down.
+        if full or not is_heartbeat(marker):
             self.flush()
 
     def flush(self) -> None:

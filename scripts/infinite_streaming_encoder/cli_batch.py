@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -401,11 +402,20 @@ _TELEMETRY_RETENTION_S = "3600"
 # A message we take but fail to delete comes back after this. Short, because the
 # only reason we would not delete is a crash between receive and delete.
 _TELEMETRY_VISIBILITY_S = "30"
-# Per poll. At the 2s progress cadence a 336-chunk run produces ~7,000 markers
-# over its lifetime; this covers a burst of ~400 without letting one poll run
-# long. Anything left is still queued — unlike a log tail, nothing is lost by
-# not reading it this cycle.
-_TELEMETRY_MAX_BATCHES = 40
+# How long one poll may spend draining. Replaced a 40-receive (400-message) cap
+# that measured badly: a 336-chunk run ended with 3,292 messages still queued
+# and every chunk already finished, which stalls the grid and lets stale markers
+# arrive after Batch has reported done. Budgeting TIME bounds the poll cycle
+# directly — the thing that actually matters — instead of guessing a count
+# against round-trip latency we do not control.
+_TELEMETRY_DRAIN_BUDGET_S = 8.0
+# Pause between drain passes when the queue is empty. Short: the whole point is
+# that a marker surfaces about a second after it is published.
+_TELEMETRY_DRAIN_IDLE_S = 0.5
+# Backlog worth reporting. A handful in flight is normal; hundreds means the
+# drain is losing to the publishers and the grid is about to look stuck.
+_TELEMETRY_BACKLOG_WARN = 200
+_TELEMETRY_LOG_EVERY_S = 20.0
 # An ENCODER-FLEET sample is a GAUGE, so a backlog can deliver one that is no
 # longer true. Records (TIMING/SPEED/VMAF) are kept regardless of age — they
 # cannot be recovered without re-encoding.
@@ -533,8 +543,22 @@ def _drain_telemetry(url: str | None, log_state: dict) -> int:
         return 0
     sqs = _sqs()
     handled = 0
+    suppressed = 0
     collected: list = []
-    for i in range(_TELEMETRY_MAX_BATCHES):
+    t0 = time.monotonic()
+    receives = 0
+    # TIME-budgeted, not count-budgeted. The first cap was 40 receives (400
+    # messages) per poll, which sounded generous and was not: a 336-chunk run
+    # left 3,292 messages queued with every chunk already finished. The grid is
+    # gated on this drain, so a backlog does not just delay markers — it makes
+    # the grid stall and then complete in a burst, and it lets a stale "running
+    # 18%" arrive after Batch has already reported the chunk done.
+    #
+    # A count cap cannot be tuned, because what matters is throughput against
+    # the poll interval, and each receive is a round trip whose latency we do
+    # not control. A time budget bounds the poll cycle directly, which is the
+    # thing we actually care about, and drains as much as that buys.
+    while time.monotonic() - t0 < _TELEMETRY_DRAIN_BUDGET_S:
         try:
             resp = sqs.receive_message(
                 QueueUrl=url, MaxNumberOfMessages=10,
@@ -543,12 +567,13 @@ def _drain_telemetry(url: str | None, log_state: dict) -> int:
                 # can return nothing while messages exist), and costs at most 1s
                 # per poll. Subsequent receives in the same drain short-poll,
                 # because we already know there is a backlog to clear.
-                WaitTimeSeconds=1 if i == 0 else 0,
+                WaitTimeSeconds=1 if receives == 0 else 0,
                 AttributeNames=["SentTimestamp"],
                 MessageAttributeNames=["pub", "seq"],
             )
         except ClientError:
             break
+        receives += 1
         msgs = resp.get("Messages") or []
         if not msgs:
             break
@@ -577,42 +602,135 @@ def _drain_telemetry(url: str | None, log_state: dict) -> int:
     seen_seq = log_state.setdefault("_tel_seq", {})
     now_ms = time.time() * 1000.0
     for m in collected:
-        body = (m.get("Body") or "").rstrip()
-        if not is_marker(body):
-            continue
+        # One message carries a PACKED batch of markers, newline-joined. The
+        # consumer's ceiling is ROUND TRIPS — SQS returns at most 10 messages per
+        # receive — so the publisher fills each body instead of sending one
+        # marker at a time. Order within a body is emission order.
         sent_ms = float(m.get("Attributes", {}).get("SentTimestamp", "0"))
-        if (is_gauge(body) and sent_ms and
-                now_ms - sent_ms > _TELEMETRY_GAUGE_MAX_AGE_S * 1000.0):
-            continue  # stale gauge — see _TELEMETRY_GAUGE_MAX_AGE_S
         pub, seq = _msg_pub(m), _msg_seq(m)
-        if pub and seq:
-            # Backstop, not the ordering mechanism — FIFO already guarantees
-            # order. This catches REDELIVERY: a batch we read but failed to
-            # delete reappears after the visibility timeout, and replaying an
-            # old percent would still walk a bar backwards.
-            #
-            # Only droppable classes are suppressed. Records are forwarded even
-            # when repeated: losing one loses data no re-read can recover, and
-            # the control plane already tolerates a duplicate record.
-            #
-            # Keyed per PUBLISHER, which is what makes a retry work. A chunk
-            # re-run after a spot reclaim is a NEW process with its own seq
-            # starting at 1, so it is never suppressed by the attempt it
-            # replaces — where a blanket "never leave a terminal state" rule
-            # would have wrongly frozen the cell on the dead attempt.
-            if seq <= seen_seq.get(pub, 0):
-                if not is_record(body):
+
+        # Redelivery backstop, NOT the ordering mechanism — FIFO already
+        # guarantees order. A batch we read but failed to delete reappears after
+        # the visibility timeout, and replaying an old percent would still walk a
+        # bar backwards.
+        #
+        # Keyed per PUBLISHER, which is what keeps retries working: a chunk
+        # re-run after a spot reclaim is a NEW process with its own seq from 1,
+        # so it is never suppressed by the attempt it replaces.
+        replay = bool(pub and seq and seq <= seen_seq.get(pub, 0))
+        if pub and seq and not replay:
+            seen_seq[pub] = seq
+
+        for body in (m.get("Body") or "").split("\n"):
+            body = body.rstrip()
+            if not is_marker(body):
+                continue
+            # A replayed message is dropped only for DROPPABLE classes. Records
+            # go through even when repeated: losing one loses data no re-read can
+            # recover, and the control plane tolerates a duplicate record.
+            if replay and not is_record(body):
+                continue
+            if (is_gauge(body) and sent_ms and
+                    now_ms - sent_ms > _TELEMETRY_GAUGE_MAX_AGE_S * 1000.0):
+                continue  # stale gauge — see _TELEMETRY_GAUGE_MAX_AGE_S
+            if sm := _STAGE_LINE_RE.match(body):
+                key, st = sm.group(1), sm.group(2)
+                seen = log_state.setdefault("_stage_status", {})
+                # DO NOT let a queued marker un-finish a chunk.
+                #
+                # This is the cross-source race, and FIFO cannot help with it:
+                # the queue orders itself, but it competes with
+                # _sync_stages_from_batch, which reads Batch status directly and
+                # is therefore FASTER. When the drain runs behind, a worker's old
+                # "running 18%" surfaces after Batch has reported SUCCEEDED — and
+                # internal/encode/job.go assigns Status and Percent
+                # unconditionally, so the cell visibly goes done -> running and
+                # the global percentage drops. Measured live: 30 reversals in 150
+                # seconds.
+                #
+                # Safe because a Batch job reaches SUCCEEDED/FAILED exactly once
+                # and never leaves it: its internal retry attempts happen while
+                # the job is still RUNNING, so this cannot hide a real retry.
+                if seen.get(key) in _TERMINAL_STAGE and st not in _TERMINAL_STAGE:
+                    suppressed += 1
                     continue
-            else:
-                seen_seq[pub] = seq
-        if sm := _STAGE_LINE_RE.match(body):
-            # The worker spoke for this stage, with a live percent. Record it
-            # so the Batch-derived backstop leaves it alone — same contract
-            # _tail_progress observes.
-            log_state.setdefault("_stage_status", {})[sm.group(1)] = sm.group(2)
-        print(body, flush=True)
-        handled += 1
+                seen[key] = st
+            print(body, flush=True)
+            handled += 1
+
+    # Report only when something is WRONG or notable, and at most every
+    # _TELEMETRY_LOG_EVERY_S — the drain thread runs continuously, so logging
+    # each pass would bury the job log. A drain that cannot keep up otherwise
+    # looks exactly like an encode running slowly, which is how the 3,292-message
+    # backlog went unnoticed until the grid visibly stalled.
+    now = time.monotonic()
+    # Running total the poll loop reads to decide whether the queue is silent.
+    # Must be the DRAIN's own count: _stage_status is populated by the Batch
+    # backstop too, so it cannot distinguish "telemetry is working" from
+    # "telemetry is dead and Batch is covering for it".
+    log_state["_tel_handled"] = log_state.get("_tel_handled", 0) + handled
+    if handled or suppressed:
+        remaining = _queue_depth(sqs, url)
+        interesting = remaining > _TELEMETRY_BACKLOG_WARN or suppressed
+        if interesting and now - log_state.get("_tel_logged", 0) > _TELEMETRY_LOG_EVERY_S:
+            log_state["_tel_logged"] = now
+            _narrate(f"[telemetry] drained {handled} in {now - t0:.1f}s "
+                     f"({receives} receives)"
+                     f"{f', {suppressed} stale suppressed' if suppressed else ''}"
+                     f"{f', ~{remaining} still queued' if remaining else ''}")
     return handled
+
+
+def _queue_depth(sqs, url: str) -> int:
+    """Approximate messages still waiting, or 0 if unavailable."""
+    try:
+        a = sqs.get_queue_attributes(
+            QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"])
+        return int(a["Attributes"]["ApproximateNumberOfMessages"])
+    except Exception:  # noqa: BLE001 — a stat we log, never act on
+        return 0
+
+
+def _start_telemetry_drain(url: str | None, log_state: dict):
+    """Drain the queue continuously on a background thread. Returns a stop event.
+
+    The drain used to run once per poll iteration, which coupled how fast a
+    marker reached the UI to how long everything ELSE in the loop took — and the
+    loop paginates the entire Step Functions execution history each cycle, which
+    for 336 chunks is thousands of events. Markers then arrived in bursts
+    whenever the cycle came round, which is precisely what "the grid hasn't
+    updated recently, then bang it completed" looks like from the outside.
+
+    A thread decouples the two: markers surface within a second of being
+    published regardless of what the poll loop is doing. That also removes most
+    of the cross-source race, because the queue stops running behind Batch
+    status — the terminal-status guard in _drain_telemetry remains as the
+    correctness backstop rather than the primary defence.
+    """
+    if not url:
+        return None
+    stop = threading.Event()
+
+    def _loop() -> None:
+        while not stop.is_set():
+            try:
+                _drain_telemetry(url, log_state)
+            except Exception:  # noqa: BLE001 — never let telemetry kill the run
+                pass
+            stop.wait(_TELEMETRY_DRAIN_IDLE_S)
+
+    threading.Thread(target=_loop, daemon=True, name="telemetry-drain").start()
+    return stop
+
+
+def _queue_depth(sqs, url: str) -> int:
+    """Approximate messages still waiting, or 0 if unavailable."""
+    try:
+        a = sqs.get_queue_attributes(
+            QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"])
+        return int(a["Attributes"]["ApproximateNumberOfMessages"])
+    except Exception:  # noqa: BLE001 — a stat we log, never act on
+        return 0
 
 
 def _stage_key_for_job(jobname: str) -> str | None:
@@ -1522,7 +1640,9 @@ def cmd_poll(args: argparse.Namespace) -> int:
     # process and may be re-attached to an execution submitted by an older
     # driver. CreateQueue returns the existing URL when the attributes match.
     tel_url = _create_telemetry_queue(exec_name)
-    tel_handled = 0
+    # Continuous, on its own thread — NOT once per poll iteration. See
+    # _start_telemetry_drain for why the coupling mattered.
+    tel_stop = _start_telemetry_drain(tel_url, log_state)
     tel_silent_s = 0
 
     print(f">>> Polling execution {args.execution_arn}", flush=True)
@@ -1565,14 +1685,6 @@ def cmd_poll(args: argparse.Namespace) -> int:
         # complete continuously, so most polls had streams to drain and the grid
         # sat 35-73 completions behind Batch (#187) — showing holes for work that
         # had already finished.
-        # Worker markers first, so the stages the workers have spoken for (with a
-        # live percent) are recorded before the Batch backstop below decides
-        # which gaps it needs to fill. Cheap — one long-poll plus one request per
-        # 10 messages, against the ~0.37s-per-container it replaces.
-        try:
-            tel_handled += _drain_telemetry(tel_url, log_state)
-        except Exception:  # noqa: BLE001 — never break polling over telemetry
-            pass
         try:
             _sync_stages_from_batch(exec_name, log_state)
         except Exception:  # noqa: BLE001 — never break polling over the grid
@@ -1587,7 +1699,7 @@ def cmd_poll(args: argparse.Namespace) -> int:
         # minutes to place the first container — an elapsed-time trigger would
         # declare the queue broken on every run that had to boot an instance,
         # which is most of them.
-        if tel_url and not tel_handled:
+        if tel_url and not log_state.get("_tel_handled"):
             started = any(v in ("running", "done")
                           for v in log_state.get("_stage_status", {}).values())
             tel_silent_s += interval_s if started else 0
@@ -1596,6 +1708,9 @@ def cmd_poll(args: argparse.Namespace) -> int:
                       f"running containers — workers are not publishing; "
                       f"falling back to CloudWatch log draining",
                       file=sys.stderr, flush=True)
+                if tel_stop is not None:
+                    tel_stop.set()  # stop polling a queue we have given up on
+                    tel_stop = None
                 tel_url = None
         # Then the live [progress]/[phase] lines from running containers, so long
         # phases show activity rather than a dark gap. Cosmetic, and now bounded
@@ -1621,8 +1736,10 @@ def cmd_poll(args: argparse.Namespace) -> int:
             # so the last jobs to finish publish AFTER the last ordinary poll.
             # This is the same gap _forward_container_timing exists to cover on
             # the log path.
+            if tel_stop is not None:
+                tel_stop.set()          # stop the thread before the last read
             try:
-                tel_handled += _drain_telemetry(tel_url, log_state)
+                _drain_telemetry(tel_url, log_state)
             except Exception:  # noqa: BLE001 — never fail a finished run
                 pass
             _delete_telemetry_queue(tel_url)
@@ -1652,6 +1769,8 @@ def cmd_poll(args: argparse.Namespace) -> int:
         time.sleep(interval_s)
         elapsed += interval_s
 
+    if tel_stop is not None:
+        tel_stop.set()
     _delete_telemetry_queue(tel_url)
     print("!!! poll timed out", file=sys.stderr)
     return 3
