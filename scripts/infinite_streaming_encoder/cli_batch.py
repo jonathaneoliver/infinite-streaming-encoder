@@ -433,6 +433,19 @@ def _create_telemetry_queue(exec_name: str) -> str | None:
                 # Long-poll by default so an empty receive costs one request
                 # rather than spinning.
                 "ReceiveMessageWaitTimeSeconds": "1",
+                # FIFO. Ordering is a property we need and standard queues do
+                # not provide — on the first 336-chunk run every chunk's
+                # progress meter visibly danced up and down as a stage's 40%
+                # printed after its 60%. Reconstructing order on read from
+                # SentTimestamp is guesswork: that stamp is applied on ARRIVAL,
+                # so publisher-side buffering can invert two markers or land
+                # them in the same millisecond.
+                #
+                # Throughput is not a concern: ~7,000 messages over a ~10-minute
+                # run is ~12/s against FIFO's 3,000/s batched ceiling.
+                "FifoQueue": "true",
+                # We supply MessageDeduplicationId ourselves — see the sink.
+                "ContentBasedDeduplication": "false",
             },
         )["QueueUrl"]
     except Exception as e:  # noqa: BLE001 — degrade to the log path, never fail
@@ -486,6 +499,28 @@ def _gc_telemetry_queues() -> None:
             continue
 
 
+def _msg_attr(m: dict, name: str) -> str:
+    return ((m.get("MessageAttributes") or {}).get(name) or {}).get("StringValue") or ""
+
+
+def _msg_pub(m: dict) -> str:
+    """Publisher id, or "" for a message from a worker predating sequencing."""
+    return _msg_attr(m, "pub")
+
+
+def _msg_seq(m: dict) -> int:
+    """Publisher-monotonic emission order, or 0 if absent/malformed.
+
+    0 disables the ordering guard for that message rather than failing it, so a
+    worker running an older image degrades to the previous behaviour instead of
+    having its telemetry dropped.
+    """
+    try:
+        return int(_msg_attr(m, "seq") or 0)
+    except ValueError:
+        return 0
+
+
 def _drain_telemetry(url: str | None, log_state: dict) -> int:
     """Print every marker waiting on the queue. Returns how many were handled.
 
@@ -498,6 +533,7 @@ def _drain_telemetry(url: str | None, log_state: dict) -> int:
         return 0
     sqs = _sqs()
     handled = 0
+    collected: list = []
     for i in range(_TELEMETRY_MAX_BATCHES):
         try:
             resp = sqs.receive_message(
@@ -509,45 +545,73 @@ def _drain_telemetry(url: str | None, log_state: dict) -> int:
                 # because we already know there is a backlog to clear.
                 WaitTimeSeconds=1 if i == 0 else 0,
                 AttributeNames=["SentTimestamp"],
+                MessageAttributeNames=["pub", "seq"],
             )
         except ClientError:
             break
         msgs = resp.get("Messages") or []
         if not msgs:
             break
-        # SQS standard queues do not preserve order, so a drain can hand back a
-        # stage's 40% after its 60%. Percent is rendered directly (the UI no
-        # longer animates between values), so an out-of-order pair reads as the
-        # bar jumping backwards. Sorting by send time fixes it within a batch,
-        # which is where reordering actually shows up.
-        msgs.sort(key=lambda m: int(m.get("Attributes", {})
-                                    .get("SentTimestamp", "0")))
-        now_ms = time.time() * 1000.0
-        for m in msgs:
-            body = (m.get("Body") or "").rstrip()
-            if not is_marker(body):
-                continue
-            sent_ms = float(m.get("Attributes", {}).get("SentTimestamp", "0"))
-            if (is_gauge(body) and sent_ms and
-                    now_ms - sent_ms > _TELEMETRY_GAUGE_MAX_AGE_S * 1000.0):
-                continue  # stale gauge — see _TELEMETRY_GAUGE_MAX_AGE_S
-            if sm := _STAGE_LINE_RE.match(body):
-                # The worker spoke for this stage, with a live percent. Record it
-                # so the Batch-derived backstop leaves it alone — same contract
-                # _tail_progress observes.
-                log_state.setdefault("_stage_status", {})[sm.group(1)] = sm.group(2)
-            print(body, flush=True)
-            handled += 1
+        collected.extend(msgs)
         try:
             sqs.delete_message_batch(
                 QueueUrl=url,
                 Entries=[{"Id": str(n), "ReceiptHandle": m["ReceiptHandle"]}
                          for n, m in enumerate(msgs)])
         except ClientError:
-            # Not deleted -> redelivered after the visibility timeout. Markers
-            # are idempotent (stage state is last-write-wins, records dedupe on
-            # the control plane), so a repeat is harmless.
+            # Not deleted -> redelivered after the visibility timeout. The seq
+            # guard below drops the repeat for droppable markers; records are
+            # idempotent on the control plane. So a repeat is harmless.
             pass
+
+    # ORDER. Receive order IS emission order — the queue is FIFO and every
+    # message carries MessageGroupId = the publishing process, so a chunk's
+    # markers can never overtake each other. Deliberately NOT sorted here:
+    # re-sorting a FIFO drain by SentTimestamp would REINTRODUCE the bug it was
+    # meant to fix, because that stamp is applied on arrival and publisher-side
+    # buffering can invert two markers or land them in the same millisecond.
+    #
+    # This replaced a standard queue, where the symptom was unmistakable on a
+    # 336-chunk run: every chunk's progress meter dancing up and down as a
+    # stage's 40% printed after its 60%.
+    seen_seq = log_state.setdefault("_tel_seq", {})
+    now_ms = time.time() * 1000.0
+    for m in collected:
+        body = (m.get("Body") or "").rstrip()
+        if not is_marker(body):
+            continue
+        sent_ms = float(m.get("Attributes", {}).get("SentTimestamp", "0"))
+        if (is_gauge(body) and sent_ms and
+                now_ms - sent_ms > _TELEMETRY_GAUGE_MAX_AGE_S * 1000.0):
+            continue  # stale gauge — see _TELEMETRY_GAUGE_MAX_AGE_S
+        pub, seq = _msg_pub(m), _msg_seq(m)
+        if pub and seq:
+            # Backstop, not the ordering mechanism — FIFO already guarantees
+            # order. This catches REDELIVERY: a batch we read but failed to
+            # delete reappears after the visibility timeout, and replaying an
+            # old percent would still walk a bar backwards.
+            #
+            # Only droppable classes are suppressed. Records are forwarded even
+            # when repeated: losing one loses data no re-read can recover, and
+            # the control plane already tolerates a duplicate record.
+            #
+            # Keyed per PUBLISHER, which is what makes a retry work. A chunk
+            # re-run after a spot reclaim is a NEW process with its own seq
+            # starting at 1, so it is never suppressed by the attempt it
+            # replaces — where a blanket "never leave a terminal state" rule
+            # would have wrongly frozen the cell on the dead attempt.
+            if seq <= seen_seq.get(pub, 0):
+                if not is_record(body):
+                    continue
+            else:
+                seen_seq[pub] = seq
+        if sm := _STAGE_LINE_RE.match(body):
+            # The worker spoke for this stage, with a live percent. Record it
+            # so the Batch-derived backstop leaves it alone — same contract
+            # _tail_progress observes.
+            log_state.setdefault("_stage_status", {})[sm.group(1)] = sm.group(2)
+        print(body, flush=True)
+        handled += 1
     return handled
 
 

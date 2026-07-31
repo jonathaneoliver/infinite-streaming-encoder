@@ -31,6 +31,7 @@ class FakeSink(telemetry._Sink):
         self._lock = threading.Lock()
 
     def send(self, markers):
+        # markers are (seq, text) tuples — the publisher stamps emission order
         if self._delay:
             time.sleep(self._delay)
         if self._fail:
@@ -43,7 +44,11 @@ class FakeSink(telemetry._Sink):
 
     def flat(self):
         with self._lock:
-            return [m for b in self.batches for m in b]
+            return [m for b in self.batches for _, m in b]
+
+    def seqs(self):
+        with self._lock:
+            return [s for b in self.batches for s, _ in b]
 
 
 def test_batches_at_max_size():
@@ -83,7 +88,7 @@ def test_close_drains_more_than_one_batch():
     p = telemetry._Publisher(sink)
     n = telemetry._BATCH_MAX * 3 + 4
     with p._lock:                      # suppress the size-triggered flush
-        p._buf.extend(f"m{i}" for i in range(n))
+        p._buf.extend((i + 1, f"m{i}") for i in range(n))
         p._oldest = time.monotonic()
     p.close()
     assert len(sink.flat()) == n, f"close() dropped markers: {len(sink.flat())} of {n}"
@@ -188,6 +193,8 @@ def test_queue_name_fits_sqs_limit_and_stays_unique():
     n = telemetry.queue_name(longest)
     assert len(n) <= telemetry._SQS_NAME_MAX, f"{len(n)} chars: {n}"
     assert n.startswith(telemetry._QUEUE_PREFIX)
+    # FIFO queues MUST end in .fifo, and the suffix eats into the 80-char budget
+    assert n.endswith(".fifo"), f"not a FIFO queue name: {n}"
     # Two executions of the SAME job differ only in the trailing suffix, so
     # trimming must never eat it — that would silently merge their queues.
     a = telemetry.queue_name("j" * 60 + "-aaaaaa")
@@ -195,14 +202,14 @@ def test_queue_name_fits_sqs_limit_and_stays_unique():
     assert a != b, "trimming collapsed two distinct executions onto one queue"
     # Short names are left alone.
     assert telemetry.queue_name("short-abc123") == \
-        telemetry._QUEUE_PREFIX + "short-abc123"
+        telemetry._QUEUE_PREFIX + "short-abc123" + telemetry._QUEUE_SUFFIX
 
 
 def test_queue_name_is_a_legal_sqs_name():
     import re
     for name in ("j" * 60 + "-abc123", "1785516812206-my_clip_p200-9f2a1c"):
         n = telemetry.queue_name(name)
-        assert re.fullmatch(r"[A-Za-z0-9_-]{1,80}", n), f"illegal queue name: {n}"
+        assert re.fullmatch(r"[A-Za-z0-9_-]{1,75}\.fifo", n), f"illegal queue name: {n}"
 
 
 def test_oversized_body_is_truncated_not_dropped():

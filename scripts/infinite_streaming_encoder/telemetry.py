@@ -53,6 +53,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 
 # The Step Functions execution this worker belongs to, injected by the workflow
 # definition as $$.Execution.Name. Its presence is what enables the SQS sink;
@@ -61,6 +62,8 @@ import time
 _EXEC_ENV = "ENCODER_TELEMETRY_EXEC"
 
 _QUEUE_PREFIX = "encoder-telemetry-"
+# FIFO queues MUST carry this suffix, and it counts against the 80-char limit.
+_QUEUE_SUFFIX = ".fifo"
 # SQS hard limit on queue names. Not advisory — CreateQueue rejects longer.
 _SQS_NAME_MAX = 80
 
@@ -80,10 +83,10 @@ def queue_name(execution_name: str) -> str:
     is needed the READABLE HEAD gives way and the suffix is preserved — trimming
     the tail instead would let two executions of the same job share a queue.
     """
-    room = _SQS_NAME_MAX - len(_QUEUE_PREFIX)
+    room = _SQS_NAME_MAX - len(_QUEUE_PREFIX) - len(_QUEUE_SUFFIX)
     if len(execution_name) > room:
         execution_name = execution_name[:room - 7] + execution_name[-7:]
-    return _QUEUE_PREFIX + execution_name
+    return _QUEUE_PREFIX + execution_name + _QUEUE_SUFFIX
 
 # Publish in batches, since SQS bills per request and accepts 10 messages in one.
 # Bounded by AGE as well as size: at the 2s progress cadence a single chunk fills
@@ -173,6 +176,13 @@ class _Sink:
         pass
 
 
+# Identifies THIS worker process, so the consumer can order a publisher's own
+# markers without caring how many other workers are publishing concurrently.
+# Ordering only ever matters within one publisher: a stage key belongs to
+# exactly one chunk, which is exactly one process.
+_PUB_ID = uuid.uuid4().hex[:12]
+
+
 class _SqsSink(_Sink):
     """Publish markers to a per-execution SQS queue.
 
@@ -193,9 +203,35 @@ class _SqsSink(_Sink):
         self._url = self._sqs.get_queue_url(QueueName=queue_name)["QueueUrl"]
         self._warned = 0
 
-    def send(self, markers: list[str]) -> None:
-        entries = [{"Id": str(i), "MessageBody": m[:_MAX_BODY]}
-                   for i, m in enumerate(markers)]
+    def send(self, markers: list[tuple[int, str]]) -> None:
+        # `pub`+`seq` ride as MESSAGE ATTRIBUTES, deliberately not in the marker
+        # text: the marker format is a contract with the Go scanner's regexes,
+        # and sequencing is a property of the transport, not of the measurement.
+        # A consumer on any other transport neither sees nor needs them.
+        entries = [
+            {
+                "Id": str(i),
+                "MessageBody": m[:_MAX_BODY],
+                "MessageAttributes": {
+                    "pub": {"DataType": "String", "StringValue": _PUB_ID},
+                    "seq": {"DataType": "Number", "StringValue": str(seq)},
+                },
+                # FIFO ordering is guaranteed WITHIN a message group, and groups
+                # are still consumed in parallel. The publisher is exactly the
+                # right group: a stage key belongs to one chunk, which is one
+                # process, so this orders everything that needs ordering while
+                # leaving 336 chunks free to interleave.
+                "MessageGroupId": _PUB_ID,
+                # Explicit, NOT ContentBasedDeduplication. Content-based dedup
+                # would hash the body and silently swallow a legitimately
+                # repeated marker inside its 5-minute window — two identical
+                # FLEET samples from a steady box, or the same percent reported
+                # twice. Silent data loss is the exact failure class this whole
+                # module exists to remove. (seq) makes every message unique.
+                "MessageDeduplicationId": f"{_PUB_ID}-{seq}",
+            }
+            for i, (seq, m) in enumerate(markers)
+        ]
         try:
             self._sqs.send_message_batch(QueueUrl=self._url, Entries=entries)
         except Exception as e:  # noqa: BLE001 — telemetry must never fail a run
@@ -221,10 +257,15 @@ class _Publisher:
 
     def __init__(self, sink: _Sink) -> None:
         self._sink = sink
-        self._buf: list[str] = []
+        self._buf: list[tuple[int, str]] = []
         self._lock = threading.Lock()
         self._oldest = 0.0
         self._warned = 0
+        # Emission order, which is the ONLY record of true ordering. SQS
+        # standard queues do not preserve it, and SentTimestamp is assigned on
+        # arrival — with up to _BATCH_MAX_AGE_S of buffering, two markers can
+        # reach the queue in the wrong order or in the same millisecond.
+        self._seq = 0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name="telemetry-flush")
@@ -235,7 +276,8 @@ class _Publisher:
         with self._lock:
             if not self._buf:
                 self._oldest = time.monotonic()
-            self._buf.append(marker)
+            self._seq += 1
+            self._buf.append((self._seq, marker))
             full = len(self._buf) >= _BATCH_MAX
         if full:
             self.flush()
