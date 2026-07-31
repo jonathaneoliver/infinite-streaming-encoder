@@ -135,7 +135,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .stages-table tbody tr:hover { background: rgba(67,97,238,0.16); }
 .stages-table tbody tr:hover td.stage-label { color: #dfe6f2; }
 .stage-bar-track { height: 6px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
-.stage-bar-fill { height: 100%; background: #4361ee; transition: width 0.3s ease; }
+/* No transition, same as .chunk-cell-fill: render the reported percent, never
+   animate between two reported values. */
+.stage-bar-fill { height: 100%; background: #4361ee; }
 .stage-bar-fill.stage-fill-done { background: #06d6a0; }
 .stage-bar-fill.stage-fill-failed { background: #ef476f; }
 .stage-bar-fill.stage-fill-skipped { background: repeating-linear-gradient(45deg, #555 0 6px, #444 6px 12px); }
@@ -192,7 +194,12 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    inline elements ignore both (unlike the whole-variant fill, which is a div).
    The fill's COLOUR is the machine the chunk ran on (set inline in JS) so
    co-located chunks are unmistakable; width is progress; red states win. */
-.chunk-cell-fill { display: block; height: 100%; width: 0; background: #4361ee; transition: width 0.3s ease; }
+/* No transition. The fill renders the REPORTED percent directly — 0, 50, 100 —
+   and never animates between two reported values. A transition here meant every
+   width write took 0.3s to land, so a cell recreated by any rebuild swept from
+   nothing to its real width and a chunk that finished long ago appeared to
+   re-fill. Progress markers arrive often enough to read as motion on their own. */
+.chunk-cell-fill { display: block; height: 100%; width: 0; background: #4361ee; }
 .chunk-cell-fill.chunk-failed { background: #ef476f; }
 /* reclaimed = AWS took the spot instance; red + pulse (encoding thrown away,
    waiting to restart on fresh capacity) until the retry begins encoding. */
@@ -2493,7 +2500,7 @@ function updateStagesTable(row, stages) {
                     <td class="stage-pct"></td></tr>`;
             }
             const cells = r.cells.map(c =>
-                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" data-fresh="1" title="chunk ${c.index}"><span class="chunk-cell-fill"></span></span>`).join('');
+                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" title="chunk ${c.index}"><span class="chunk-cell-fill"></span></span>`).join('');
             // The join is implicit in the solid bar (concat is folded into
             // package-all), so no separate join glyph is drawn. Any concat stage
             // is still absorbed into this group (below) so it doesn't spawn a row.
@@ -2522,7 +2529,6 @@ function updateStagesTable(row, stages) {
             const cell = document.createElement('span');
             cell.className = 'chunk-cell';
             cell.dataset.chunkKey = c.key;
-            cell.dataset.fresh = '1';
             cell.title = 'chunk ' + c.index;
             cell.innerHTML = '<span class="chunk-cell-fill"></span>';
             grid.appendChild(cell);
@@ -2613,20 +2619,6 @@ function updateStagesTable(row, stages) {
                 if (fill.style.background !== _wantBg) {
                     fill.style.background = _wantBg;
                     window.__cellPaints = (window.__cellPaints || 0) + 1;
-                }
-                // A cell's FIRST paint must not animate. .chunk-cell-fill starts
-                // at width:0 with a 0.3s transition, so a cell that is recreated
-                // — by any rebuild — sweeps from nothing to its real width, and
-                // a chunk that finished long ago appears to re-fill. Painting the
-                // initial width with the transition off makes a rebuilt cell
-                // appear already-correct; the transition is restored on the next
-                // frame so genuine progress still animates.
-                if (cell.dataset.fresh) {
-                    delete cell.dataset.fresh;
-                    const prev = fill.style.transition;
-                    fill.style.transition = 'none';
-                    void fill.offsetWidth;               // flush, so 'none' applies to THIS write
-                    requestAnimationFrame(() => { fill.style.transition = prev; });
                 }
             }
             cell.title = stageTooltip(c.s, 'chunk ' + c.index) + (c.s.reused ? ' · reused from prior staging' : '');
