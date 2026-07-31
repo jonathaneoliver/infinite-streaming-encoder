@@ -58,6 +58,7 @@ from infinite_streaming_encoder.packager import PackageSpec, package
 from infinite_streaming_encoder.padding import multi_duration_lcm, plan_padding
 from infinite_streaming_encoder.progress import (
     emit_boot_ami, emit_stage, prime_fleet_cpu)
+from infinite_streaming_encoder.telemetry import emit, flush as flush_telemetry
 
 try:
     import boto3
@@ -493,10 +494,10 @@ def _get_or_build_prescaled_ref(mezz_local: Path, mezz_uri: str, info,
     with open(Path(cache_dir) / f"vmafref-{key}.lock", "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         if ref.is_file() and done.is_file():
-            print("[[ENCODER-VMAFREF status=cached]]", flush=True)
+            emit("[[ENCODER-VMAFREF status=cached]]")
         else:
-            print(f"[[ENCODER-VMAFREF status=building dims={cw}x{ch} crf={_VMAF_REF_CRF}]]",
-                  flush=True)
+            emit(f"[[ENCODER-VMAFREF status=building dims={cw}x{ch} "
+                 f"crf={_VMAF_REF_CRF}]]")
             try:
                 tmp = ref.with_suffix(".building.mp4")
                 _build_prescaled_ref(mezz_local, tmp, cw, ch, str(info.fps),
@@ -504,10 +505,10 @@ def _get_or_build_prescaled_ref(mezz_local: Path, mezz_uri: str, info,
                 tmp.replace(ref)
                 done.write_text(str(ref.stat().st_size))
                 _prune_mezz_cache(Path(cache_dir))
-                print(f"[[ENCODER-VMAFREF status=built dims={cw}x{ch}]]", flush=True)
+                emit(f"[[ENCODER-VMAFREF status=built dims={cw}x{ch}]]")
             except Exception as e:  # noqa: BLE001 — fall back to native mezz
-                print(f"[[ENCODER-VMAFREF status=failed err={type(e).__name__}:{str(e)[:120]}]]",
-                      flush=True)
+                emit(f"[[ENCODER-VMAFREF status=failed "
+                     f"err={type(e).__name__}:{str(e)[:120]}]]")
                 return None
     return ref
 
@@ -595,8 +596,8 @@ class _StepTimer:
         # can divide them by reserved-vCPU x encode wall-time per tier.
         extra_kv = "".join(f" {k}={v}" for k, v in extra.items())
         # Machine-readable (parsed by cloud.timing / the app), then human.
-        print(f"[[ENCODER-TIMING phase={self.phase} key={key} {kv}{extra_kv} "
-              f"total_s={total:.2f}]]", flush=True)
+        emit(f"[[ENCODER-TIMING phase={self.phase} key={key} {kv}{extra_kv} "
+             f"total_s={total:.2f}]]")
         human = ", ".join(f"{n}={d:.1f}s" for n, d in self.marks)
         print(f"[timing] {self.phase} {key}: {human}, total={total:.1f}s",
               flush=True)
@@ -810,16 +811,15 @@ def phase_variant(args: argparse.Namespace) -> int:
                 fps=str(info.fps),
                 n_frames=n_frames,
             )
-            print(vmaf_marker(args.codec, args.label, rung.height,
-                              chunk.index if chunk is not None else -1, r),
-                  flush=True)
+            emit(vmaf_marker(args.codec, args.label, rung.height,
+                             chunk.index if chunk is not None else -1, r))
         except Exception as e:  # noqa: BLE001 — audit must never fail the encode
             # Prefix with [[ENCODER so the temporal worker relays it (it only
             # forwards [[ENCODER… lines) — otherwise a VMAF failure is invisible.
             import traceback
-            print(f"[[ENCODER-VMAF-ERROR codec={args.codec} label={args.label} "
-                  f"chunk={chunk.index if chunk is not None else -1}: "
-                  f"{type(e).__name__}: {str(e)[:220]}]]", flush=True)
+            emit(f"[[ENCODER-VMAF-ERROR codec={args.codec} label={args.label} "
+                 f"chunk={chunk.index if chunk is not None else -1}: "
+                 f"{type(e).__name__}: {str(e)[:220]}]]")
             print("[vmaf] " + traceback.format_exc().replace("\n", " | "),
                   flush=True)
         timer.mark("vmaf")
@@ -846,10 +846,15 @@ def phase_variant(args: argparse.Namespace) -> int:
     machine = os.environ.get("WORKER_LABEL") or "graviton"
     fps_i = max(1, round(float(info.fps)))
     if encode_wall_s > 0 and content_s > 0:
-        print(f"[[ENCODER-SPEED machine={machine} codec={args.codec} "
-              f"height={rung.height} two_pass={two_pass} preset={args.preset} "
-              f"fps={fps_i} content_s={content_s:.1f} "
-              f"encode_s={encode_wall_s:.1f}]]", flush=True)
+        emit(f"[[ENCODER-SPEED machine={machine} codec={args.codec} "
+             f"height={rung.height} two_pass={two_pass} preset={args.preset} "
+             f"fps={fps_i} content_s={content_s:.1f} "
+             f"encode_s={encode_wall_s:.1f}]]")
+    # ENCODER-SPEED and ENCODER-TIMING are the LAST things this phase says, and
+    # both are records that cannot be recovered without re-encoding. Hand them to
+    # the sink before returning rather than relying on the interpreter shutting
+    # down cleanly — on spot capacity it often does not.
+    flush_telemetry()
     return 0
 
 

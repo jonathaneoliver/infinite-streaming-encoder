@@ -47,6 +47,7 @@ from infinite_streaming_encoder.mezzanine import MezzanineSpec, create_mezzanine
 from infinite_streaming_encoder.packager import PackageSpec, package
 from infinite_streaming_encoder.padding import multi_duration_lcm, plan_padding
 from infinite_streaming_encoder.progress import Stage, emit_boot_ami, emit_plan, emit_stage
+from infinite_streaming_encoder.telemetry import emit
 from infinite_streaming_encoder.resume import discover, resolve_codec_selection
 
 # Matches bash's minimum.
@@ -686,9 +687,9 @@ def _log_run_summary(wall_s: float, cpu_s: float) -> None:
     rate = float(os.environ.get("SPOT_USD_PER_VCPU_HR", _SPOT_USD_PER_VCPU_HR))
     cost = wall_s / 3600.0 * vcpu * rate
     # Machine-readable marker (parsed like the other ENCODER-* markers) + human.
-    print(f"[[ENCODER-SUMMARY wall_s={wall_s:.1f} cpu_s={cpu_s:.1f} vcpu={vcpu} "
-          f"cores_busy={cores_busy:.2f} efficiency_pct={util * 100:.0f} "
-          f"cost_usd={cost:.3f}]]", flush=True)
+    emit(f"[[ENCODER-SUMMARY wall_s={wall_s:.1f} cpu_s={cpu_s:.1f} vcpu={vcpu} "
+         f"cores_busy={cores_busy:.2f} efficiency_pct={util * 100:.0f} "
+         f"cost_usd={cost:.3f}]]")
     print(f"[run summary] wall={wall_s:.1f}s  cpu-time={cpu_s:.1f}s  "
           f"efficiency={util * 100:.0f}% ({cores_busy:.1f} of {vcpu} cores busy)"
           f"  est encode cost=${cost:.3f} (Graviton spot)", flush=True)

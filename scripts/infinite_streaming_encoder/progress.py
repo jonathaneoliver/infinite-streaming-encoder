@@ -32,6 +32,8 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Iterable
 
+from .telemetry import emit
+
 
 # ---------------------------------------------------------------------------
 # Plan + stage markers
@@ -52,16 +54,13 @@ def emit_plan(stages: Iterable[Stage]) -> None:
     matching rows by key.
     """
     payload = json.dumps([asdict(s) for s in stages], separators=(",", ":"))
-    print(f"[[ENCODER-PLAN {payload}]]", flush=True)
+    emit(f"[[ENCODER-PLAN {payload}]]")
 
 
 def emit_stage(key: str, status: str, percent: float = 0.0) -> None:
     """Update one stage's status and (optionally) percent complete."""
     pct = max(0.0, min(100.0, float(percent)))
-    print(
-        f"[[ENCODER-STAGE key={key} status={status} percent={pct:.1f}]]",
-        flush=True,
-    )
+    emit(f"[[ENCODER-STAGE key={key} status={status} percent={pct:.1f}]]")
     # Piggyback the fleet CPU sample on the progress cadence (throttled inside)
     # rather than running a timer thread: these already fire ~20x per chunk,
     # which is a finer interval than the 15s throttle needs.
@@ -175,8 +174,8 @@ def emit_fleet_cpu() -> None:
     if busy is None:
         return
     _FLEET_PREV["emitted"] = now
-    print(f"[[ENCODER-FLEET machine={machine} busy={busy:.2f} "
-          f"perf={os.cpu_count() or 0}]]", flush=True)
+    emit(f"[[ENCODER-FLEET machine={machine} busy={busy:.2f} "
+         f"perf={os.cpu_count() or 0}]]")
 
 
 def emit_boot_ami() -> None:
@@ -197,19 +196,34 @@ def emit_boot_ami() -> None:
     except Exception:  # noqa: BLE001 — not on EC2, or IMDS unavailable
         return
     if ami:
-        print(f"[[ENCODER-BOOT ami={ami}]]", flush=True)
+        emit(f"[[ENCODER-BOOT ami={ami}]]")
 
 
 # ---------------------------------------------------------------------------
 # ffmpeg progress parser
 # ---------------------------------------------------------------------------
 
-# Throttle how often we emit STAGE markers. The driving constraint is
-# ffmpeg's own `-stats_period` (see _FFMPEG_STATS_PERIOD below); setting
-# this any tighter than that just means we process ticks as they arrive.
-# We intentionally keep it below the stats period so no tick gets
-# dropped — 0.2s against a 0.25s ffmpeg period leaves headroom.
-_MIN_EMIT_INTERVAL_S = 0.2
+# How often a running stage reports its percent. This is a TRANSPORT rate, and
+# it is deliberately decoupled from ffmpeg's tick rate (_FFMPEG_STATS_PERIOD).
+#
+# It used to be 0.2s, chosen to sit just under the 0.25s stats period so that no
+# ffmpeg tick was ever dropped. That is the right instinct for a local pipe and
+# the wrong one for a message: at 0.2s a marker is superseded 250ms later, and
+# measured against real runs (~8,800 encode-seconds per 4K ladder) it produced
+# ~35,000 progress markers per run — every one of them written to CloudWatch,
+# re-read by the orchestrator, re-printed, and re-scanned by the Go server.
+#
+# Nothing downstream can use that resolution. The UI renders a bar and polls on
+# a multi-second cadence, so ~8 of every 9 markers were paid for and discarded.
+#
+# 2s matches what the local-dist path already settled on independently for the
+# same data (`default_heartbeat_throttle_interval` in temporal_worker.py), so
+# both paths now report progress at the same cadence.
+#
+# Dropping ticks is the intended behaviour, not a tolerated side effect: percent
+# is a GAUGE, so the newest value is the only one that matters and a missed one
+# costs nothing. Records (TIMING/SPEED/VMAF) are emitted unthrottled elsewhere.
+_MIN_EMIT_INTERVAL_S = float(os.environ.get("ENCODER_PROGRESS_INTERVAL_S", "2.0"))
 
 # How often to ask ffmpeg to emit -progress output. Default is 0.5s,
 # which on fast encodes (several × realtime on short clips) means

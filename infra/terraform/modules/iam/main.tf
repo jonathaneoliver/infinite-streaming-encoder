@@ -99,6 +99,34 @@ resource "aws_iam_role_policy" "task_s3" {
   policy = data.aws_iam_policy_document.s3_rw.json
 }
 
+# Telemetry: workers publish their [[ENCODER-…]] markers to a per-execution SQS
+# queue that the orchestrator creates, drains and deletes. Send-only, and only
+# on queues named for this system — a worker must not be able to read (and so
+# delete) the telemetry of the run it is part of, nor touch any other queue in
+# the account.
+#
+# Wildcarded because the queue name carries the execution name and so is not
+# known until submit time. GetQueueUrl is needed because the worker is given the
+# execution name, not a URL: the URL embeds the account id, which the workflow
+# definition has no clean way to interpolate.
+data "aws_iam_policy_document" "task_sqs" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "sqs:SendMessage",
+      "sqs:SendMessageBatch",
+      "sqs:GetQueueUrl",
+    ]
+    resources = ["arn:aws:sqs:*:*:encoder-telemetry-*"]
+  }
+}
+
+resource "aws_iam_role_policy" "task_sqs" {
+  role   = aws_iam_role.task.id
+  name   = "TelemetrySend"
+  policy = data.aws_iam_policy_document.task_sqs.json
+}
+
 # ---------------------------------------------------------------
 # Execution role — ECS uses this to pull the image from ECR and
 # ship container stdout/stderr to CloudWatch Logs.

@@ -25,6 +25,10 @@ import sys
 import time
 from pathlib import Path
 
+# Taxonomy only — cli_batch is the queue's CONSUMER and must never emit through
+# telemetry, or it would republish what it just drained.
+from infinite_streaming_encoder.telemetry import is_gauge, is_marker, queue_name
+
 try:
     import boto3
     from botocore.exceptions import ClientError
@@ -62,6 +66,10 @@ def _batch():
 
 def _ecs():
     return boto3.client("ecs", region_name=_region())
+
+
+def _sqs():
+    return boto3.client("sqs", region_name=_region())
 
 
 # containerInstanceArn -> EC2 instance-id, resolved once per instance. The ARN
@@ -310,7 +318,8 @@ def _backfill_completed_hosts(exec_name: str, log_state: dict) -> None:
 _MAX_DRAINS_PER_POLL = 12
 
 
-def _forward_running_logs(exec_name: str, log_state: dict) -> None:
+def _forward_running_logs(exec_name: str, log_state: dict,
+                          drain_finished: bool = True) -> None:
     """Tail the CloudWatch streams of currently-RUNNING jobs and forward their
     [progress]/[phase] lines into the app log — so long phases (mezzanine,
     packaging, big S3 transfers) show live activity instead of a dark gap
@@ -332,8 +341,14 @@ def _forward_running_logs(exec_name: str, log_state: dict) -> None:
     # finished jobs each poll would cost a GetLogEvents call apiece for nothing.
     drained = log_state.setdefault("_drained", set())
     live_ids = [j["jobId"] for j in _list_exec_jobs(exec_name, "RUNNING")]
-    done_ids = [j["jobId"] for j in _list_exec_jobs(exec_name, "SUCCEEDED")
-                if j["jobId"] not in drained]
+    # `drain_finished` False means the telemetry queue is delivering markers, so
+    # a finished container's stream holds nothing we still need — and reading it
+    # is the single most expensive thing in the poll loop (125.53s for 337
+    # streams, measured). Skipping it is the whole point of #188; the RUNNING
+    # tail below stays, because the [progress]/[phase] NARRATION it forwards for
+    # long phases is not marker traffic and never went on the queue.
+    done_ids = ([j["jobId"] for j in _list_exec_jobs(exec_name, "SUCCEEDED")
+                 if j["jobId"] not in drained] if drain_finished else [])
     # BOUNDED. Draining a finished job's stream costs ~0.37s (get_log_events per
     # stream, measured at 125s for 337 of them). A burst of completions would
     # otherwise make one poll take minutes, and everything after it in the loop —
@@ -362,6 +377,178 @@ def _forward_running_logs(exec_name: str, log_state: dict) -> None:
         # Colour every running job's rows (encode chunks + mezzanine / audio /
         # package / fragments / hls) by the instance it landed on. Best-effort.
         _tag_hosts_for_jobs(jobs, log_state)
+
+
+# ---------------------------------------------------------------------------
+# Telemetry queue — the transport that replaces scraping finished containers'
+# CloudWatch streams for their markers (#188).
+#
+# Shape: ONE queue per execution, created here before the execution starts and
+# deleted when it ends. Per-execution rather than shared because SQS returns a
+# SAMPLE of available messages: with one queue, two concurrent runs would each
+# keep drawing the other's messages, be unable to delete them, and the smaller
+# run could starve indefinitely.
+#
+# The worker derives the same name from telemetry.queue_name(). That function is
+# the single definition of the name — see its docstring.
+# ---------------------------------------------------------------------------
+
+# Messages outlive a server restart, which CloudWatch tailing state did not:
+# bouncing the server mid-encode used to strand a job's grid permanently (a run
+# stuck displaying 159/336) because the replay could not recover what had
+# already been read. 1h is far longer than any run and keeps orphans cheap.
+_TELEMETRY_RETENTION_S = "3600"
+# A message we take but fail to delete comes back after this. Short, because the
+# only reason we would not delete is a crash between receive and delete.
+_TELEMETRY_VISIBILITY_S = "30"
+# Per poll. At the 2s progress cadence a 336-chunk run produces ~7,000 markers
+# over its lifetime; this covers a burst of ~400 without letting one poll run
+# long. Anything left is still queued — unlike a log tail, nothing is lost by
+# not reading it this cycle.
+_TELEMETRY_MAX_BATCHES = 40
+# An ENCODER-FLEET sample is a GAUGE, so a backlog can deliver one that is no
+# longer true. Records (TIMING/SPEED/VMAF) are kept regardless of age — they
+# cannot be recovered without re-encoding.
+_TELEMETRY_GAUGE_MAX_AGE_S = 30.0
+# How long the queue may stay silent WHILE CONTAINERS ARE RUNNING before we
+# conclude the workers cannot publish and go back to reading logs. Generous: a
+# worker's first marker lands within seconds of its container starting, so this
+# only trips on a real misconfiguration.
+_TELEMETRY_SILENT_GIVEUP_S = 120
+
+
+def _create_telemetry_queue(exec_name: str) -> str | None:
+    """Create this execution's queue. Returns its URL, or None if unavailable.
+
+    Called BEFORE the execution starts, so no worker can race a missing queue.
+    Failure is not fatal: workers fall back to stdout->CloudWatch and the
+    orchestrator keeps its log-draining path.
+    """
+    try:
+        return _sqs().create_queue(
+            QueueName=queue_name(exec_name),
+            Attributes={
+                "MessageRetentionPeriod": _TELEMETRY_RETENTION_S,
+                "VisibilityTimeout": _TELEMETRY_VISIBILITY_S,
+                # Long-poll by default so an empty receive costs one request
+                # rather than spinning.
+                "ReceiveMessageWaitTimeSeconds": "1",
+            },
+        )["QueueUrl"]
+    except Exception as e:  # noqa: BLE001 — degrade to the log path, never fail
+        print(f"!!! telemetry queue unavailable ({type(e).__name__}: {e}); "
+              f"falling back to CloudWatch log draining", file=sys.stderr,
+              flush=True)
+        return None
+
+
+def _delete_telemetry_queue(url: str | None) -> None:
+    if not url:
+        return
+    try:
+        _sqs().delete_queue(QueueUrl=url)
+    except Exception:  # noqa: BLE001 — retention expires it anyway
+        pass
+
+
+def _gc_telemetry_queues() -> None:
+    """Delete telemetry queues left behind by runs that never finished cleanly.
+
+    A driver killed mid-run (the server restarting kills the cli_batch
+    subprocess) never reaches its own delete. Retention expires the MESSAGES
+    after an hour but the empty queue itself persists forever, so without this
+    the account accumulates one queue per crashed run. Best-effort, and bounded:
+    only queues with no messages and no in-flight messages, older than the
+    retention window, are removed — so a live run's queue can never be deleted
+    out from under it, even if this races one.
+    """
+    try:
+        sqs = _sqs()
+        names = sqs.list_queues(QueueNamePrefix="encoder-telemetry-",
+                                MaxResults=1000).get("QueueUrls") or []
+    except Exception:  # noqa: BLE001 — housekeeping is best-effort
+        return
+    now = time.time()
+    for url in names:
+        try:
+            a = sqs.get_queue_attributes(
+                QueueUrl=url,
+                AttributeNames=["CreatedTimestamp",
+                                "ApproximateNumberOfMessages",
+                                "ApproximateNumberOfMessagesNotVisible"],
+            )["Attributes"]
+            age = now - float(a.get("CreatedTimestamp", now))
+            empty = (int(a.get("ApproximateNumberOfMessages", 1)) == 0 and
+                     int(a.get("ApproximateNumberOfMessagesNotVisible", 1)) == 0)
+            if empty and age > float(_TELEMETRY_RETENTION_S):
+                sqs.delete_queue(QueueUrl=url)
+        except Exception:  # noqa: BLE001 — one bad queue must not stop the sweep
+            continue
+
+
+def _drain_telemetry(url: str | None, log_state: dict) -> int:
+    """Print every marker waiting on the queue. Returns how many were handled.
+
+    This is what `_forward_running_logs` used to do for finished jobs, at
+    ~0.37s per container stream (measured: 125.53s for 337 of them). Here the
+    whole run's markers arrive in one place, ten to a request, with no
+    dependency on CloudWatch ingestion latency.
+    """
+    if not url:
+        return 0
+    sqs = _sqs()
+    handled = 0
+    for i in range(_TELEMETRY_MAX_BATCHES):
+        try:
+            resp = sqs.receive_message(
+                QueueUrl=url, MaxNumberOfMessages=10,
+                # Long-poll only the FIRST receive of a cycle. It confirms an
+                # empty queue is really empty (a short poll samples servers and
+                # can return nothing while messages exist), and costs at most 1s
+                # per poll. Subsequent receives in the same drain short-poll,
+                # because we already know there is a backlog to clear.
+                WaitTimeSeconds=1 if i == 0 else 0,
+                AttributeNames=["SentTimestamp"],
+            )
+        except ClientError:
+            break
+        msgs = resp.get("Messages") or []
+        if not msgs:
+            break
+        # SQS standard queues do not preserve order, so a drain can hand back a
+        # stage's 40% after its 60%. Percent is rendered directly (the UI no
+        # longer animates between values), so an out-of-order pair reads as the
+        # bar jumping backwards. Sorting by send time fixes it within a batch,
+        # which is where reordering actually shows up.
+        msgs.sort(key=lambda m: int(m.get("Attributes", {})
+                                    .get("SentTimestamp", "0")))
+        now_ms = time.time() * 1000.0
+        for m in msgs:
+            body = (m.get("Body") or "").rstrip()
+            if not is_marker(body):
+                continue
+            sent_ms = float(m.get("Attributes", {}).get("SentTimestamp", "0"))
+            if (is_gauge(body) and sent_ms and
+                    now_ms - sent_ms > _TELEMETRY_GAUGE_MAX_AGE_S * 1000.0):
+                continue  # stale gauge — see _TELEMETRY_GAUGE_MAX_AGE_S
+            if sm := _STAGE_LINE_RE.match(body):
+                # The worker spoke for this stage, with a live percent. Record it
+                # so the Batch-derived backstop leaves it alone — same contract
+                # _tail_progress observes.
+                log_state.setdefault("_stage_status", {})[sm.group(1)] = sm.group(2)
+            print(body, flush=True)
+            handled += 1
+        try:
+            sqs.delete_message_batch(
+                QueueUrl=url,
+                Entries=[{"Id": str(n), "ReceiptHandle": m["ReceiptHandle"]}
+                         for n, m in enumerate(msgs)])
+        except ClientError:
+            # Not deleted -> redelivered after the visibility timeout. Markers
+            # are idempotent (stage state is last-write-wins, records dedupe on
+            # the control plane), so a repeat is harmless.
+            pass
+    return handled
 
 
 def _stage_key_for_job(jobname: str) -> str | None:
@@ -503,8 +690,8 @@ def _tail_progress(stream: str, label: str, log_state: dict,
     for e in events:
         log_state[stream] = max(log_state.get(stream, 0), e.get("timestamp", 0))
         msg = e.get("message", "").rstrip()
-        if msg.startswith("[[ENCODER-FLEET ") and not live:
-            continue  # gauge: a finished job's sample is stale — see the docstring
+        if is_gauge(msg) and not live:
+            continue  # a finished job's sample is stale — see the docstring
         if sm := _STAGE_LINE_RE.match(msg):
             # The worker reported this stage itself, with a live percent. Record
             # it so the Batch-derived backstop leaves it alone.
@@ -880,6 +1067,16 @@ def cmd_submit(args: argparse.Namespace) -> int:
     if base:
         import uuid
         kwargs["name"] = f"{base}-{uuid.uuid4().hex[:6]}"
+    # Create the telemetry queue BEFORE starting the execution. The mezzanine
+    # job is submitted the instant the execution starts, so a queue created
+    # afterwards would be raced by the first worker's GetQueueUrl — which fails
+    # closed (that worker silently drops to stdout for its whole life).
+    if name := kwargs.get("name"):
+        _create_telemetry_queue(name)
+    # Sweep queues stranded by earlier runs that were killed mid-flight. Done at
+    # submit rather than on a timer: it is the one moment we are already talking
+    # to SQS and are not on the latency-sensitive poll path.
+    _gc_telemetry_queues()
     resp = sfn.start_execution(**kwargs)
     print(resp["executionArn"], flush=True)
     return 0
@@ -1257,6 +1454,12 @@ def cmd_poll(args: argparse.Namespace) -> int:
     exec_name = args.execution_arn.rsplit(":", 1)[-1]
     interval_s = int(os.environ.get("BATCH_POLL_INTERVAL_S", "5"))
     timeout_s = int(os.environ.get("BATCH_POLL_TIMEOUT_S", "14400"))  # 4h ceiling
+    # Idempotent: cmd_submit already created this, but poll is a separate
+    # process and may be re-attached to an execution submitted by an older
+    # driver. CreateQueue returns the existing URL when the attributes match.
+    tel_url = _create_telemetry_queue(exec_name)
+    tel_handled = 0
+    tel_silent_s = 0
 
     print(f">>> Polling execution {args.execution_arn}", flush=True)
     elapsed = 0
@@ -1298,15 +1501,44 @@ def cmd_poll(args: argparse.Namespace) -> int:
         # complete continuously, so most polls had streams to drain and the grid
         # sat 35-73 completions behind Batch (#187) — showing holes for work that
         # had already finished.
+        # Worker markers first, so the stages the workers have spoken for (with a
+        # live percent) are recorded before the Batch backstop below decides
+        # which gaps it needs to fill. Cheap — one long-poll plus one request per
+        # 10 messages, against the ~0.37s-per-container it replaces.
+        try:
+            tel_handled += _drain_telemetry(tel_url, log_state)
+        except Exception:  # noqa: BLE001 — never break polling over telemetry
+            pass
         try:
             _sync_stages_from_batch(exec_name, log_state)
         except Exception:  # noqa: BLE001 — never break polling over the grid
             pass
+        # If the queue exists but has produced NOTHING while containers are
+        # demonstrably running, the workers are not publishing (missing IAM, an
+        # image predating the sink, a queue-name mismatch). Say so and put the
+        # log drain back, rather than rendering an increasingly empty grid and
+        # leaving the cause to be guessed at.
+        #
+        # Measured against WORK, not wall time. Batch cold-start routinely takes
+        # minutes to place the first container — an elapsed-time trigger would
+        # declare the queue broken on every run that had to boot an instance,
+        # which is most of them.
+        if tel_url and not tel_handled:
+            started = any(v in ("running", "done")
+                          for v in log_state.get("_stage_status", {}).values())
+            tel_silent_s += interval_s if started else 0
+            if tel_silent_s >= _TELEMETRY_SILENT_GIVEUP_S:
+                print(f"!!! telemetry queue silent for {tel_silent_s}s of "
+                      f"running containers — workers are not publishing; "
+                      f"falling back to CloudWatch log draining",
+                      file=sys.stderr, flush=True)
+                tel_url = None
         # Then the live [progress]/[phase] lines from running containers, so long
         # phases show activity rather than a dark gap. Cosmetic, and now bounded
         # (see _MAX_DRAINS_PER_POLL) so it cannot starve the loop above.
         try:
-            _forward_running_logs(exec_name, log_state)
+            _forward_running_logs(exec_name, log_state,
+                                  drain_finished=tel_url is None)
         except Exception:  # noqa: BLE001 — live tailing is cosmetic
             pass
         # Backfill instance colour for chunks that finished between polls (short
@@ -1320,6 +1552,17 @@ def cmd_poll(args: argparse.Namespace) -> int:
         status = desc["status"]
 
         if status in ("SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"):
+            # One last drain before tearing the queue down. A chunk's final
+            # records — ENCODER-TIMING, ENCODER-SPEED — are emitted as it exits,
+            # so the last jobs to finish publish AFTER the last ordinary poll.
+            # This is the same gap _forward_container_timing exists to cover on
+            # the log path.
+            try:
+                tel_handled += _drain_telemetry(tel_url, log_state)
+            except Exception:  # noqa: BLE001 — never fail a finished run
+                pass
+            _delete_telemetry_queue(tel_url)
+            tel_url = None
             if status == "SUCCEEDED":
                 # Safety net: the packaging sub-stages come from live tailing;
                 # if the last tail poll missed a "done" marker, force them
@@ -1345,6 +1588,7 @@ def cmd_poll(args: argparse.Namespace) -> int:
         time.sleep(interval_s)
         elapsed += interval_s
 
+    _delete_telemetry_queue(tel_url)
     print("!!! poll timed out", file=sys.stderr)
     return 3
 
