@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/encode"
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/imageinfo"
@@ -29,6 +30,17 @@ type Server struct {
 	GitSha     string
 	ImageTag   string
 	CloudImage string
+	// invMu/invLast/invAt cache the last SUCCESSFUL cloud inventory. The
+	// inventory shells out to Python which makes half a dozen AWS calls, and any
+	// one of them failing — a throttle, a timeout, a transient 5xx — used to turn
+	// the whole endpoint into a 502. The page's fetch then threw and the Cloud
+	// Fleet panel rendered empty, so a momentary AWS hiccup looked like the fleet
+	// vanishing. It came back on the next poll, which is why it was only ever
+	// seen as a flicker and never diagnosed. Serving the last good payload for a
+	// short window turns that into a stale reading instead of a blank one.
+	invMu   sync.Mutex
+	invLast []byte
+	invAt   time.Time
 	// GHCRImage is the GHCR image (no tag) whose OCI labels stand in for the
 	// cloud worker image's — the worker image is an ECR ref imageinfo can't
 	// query, but publish keeps ECR + GHCR in sync by tag.
@@ -988,12 +1000,35 @@ func runPythonCloud(module string, args ...string) ([]byte, error) {
 	return out, nil
 }
 
+// invStaleWindow is how long a cached inventory may stand in for a failed read.
+// Long enough to ride out a throttle or a slow call (the poll is every few
+// seconds), short enough that a genuinely broken inventory surfaces rather than
+// being papered over indefinitely.
+const invStaleWindow = 2 * time.Minute
+
 func (s *Server) awsInventory(w http.ResponseWriter, r *http.Request) {
 	out, err := runPythonCloud("inventory")
 	if err != nil {
+		// Log it: this path was previously silent, so the fleet blanking left no
+		// trace at all and could not be told apart from the fleet being empty.
+		log.Printf("[inventory] read FAILED: %v", err)
+		s.invMu.Lock()
+		cached, at := s.invLast, s.invAt
+		s.invMu.Unlock()
+		if cached != nil && time.Since(at) < invStaleWindow {
+			log.Printf("[inventory] serving cached payload from %s ago instead of blanking the panel",
+				time.Since(at).Round(time.Second))
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Inventory-Stale", time.Since(at).Round(time.Second).String())
+			w.Write(s.attachFleetCPU(cached))
+			return
+		}
 		http.Error(w, err.Error(), 502)
 		return
 	}
+	s.invMu.Lock()
+	s.invLast, s.invAt = out, time.Now()
+	s.invMu.Unlock()
 	out = s.attachFleetCPU(out)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(out)

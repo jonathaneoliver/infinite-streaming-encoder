@@ -2486,7 +2486,7 @@ function updateStagesTable(row, stages) {
                     <td class="stage-pct"></td></tr>`;
             }
             const cells = r.cells.map(c =>
-                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" title="chunk ${c.index}"><span class="chunk-cell-fill"></span></span>`).join('');
+                `<span class="chunk-cell" data-chunk-key="${escapeHtml(c.key)}" data-fresh="1" title="chunk ${c.index}"><span class="chunk-cell-fill"></span></span>`).join('');
             // The join is implicit in the solid bar (concat is folded into
             // package-all), so no separate join glyph is drawn. Any concat stage
             // is still absorbed into this group (below) so it doesn't spawn a row.
@@ -2515,6 +2515,7 @@ function updateStagesTable(row, stages) {
             const cell = document.createElement('span');
             cell.className = 'chunk-cell';
             cell.dataset.chunkKey = c.key;
+            cell.dataset.fresh = '1';
             cell.title = 'chunk ' + c.index;
             cell.innerHTML = '<span class="chunk-cell-fill"></span>';
             grid.appendChild(cell);
@@ -2593,6 +2594,20 @@ function updateStagesTable(row, stages) {
                 // unmissable so co-located chunks pop; red/reused states keep their
                 // class colour (clear the inline so the class wins).
                 fill.style.background = (isRed || reused) ? '' : (instanceColor(c.s.instance) || '#4361ee');
+                // A cell's FIRST paint must not animate. .chunk-cell-fill starts
+                // at width:0 with a 0.3s transition, so a cell that is recreated
+                // — by any rebuild — sweeps from nothing to its real width, and
+                // a chunk that finished long ago appears to re-fill. Painting the
+                // initial width with the transition off makes a rebuilt cell
+                // appear already-correct; the transition is restored on the next
+                // frame so genuine progress still animates.
+                if (cell.dataset.fresh) {
+                    delete cell.dataset.fresh;
+                    const prev = fill.style.transition;
+                    fill.style.transition = 'none';
+                    void fill.offsetWidth;               // flush, so 'none' applies to THIS write
+                    requestAnimationFrame(() => { fill.style.transition = prev; });
+                }
             }
             cell.title = stageTooltip(c.s, 'chunk ' + c.index) + (c.s.reused ? ' · reused from prior staging' : '');
         }
