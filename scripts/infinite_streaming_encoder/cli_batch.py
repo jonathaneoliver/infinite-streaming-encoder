@@ -856,22 +856,39 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
         etype = ev["type"]
 
         if etype == "TaskStateEntered":
+            # SUBMITTED, not running. Entering the state means the job was handed
+            # to Batch; it then sits RUNNABLE until a slot frees and only becomes
+            # RUNNING once placed on an instance. Emitting "running" here claimed
+            # the whole ladder was encoding the instant it fanned out — 336 chunks
+            # "running" against a handful actually executing — and, worse, marked
+            # them running BEFORE any machine existed to attribute them to, since
+            # containerInstanceArn is only assigned at placement. That is what
+            # rendered chunks (and the package phase) as uncoloured blue cells:
+            # not a failed host lookup, but a status applied before a host could
+            # possibly be known.
+            #
+            # "queued" is what the state actually is, and it makes "running" mean
+            # PLACED — at which point _sync_stages_from_batch announces it and
+            # tags its host in the same pass, so a running cell is coloured from
+            # the moment it appears. _reflect_batch_status still corrects the
+            # RUNNABLE/STARTING/RUNNING split from Batch as before; it simply no
+            # longer has a false "running" burst to undo.
             name = ev.get("stateEnteredEventDetails", {}).get("name", "")
             key = _STEP_TO_STAGE.get(name)
             if key:
-                _emit_stage(key, "running", 0.0)
+                _emit_stage(key, "queued", 0.0)
                 _narrate(f"▶ {key.replace(':', ' ')} submitted")
             elif name == "EncodeChunk":
                 idn = chunk_enter.get(ev["id"])
                 if idn:
                     c, t, ci = idn
-                    _emit_stage(f"encode:{c}:{t}:chunk{ci}", "running", 0.0)
+                    _emit_stage(f"encode:{c}:{t}:chunk{ci}", "queued", 0.0)
                     _narrate(f"▶ encode {c} {t} chunk{ci} submitted")
             elif name == "EncodeWhole":
                 idn = whole_enter.get(ev["id"])
                 if idn:
                     c, t = idn
-                    _emit_stage(f"encode:{c}:{t}", "running", 0.0)
+                    _emit_stage(f"encode:{c}:{t}", "queued", 0.0)
                     _narrate(f"▶ encode {c} {t} submitted")
 
         elif etype == "TaskStateExited":
