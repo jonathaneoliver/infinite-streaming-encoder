@@ -1019,12 +1019,63 @@ func (s *Server) attachFleetCPU(out []byte) []byte {
 	if json.Unmarshal(out, &doc) != nil {
 		return out
 	}
-	doc["fleet"] = fleet
+	doc["fleet"] = filterToLiveInstances(fleet, doc["instances"])
 	merged, err := json.Marshal(doc)
 	if err != nil {
 		return out
 	}
 	return merged
+}
+
+// filterToLiveInstances drops fleet rows for instances that no longer exist.
+//
+// The CPU marker pipeline has no way to learn that a box was terminated — the
+// last sample simply stops arriving — so a scaled-down instance stayed on the
+// panel at its final reading. Measured on a real run: the panel showed 11
+// machines averaging 60.3% when ONE existed at 0.7%, the other ten having been
+// terminated 11-13 minutes earlier. The average is what misleads most, since it
+// is computed over the dead.
+//
+// The answer is already in the same payload: the inventory lists every instance
+// with its EC2 state, so this is a join, not a timeout. That makes it exact
+// where encode.fleetEntryTTL can only be approximate — the TTL still runs first
+// as the backstop, and covers the local fleet, which has no EC2 inventory.
+//
+// Best-effort: if the inventory is missing or unparseable the fleet passes
+// through untouched, so a transient inventory failure never blanks the panel.
+// An inventory that parses and reports every instance terminated is NOT that
+// case — it is the authoritative "the fleet is gone", and the rows are dropped.
+func filterToLiveInstances(fleet []encode.FleetCPUEntry, instances any) []encode.FleetCPUEntry {
+	list, ok := instances.([]any)
+	if !ok || len(list) == 0 {
+		return fleet
+	}
+	live := map[string]bool{}
+	for _, it := range list {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := m["id"].(string)
+		state, _ := m["state"].(string)
+		// Anything not yet terminated counts: a "pending" box is booting to run
+		// our work and should appear as soon as it reports.
+		if id != "" && state != "terminated" && state != "shutting-down" {
+			live[id] = true
+		}
+	}
+	// NOT guarded on len(live) == 0. Reaching here means a non-empty instance
+	// list parsed cleanly and every instance is terminated — a fully scaled-down
+	// fleet, which is the normal end of every run, not a suspicious reading. An
+	// earlier version bailed out here and so kept showing the whole dead fleet in
+	// exactly the state the panel is most often looked at.
+	kept := make([]encode.FleetCPUEntry, 0, len(fleet))
+	for _, e := range fleet {
+		if live[e.Machine] {
+			kept = append(kept, e)
+		}
+	}
+	return kept
 }
 
 // awsImageState reports the cloud worker-image + AMI state for the About tab

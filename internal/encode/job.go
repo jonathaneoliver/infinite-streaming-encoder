@@ -1190,6 +1190,16 @@ type Manager struct {
 	fleetMu     sync.Mutex
 	fleetCPU    map[string][]fleetSample
 	fleetChunks map[string][]string
+	// fleetFirstSeen is when each machine first reported, used to order the
+	// fleet view oldest-first so a box that has been encoding since the start
+	// keeps its position and newly-scaled-up boxes append at the bottom.
+	//
+	// Kept separately rather than read off fleetCPU[m][0]: the sample ring is
+	// trimmed to fleetHistoryLen, so its first element is the oldest RETAINED
+	// sample, not the first ever. On a long run every machine's apparent
+	// first-seen would keep advancing and the order would churn — the exact
+	// thing this is meant to stop.
+	fleetFirstSeen map[string]time.Time
 }
 
 // fleetSample is one CPU reading for a distributed-local worker box.
@@ -1227,6 +1237,10 @@ func (m *Manager) recordFleetCPU(line string) bool {
 	if m.fleetCPU == nil {
 		m.fleetCPU = map[string][]fleetSample{}
 		m.fleetChunks = map[string][]string{}
+		m.fleetFirstSeen = map[string]time.Time{}
+	}
+	if _, seen := m.fleetFirstSeen[mm[1]]; !seen {
+		m.fleetFirstSeen[mm[1]] = time.Now()
 	}
 	// Throttle per machine. On the cloud path EVERY chunk container on a box
 	// emits this — /proc/stat is the host's, so 4 concurrent chunks all report
@@ -1255,6 +1269,24 @@ func (m *Manager) recordFleetCPU(line string) bool {
 	return true
 }
 
+// fleetEntryTTL drops a machine from the fleet view once it has been silent this
+// long. Without it m.fleetCPU only ever grows: FleetCPU skipped machines with NO
+// samples but never aged out old ones, so terminated cloud instances stayed on
+// the panel at their final reading until the server restarted. Measured on a
+// real run, the panel showed 11 machines averaging 60.3% CPU when ONE machine
+// existed at 0.7% — the other ten were terminated 11-13 minutes earlier. Before
+// a restart, entries 17 hours old were still being rendered.
+//
+// It also corrupted two things that are not the panel: localFleetPerfCores sums
+// Perf across every entry, so dead CLOUD instances inflated the LOCAL fleet's
+// core budget and shrank its wall-time projection.
+//
+// 10 minutes is deliberately generous — a machine that is encoding reports every
+// ~5s, so this only catches boxes that are genuinely gone or idle. Callers that
+// can do better should: the cloud panel cross-checks against the EC2 inventory
+// (see attachFleetCPU), which is authoritative rather than a timeout.
+const fleetEntryTTL = 10 * time.Minute
+
 // FleetCPUEntry is one machine's CPU history for the local fleet view. History is
 // the normalized busy% (busy/perf*100): 100 = the box at its perf-core target,
 // >100 = SMT/E-core spill. Latest/Perf label the current reading; AgeS flags a
@@ -1279,6 +1311,9 @@ func (m *Manager) FleetCPU() []FleetCPUEntry {
 		if len(samples) == 0 {
 			continue
 		}
+		if now.Sub(samples[len(samples)-1].T) > fleetEntryTTL {
+			continue // silent too long — see fleetEntryTTL
+		}
 		hist := make([]float64, len(samples))
 		for i, s := range samples {
 			if s.Perf > 0 {
@@ -1294,7 +1329,22 @@ func (m *Manager) FleetCPU() []FleetCPUEntry {
 			Chunks:  m.fleetChunks[machine],
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Machine < out[j].Machine })
+	// Oldest-first by when the machine first reported. Sorting by machine name
+	// (the previous behaviour) is effectively random for EC2 instance ids, so
+	// the list reshuffled every time the fleet scaled and a box you were
+	// watching jumped position. Ties and unknowns fall back to the name so the
+	// order is still deterministic.
+	sort.Slice(out, func(i, j int) bool {
+		ti, oki := m.fleetFirstSeen[out[i].Machine]
+		tj, okj := m.fleetFirstSeen[out[j].Machine]
+		if oki && okj && !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		if oki != okj {
+			return oki
+		}
+		return out[i].Machine < out[j].Machine
+	})
 	return out
 }
 

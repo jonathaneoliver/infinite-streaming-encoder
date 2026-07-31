@@ -266,6 +266,80 @@ def _forward_running_logs(exec_name: str, log_state: dict) -> None:
         _tag_hosts_for_jobs(jobs, log_state)
 
 
+def _stage_key_for_job(jobname: str) -> str | None:
+    """`encode:` stage key for a variant Batch job, or None if it isn't one.
+
+    Mirrors encode_variants.variant_stage_key, which is what the workers emit and
+    what the Go control plane keys stages by. Only variant jobs are mapped:
+    mezzanine/audio/package-all are long-running and are observed reliably by log
+    tailing, and one package-all job backs THREE stages (package/fragments/hls),
+    so it has no single key to sync.
+    """
+    m = _CHUNK_JOBNAME_RE.match(jobname)
+    if m:
+        return f"encode:{m.group(1)}:{m.group(2)}:chunk{int(m.group(3))}"
+    w = _WHOLE_JOBNAME_RE.match(jobname)
+    if w:
+        return f"encode:{w.group(1)}:{w.group(2)}"
+    return None
+
+
+# A forwarded worker STAGE line, so its status can be recorded alongside the
+# Batch-derived ones — see _sync_stages_from_batch on why they must not fight.
+_STAGE_LINE_RE = re.compile(r"^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=")
+
+# Batch job status -> the stage status the UI grid renders.
+_BATCH_STAGE_STATUS = {
+    "RUNNING": "running",
+    "SUCCEEDED": "done",
+    "FAILED": "failed",
+}
+# Stage statuses that must never be walked back: once a chunk is finished, a
+# later poll seeing a stale RUNNING (or a retry attempt) must not un-finish it.
+_TERMINAL_STAGE = {"done", "failed"}
+
+
+def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
+    """Drive `encode:*` stage state from Batch job status, not from log markers.
+
+    Stage state used to come only from [[ENCODER-STAGE]] lines the workers wrote
+    to CloudWatch, which the poll tailed. That systematically under-reported
+    running work: a chunk shorter than the poll interval is never observed
+    RUNNING, and its running+done markers arrive in the same poll, so the cell
+    went queued -> done and never rendered as running. Measured on a 343-chunk
+    run, the grid showed 1 running while Batch actually had 25 — so a fully busy
+    fleet displayed as idle, which is exactly when someone is watching it.
+
+    Batch's own job status is authoritative and complete: every job is in exactly
+    one state, and listing by state is a full census rather than a sample. So the
+    count of currently-running chunks becomes exact, bounded only by the poll
+    interval, with no dependency on CloudWatch ingestion.
+
+    Emits only on CHANGE (tracked in log_state) so the control plane sees one
+    transition per stage, and never regresses out of a terminal status.
+
+    Deliberately a BACKSTOP, not a replacement. Worker STAGE lines carry a live
+    percent; these carry none, and the control plane assigns Percent
+    unconditionally, so re-announcing a stage the worker already reported would
+    reset its progress bar to 0 on every poll. _tail_progress records the
+    statuses it forwards into the same map, so a stage the worker has spoken for
+    is skipped here and only the gaps — chunks whose logs have not been ingested
+    yet, or that were never observed RUNNING at all — are filled in.
+    """
+    seen = log_state.setdefault("_stage_status", {})
+    for status, stage_status in _BATCH_STAGE_STATUS.items():
+        for j in _list_exec_jobs(exec_name, status):
+            key = _stage_key_for_job(j.get("jobName", ""))
+            if key is None:
+                continue
+            if seen.get(key) == stage_status or seen.get(key) in _TERMINAL_STAGE:
+                continue
+            seen[key] = stage_status
+            pct = 100.0 if stage_status == "done" else 0.0
+            print(f"[[ENCODER-STAGE key={key} status={stage_status} "
+                  f"percent={pct:.1f}]]", flush=True)
+
+
 def _tail_progress(stream: str, label: str, log_state: dict,
                    live: bool = True) -> None:
     """Forward new progress-marked lines from one container's stream.
@@ -291,6 +365,10 @@ def _tail_progress(stream: str, label: str, log_state: dict,
         msg = e.get("message", "").rstrip()
         if msg.startswith("[[ENCODER-FLEET ") and not live:
             continue  # gauge: a finished job's sample is stale — see the docstring
+        if sm := _STAGE_LINE_RE.match(msg):
+            # The worker reported this stage itself, with a live percent. Record
+            # it so the Batch-derived backstop leaves it alone.
+            log_state.setdefault("_stage_status", {})[sm.group(1)] = sm.group(2)
         if msg.startswith("[[ENCODER-"):
             # Forward EVERY marker verbatim, not a whitelist. This used to pass
             # only ENCODER-BOOT and ENCODER-STAGE, which meant each new marker
@@ -1061,6 +1139,14 @@ def cmd_poll(args: argparse.Namespace) -> int:
         try:
             _forward_running_logs(exec_name, log_state)
         except Exception:  # noqa: BLE001 — live tailing is cosmetic
+            pass
+        # Authoritative stage state from Batch itself. Runs BEFORE the log-marker
+        # path's own STAGE lines are forwarded above only by ordering accident —
+        # both are idempotent, and the control plane takes the latest. See
+        # _sync_stages_from_batch for why log markers alone under-report.
+        try:
+            _sync_stages_from_batch(exec_name, log_state)
+        except Exception:  # noqa: BLE001 — never break polling over the grid
             pass
         # Backfill instance colour for chunks that finished between polls (short
         # rungs never seen RUNNING), so their cells aren't left the default blue.

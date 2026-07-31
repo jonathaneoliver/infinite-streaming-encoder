@@ -3153,6 +3153,54 @@ function _jobFriendly(name) {
 
 // Colour a fleet-packing segment by the codec in the Batch job name.
 function _hashStr(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return Math.abs(h); }
+// A shade of the MACHINE's colour for one chunk/job on that machine.
+//
+// The fleet rows and the chunk plot are read together — "which box ran this
+// chunk" is the question — so a chunk takes its host's hue and varies only in
+// lightness. Adjacent chunks on one box stay individually visible, while every
+// chunk on that box still reads as belonging to it.
+//
+// Replaces colouring cloud chunks by CODEC hue, which shared no colour with the
+// machine row above them, and flat host-colour on local, where neighbouring
+// chunks were indistinguishable except for the divider.
+function _shadeOfHost(hostColor, key) {
+    if (!hostColor) return null;
+    const hsl = _toHsl(hostColor);
+    if (!hsl) return hostColor;
+    // Quantised to 6 discrete steps across 34-64% rather than a continuous
+    // hash: a raw hash produced neighbours like 36% and 37%, which are the same
+    // colour to the eye. Stepping guarantees any two different shades are
+    // visibly apart. Keyed by hash (not list index) so a chunk keeps its shade
+    // across polls — index-based would repaint chunks whenever the list
+    // reorders, which reads as flicker.
+    // 34-64% keeps every step legible against the #20252f track: lighter washes
+    // out the white label, darker merges into the idle segment.
+    const STEPS = 6;
+    const light = 34 + (_hashStr(key || '') % STEPS) * (30 / (STEPS - 1));
+    return `hsl(${hsl.h}, ${hsl.s}%, ${light}%)`;
+}
+
+// #rrggbb (the instance palette) or an existing hsl() -> {h,s,l}. Null if neither.
+function _toHsl(c) {
+    const m = /^hsl\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%/.exec(c);
+    if (m) return { h: +m[1], s: +m[2], l: +m[3] };
+    const hex = /^#([0-9a-f]{6})$/i.exec(c);
+    if (!hex) return null;
+    const n = parseInt(hex[1], 16);
+    const r = ((n >> 16) & 255) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255;
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+    let h = 0;
+    if (d) {
+        if (mx === r) h = ((g - b) / d + (g < b ? 6 : 0));
+        else if (mx === g) h = (b - r) / d + 2;
+        else h = (r - g) / d + 4;
+        h *= 60;
+    }
+    const l = (mx + mn) / 2;
+    const sat = d ? d / (1 - Math.abs(2 * l - 1)) : 0;
+    return { h: Math.round(h), s: Math.round(sat * 100), l: Math.round(l * 100) };
+}
+
 function _jobColor(name) {
     name = name || '';
     // Codec picks the HUE (so codec stays recognisable at a glance); a hash of
@@ -3186,7 +3234,10 @@ function _fleetInstanceRow(i, maxV) {
     // A track-coloured right border puts a vertical break between adjacent jobs
     // so you can see each one (esp. when they differ in vCPU width).
     const divider = 'border-right:2px solid #20252f;';
-    let parts = jobs.map(j => seg(cap ? (j.vcpu || 0) / cap * 100 : 0, _jobColor(j.name),
+    // Host colour first — the chunk segments below are shades of it.
+    const hostColor = i.id ? instanceColor(i.id) : null;
+    const chunkColor = j => _shadeOfHost(hostColor, j.name) || _jobColor(j.name);
+    let parts = jobs.map(j => seg(cap ? (j.vcpu || 0) / cap * 100 : 0, chunkColor(j),
         `${_jobFriendly(j.name)} — ${j.vcpu} vCPU${starting(j) ? ' (starting — pulling image)' : ''}`,
         divider + (starting(j) ? 'opacity:.5;' + stripe('rgba(255,255,255,.3)') : ''))).join('');
 
@@ -3211,7 +3262,7 @@ function _fleetInstanceRow(i, maxV) {
     // Inline list of what this box is running right now (friendly names + dot).
     const jobList = jobs.length
         ? `<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:#9aa;margin-top:3px">`
-          + jobs.map(j => `<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${_jobColor(j.name)};vertical-align:middle;margin-right:4px;${starting(j) ? 'opacity:.5' : ''}"></span>`
+          + jobs.map(j => `<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${chunkColor(j)};vertical-align:middle;margin-right:4px;${starting(j) ? 'opacity:.5' : ''}"></span>`
               + `${escapeHtml(_jobFriendly(j.name))} <span style="color:#666">${j.vcpu}v${starting(j) ? ' · starting' : ''}</span></span>`).join('')
           + `</div>`
         : '';
@@ -3224,10 +3275,7 @@ function _fleetInstanceRow(i, maxV) {
     // lagged, so a fresh box gets the number first, the line a poll later).
     // Same source and same renderer as the local fleet — see _cpuSparkHtml.
     const cpuSpark = _cpuSparkHtml(_fleetEntry(_awsFleet, i.id), 120);
-    // Swatch keyed by the SAME instanceColor() the chunk plot uses, so a box
-    // here and its chunks below share one colour — the machine a chunk ran on is
-    // traceable to this fleet row at a glance.
-    const hostColor = i.id ? instanceColor(i.id) : null;
+    // (hostColor computed above — the chunk segments are shades of it.)
     const swatch = hostColor
         ? `<span title="machine ${escapeHtml(i.id)} — matches its chunk colour in the plot" style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${hostColor};vertical-align:middle;margin-right:6px"></span>`
         : '';
@@ -3522,7 +3570,8 @@ function _localFleetRow(inst, maxCores) {
     let parts, rightLabel;
     if (chunks.length) {
         const used = Math.min(cap, chunks.length * 2);
-        parts = chunks.map(c => seg(cap ? 2 / cap * 100 : 0, color, _localChunkFriendly(c), divider)).join('');
+        parts = chunks.map(c => seg(cap ? 2 / cap * 100 : 0, _shadeOfHost(color, c) || color,
+            _localChunkFriendly(c), divider)).join('');
         if (cap - used > 0) parts += seg((cap - used) / cap * 100, '#20252f', `${cap - used} idle core${cap - used > 1 ? 's' : ''}`);
         rightLabel = `${used}/${cap} cores · ${chunks.length} chunk${chunks.length > 1 ? 's' : ''}`;
     } else {
