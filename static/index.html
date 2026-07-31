@@ -2907,6 +2907,7 @@ function renderJobs() {
     });
 
     const seen = new Set();
+    let expected = list.firstElementChild;   // where the next row SHOULD sit
     for (const j of ordered) {
         seen.add(j.id);
         let row = document.getElementById('job-' + j.id);
@@ -2915,7 +2916,21 @@ function renderJobs() {
             tmp.innerHTML = jobRowHtml(j);
             row = tmp.firstElementChild;
         }
-        list.appendChild(row); // move into chronological order (preserves DOM/logs)
+        // Move ONLY when the row is not already in the right place. appendChild
+        // on an attached node MOVES it, and moving a node forces layout and a
+        // repaint of its entire subtree — for a job row that is a stage table
+        // with hundreds of chunk cells. Doing that unconditionally every poll
+        // repainted the whole grid on every tick even when no cell had changed:
+        // measured 22 seconds with zero data changes while the grid was visibly
+        // re-rendering.
+        if (row !== expected) {
+            // Not where it belongs: put it before the node that is. `expected`
+            // stays put — the next row goes before it too.
+            list.insertBefore(row, expected);
+        } else {
+            // Already correct; advance to the next slot without touching the DOM.
+            expected = expected.nextElementSibling;
+        }
         updateJobRow(row, j);
     }
 
@@ -3475,7 +3490,23 @@ function _fleetSparks(fleet) {
 let _lastFleet = null;
 function renderFleet(fleet, instances) {
     _lastFleet = { fleet, instances };
-    const running = (instances || []).filter(i => i.state === 'running');
+    // Oldest box first, by launch time. The inventory returns instances in
+    // whatever order EC2 hands them back, which is arbitrary and free to change
+    // between polls — so a box you were watching jumped position for no reason.
+    // Ordering by age means a box running since the start keeps its place and
+    // newly scaled-up ones append at the bottom.
+    //
+    // NOTE the matching change in encode.FleetCPU orders the CPU/sparkline data,
+    // NOT these rows: the rows come from the inventory's instance list, so the
+    // ordering has to be applied here too or it has no visible effect.
+    const _launched = i => {
+        const t = Date.parse(i.launched_at || '');
+        if (!isNaN(t)) return t;
+        // No timestamp: fall back to age (bigger age = launched earlier).
+        return Date.now() - (Number(i.age_seconds) || 0) * 1000;
+    };
+    const running = (instances || []).filter(i => i.state === 'running')
+        .sort((a, b) => _launched(a) - _launched(b) || String(a.id).localeCompare(String(b.id)));
     const total = fleet.total_vcpus || 0, used = fleet.used_vcpus || 0;
     const idle = (fleet.idle_vcpus != null) ? fleet.idle_vcpus : Math.max(0, total - used);
     const pct = total ? Math.round(used / total * 100) : 0;
