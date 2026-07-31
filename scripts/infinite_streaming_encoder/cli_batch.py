@@ -291,6 +291,11 @@ _STAGE_LINE_RE = re.compile(r"^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=
 # Batch job status -> the stage status the UI grid renders.
 _BATCH_STAGE_STATUS = {
     "RUNNING": "running",
+    # STARTING = placed on an instance, creating the container / pulling the
+    # image, not yet encoding. Distinct from queued (waiting for a slot, no
+    # machine yet) and from running (actually encoding). The UI hatches it, the
+    # same way the fleet view hatches a box that is booting or pulling.
+    "STARTING": "starting",
     "SUCCEEDED": "done",
     "FAILED": "failed",
 }
@@ -336,7 +341,9 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
             if seen.get(key) == stage_status or seen.get(key) in _TERMINAL_STAGE:
                 continue
             seen[key] = stage_status
-            if stage_status == "running" and j.get("jobId"):
+            if stage_status in ("running", "starting") and j.get("jobId"):
+                # STARTING is already placed, so containerInstanceArn exists and
+                # the hatch can carry the machine's colour from the outset.
                 newly_running.append(j["jobId"])
             pct = 100.0 if stage_status == "done" else 0.0
             print(f"[[ENCODER-STAGE key={key} status={stage_status} "

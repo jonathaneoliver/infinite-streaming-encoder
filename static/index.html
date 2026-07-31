@@ -201,6 +201,13 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    reads at a glance and never blends with a machine colour or the flash-blue. */
 .chunk-cell-fill.chunk-reused { background-color: #55617a;
     background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.13) 0 2px, transparent 2px 5px); }
+/* Placed on a box, pulling the image / starting the container — not encoding
+   yet. Same 45deg hatch the fleet view uses for a booting/pulling box, so the
+   two displays read alike, but over the MACHINE's colour: Batch has already
+   placed the job, so we know which box it landed on. */
+.chunk-cell-fill.chunk-starting {
+    background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.35) 0 6px, transparent 6px 12px);
+    opacity: 0.65; }
 .stage-bar-fill.stage-fill-reclaimed { background: #ef476f; animation: reclaimpulse 1s ease-in-out infinite; }
 @keyframes reclaimpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
@@ -2518,11 +2525,15 @@ function updateStagesTable(row, stages) {
                 // no-instance blue — see .chunk-reused. Overrides the machine tint.
                 const reused = !!c.s.reused;
                 // reclaimed → fill red (waiting to restart); else show progress.
-                fill.style.width = (reused || st === 'reclaimed' ? 100 : prog).toFixed(1) + '%';
+                // 'starting' has no meaningful progress yet, so fill the cell and
+                // let the hatch carry the meaning rather than showing a 0% sliver.
+                fill.style.width = (reused || st === 'reclaimed' || st === 'starting'
+                    ? 100 : prog).toFixed(1) + '%';
                 fill.className = 'chunk-cell-fill'
                     + (st === 'failed' ? ' chunk-failed'
                         : st === 'reclaimed' ? ' chunk-reclaimed'
-                            : reused ? ' chunk-reused' : '');
+                            : reused ? ' chunk-reused'
+                                : st === 'starting' ? ' chunk-starting' : '');
                 // The fill COLOUR is the machine this chunk ran on — bold and
                 // unmissable so co-located chunks pop; red/reused states keep their
                 // class colour (clear the inline so the class wins).
