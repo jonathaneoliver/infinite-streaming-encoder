@@ -2442,9 +2442,16 @@ function updateStagesTable(row, stages) {
         if (pa !== pb) return pa - pb;
         return pa === 3 ? _rowHeight(b) - _rowHeight(a) : 0;
     });
-    // Structural signature: rebuild the tbody only when the row set changes.
+    // Structural signature: which ROWS exist, deliberately WITHOUT each row's
+    // cell count. The count used to be part of it, so every time one more chunk
+    // stage arrived for a variant the signature changed and the entire tbody was
+    // rebuilt — all rows, every cell recreated at width:0 and animating back, so
+    // chunks that finished long ago visibly repainted. Instrumentation caught it
+    // exactly: rows:19 delta:0 with the 2160p row going ":12" -> ":16" -> ":17"
+    // -> ":23" in 23 milliseconds, i.e. four full-table rebuilds for four new
+    // cells. Cell counts are now reconciled per row, in place, below.
     const sig = rows.map(r => r.kind === 'chunks'
-        ? 'c:' + r.codec + ':' + r.tier + ':' + r.cells.length + (r.concat ? ':j' : '')
+        ? 'c:' + r.codec + ':' + r.tier + (r.concat ? ':j' : '')
         : r.s.key).join(',');
     if (tbody.dataset.sig !== sig) {
         // Rebuilding destroys every cell and recreates it at width:0, so each one
@@ -2489,6 +2496,34 @@ function updateStagesTable(row, stages) {
                 <td class="stage-pct chunk-count"></td></tr>`;
         }).join('');
         tbody.dataset.sig = sig;
+    }
+
+    // Reconcile each chunk row's cells against the DOM without touching the ones
+    // already there. Appending only the missing keys is what keeps a settled
+    // cell settled — rebuilding the row (even just this row) would restart every
+    // fill animation in it.
+    for (const r of rows) {
+        if (r.kind !== 'chunks') continue;
+        const grid = tbody.querySelector(
+            `tr[data-chunk-group="${r.codec}:${r.tier}"] .chunk-grid`);
+        if (!grid) continue;
+        const have = new Set([...grid.children].map(el => el.dataset.chunkKey));
+        const want = new Set(r.cells.map(c => c.key));
+        if (have.size === want.size && [...want].every(k => have.has(k))) continue;
+        for (const c of r.cells) {
+            if (have.has(c.key)) continue;
+            const cell = document.createElement('span');
+            cell.className = 'chunk-cell';
+            cell.dataset.chunkKey = c.key;
+            cell.title = 'chunk ' + c.index;
+            cell.innerHTML = '<span class="chunk-cell-fill"></span>';
+            grid.appendChild(cell);
+        }
+        // A key that vanished (a plan revision) is dropped rather than left
+        // behind as a cell nothing will ever update.
+        for (const el of [...grid.children]) {
+            if (!want.has(el.dataset.chunkKey)) el.remove();
+        }
     }
 
     // Per-tick update.
