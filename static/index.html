@@ -2447,6 +2447,25 @@ function updateStagesTable(row, stages) {
         ? 'c:' + r.codec + ':' + r.tier + ':' + r.cells.length + (r.concat ? ':j' : '')
         : r.s.key).join(',');
     if (tbody.dataset.sig !== sig) {
+        // Rebuilding destroys every cell and recreates it at width:0, so each one
+        // animates back from nothing — chunks that finished long ago visibly
+        // repaint. Record WHY, because the trigger was not obvious: the signature
+        // covers the row set and each row's cell COUNT, and a chunk row's count
+        // grows as its stages arrive, so any late-arriving stage rebuilds the
+        // whole table. Kept as a ring buffer on window plus a console line, so a
+        // repaint someone notices can be traced to the row that caused it.
+        const _prevSig = tbody.dataset.sig || '';
+        if (_prevSig) {
+            const a = _prevSig.split(','), b = sig.split(',');
+            const added = b.filter(x => !a.includes(x));
+            const removed = a.filter(x => !b.includes(x));
+            const rec = { t: new Date().toISOString(), rows: b.length,
+                          delta: b.length - a.length,
+                          added: added.slice(0, 5), removed: removed.slice(0, 5) };
+            (window.__gridRebuilds = window.__gridRebuilds || []).push(rec);
+            if (window.__gridRebuilds.length > 200) window.__gridRebuilds.shift();
+            console.debug('[grid] tbody rebuilt — all cells repaint', rec);
+        }
         tbody.innerHTML = rows.map(r => {
             if (r.kind === 'stage') {
                 // Normalize a raw whole-variant encode key ("encode:h264:720p")
