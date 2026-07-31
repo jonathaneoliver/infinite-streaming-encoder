@@ -322,7 +322,7 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
     yet, or that were never observed RUNNING at all — are filled in.
     """
     seen = log_state.setdefault("_stage_status", {})
-    newly_running: list[str] = []
+    newly_announced: list[str] = []
     for status, stage_status in _BATCH_STAGE_STATUS.items():
         for j in _list_exec_jobs(exec_name, status):
             key = _stage_key_for_job(j.get("jobName", ""))
@@ -331,7 +331,7 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
             if seen.get(key) == stage_status or seen.get(key) in _TERMINAL_STAGE:
                 continue
             seen[key] = stage_status
-            if stage_status in ("running", "starting") and j.get("jobId"):
+            if stage_status in ("running", "starting", "done") and j.get("jobId"):
                 # Try STARTING as well as RUNNING. Measured, a STARTING job
                 # carries containerInstanceArn only SOMETIMES — the status flips
                 # around the same time placement is recorded, so it is a race.
@@ -340,12 +340,18 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
                 # the host lands on the RUNNING transition instead. So a hatched
                 # cell is usually machine-coloured, occasionally neutral for a
                 # poll — never wrong, just sometimes late.
-                newly_running.append(j["jobId"])
+                newly_announced.append(j["jobId"])
             pct = 100.0 if stage_status == "done" else 0.0
             print(f"[[ENCODER-STAGE key={key} status={stage_status} "
                   f"percent={pct:.1f}]]", flush=True)
 
-    # Colour the chunks we just announced, in the same pass.
+    # Colour the chunks we just announced, in the same pass — including the ones
+    # we are announcing as DONE. A chunk that starts and finishes between polls
+    # is never seen running, so it is marked done with no host and renders as an
+    # uncoloured cell until _backfill_completed_hosts gets to it a poll or more
+    # later. That late attribution repaints a cell that had already settled,
+    # which reads as finished blocks filling themselves in again. Tagging on the
+    # same pass that announces done means the cell is right the first time.
     #
     # _forward_running_logs already tags hosts, but off its OWN describe_jobs
     # earlier in the poll — so a job that entered the RUNNING census after that
@@ -355,12 +361,12 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
     # when we waited for their log marker. Describing just the newly-announced
     # ids keeps the host no later than the status it belongs to. Bounded by the
     # number of NEW jobs per poll, not the ladder size.
-    if newly_running:
+    if newly_announced:
         batch = _batch()
-        for i in range(0, len(newly_running), 100):
+        for i in range(0, len(newly_announced), 100):  # describe_jobs caps at 100
             try:
                 described = batch.describe_jobs(
-                    jobs=newly_running[i:i + 100]).get("jobs", [])
+                    jobs=newly_announced[i:i + 100]).get("jobs", [])
             except ClientError:
                 continue
             _tag_hosts_for_jobs(described, log_state)
