@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -982,9 +983,19 @@ func isVideo(ext string) bool {
 
 // runPythonCloud invokes `python3 -m infinite_streaming_encoder.cloud.<module> <args>` and
 // returns the captured stdout on exit-0, or an error containing stderr.
+// runPythonCloudTimeout bounds a cloud helper. The inventory normally returns in
+// ~5s but was measured at 41s under load — a dozen paginated AWS calls, any of
+// which can be slow or throttled. Unbounded, that stalls the page's poll and the
+// Cloud Fleet panel renders empty until it returns. Failing at 25s lets the
+// caller serve its cached payload instead, which is a stale fleet rather than no
+// fleet.
+const runPythonCloudTimeout = 25 * time.Second
+
 func runPythonCloud(module string, args ...string) ([]byte, error) {
 	fullArgs := append([]string{"-m", "infinite_streaming_encoder.cloud." + module, "--json"}, args...)
-	cmd := exec.Command("python3", fullArgs...)
+	ctx, cancel := context.WithTimeout(context.Background(), runPythonCloudTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "python3", fullArgs...)
 	// The Python modules read AWS_REGION, S3_BUCKET, etc. from the
 	// server process's environment — same vars the encoder has been
 	// forwarding into worker containers all along.
@@ -994,6 +1005,10 @@ func runPythonCloud(module string, args ...string) ([]byte, error) {
 		if ee, ok := err.(*exec.ExitError); ok {
 			return nil, fmt.Errorf("python3 -m infinite_streaming_encoder.cloud.%s exited %d: %s",
 				module, ee.ExitCode(), strings.TrimSpace(string(ee.Stderr)))
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("python3 -m infinite_streaming_encoder.cloud.%s timed out after %s",
+				module, runPythonCloudTimeout)
 		}
 		return nil, fmt.Errorf("python3 -m infinite_streaming_encoder.cloud.%s: %w", module, err)
 	}

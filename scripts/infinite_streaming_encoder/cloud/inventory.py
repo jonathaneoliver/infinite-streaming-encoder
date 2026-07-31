@@ -349,7 +349,14 @@ def _enrich_fleet(batch_jobs: list[dict], instances: list[dict]) -> dict[str, An
     instance (ecs.describe_container_instances).
     """
     active = [j for j in batch_jobs if not j.get("error")]
-    ids = [j["id"] for j in active]
+    # DEDUPED. batch.describe_jobs rejects the WHOLE call with
+    # "Jobs contains duplicates." if an id repeats, and batch_jobs can repeat one
+    # — a job observed under two statuses across paginated list calls, or listed
+    # twice as it transitions. One duplicate therefore cost the entire job ->
+    # instance mapping, so every box rendered with no chunks on it and the fleet
+    # looked idle while it was flat out encoding. dict.fromkeys keeps first-seen
+    # order, which the callers below rely on.
+    ids = list(dict.fromkeys(j["id"] for j in active))
     running = [i for i in instances if i.get("state") == "running"]
     for inst in instances:
         inst["vcpus"] = _vcpus_for_type(inst.get("type"))
