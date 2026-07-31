@@ -2464,7 +2464,7 @@ function updateStagesTable(row, stages) {
                           added: added.slice(0, 5), removed: removed.slice(0, 5) };
             (window.__gridRebuilds = window.__gridRebuilds || []).push(rec);
             if (window.__gridRebuilds.length > 200) window.__gridRebuilds.shift();
-            console.debug('[grid] tbody rebuilt — all cells repaint', rec);
+            uiLog('grid-rebuild', rec);
         }
         tbody.innerHTML = rows.map(r => {
             if (r.kind === 'stage') {
@@ -3256,6 +3256,28 @@ const _FLEET_STATE = {
     draining: { c: '#8a94a2', t: '↓ draining', tip: 'ECS is draining this box — finishing work, no new tasks placed' },
     leaving:  { c: '#8a94a2', t: '↓ leaving', tip: 'deregistered from ECS and being scaled down — EC2 shutdown pending' },
 };
+// Post a diagnostic to the server so it lands in `docker logs`.
+//
+// Some faults only exist in the browser — the chunk grid repainting settled
+// cells, for one — and the console is not somewhere anyone can read after the
+// fact, or ask about later. Batched on a 2s timer so a burst of rebuilds is one
+// request, capped so a runaway loop in here cannot become unbounded log volume,
+// and fire-and-forget so logging can never break the page it is instrumenting.
+let _uiLogQueue = [];
+let _uiLogTimer = null;
+let _uiLogDropped = 0;
+function uiLog(kind, data) {
+    if (_uiLogQueue.length >= 20) { _uiLogDropped++; return; }
+    _uiLogQueue.push({ kind, ...data });
+    if (_uiLogTimer) return;
+    _uiLogTimer = setTimeout(() => {
+        const batch = _uiLogQueue; _uiLogQueue = []; _uiLogTimer = null;
+        const dropped = _uiLogDropped; _uiLogDropped = 0;
+        const body = JSON.stringify(dropped ? { batch, dropped } : { batch });
+        fetch('/api/ui-log', { method: 'POST', body }).catch(() => {});
+    }, 2000);
+}
+
 function _fleetInstanceRow(i, maxV) {
     const cap = i.vcpus || 0;
     const used = i.used_vcpus || 0;

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -80,6 +81,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/jobs", s.listJobs)
 	s.Mux.HandleFunc("GET /api/jobs/{id}/logs", s.jobLogs)
 	s.Mux.HandleFunc("GET /api/jobs/stream", s.streamJobs)
+	s.Mux.HandleFunc("POST /api/ui-log", s.uiLog)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/cancel", s.cancelJob)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/retry", s.retryJob)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/redo", s.redoJob)
@@ -1087,6 +1089,34 @@ func filterToLiveInstances(fleet []encode.FleetCPUEntry, instances any) []encode
 		}
 	}
 	return kept
+}
+
+// uiLog records a diagnostic the PAGE observed, into the server log.
+//
+// Some faults are only visible in the browser — the chunk grid repainting cells
+// that had already settled, for instance. The data behind it is provably fine
+// (a churn detector sampling every stage every 2s for 300s of active encoding
+// found no status/percent/instance flip-flops), so the cause is in rendering,
+// and rendering leaves no trace anywhere the server can see. Console logging
+// does not help either: it requires someone to be looking at the right moment
+// and to relay it.
+//
+// So the page posts here and the event lands in `docker logs` alongside
+// everything else, where it can be read after the fact.
+//
+// Deliberately minimal and unauthenticated, like the rest of this local-only
+// surface: capped body, one line out, never fails the caller. It is a debugging
+// aid, not an ingestion endpoint — the cap is what stops a loop in the page
+// turning into unbounded log volume.
+func (s *Server) uiLog(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 8<<10))
+	line := strings.TrimSpace(string(body))
+	if line != "" {
+		// Single line: a newline in the payload would fake a log entry.
+		line = strings.ReplaceAll(line, "\n", " ")
+		log.Printf("[ui] %s", line)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // awsImageState reports the cloud worker-image + AMI state for the About tab
