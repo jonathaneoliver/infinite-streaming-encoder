@@ -304,6 +304,12 @@ def _backfill_completed_hosts(exec_name: str, log_state: dict) -> None:
         _tag_hosts_for_jobs(jobs, log_state)
 
 
+# How many FINISHED jobs' streams to drain in one poll. At ~0.37s per stream this
+# bounds that work to a few seconds, so a wave of completions cannot stall the
+# poll loop — and therefore cannot delay the stage sync that runs before it.
+_MAX_DRAINS_PER_POLL = 12
+
+
 def _forward_running_logs(exec_name: str, log_state: dict) -> None:
     """Tail the CloudWatch streams of currently-RUNNING jobs and forward their
     [progress]/[phase] lines into the app log — so long phases (mezzanine,
@@ -328,6 +334,16 @@ def _forward_running_logs(exec_name: str, log_state: dict) -> None:
     live_ids = [j["jobId"] for j in _list_exec_jobs(exec_name, "RUNNING")]
     done_ids = [j["jobId"] for j in _list_exec_jobs(exec_name, "SUCCEEDED")
                 if j["jobId"] not in drained]
+    # BOUNDED. Draining a finished job's stream costs ~0.37s (get_log_events per
+    # stream, measured at 125s for 337 of them). A burst of completions would
+    # otherwise make one poll take minutes, and everything after it in the loop —
+    # including the next status sync — waits that long. Capping the per-poll
+    # drain keeps the cycle short; the remainder is picked up next poll, and
+    # nothing is lost because `drained` is only marked once a stream is actually
+    # read. Live (RUNNING) jobs are never capped: those carry the progress
+    # percentages the UI animates.
+    if len(done_ids) > _MAX_DRAINS_PER_POLL:
+        done_ids = done_ids[:_MAX_DRAINS_PER_POLL]
     ids = live_ids + done_ids
     live = set(live_ids)
     for i in range(0, len(ids), 100):
@@ -1271,19 +1287,27 @@ def cmd_poll(args: argparse.Namespace) -> int:
             _report_live_reclaims(exec_name, reclaim_seen)
         except Exception:  # noqa: BLE001 — reclaim reporting is best-effort
             pass
-        # Forward live [progress]/[phase] lines from running containers so
-        # long phases show activity, not a dark gap. Best-effort.
-        try:
-            _forward_running_logs(exec_name, log_state)
-        except Exception:  # noqa: BLE001 — live tailing is cosmetic
-            pass
-        # Authoritative stage state from Batch itself. Runs BEFORE the log-marker
-        # path's own STAGE lines are forwarded above only by ordering accident —
-        # both are idempotent, and the control plane takes the latest. See
-        # _sync_stages_from_batch for why log markers alone under-report.
+        # STAGE STATE FIRST, deliberately.
+        #
+        # This derives every chunk's state from Batch's own job status and needs
+        # no logs at all — one cached scan, ~0.8s. It used to run AFTER the log
+        # forwarding below, which meant the cheap authoritative update was
+        # blocked behind a slow drain it does not depend on: draining the
+        # CloudWatch stream of each newly-completed job measured 125s for 337
+        # streams (~0.37s each), against 0.8s for the scan. During a run, chunks
+        # complete continuously, so most polls had streams to drain and the grid
+        # sat 35-73 completions behind Batch (#187) — showing holes for work that
+        # had already finished.
         try:
             _sync_stages_from_batch(exec_name, log_state)
         except Exception:  # noqa: BLE001 — never break polling over the grid
+            pass
+        # Then the live [progress]/[phase] lines from running containers, so long
+        # phases show activity rather than a dark gap. Cosmetic, and now bounded
+        # (see _MAX_DRAINS_PER_POLL) so it cannot starve the loop above.
+        try:
+            _forward_running_logs(exec_name, log_state)
+        except Exception:  # noqa: BLE001 — live tailing is cosmetic
             pass
         # Backfill instance colour for chunks that finished between polls (short
         # rungs never seen RUNNING), so their cells aren't left the default blue.
