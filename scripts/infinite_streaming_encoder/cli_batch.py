@@ -165,12 +165,104 @@ def _tag_hosts_for_jobs(described_jobs: list, log_state: dict) -> None:
                 _emit_host(key, inst)
 
 
+# One scan of this execution's jobs, shared by every caller within a poll.
+#
+# _list_exec_jobs used to make a SEPARATE list_jobs call per status, each
+# paginating the queue's ENTIRE history and filtering to this execution in
+# Python. Measured on a live run: 4 status scans cost 7.9s per poll against a
+# nominal 5s sleep, dominated by SUCCEEDED at 5.97s — because the queue holds
+# thousands of succeeded jobs from previous runs and it walked all of them to
+# find this execution's 68. Worse, the cost GREW as the run progressed, so the
+# grid fell further behind exactly as more chunks finished. The grid was measured
+# 43 chunks behind Batch mid-run, and showing 30 chunks still queued after Batch
+# had succeeded all 336 (#187).
+#
+# AFTER_CREATED_AT scoped to the execution's own start collapses that to this
+# run's jobs. It cannot be combined with jobStatus — Batch rejects the pair with
+# "job status [is] not applicable when ListJobs filters are specified" — but that
+# is fine, because one unfiltered-by-status scan returns everything we need and
+# the statuses are bucketed here. Four calls become one, and the SUCCEEDED scan
+# that _sync_stages_from_batch and _backfill_completed_hosts each performed
+# separately is now shared.
+_EXEC_JOBS_TTL_S = 2.0
+_exec_jobs_cache: dict[str, tuple[float, dict[str, list]]] = {}
+
+
+def _exec_start_ms(exec_name: str) -> int | None:
+    """Execution start as epoch ms, from the job id the SFN execution name
+    carries as its prefix (`<jobID>-<base>-<hash>`; jobID is a ms timestamp).
+
+    Read from the name rather than describe_execution so this costs no API call
+    and cannot itself become a source of latency. Returns None if the prefix is
+    not a plausible timestamp, which sends the caller back to the unfiltered
+    per-status path rather than silently narrowing the scan to nothing.
+    """
+    head = exec_name.split("-", 1)[0]
+    if not head.isdigit():
+        return None
+    ms = int(head)
+    # Sanity: 2001-09-09 .. 2286-11-20 in ms. A plain second-precision value or a
+    # stray number would otherwise shift the window by decades.
+    return ms if 1_000_000_000_000 <= ms <= 9_999_999_999_999 else None
+
+
+def _exec_jobs_snapshot(exec_name: str) -> dict[str, list] | None:
+    """This execution's jobs bucketed by status, cached briefly so the several
+    callers in one poll cycle share a single scan.
+
+    None means the snapshot is UNAVAILABLE (start time underivable, or the scan
+    errored) and the caller should fall back. An empty dict is a valid answer —
+    the execution has no jobs yet — and must NOT trigger the fallback, or every
+    poll before the first job appears would pay for the expensive path.
+    """
+    now = time.monotonic()
+    hit = _exec_jobs_cache.get(exec_name)
+    if hit and now - hit[0] < _EXEC_JOBS_TTL_S:
+        return hit[1]
+
+    start = _exec_start_ms(exec_name)
+    if start is None:
+        return None  # unavailable — caller falls back to the per-status path
+
+    batch = _batch()
+    queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
+    out: dict[str, list] = {}
+    tok = None
+    while True:
+        try:
+            kw = dict(jobQueue=queue, maxResults=100,
+                      filters=[{"name": "AFTER_CREATED_AT", "values": [str(start)]}])
+            if tok:
+                kw["nextToken"] = tok
+            r = batch.list_jobs(**kw)
+        except ClientError:
+            # Partial results are worse than none here: a truncated snapshot
+            # would look like jobs disappearing. Fall back to the old path.
+            return None
+        for j in r.get("jobSummaryList", []):
+            if exec_name in j.get("jobName", ""):
+                out.setdefault(j.get("status", ""), []).append(j)
+        tok = r.get("nextToken")
+        if not tok:
+            break
+    _exec_jobs_cache[exec_name] = (now, out)
+    return out
+
+
 def _list_exec_jobs(exec_name: str, status: str) -> list:
     """Every Batch job summary in `status` whose name carries this execution,
     following nextToken. list_jobs returns at most 100 summaries per page; the
     host-tagging callers below used to read only the FIRST page, so on a ladder
     with >100 jobs the chunks past it were never described and their cells stayed
     the default blue. Paginating covers every chunk regardless of ladder size."""
+    # Preferred: one execution-scoped scan, shared across callers. Returns {} if
+    # the execution start could not be derived or the scan failed, in which case
+    # fall through to the original per-status walk so behaviour is never worse
+    # than before.
+    snap = _exec_jobs_snapshot(exec_name)
+    if snap is not None:
+        return snap.get(status, [])
+
     batch = _batch()
     queue = os.environ.get("BATCH_JOB_QUEUE", "infinite-streaming-encoder-queue")
     out, tok = [], None
