@@ -158,7 +158,8 @@
                           { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" },
                           { "Name": "BURNIN", "Value.$": "$.burnin" },
                           { "Name": "EST_VMAF", "Value.$": "$.est_vmaf" },
-                          { "Name": "EST_VMAF_CLAMPED", "Value.$": "$.est_vmaf_clamped" }
+                          { "Name": "EST_VMAF_CLAMPED", "Value.$": "$.est_vmaf_clamped" },
+                          { "Name": "ENCODE_THREADS", "Value": "2" }
                         ],
                         "ResourceRequirements": [
                           { "Type": "VCPU", "Value.$": "$.vcpu" },
@@ -237,7 +238,8 @@
                                 { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" },
                                 { "Name": "BURNIN", "Value.$": "$.burnin" },
                                 { "Name": "EST_VMAF", "Value.$": "$.est_vmaf" },
-                                { "Name": "EST_VMAF_CLAMPED", "Value.$": "$.est_vmaf_clamped" }
+                                { "Name": "EST_VMAF_CLAMPED", "Value.$": "$.est_vmaf_clamped" },
+                                { "Name": "ENCODE_THREADS", "Value": "2" }
                               ],
                               "ResourceRequirements": [
                                 { "Type": "VCPU", "Value.$": "$.vcpu" },
