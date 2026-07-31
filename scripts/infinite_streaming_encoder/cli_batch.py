@@ -106,30 +106,20 @@ _WHOLE_JOBNAME_RE = re.compile(r"^var-([^-]+)-([^-]+)-whole-")
 _CHUNK_OBJ_RE = re.compile(r"^([^_]+)_(.+)_chunk(\d+)\.mp4$")
 
 
-def _reflect_batch_status(exec_name: str) -> None:
-    """Reflect each chunk job's actual Batch status into its grid cell, so a
-    cell shows 'queued' (waiting for a slot) vs 'running' (actually encoding).
-    The SFN state-enter event only says 'submitted', which spans RUNNABLE →
-    STARTING → RUNNING — so we ask Batch directly. Done chunks are SUCCEEDED
-    and won't appear in these lists, so their 'done' state is left intact."""
-    def _emit_for(status_filter: str, stage_status: str) -> None:
-        for j in _list_exec_jobs(exec_name, status_filter):
-            name = j.get("jobName", "")
-            m = _CHUNK_JOBNAME_RE.match(name)
-            if m:
-                c, t, ci = m.group(1), m.group(2), int(m.group(3))
-                _emit_stage(f"encode:{c}:{t}:chunk{ci}", stage_status, 0.0)
-                continue
-            w = _WHOLE_JOBNAME_RE.match(name)
-            if w:
-                _emit_stage(f"encode:{w.group(1)}:{w.group(2)}", stage_status, 0.0)
-
-    # RUNNABLE -> queued, STARTING -> running (0%). RUNNING is deliberately NOT
-    # reflected here: once the container is up it emits its own ENCODER-STAGE
-    # percent markers (now forwarded live), and re-stamping running/0% every
-    # poll would reset that smooth progress back to zero.
-    _emit_for("RUNNABLE", "queued")
-    _emit_for("STARTING", "running")
+# _reflect_batch_status was removed. It reflected RUNNABLE -> queued and
+# STARTING -> running on EVERY poll with no dedupe, which _sync_stages_from_batch
+# now supersedes and actively conflicted with:
+#
+#   - it re-stamped "queued" on every RUNNABLE chunk each poll — 100-300 markers
+#     per cycle on a full ladder, rewriting cells that had not changed, which
+#     showed in the UI as chunk pills constantly re-rendering.
+#   - it called STARTING "running" while _sync_stages_from_batch calls it
+#     "starting". Both ran each poll, so a placed-but-not-yet-encoding chunk
+#     flipped between the two states continuously.
+#
+# Its purpose is covered: submission now emits "queued" (a chunk is queued from
+# the moment it is handed to Batch until placed), and _sync_stages_from_batch
+# emits starting/running/done/failed exactly once per transition.
 
 
 # CloudWatch log group the Batch job definitions write to (see
@@ -877,9 +867,9 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
             # "queued" is what the state actually is, and it makes "running" mean
             # PLACED — at which point _sync_stages_from_batch announces it and
             # tags its host in the same pass, so a running cell is coloured from
-            # the moment it appears. _reflect_batch_status still corrects the
-            # RUNNABLE/STARTING/RUNNING split from Batch as before; it simply no
-            # longer has a false "running" burst to undo.
+            # the moment it appears. _sync_stages_from_batch is now the single
+            # source for the RUNNABLE/STARTING/RUNNING split, emitting once per
+            # transition rather than re-stamping every cell each poll.
             name = ev.get("stateEnteredEventDetails", {}).get("name", "")
             key = _STEP_TO_STAGE.get(name)
             if key:
@@ -1172,10 +1162,6 @@ def cmd_poll(args: argparse.Namespace) -> int:
         # Then refine chunk cells to queued/running from live Batch status
         # (runs after _translate_events so it wins over the enter-event's
         # coarse "running"). Best-effort — never let it break polling.
-        try:
-            _reflect_batch_status(exec_name)
-        except Exception:  # noqa: BLE001 — status reflection is cosmetic
-            pass
         # Detect spot reclaims of in-flight encode jobs (red bar + waste stats).
         try:
             _report_live_reclaims(exec_name, reclaim_seen)

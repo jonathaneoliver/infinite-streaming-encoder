@@ -543,10 +543,17 @@ def _annotate_init_states(instances: list[dict]) -> None:
             inst["init_state"] = "draining"
         elif not ci.get("agentConnected") or ci.get("status") == "REGISTERING":
             inst["init_state"] = "booting"
-        elif ci.get("pendingTasksCount", 0) > 0:
-            inst["init_state"] = "pulling"
         elif ci.get("runningTasksCount", 0) > 0 or inst.get("jobs"):
+            # RUNNING wins over pending. A busy box almost always has a task
+            # pending as well — the next chunk being placed — and with denser
+            # packing that is nearly every box, every poll. Checking pending
+            # first therefore labelled the whole fleet "pulling image" in the
+            # middle of an encode while it was flat out encoding.
             inst["init_state"] = "running"
+        elif ci.get("pendingTasksCount", 0) > 0:
+            # Pending with nothing running: genuinely warming up for its first
+            # task.
+            inst["init_state"] = "pulling"
         else:
             inst["init_state"] = "idle"
 
