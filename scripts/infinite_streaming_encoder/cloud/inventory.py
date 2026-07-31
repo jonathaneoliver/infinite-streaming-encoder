@@ -361,6 +361,9 @@ def _enrich_fleet(batch_jobs: list[dict], instances: list[dict]) -> dict[str, An
 
     by_id = {j["id"]: j for j in active}
     arns_by_cluster: dict[str, set] = {}
+    # Which reads failed, surfaced on the payload so the UI can tell "no jobs"
+    # from "could not determine jobs" — they look identical today.
+    degraded: list[str] = []
     try:
         batch = batch_client()
         for i in range(0, len(ids), 100):
@@ -387,8 +390,11 @@ def _enrich_fleet(batch_jobs: list[dict], instances: list[dict]) -> dict[str, An
                     cluster = arn.split("/")[-2]
                     arns_by_cluster.setdefault(cluster, set()).add(arn)
                     jm["_ci_arn"] = arn
-    except ClientError:
-        pass
+    except ClientError as e:
+        # Leaves every job without vcpu/_ci_arn, so no instance gets a job list
+        # and the whole fleet renders idle. The single most visible degradation.
+        _warn("batch.describe_jobs (job -> instance mapping)", e)
+        degraded.append("job_map")
 
     ci_to_ec2: dict[str, str] = {}
     try:
@@ -400,8 +406,11 @@ def _enrich_fleet(batch_jobs: list[dict], instances: list[dict]) -> dict[str, An
                         cluster=cluster, containerInstances=al[i:i + 100]
                 ).get("containerInstances", []):
                     ci_to_ec2[ci.get("containerInstanceArn")] = ci.get("ec2InstanceId")
-    except ClientError:
-        pass
+    except ClientError as e:
+        # Jobs keep their vcpu but lose the instance they map to, so boxes show
+        # capacity with no chunks on them.
+        _warn("ecs.describe_container_instances (instance resolution)", e)
+        degraded.append("instance_map")
 
     used_by_inst: dict[str, int] = {}
     jobs_by_inst: dict[str, list] = {}
@@ -478,6 +487,21 @@ def _ecs_cluster_name() -> str | None:
 # stop calling it "booting". OS boot + ECS agent registration is well under this;
 # past it, absence means the instance was deregistered on scale-down.
 _ECS_JOIN_GRACE_S = 300
+
+
+def _warn(what: str, err: object) -> None:
+    """Report a degraded inventory read.
+
+    Every AWS call here was previously wrapped in `except ClientError: pass`, so
+    a throttle or transient error produced a SUCCESSFUL-looking payload with data
+    missing — instances with no jobs, which the fleet view renders as "idle (N
+    vCPU)" and 0% utilisation. Three separate "the fleet just emptied / all
+    machines idle / no chunks on any box" reports turned out to be this, and none
+    of them left a trace to diagnose from. Failing loudly in the log costs
+    nothing and makes the next one a five-second answer.
+    """
+    print(f"[inventory] DEGRADED: {what}: {type(err).__name__}: {err}",
+          file=sys.stderr, flush=True)
 
 
 def _annotate_init_states(instances: list[dict]) -> None:
