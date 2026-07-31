@@ -56,6 +56,13 @@ BATCH_LOG_GROUP = "/aws/batch/infinite-streaming-encoder"
 # differs by exactly that (`-f null` for the analysis pass vs `-f mp4`). Masking
 # it would hide the single most likely two-pass divergence.
 _PATH_VALUED = {"-i", "-passlogfile"}
+# Per-CHUNK values, not settings. -ss and -frames:v differ for every chunk by
+# design, so leaving them in makes each chunk its own "setting set" and every
+# rung reads as divergent — noise that buries the real comparison. They are
+# masked here and reported separately as the chunk PLAN, which is its own
+# question (do local and cloud cut the clip in the same places?) and deserves
+# its own answer rather than being mixed into the rate-control diff.
+_PER_CHUNK = {"-ss", "-frames:v", "-t"}
 _PATH_RE = re.compile(r"^(/|s3://|https?://|file:)")
 # Output dir naming is the codec/height contract (see OutputStem in CLAUDE.md).
 # `(?!\d)` rather than `\b` after the height: chunk outputs are named
@@ -77,6 +84,10 @@ def normalize(argv: list[str]) -> str:
             out.append(tok)
             skip_next = True
             continue
+        if tok in _PER_CHUNK:
+            out.append(tok)
+            skip_next = True   # emitted as <PATH>; see chunk_plan() for the values
+            continue
         # A bare trailing output path, or any other absolute path.
         out.append("<PATH>" if _PATH_RE.match(tok) else tok)
     # -progress/-stats_period are appended by run_ffmpeg_with_progress on every
@@ -85,6 +96,16 @@ def normalize(argv: list[str]) -> str:
     for noise in (" -progress pipe:1", ):
         text = text.replace(noise, "")
     return re.sub(r" -stats_period \S+", "", text)
+
+
+def chunk_span(argv: list[str]) -> tuple[str, str] | None:
+    """This invocation's (-ss, -frames:v) — i.e. which slice of the clip it
+    encoded. None for a whole-variant encode, which seeks nowhere."""
+    def val(flag: str) -> str:
+        return argv[argv.index(flag) + 1] if flag in argv else "-"
+    if "-ss" not in argv:
+        return None
+    return (val("-ss"), val("-frames:v"))
 
 
 def rung_key(argv: list[str]) -> str:
@@ -202,6 +223,42 @@ def main() -> int:
             continue
         by_rung[key][line if args.raw else normalize(argv)].add(source)
 
+    # Chunk plans, per rung per source-kind. #176 made the orchestrator the sole
+    # authority on boundaries, so local and cloud should now cut identically —
+    # this is where that shows up or doesn't.
+    plans: dict[str, dict[str, set]] = defaultdict(lambda: defaultdict(set))
+    for source, line in rows:
+        try:
+            argv = shlex.split(line)
+        except ValueError:
+            continue
+        key = rung_key(argv)
+        if args.rung and key != args.rung:
+            continue
+        span = chunk_span(argv)
+        if span:
+            plans[key][source.split(":")[0]].add(span)
+
+    if plans:
+        print("\n=== chunk plans (start_s, frames) — do the paths cut the clip alike?")
+        for rung in sorted(plans):
+            kinds = plans[rung]
+            starts = {k: sorted(float(a) for a, _ in v) for k, v in kinds.items()}
+            # dist:local and dist:ubuntu are the SAME plan split across boxes.
+            merged: dict[str, set] = defaultdict(set)
+            for k, v in kinds.items():
+                merged["local" if k == "dist" else k] |= v
+            sig = {k: sorted(v) for k, v in merged.items()}
+            same = len({tuple(v) for v in sig.values()}) == 1 and len(sig) > 1
+            mark = "identical" if same else ("only one path logged" if len(sig) < 2 else "DIFFER")
+            print(f"  {rung}: " + ", ".join(f"{k}={len(v)} chunks" for k, v in sorted(sig.items()))
+                  + f"  -> {mark}")
+            if mark == "DIFFER":
+                for k, v in sorted(sig.items()):
+                    print(f"      {k}: " + ", ".join(a for a, _ in v[:8])
+                          + (" ..." if len(v) > 8 else ""))
+
+    print("\n=== encoder settings (per-chunk seek/frame-count masked)")
     divergent = 0
     for rung in sorted(by_rung):
         variants = by_rung[rung]
