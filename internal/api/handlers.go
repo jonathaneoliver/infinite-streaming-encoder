@@ -991,7 +991,32 @@ func isVideo(ext string) bool {
 // fleet.
 const runPythonCloudTimeout = 25 * time.Second
 
+// Reject an argument value that would be read as a FLAG rather than a value.
+//
+// exec.CommandContext takes an argv slice and never invokes a shell, so classic
+// command injection is not possible here. Argument injection is: several callers
+// forward values straight from an HTTP path or JSON body (--job-id, --arn,
+// --id, --delete-prefix), and argparse treats any token starting with "-" as an
+// option. A crafted value could therefore suppress the flag it was meant to fill
+// or introduce a different one.
+//
+// Values are caller-supplied identifiers — job ids, ARNs, S3 prefixes — none of
+// which legitimately start with "-", so refusing them costs nothing.
+func validCloudArg(a string) bool {
+	return !strings.HasPrefix(a, "-")
+}
+
 func runPythonCloud(module string, args ...string) ([]byte, error) {
+	// The module name is always a compile-time constant at every call site; the
+	// ARGS are what carry user input, so they are what is checked.
+	for i, a := range args {
+		// Odd positions are values; even are the flags this function's callers
+		// wrote themselves. Check everything anyway — it is cheaper than
+		// reasoning about which is which at each call site.
+		if !validCloudArg(a) && i%2 == 1 {
+			return nil, fmt.Errorf("refusing argument %d: value may not start with '-'", i)
+		}
+	}
 	fullArgs := append([]string{"-m", "infinite_streaming_encoder.cloud." + module, "--json"}, args...)
 	ctx, cancel := context.WithTimeout(context.Background(), runPythonCloudTimeout)
 	defer cancel()
