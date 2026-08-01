@@ -2018,7 +2018,15 @@ func (m *Manager) writeHistory(job *Job) {
 }
 
 func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
-	if len(job.Stages) == 0 && len(job.StagesHistory) == 0 {
+	// Snapshot under the lock. This runs at job teardown, when mutation is
+	// unlikely but not impossible — and the SSE marshaller can be walking the
+	// same slices. Copying the headers is enough: the elements are only ever
+	// replaced wholesale, never mutated in place after this point.
+	job.mu.Lock()
+	stages := append([]StageProgress(nil), job.Stages...)
+	history := append([]FileStages(nil), job.StagesHistory...)
+	job.mu.Unlock()
+	if len(stages) == 0 && len(history) == 0 {
 		return
 	}
 
@@ -2030,7 +2038,7 @@ func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
 		stage     StageProgress
 	}
 	var rows []stageRow
-	for _, h := range job.StagesHistory {
+	for _, h := range history {
 		label := h.File
 		if h.TotalFiles > 1 {
 			label = fmt.Sprintf("[%d/%d] %s", h.FileIndex, h.TotalFiles, h.File)
@@ -2043,7 +2051,7 @@ func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
 	if job.TotalFiles > 1 && job.CurrentFile != "" {
 		currentLabel = fmt.Sprintf("[%d/%d] %s", job.CurrentFileIndex, job.TotalFiles, job.CurrentFile)
 	}
-	for _, s := range job.Stages {
+	for _, s := range stages {
 		rows = append(rows, stageRow{fileLabel: currentLabel, stage: s})
 	}
 
