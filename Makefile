@@ -125,7 +125,7 @@ check:                ## run the same static checks CI runs (gofmt/vet/build, to
 	if out=$$(python3 scripts/check_sfn_scopes.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  go test        '; \
-	if out=$$(go test ./... 2>&1); then echo "ok"; \
+	if out=$$(go test -race ./... 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py undefined   '; \
 	if ! command -v ruff >/dev/null 2>&1; then echo "skipped (pip install ruff)"; \

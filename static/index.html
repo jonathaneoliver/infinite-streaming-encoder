@@ -2626,11 +2626,25 @@ function updateStagesTable(row, stages) {
                     // to either the data or this renderer, rather than argued
                     // about. A cell being CREATED reads as 0 -> n and is not a
                     // regression, so compare only against a width we already set.
+                    // EVERY width change this renderer makes, both directions.
+                    // Only logging shrinks names the victim without naming the
+                    // culprit — "filled then zeroed" needs the fill on record too.
+                    //
+                    // Bounded per cell rather than globally: the reported problem
+                    // is at cell STARTUP ("once it fills with progress it seems
+                    // fine"), so the first handful of transitions per cell is
+                    // exactly the interesting part, and capping there keeps a
+                    // 336-chunk run from flooding the log channel.
                     const _prevW = parseFloat(fill.style.width);
                     const _newW = parseFloat(_wantW);
-                    if (!isNaN(_prevW) && _newW < _prevW - 0.05) {
-                        uiLog('cell-shrink', {
-                            key: c.key, from: _prevW, to: _newW,
+                    window.__cellLogN = window.__cellLogN || {};
+                    const _seen = window.__cellLogN[c.key] || 0;
+                    if (_seen < 12) {
+                        window.__cellLogN[c.key] = _seen + 1;
+                        uiLog('cell-width', {
+                            key: c.key, from: isNaN(_prevW) ? null : _prevW,
+                            to: _newW, n: _seen + 1,
+                            down: !isNaN(_prevW) && _newW < _prevW - 0.05,
                             status: st, pct: c.s.percent,
                             inst: c.s.instance || '', reused: !!c.s.reused,
                         });

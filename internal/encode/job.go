@@ -925,6 +925,29 @@ type VmafScore struct {
 	invSum   float64 // Σ(chunk inv_sum)
 }
 
+// MarshalJSON serialises a Job under its own lock.
+//
+// The SSE stream sends *Job POINTERS to subscribers, so the handler marshals
+// whatever the job holds AT SEND TIME rather than a snapshot taken when the
+// notify fired. That is deliberate — it means a frame is always the latest
+// state and can never deliver an older one after a newer one — but it also
+// means json.Marshal walks j.Stages concurrently with upsertStage mutating it.
+//
+// Without this the read is unsynchronised, and the dangerous case is not a
+// stale field: upsertStage APPENDS a StageProgress for a key it has not seen,
+// and an append can reallocate the backing array while the marshaller is
+// walking it. Appends happen while the grid is filling in, which is exactly
+// when the UI was reported showing cells briefly wrong.
+//
+// The alias type is the standard idiom to avoid recursing into this method.
+// Conversion is pointer-to-pointer, so the mutex is never copied.
+func (j *Job) MarshalJSON() ([]byte, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	type alias Job
+	return json.Marshal((*alias)(j))
+}
+
 type Job struct {
 	ID        string     `json:"id"`
 	Config    JobConfig  `json:"config"`

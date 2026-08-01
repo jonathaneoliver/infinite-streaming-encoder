@@ -1520,10 +1520,17 @@ def _emit_stage(key: str, status: str, percent: float | None = 0.0,
     # grid raises, rather than a proxy for it.
     before, after = _rendered_width(prev, _STAGE_PCT.get(key)), \
         _rendered_width(status, percent)
-    if after < before - 0.05:
-        print(f"[fill] {time.strftime('%H:%M:%S')} {key} {before:.0f}% -> "
-              f"{after:.0f}%  ({prev or 'unset'} -> {status}) via {src or 'worker'}",
-              flush=True)
+    if abs(after - before) > 0.05:
+        # EVERY width change, both directions — not just the drops.
+        #
+        # Logging only decreases was the obvious economy and it is useless for
+        # the question being asked: "filled then zeroed" cannot be explained
+        # without the record of what FILLED it. The drop names a victim; the
+        # rise names the culprit.
+        arrow = "DOWN" if after < before else "up"
+        print(f"[fill] {time.strftime('%H:%M:%S')} {arrow:>4} {key} "
+              f"{before:.0f}% -> {after:.0f}%  ({prev or 'unset'} -> {status}) "
+              f"via {src or 'worker'}", flush=True)
     _STAGE_STATE[key] = status
     _STAGE_PCT[key] = percent
     print(f"[[ENCODER-STAGE key={key} status={status} percent={percent:.1f}]]",
