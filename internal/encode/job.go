@@ -140,6 +140,12 @@ func stripANSI(s string) string {
 var (
 	planMarkerRe  = regexp.MustCompile(`^\[\[ENCODER-PLAN (.+)\]\]$`)
 	stageMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=([0-9.]+)\]\]$`)
+	// [[ENCODER-TIMING phase=variant key=encode:h264:1080p:chunk3 fetch_s=1.8
+	//   encode_s=9.2 cpu_s=18.4 mem_mib=425 total_s=11.4]]
+	// Captured as a whole so new measurements are picked up without a new
+	// regex — the worker adds fields to this marker as it learns to measure
+	// more, and a positional pattern would silently ignore them.
+	timingMarkerRe = regexp.MustCompile(`^\[\[ENCODER-TIMING (.+)\]\]$`)
 	// ENCODER-HOST reports the machine (EC2 instance-id, or a stable ARN slug)
 	// a stage's Batch job landed on — used to colour the chunk plot by instance
 	// so co-located heavy chunks are visible. Emitted once per (stage, instance).
@@ -492,6 +498,39 @@ func (j *Job) parseMarker(line string) bool {
 			j.Stages = append(j.Stages, tail...)
 		}
 		j.mu.Unlock()
+		return true
+	}
+	if m := timingMarkerRe.FindStringSubmatch(line); m != nil {
+		var key string
+		var cpu, total, mem float64
+		for _, f := range strings.Fields(m[1]) {
+			k, v, ok := strings.Cut(f, "=")
+			if !ok {
+				continue
+			}
+			switch k {
+			case "key":
+				key = v
+			case "cpu_s":
+				cpu, _ = strconv.ParseFloat(v, 64)
+			case "total_s":
+				total, _ = strconv.ParseFloat(v, 64)
+			case "mem_mib":
+				mem, _ = strconv.ParseFloat(v, 64)
+			}
+		}
+		if key != "" {
+			j.mu.Lock()
+			for i := range j.Stages {
+				if j.Stages[i].Key == key {
+					j.Stages[i].CPUSeconds = cpu
+					j.Stages[i].WorkerSeconds = total
+					j.Stages[i].PeakMemMiB = mem
+					break
+				}
+			}
+			j.mu.Unlock()
+		}
 		return true
 	}
 	if m := stageMarkerRe.FindStringSubmatch(line); m != nil {
@@ -905,6 +944,19 @@ type StageProgress struct {
 	// styles reused cells with a distinct neutral so they don't read as a
 	// freshly-encoded machine colour (or the transient no-instance blue).
 	Reused bool `json:"reused,omitempty"`
+	// CPUSeconds / WorkerSeconds / PeakMemMiB come from ENCODER-TIMING, which
+	// the worker emits from getrusage as the phase exits.
+	//
+	// WorkerSeconds is the worker's OWN wall clock for the phase, which is not
+	// the same as EndedAt-StartedAt: those bracket the whole Batch job, so they
+	// include image pull, the mezzanine fetch, and the upload. The gap between
+	// the two is exactly the non-encoding overhead, which is why both are kept.
+	//
+	// CPUSeconds against WorkerSeconds gives cores actually used — the number
+	// that says whether a reservation is earning its keep.
+	CPUSeconds    float64 `json:"cpu_seconds,omitempty"`
+	WorkerSeconds float64 `json:"worker_seconds,omitempty"`
+	PeakMemMiB    float64 `json:"peak_mem_mib,omitempty"`
 	// Timestamps of state transitions. StartedAt is set the first time
 	// the stage sees `status=running`; EndedAt is set when it reaches
 	// a terminal state (done|failed). Used to build the end-of-job
@@ -2122,9 +2174,102 @@ func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
 		rows = append(rows, stageRow{fileLabel: currentLabel, stage: s})
 	}
 
+	var table strings.Builder
+
+	// PHASE ROLLUP first. The detail table below is one row per stage, which on
+	// a 336-chunk run is 350 rows nobody reads. This aggregates by phase and is
+	// the part worth looking at.
+	//
+	// Three different times are reported because they answer different
+	// questions and are routinely confused:
+	//
+	//   span   first start -> last end for the phase. Real elapsed time, so
+	//          parallel chunks count once. This is "how long did this phase
+	//          take".
+	//   Σ job  sum of per-stage Batch wall clock. Includes container start, the
+	//          mezzanine fetch and the upload.
+	//   Σ work the worker's OWN measure of the same phases, from its timer.
+	//          The gap against Σ job is the non-encoding overhead.
+	//   Σ cpu  getrusage user+sys, so cores = Σ cpu / Σ work is what the phase
+	//          actually used against what it reserved.
+	type agg struct {
+		n              int
+		first, last    time.Time
+		jobWall        time.Duration
+		cpu, work, mem float64
+	}
+	groups := map[string]*agg{}
+	var order []string
+	for _, r := range rows {
+		st := r.stage
+		g := st.Key
+		// encode:h264:1080p:chunk3 -> encode:h264:1080p, so a rung is one row
+		// rather than 28.
+		if i := strings.LastIndex(g, ":chunk"); i > 0 {
+			g = g[:i]
+		}
+		a := groups[g]
+		if a == nil {
+			a = &agg{}
+			groups[g] = a
+			order = append(order, g)
+		}
+		a.n++
+		a.cpu += st.CPUSeconds
+		a.work += st.WorkerSeconds
+		if st.PeakMemMiB > a.mem {
+			a.mem = st.PeakMemMiB
+		}
+		if st.StartedAt != nil {
+			if a.first.IsZero() || st.StartedAt.Before(a.first) {
+				a.first = *st.StartedAt
+			}
+			if st.EndedAt != nil {
+				a.jobWall += st.EndedAt.Sub(*st.StartedAt)
+				if st.EndedAt.After(a.last) {
+					a.last = *st.EndedAt
+				}
+			}
+		}
+	}
+	table.WriteString("\n### Phase rollup\n\n")
+	table.WriteString("| Phase | n | span | Σ job wall | Σ worker | Σ cpu | cores | peak MiB |\n")
+	table.WriteString("|-------|---|------|------------|----------|-------|-------|----------|\n")
+	var totCPU, totWork float64
+	for _, g := range order {
+		a := groups[g]
+		span := "—"
+		if !a.first.IsZero() && !a.last.IsZero() {
+			span = a.last.Sub(a.first).Round(100 * time.Millisecond).String()
+		}
+		cores := "—"
+		if a.work > 0 {
+			cores = fmt.Sprintf("%.2f", a.cpu/a.work)
+		}
+		cpuStr, workStr, memStr := "—", "—", "—"
+		if a.cpu > 0 {
+			cpuStr = fmt.Sprintf("%.0fs", a.cpu)
+		}
+		if a.work > 0 {
+			workStr = fmt.Sprintf("%.0fs", a.work)
+		}
+		if a.mem > 0 {
+			memStr = fmt.Sprintf("%.0f", a.mem)
+		}
+		table.WriteString(fmt.Sprintf("| %s | %d | %s | %s | %s | %s | %s | %s |\n",
+			g, a.n, span, a.jobWall.Round(100*time.Millisecond),
+			workStr, cpuStr, cores, memStr))
+		totCPU += a.cpu
+		totWork += a.work
+	}
+	if totWork > 0 {
+		table.WriteString(fmt.Sprintf(
+			"| **total** |  |  |  | %.0fs | %.0fs | %.2f |  |\n",
+			totWork, totCPU, totCPU/totWork))
+	}
+
 	// Also dump the same summary into the per-job log file so it's
 	// trivially greppable later.
-	var table strings.Builder
 	table.WriteString("\n### Stage timing\n\n")
 	if job.TotalFiles > 1 {
 		table.WriteString("| File | Stage | Status | Started | Ended | Duration |\n")
