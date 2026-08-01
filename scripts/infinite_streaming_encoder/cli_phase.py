@@ -1038,6 +1038,13 @@ def phase_byteranges(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def phase_package_all(args: argparse.Namespace) -> int:
+    # Timed like the variant phase. Without this the package job recorded no
+    # marks at all, so "how much of package-all is fetching versus joining
+    # versus actually packaging" could not be answered from a finished run —
+    # only estimated from the shape of a progress bar. It is also why package
+    # rows show "—" for cpu/worker in the phase rollup.
+    _pkg_timer = _StepTimer("package-all")
+    _pkg_ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
     work = _prepare_work_dir()
 
     # Discover this codec's variants. Whole-variant runs upload
@@ -1134,12 +1141,14 @@ def phase_package_all(args: argparse.Namespace) -> int:
     pkg_dir = work / stem
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
+    _pkg_timer.mark("fetch_join")
     emit_stage(f"package:{args.codec}", "running", 90.0)
     package(PackageSpec(
         tmp_dir=work, output_dir=pkg_dir, codec=args.codec,
         labels=tuple(labels_present), segment_duration_s=_SEGMENT_DURATION_S,
         partial_duration_s=_PARTIAL_DURATION_S, include_audio=has_audio,
     ))
+    _pkg_timer.mark("shaka")
     emit_stage(f"package:{args.codec}", "done", 100.0)
 
     # Byteranges BEFORE HLS — the playlists embed the fragment byte ranges.
@@ -1147,13 +1156,21 @@ def phase_package_all(args: argparse.Namespace) -> int:
     generate_byteranges_sidecars(pkg_dir)
     # Self-contained DASH: expand fragment byte-ranges into manifest_fragmented.mpd
     write_fragmented_mpd(pkg_dir)
+    _pkg_timer.mark("fragments")
     emit_stage(f"fragments:{args.codec}", "done", 100.0)
 
     emit_stage(f"hls:{args.codec}", "running", 0.0)
     generate_fmp4_hls(pkg_dir)
+    _pkg_timer.mark("hls")
     emit_stage(f"hls:{args.codec}", "done", 100.0)
 
     _upload_dir(pkg_dir, args.s3_out.rstrip("/") + f"/{stem}")
+    _pkg_timer.mark("upload")
+    _ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    _cpu = ((_ru1.ru_utime - _pkg_ru0.ru_utime)
+            + (_ru1.ru_stime - _pkg_ru0.ru_stime))
+    _pkg_timer.emit(f"package:{args.codec}", cpu_s=f"{_cpu:.2f}")
+    flush_telemetry()
     return 0
 
 
