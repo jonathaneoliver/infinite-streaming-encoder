@@ -1091,8 +1091,11 @@ type Job struct {
 	// styling. Today: "spot_interrupted" | "" (generic).
 	FailureReason string `json:"failure_reason,omitempty"`
 
-	mu        sync.Mutex
-	logLines  []string
+	mu       sync.Mutex
+	logLines []string
+	// Diagnostic stream: its own file, never trimmed. See appendDiag.
+	diagPath  string
+	diagFile  *os.File
 	cancelled bool
 	// cloudExecArn is the SFN execution ARN of the CURRENT cloud-batch file's
 	// running execution. Persisted so Reconcile can re-attach to it after a
@@ -1132,12 +1135,67 @@ func (j *Job) IsCancelled() bool {
 	return j.cancelled
 }
 
+// Diagnostic streams: high-volume, machine-oriented lines emitted for
+// post-mortem rather than for a human watching the log viewer.
+//
+// They are kept OUT of logLines and streamed to their own file. Both halves
+// matter. A 336-chunk run emits ~1,300 [state] and ~2,000 [fill] lines against
+// a buffer that keeps the LAST 500 — so routing them through logLines both lost
+// almost all of them AND evicted the human-readable narration they were meant
+// to explain. A run was measured afterwards with 6 of its [state] lines
+// surviving.
+var diagPrefixes = []string{"[state] ", "[fill] ", "[census] ", "[host] "}
+
+func isDiagLine(line string) bool {
+	for _, p := range diagPrefixes {
+		if strings.HasPrefix(line, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func (j *Job) AppendLog(line string) {
+	if isDiagLine(line) {
+		j.appendDiag(line)
+		return
+	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.logLines = append(j.logLines, line)
 	if len(j.logLines) > 1000 {
 		j.logLines = j.logLines[len(j.logLines)-500:]
+	}
+}
+
+// appendDiag streams one diagnostic line straight to the job's .diag.log.
+//
+// Written as it arrives rather than buffered and flushed at the end: the runs
+// worth investigating are the ones that crash, get killed, or are cancelled
+// mid-flight, and a buffer held until terminal loses exactly those. The file
+// handle is opened once and closed by closeDiag on the terminal path.
+func (j *Job) appendDiag(line string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.diagFile == nil {
+		if j.diagPath == "" {
+			return // no path configured; drop rather than guess a location
+		}
+		f, err := os.OpenFile(j.diagPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return // diagnostics are never worth failing an encode for
+		}
+		j.diagFile = f
+	}
+	_, _ = j.diagFile.WriteString(line + "\n")
+}
+
+func (j *Job) closeDiag() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.diagFile != nil {
+		_ = j.diagFile.Close()
+		j.diagFile = nil
 	}
 }
 
@@ -1635,6 +1693,14 @@ func (m *Manager) Submit(cfg JobConfig) *Job {
 }
 
 func (m *Manager) run(job *Job, startIdx int) {
+	// Diagnostics stream to their own file from the first line. Set here rather
+	// than at teardown so a run that crashes or is cancelled still leaves them.
+	logsDir := filepath.Join(m.TmpDir, "logs")
+	if err := os.MkdirAll(logsDir, 0o755); err == nil {
+		job.mu.Lock()
+		job.diagPath = filepath.Join(logsDir, job.ID+".diag.log")
+		job.mu.Unlock()
+	}
 	if startIdx == 0 {
 		job.Progress = "waiting for slot"
 	} else {
@@ -1949,6 +2015,7 @@ func (m *Manager) removeJobContainers(id string) {
 func (m *Manager) writeHistory(job *Job) {
 	logsDir := filepath.Join(m.TmpDir, "logs")
 	os.MkdirAll(logsDir, 0755)
+	job.closeDiag() // flush + release the diagnostic stream for this run
 
 	// Write full log to a per-job file, stripping ANSI escape codes
 	logPath := filepath.Join(logsDir, job.ID+".log")
