@@ -2620,6 +2620,21 @@ function updateStagesTable(row, stages) {
                 // to redraw. Counted so a redraw someone SEES can be checked
                 // against whether we wrote anything at all.
                 if (fill.style.width !== _wantW) {
+                    // Report any write that makes a cell show LESS colour. The
+                    // server logs the same thing for its own emissions ([fill]);
+                    // between them, "a cell filled then zeroed" is attributable
+                    // to either the data or this renderer, rather than argued
+                    // about. A cell being CREATED reads as 0 -> n and is not a
+                    // regression, so compare only against a width we already set.
+                    const _prevW = parseFloat(fill.style.width);
+                    const _newW = parseFloat(_wantW);
+                    if (!isNaN(_prevW) && _newW < _prevW - 0.05) {
+                        uiLog('cell-shrink', {
+                            key: c.key, from: _prevW, to: _newW,
+                            status: st, pct: c.s.percent,
+                            inst: c.s.instance || '', reused: !!c.s.reused,
+                        });
+                    }
                     fill.style.width = _wantW;
                     window.__cellWrites = (window.__cellWrites || 0) + 1;
                 }

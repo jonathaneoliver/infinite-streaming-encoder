@@ -773,7 +773,8 @@ def _drain_telemetry(url: str | None, log_state: dict) -> int:
                 # came from Step Functions history, which a check local to this
                 # function could not see. That blind spot is why reversals
                 # survived the first attempt at fixing them.
-                if not _emit_stage(sm.group(1), sm.group(2), float(sm.group(3))):
+                if not _emit_stage(sm.group(1), sm.group(2), float(sm.group(3)),
+                                   src="worker"):
                     suppressed += 1
                     continue
                 handled += 1
@@ -1143,7 +1144,8 @@ def _drain_state(url: str | None, log_state: dict) -> int:
             st = _EVENT_STAGE_STATUS.get(d.get("status", ""))
             if not key or not st:
                 continue
-            ok = _emit_stage(key, st, 100.0 if st == "done" else None)
+            ok = _emit_stage(key, st, 100.0 if st == "done" else None,
+                             src="event")
             applied += 1 if ok else 0
             _log_state_event(body, d, st, key, ok)
             # The instance is IN the event from STARTING onward, so a chunk is
@@ -1338,7 +1340,8 @@ def _tail_progress(stream: str, label: str, log_state: dict,
             # Same chokepoint as the queue path. The fallback must obey the same
             # rule or turning it on would reintroduce the reversals it exists to
             # cover for. _emit_stage prints it, so skip the verbatim forward.
-            _emit_stage(sm.group(1), sm.group(2), float(sm.group(3)))
+            _emit_stage(sm.group(1), sm.group(2), float(sm.group(3)),
+                        src="cwlog")
             continue
         if msg.startswith("[[ENCODER-"):
             # Forward EVERY marker verbatim, not a whitelist. This used to pass
@@ -1468,6 +1471,21 @@ _STAGE_PCT: dict[str, float] = {}
 _FINAL_STAGE = {"done"}
 
 
+def _rendered_width(status: str | None, percent: float | None) -> float:
+    """What the UI actually paints, mirroring static/index.html.
+
+    Kept in step with the grid deliberately: "the cell showed less colour" is a
+    statement about WIDTH, and width is not the percent field — done and reused
+    paint full regardless, queued and starting paint empty regardless. Comparing
+    raw percent would miss exactly the transitions being asked about.
+    """
+    if status in (None, "pending", "queued", "starting"):
+        return 0.0
+    if status in ("done", "skipped", "reclaimed"):
+        return 100.0
+    return float(percent or 0.0)
+
+
 def _emit_stage(key: str, status: str, percent: float | None = 0.0,
                 src: str = "") -> bool:
     """Announce a stage transition. Returns False if it was suppressed as stale.
@@ -1495,6 +1513,17 @@ def _emit_stage(key: str, status: str, percent: float | None = 0.0,
     elif (status not in _FINAL_STAGE and status == prev
             and percent < _STAGE_PCT.get(key, 0.0)):
         percent = _STAGE_PCT[key]
+    # ANY emission that makes a cell show LESS colour is logged, whatever the
+    # source. The [state] log only ever covered Batch events, while the worker's
+    # percent markers — the main driver of fullness — went through here silently.
+    # This mirrors the UI's own width rule so the log answers the question the
+    # grid raises, rather than a proxy for it.
+    before, after = _rendered_width(prev, _STAGE_PCT.get(key)), \
+        _rendered_width(status, percent)
+    if after < before - 0.05:
+        print(f"[fill] {time.strftime('%H:%M:%S')} {key} {before:.0f}% -> "
+              f"{after:.0f}%  ({prev or 'unset'} -> {status}) via {src or 'worker'}",
+              flush=True)
     _STAGE_STATE[key] = status
     _STAGE_PCT[key] = percent
     print(f"[[ENCODER-STAGE key={key} status={status} percent={percent:.1f}]]",
@@ -1680,7 +1709,7 @@ def _report_live_reclaims(exec_name: str, seen: dict) -> None:
                 print(f"[[ENCODER-RECLAIM key={stage} count={n} "
                       f"lost_s={lost:.1f} total_s={total:.1f}]]", flush=True)
             if status_by_id.get(jid) in ("RUNNABLE", "STARTING"):
-                _emit_stage(stage, "reclaimed", 0.0)  # red until the retry runs
+                _emit_stage(stage, "reclaimed", 0.0, src="reclaim")
 
 
 def _report_reclaims(exit_ev: dict, label: str) -> None:
