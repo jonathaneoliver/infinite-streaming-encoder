@@ -29,7 +29,7 @@ from pathlib import Path
 # Taxonomy only — cli_batch is the queue's CONSUMER and must never emit through
 # telemetry, or it would republish what it just drained.
 from infinite_streaming_encoder.telemetry import (
-    MARKER_PREFIX, is_gauge, is_marker, queue_name, trim_execution_name)
+    is_gauge, is_marker, queue_name, trim_execution_name)
 
 try:
     import boto3
@@ -492,13 +492,19 @@ def _create_telemetry_queue(exec_name: str) -> str | None:
                 # Long-poll by default so an empty receive costs one request
                 # rather than spinning.
                 "ReceiveMessageWaitTimeSeconds": "1",
-                # STANDARD, not FIFO. This queue now carries Batch state
-                # events from EventBridge as well as worker markers, and
-                # EventBridge cannot usefully target a FIFO queue. Ordering is
-                # not needed either: the lifecycle rank guard and the percent
-                # monotonic guard in _emit_stage make the path
-                # order-insensitive, which is what actually fixed the bars
-                # going backwards.
+                # FIFO. Ordering is a property we need and standard queues do
+                # not provide — on the first 336-chunk run every chunk's
+                # progress meter visibly danced up and down as a stage's 40%
+                # printed after its 60%. Reconstructing order on read from
+                # SentTimestamp is guesswork: that stamp is applied on ARRIVAL,
+                # so publisher-side buffering can invert two markers or land
+                # them in the same millisecond.
+                #
+                # Throughput is not a concern: ~7,000 messages over a ~10-minute
+                # run is ~12/s against FIFO's 3,000/s batched ceiling.
+                "FifoQueue": "true",
+                # We supply MessageDeduplicationId ourselves — see the sink.
+                "ContentBasedDeduplication": "false",
             },
         )["QueueUrl"]
     except Exception as e:  # noqa: BLE001 — degrade to the log path, never fail
@@ -818,7 +824,8 @@ def _queue_depth(sqs, url: str) -> int:
         return 0
 
 
-def _start_drain_thread(url: str | None, log_state: dict):
+def _start_drain_thread(tel_url: str | None, state_url: str | None,
+                        log_state: dict):
     """Drain the queue continuously on a background thread. Returns a stop event.
 
     The drain used to run once per poll iteration, which coupled how fast a
@@ -834,19 +841,23 @@ def _start_drain_thread(url: str | None, log_state: dict):
     status — the terminal-status guard in _drain_telemetry remains as the
     correctness backstop rather than the primary defence.
     """
-    if not url:
+    if not (tel_url or state_url):
         return None
     stop = threading.Event()
 
     def _loop() -> None:
         while not stop.is_set():
-            # ONE queue, one drain. It used to be two channels drained in
-            # sequence, each opening with a 1s long-poll — most of the ~2.2s
-            # median state lag was simply that second poll waiting its turn.
-            try:
-                _drain_telemetry(url, log_state)
-            except Exception:  # noqa: BLE001 — never let a drain kill the run
-                pass
+            # BOTH channels on this thread. State events were originally drained
+            # from the poll loop instead, and the per-event lag logging showed
+            # what that cost: +2.9s to +7.3s against the 0.6s EventBridge
+            # actually delivers in. The events were never slow; they were sitting
+            # in the queue waiting for the next poll cycle.
+            for fn, url in ((_drain_state, state_url),
+                            (_drain_telemetry, tel_url)):
+                try:
+                    fn(url, log_state)
+                except Exception:  # noqa: BLE001 — never let a drain kill the run
+                    pass
             stop.wait(_TELEMETRY_DRAIN_IDLE_S)
 
     threading.Thread(target=_loop, daemon=True, name="telemetry-drain").start()
@@ -913,25 +924,9 @@ _EB_RULE_NAME_MAX = 64
 
 
 def _state_names(exec_name: str) -> tuple[str, str]:
-    """(rule_name, queue_name) for one execution.
-
-    ONE queue, shared with worker telemetry. There used to be two — a FIFO
-    telemetry queue and a standard state queue — and the split existed only
-    because telemetry was FIFO. That reason expired: FIFO was adopted to stop
-    chunk bars going backwards, did not fix it, and the guards that did fix it
-    made ordering irrelevant.
-    
-    Merging halves the per-run resources and their lifecycle, and it halves
-    drain latency: the drain used to make two sequential 1s long-polls per cycle,
-    which was most of the ~2.2s median state lag.
-
-    The names still differ in LENGTH budget — an EventBridge rule caps at 64
-    characters, SQS at 80 — so they are trimmed separately rather than forced to
-    match.
-    """
-    rule = _STATE_PREFIX + trim_execution_name(
-        exec_name, _EB_RULE_NAME_MAX - len(_STATE_PREFIX))
-    return rule, queue_name(exec_name)
+    """(rule_name, queue_name) for one execution. Single definition of both."""
+    core = trim_execution_name(exec_name, _EB_RULE_NAME_MAX - len(_STATE_PREFIX))
+    return _STATE_PREFIX + core, _STATE_PREFIX + core
 
 
 def _ensure_state_dlq() -> str:
@@ -1005,9 +1000,12 @@ def _create_state_channel(exec_name: str) -> str | None:
     rule, queue = _state_names(exec_name)
     try:
         sqs, events = _sqs(), _events()
-        # The queue already exists — _create_telemetry_queue made it. This only
-        # points EventBridge at it.
-        url = sqs.get_queue_url(QueueName=queue)["QueueUrl"]
+        url = sqs.create_queue(
+            QueueName=queue,
+            Attributes={"MessageRetentionPeriod": _TELEMETRY_RETENTION_S,
+                        "VisibilityTimeout": _TELEMETRY_VISIBILITY_S,
+                        "ReceiveMessageWaitTimeSeconds": "1"},
+        )["QueueUrl"]
         qarn = sqs.get_queue_attributes(
             QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
         rarn = events.put_rule(
@@ -1043,7 +1041,7 @@ def _create_state_channel(exec_name: str) -> str | None:
         return None
 
 
-def _delete_state_channel(exec_name: str) -> None:
+def _delete_state_channel(exec_name: str, url: str | None) -> None:
     """Stop the event flow. Deliberately leaves the QUEUE for the GC to sweep.
 
     Targets must be removed before the rule — but deleting the queue here as
@@ -1115,30 +1113,61 @@ def _log_state_event(body: dict, detail: dict, st: str, key: str,
           flush=True)
 
 
-def _apply_state_message(m: dict, log_state: dict) -> None:
-    """Apply one EventBridge Batch Job State Change message.
+def _drain_state(url: str | None, log_state: dict) -> int:
+    """Apply queued Batch state transitions. Returns how many were applied.
 
-    Split out of the old _drain_state when telemetry and state merged onto one
-    queue: the drain no longer knows which kind of message it is holding until
-    it looks, so the per-message work has to stand on its own.
+    Replaces the per-poll `list_jobs` census for the common case. Every
+    transition goes through _emit_stage, which is what makes an out-of-order
+    delivery harmless — EventBridge is at-least-once and unordered, so this
+    channel needs the same guard as every other one, not a weaker one.
     """
-    try:
-        body = json.loads(m.get("Body") or "{}")
-        d = body.get("detail") or {}
-    except ValueError:
-        return
-    key = _stage_key_for_job(d.get("jobName", ""))
-    st = _EVENT_STAGE_STATUS.get(d.get("status", ""))
-    if not key or not st:
-        return
-    ok = _emit_stage(key, st, 100.0 if st == "done" else None, src="event")
-    _log_state_event(body, d, st, key, ok)
-    # The instance is IN the event from STARTING onward, so a chunk is coloured
-    # by the same message that says it started — no describe_jobs, and no window
-    # where a running cell is uncoloured.
-    arn = (d.get("container") or {}).get("containerInstanceArn")
-    if arn and st in ("starting", "running", "done"):
-        _tag_host_from_arn(d.get("jobName", ""), arn, log_state)
+    if not url:
+        return 0
+    sqs = _sqs()
+    applied = 0
+    hosts: list = []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < _TELEMETRY_DRAIN_BUDGET_S:
+        try:
+            resp = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10,
+                                       WaitTimeSeconds=1 if not applied else 0)
+        except ClientError:
+            break
+        msgs = resp.get("Messages") or []
+        if not msgs:
+            break
+        try:
+            sqs.delete_message_batch(
+                QueueUrl=url,
+                Entries=[{"Id": str(n), "ReceiptHandle": m["ReceiptHandle"]}
+                         for n, m in enumerate(msgs)])
+        except ClientError:
+            pass  # redelivery is harmless: _emit_stage suppresses the repeat
+        for m in msgs:
+            try:
+                body = json.loads(m.get("Body") or "{}")
+                d = body.get("detail") or {}
+            except ValueError:
+                continue
+            key = _stage_key_for_job(d.get("jobName", ""))
+            st = _EVENT_STAGE_STATUS.get(d.get("status", ""))
+            if not key or not st:
+                continue
+            ok = _emit_stage(key, st, 100.0 if st == "done" else None,
+                             src="event")
+            applied += 1 if ok else 0
+            _log_state_event(body, d, st, key, ok)
+            # The instance is IN the event from STARTING onward, so a chunk is
+            # coloured by the same message that says it started — no
+            # describe_jobs, and no window where a running cell is uncoloured.
+            arn = (d.get("container") or {}).get("containerInstanceArn")
+            if arn and st in ("starting", "running", "done"):
+                hosts.append((d.get("jobName", ""), arn))
+    for jobname, arn in hosts:
+        _tag_host_from_arn(jobname, arn, log_state)
+    if applied:
+        log_state["_state_applied"] = log_state.get("_state_applied", 0) + applied
+    return applied
 
 
 def _stage_key_for_job(jobname: str) -> str | None:
@@ -2234,9 +2263,8 @@ def cmd_poll(args: argparse.Namespace) -> int:
     tel_url = _create_telemetry_queue(exec_name)
     # Continuous, on its own thread — NOT once per poll iteration. See
     # _start_telemetry_drain for why the coupling mattered.
-    # The rule points EventBridge at the SAME queue the workers publish to.
-    state_ok = _create_state_channel(exec_name) is not None
-    tel_stop = _start_drain_thread(tel_url, log_state)
+    state_url = _create_state_channel(exec_name)
+    tel_stop = _start_drain_thread(tel_url, state_url, log_state)
     tel_silent_s = 0
     last_census = 0.0
 
@@ -2288,7 +2316,7 @@ def cmd_poll(args: argparse.Namespace) -> int:
         #
         # When events are NOT available it falls back to every poll, which is
         # exactly the old behaviour.
-        census_gap = _CENSUS_BACKSTOP_S if state_ok else 0
+        census_gap = _CENSUS_BACKSTOP_S if state_url else 0
         if time.monotonic() - last_census >= census_gap:
             last_census = time.monotonic()
             try:
@@ -2348,13 +2376,14 @@ def cmd_poll(args: argparse.Namespace) -> int:
                 _drain_telemetry(tel_url, log_state)
             except Exception:  # noqa: BLE001 — never fail a finished run
                 pass
-            # Rule first, queue never. Deleting the queue here would dead-letter
-            # whatever EventBridge is still retrying — the NO_RESOURCE entries
-            # this DLQ caught the first time round. Now that one queue serves
-            # both channels, that hazard applies to the telemetry queue too, so
-            # it is left for _gc_telemetry_queues exactly like the state queue.
-            _delete_state_channel(exec_name)
+            _delete_telemetry_queue(tel_url)
             tel_url = None
+            try:
+                _drain_state(state_url, log_state)   # last transitions
+            except Exception:  # noqa: BLE001
+                pass
+            _delete_state_channel(exec_name, state_url)
+            state_url = None
             if status == "SUCCEEDED":
                 # Safety net: the packaging sub-stages come from live tailing;
                 # if the last tail poll missed a "done" marker, force them
@@ -2382,7 +2411,8 @@ def cmd_poll(args: argparse.Namespace) -> int:
 
     if tel_stop is not None:
         tel_stop.set()
-    _delete_state_channel(exec_name)
+    _delete_telemetry_queue(tel_url)
+    _delete_state_channel(exec_name, state_url)
     print("!!! poll timed out", file=sys.stderr)
     return 3
 

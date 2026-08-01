@@ -205,23 +205,17 @@ def test_interrupts_are_still_allowed_from_running():
         assert ok, f"{interrupt} was wrongly suppressed"
 
 
-def test_state_channel_names_fit_their_own_limits():
-    """ONE queue now, shared with telemetry — the rule just points at it.
-
-    The two names have DIFFERENT length limits (EventBridge 64, SQS 80) so they
-    are trimmed separately rather than forced to match.
-    """
-    from infinite_streaming_encoder.telemetry import queue_name
+def test_state_channel_names_fit_the_tighter_limit():
+    """Both names are built from ONE core sized to the EventBridge limit (64),
+    which is tighter than SQS's 80 — so they can never drift apart."""
     longest = "j" * 60 + "-abc123"
     rule, queue = cli_batch._state_names(longest)
-    assert len(rule) <= cli_batch._EB_RULE_NAME_MAX, f"rule {len(rule)}: {rule}"
-    assert queue == queue_name(longest), "state rule points at a different queue"
-    assert not queue.endswith(".fifo"), "queue must be standard: EventBridge " \
-        "cannot usefully target FIFO, and ordering is no longer relied on"
+    assert rule == queue, "rule and queue names diverged"
+    assert len(rule) <= cli_batch._EB_RULE_NAME_MAX, f"{len(rule)} chars: {rule}"
     # two executions of the SAME job differ only in the trailing suffix
-    a, qa = cli_batch._state_names("j" * 60 + "-aaaaaa")
-    b, qb = cli_batch._state_names("j" * 60 + "-bbbbbb")
-    assert a != b and qa != qb, "trimming collapsed two executions onto one channel"
+    a, _ = cli_batch._state_names("j" * 60 + "-aaaaaa")
+    b, _ = cli_batch._state_names("j" * 60 + "-bbbbbb")
+    assert a != b, "trimming collapsed two executions onto one rule"
 
 
 def test_every_batch_status_maps_to_a_stage_status():

@@ -262,10 +262,8 @@ def test_queue_name_fits_sqs_limit_and_stays_unique():
     n = telemetry.queue_name(longest)
     assert len(n) <= telemetry._SQS_NAME_MAX, f"{len(n)} chars: {n}"
     assert n.startswith(telemetry._QUEUE_PREFIX)
-    # STANDARD, not FIFO. One queue now carries worker markers AND Batch state
-    # events, and EventBridge cannot usefully target a FIFO queue — a target
-    # takes one static MessageGroupId, and its own delivery is unordered anyway.
-    assert not n.endswith(".fifo"), f"queue must be standard: {n}"
+    # FIFO queues MUST end in .fifo, and the suffix eats into the 80-char budget
+    assert n.endswith(".fifo"), f"not a FIFO queue name: {n}"
     # Two executions of the SAME job differ only in the trailing suffix, so
     # trimming must never eat it — that would silently merge their queues.
     a = telemetry.queue_name("j" * 60 + "-aaaaaa")
@@ -280,7 +278,7 @@ def test_queue_name_is_a_legal_sqs_name():
     import re
     for name in ("j" * 60 + "-abc123", "1785516812206-my_clip_p200-9f2a1c"):
         n = telemetry.queue_name(name)
-        assert re.fullmatch(r"[A-Za-z0-9_-]{1,80}", n), f"illegal queue name: {n}"
+        assert re.fullmatch(r"[A-Za-z0-9_-]{1,75}\.fifo", n), f"illegal queue name: {n}"
 
 
 def test_oversized_body_is_truncated_not_dropped():
