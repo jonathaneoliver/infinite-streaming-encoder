@@ -452,6 +452,10 @@ _TELEMETRY_SILENT_GIVEUP_S = 120
 # it exists only to catch a transition EventBridge failed to deliver; short
 # enough that such a gap closes well inside a run.
 _CENSUS_BACKSTOP_S = 60.0
+# Grace before a target-less state rule may be swept. Covers the window between
+# another submit's put_rule and its put_targets, during which its execution does
+# not yet exist and so cannot appear in the keep-list.
+_STATE_RULE_MIN_AGE_S = 300.0
 
 
 def _create_telemetry_queue(exec_name: str) -> str | None:
@@ -592,6 +596,7 @@ def _gc_state_rules(sm_arn: str = "") -> None:
     except Exception:  # noqa: BLE001 — best-effort
         return
     keep = _active_execution_cores(sm_arn)
+    sqs = _sqs()
     for r in rules:
         name = r.get("Name")
         if not name or any(c and c in name for c in keep):
@@ -599,6 +604,22 @@ def _gc_state_rules(sm_arn: str = "") -> None:
         try:
             if events.list_targets_by_rule(Rule=name).get("Targets"):
                 continue  # live, or a run we must not disturb
+            # A target-less rule looks orphaned, but there is a RACE: another
+            # job's submit creates its rule and attaches the target a moment
+            # later, and its execution does not exist yet — so the keep-list
+            # cannot protect it and this sweep would delete a rule that is about
+            # to become live, silently costing that run its state events.
+            #
+            # The queue is created BEFORE the rule and carries a timestamp, so it
+            # is the evidence the rule lacks. A young queue means a young rule.
+            try:
+                a = sqs.get_queue_attributes(
+                    QueueUrl=sqs.get_queue_url(QueueName=name)["QueueUrl"],
+                    AttributeNames=["CreatedTimestamp"])["Attributes"]
+                if time.time() - float(a["CreatedTimestamp"]) < _STATE_RULE_MIN_AGE_S:
+                    continue
+            except Exception:  # noqa: BLE001 — no queue at all: genuinely orphaned
+                pass
             events.delete_rule(Name=name)
         except Exception:  # noqa: BLE001 — one bad rule must not stop the sweep
             continue
