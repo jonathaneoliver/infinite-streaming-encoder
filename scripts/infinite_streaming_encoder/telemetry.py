@@ -63,8 +63,19 @@ import uuid
 _EXEC_ENV = "ENCODER_TELEMETRY_EXEC"
 
 _QUEUE_PREFIX = "encoder-telemetry-"
-# FIFO queues MUST carry this suffix, and it counts against the 80-char limit.
-_QUEUE_SUFFIX = ".fifo"
+# Empty: this was ".fifo" until the queue became the SINGLE per-execution
+# channel, carrying Batch state events from EventBridge as well as worker
+# markers. Two reasons FIFO went:
+#
+#   * EventBridge cannot usefully target a FIFO queue — a target takes one
+#     STATIC MessageGroupId, so every state event would serialise into one
+#     group, and EventBridge's own delivery is unordered anyway, so the
+#     guarantee would be over already-shuffled input.
+#   * Ordering is no longer needed. FIFO was adopted to stop chunk bars going
+#     backwards and did not fix it; the lifecycle rank guard and the percent
+#     monotonic guard in cli_batch did, and those make the whole path
+#     order-INSENSITIVE. A guarantee nothing relies on is cost without benefit.
+_QUEUE_SUFFIX = ""
 # SQS hard limit on queue names. Not advisory — CreateQueue rejects longer.
 _SQS_NAME_MAX = 80
 
@@ -275,19 +286,6 @@ class _SqsSink(_Sink):
                     # message, not per marker.
                     "seq": {"DataType": "Number", "StringValue": str(first_seq)},
                 },
-                # FIFO ordering is guaranteed WITHIN a message group, and groups
-                # are still consumed in parallel. The publisher is exactly the
-                # right group: a stage key belongs to one chunk, which is one
-                # process, so this orders everything that needs ordering while
-                # leaving 336 chunks free to interleave.
-                "MessageGroupId": _PUB_ID,
-                # Explicit, NOT ContentBasedDeduplication. Content-based dedup
-                # would hash the body and silently swallow a legitimately
-                # repeated marker inside its 5-minute window — two identical
-                # FLEET samples from a steady box, or the same percent reported
-                # twice. Silent data loss is the exact failure class this whole
-                # module exists to remove. (seq) makes every message unique.
-                "MessageDeduplicationId": f"{_PUB_ID}-{first_seq}",
             }
         ]
         try:
