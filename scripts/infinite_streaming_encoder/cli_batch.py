@@ -849,22 +849,36 @@ def _start_drain_thread(tel_url: str | None, state_url: str | None,
         return None
     stop = threading.Event()
 
-    def _loop() -> None:
+    # ONE THREAD PER QUEUE, not one thread draining both in sequence.
+    #
+    # Draining them in turn made a cycle as long as the sum of their budgets:
+    # 8s for state, 8s for telemetry, plus the idle wait. An event landing just
+    # after its queue was read then waited a whole cycle, or two if unlucky.
+    #
+    # Measured, and unmistakable in the log: the eight worst-lagged chunks of a
+    # run were all delivered at 19:55:34, within 0.2s of each other, carrying
+    # lags of 32-35s. Arriving in one clump means the consumer was stalled and
+    # caught up in a single pass — not that EventBridge was slow, which it was
+    # not (0.6s median, verified in #188 step 0).
+    #
+    # Each queue now has its own thread, so neither waits on the other and a
+    # cycle is about a second. The two drains touch shared state only through
+    # _emit_stage and log_state; _emit_stage is the ordering chokepoint and is
+    # already the arbiter between racing sources, so concurrency here is the
+    # case it was built for rather than a new hazard.
+    def _loop(fn, url, name) -> None:
         while not stop.is_set():
-            # BOTH channels on this thread. State events were originally drained
-            # from the poll loop instead, and the per-event lag logging showed
-            # what that cost: +2.9s to +7.3s against the 0.6s EventBridge
-            # actually delivers in. The events were never slow; they were sitting
-            # in the queue waiting for the next poll cycle.
-            for fn, url in ((_drain_state, state_url),
-                            (_drain_telemetry, tel_url)):
-                try:
-                    fn(url, log_state)
-                except Exception:  # noqa: BLE001 — never let a drain kill the run
-                    pass
+            try:
+                fn(url, log_state)
+            except Exception:  # noqa: BLE001 — never let a drain kill the run
+                pass
             stop.wait(_TELEMETRY_DRAIN_IDLE_S)
 
-    threading.Thread(target=_loop, daemon=True, name="telemetry-drain").start()
+    for fn, url, name in ((_drain_state, state_url, "state-drain"),
+                          (_drain_telemetry, tel_url, "telemetry-drain")):
+        if url:
+            threading.Thread(target=_loop, args=(fn, url, name),
+                             daemon=True, name=name).start()
     return stop
 
 
