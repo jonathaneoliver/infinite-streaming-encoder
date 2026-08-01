@@ -25,9 +25,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
     from infinite_streaming_encoder import cli_batch  # noqa: E402
-except Exception as e:  # pragma: no cover — boto3 absent
-    print(f"test_stage_state: skipped ({type(e).__name__}: {e})")
-    raise SystemExit(0)
+except ModuleNotFoundError as e:  # pragma: no cover — a dependency is absent
+    # ONLY a missing dependency is a skip. This used to catch Exception, which
+    # meant a module that could not import at all reported as a PASS — and it
+    # did exactly that, hiding a NameError that would have stopped the
+    # orchestrator from starting. A broken module must fail loudly.
+    if "boto3" in str(e) or "botocore" in str(e):
+        print(f"test_stage_state: skipped (dependency absent: {e})")
+        raise SystemExit(0)
+    raise
 
 
 def emit(key, status, percent=0.0):
@@ -107,6 +113,39 @@ def test_state_survives_across_emitters():
     # as if from _drain_telemetry, a stale worker marker arriving later
     ok, _ = emit("encode:h264:396p:chunk2", "running", 18.4)
     assert not ok, "a done from one emitter was invisible to another"
+
+
+def test_state_channel_names_fit_the_tighter_limit():
+    """Both names are built from ONE core sized to the EventBridge limit (64),
+    which is tighter than SQS's 80 — so they can never drift apart."""
+    longest = "j" * 60 + "-abc123"
+    rule, queue = cli_batch._state_names(longest)
+    assert rule == queue, "rule and queue names diverged"
+    assert len(rule) <= cli_batch._EB_RULE_NAME_MAX, f"{len(rule)} chars: {rule}"
+    # two executions of the SAME job differ only in the trailing suffix
+    a, _ = cli_batch._state_names("j" * 60 + "-aaaaaa")
+    b, _ = cli_batch._state_names("j" * 60 + "-bbbbbb")
+    assert a != b, "trimming collapsed two executions onto one rule"
+
+
+def test_every_batch_status_maps_to_a_stage_status():
+    """A status with no mapping is silently ignored by the drain, which would
+    show as cells that never leave queued. Pin the full set Batch emits."""
+    for st in ("SUBMITTED", "RUNNABLE", "STARTING", "RUNNING", "SUCCEEDED", "FAILED"):
+        assert st in cli_batch._EVENT_STAGE_STATUS, f"{st} has no stage mapping"
+    m = cli_batch._EVENT_STAGE_STATUS
+    assert m["RUNNABLE"] == "queued" and m["STARTING"] == "starting"
+    assert m["RUNNING"] == "running" and m["SUCCEEDED"] == "done"
+
+
+def test_events_cannot_walk_a_chunk_back_either():
+    """EventBridge is at-least-once AND unordered, so the event path needs the
+    same guard as every other channel — not a weaker one."""
+    reset()
+    emit("encode:h264:1440p:chunk3", "done", 100.0)
+    # a RUNNING event redelivered after the SUCCEEDED one
+    ok, _ = emit("encode:h264:1440p:chunk3", "running", 0.0)
+    assert not ok, "an out-of-order Batch event un-finished a chunk"
 
 
 def main() -> int:

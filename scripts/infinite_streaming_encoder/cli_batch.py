@@ -28,7 +28,8 @@ from pathlib import Path
 
 # Taxonomy only — cli_batch is the queue's CONSUMER and must never emit through
 # telemetry, or it would republish what it just drained.
-from infinite_streaming_encoder.telemetry import is_gauge, is_marker, queue_name
+from infinite_streaming_encoder.telemetry import (
+    is_gauge, is_marker, queue_name, trim_execution_name)
 
 try:
     import boto3
@@ -71,6 +72,10 @@ def _ecs():
 
 def _sqs():
     return boto3.client("sqs", region_name=_region())
+
+
+def _events():
+    return boto3.client("events", region_name=_region())
 
 
 # containerInstanceArn -> EC2 instance-id, resolved once per instance. The ARN
@@ -152,6 +157,24 @@ def _short_label(jobname: str) -> str:
     return {"mezz": "mezzanine", "audio": "audio", "pkg": "package",
             "hls": "hls", "br": "fragments", "concat": "concat",
             }.get(jobname.split("-", 1)[0], jobname.split("-", 1)[0])
+
+
+def _tag_host_from_arn(jobname: str, ci_arn: str, log_state: dict) -> None:
+    """Colour a job's stage keys from an arn we were HANDED rather than looked up.
+
+    The event carries containerInstanceArn from STARTING onward, so this replaces
+    the describe_jobs behind _tag_hosts_for_jobs for the event path. Same dedupe
+    key, so the two paths cannot double-announce. Only the ARN -> EC2 id lookup
+    remains, and that is cached per ARN.
+    """
+    inst = _ec2_for_container_instance(ci_arn)
+    if not inst:
+        return
+    for key in _host_stage_keys(jobname):
+        seen_key = "_host:" + key
+        if log_state.get(seen_key) != inst:
+            log_state[seen_key] = inst
+            _emit_host(key, inst)
 
 
 def _tag_hosts_for_jobs(described_jobs: list, log_state: dict) -> None:
@@ -425,6 +448,10 @@ _TELEMETRY_GAUGE_MAX_AGE_S = 30.0
 # worker's first marker lands within seconds of its container starting, so this
 # only trips on a real misconfiguration.
 _TELEMETRY_SILENT_GIVEUP_S = 120
+# How often the Batch census still runs when events ARE flowing. Long, because
+# it exists only to catch a transition EventBridge failed to deliver; short
+# enough that such a gap closes well inside a run.
+_CENSUS_BACKSTOP_S = 60.0
 
 
 def _create_telemetry_queue(exec_name: str) -> str | None:
@@ -474,7 +501,31 @@ def _delete_telemetry_queue(url: str | None) -> None:
         pass
 
 
-def _gc_telemetry_queues() -> None:
+def _active_execution_cores(sm_arn: str) -> set:
+    """Trimmed name cores of executions that are RUNNING right now.
+
+    The keep-list for both sweeps. Derived from the same trim the resources were
+    named with, so a match is exact rather than a prefix guess. On failure this
+    returns an empty set — which makes the sweep MORE aggressive, so callers
+    must keep their other bounds rather than rely on this alone.
+    """
+    if not sm_arn:
+        return set()
+    try:
+        paginator = _sfn().get_paginator("list_executions")
+        cores = set()
+        for page in paginator.paginate(stateMachineArn=sm_arn,
+                                       statusFilter="RUNNING"):
+            for e in page.get("executions", []):
+                cores.add(trim_execution_name(
+                    e["name"], _EB_RULE_NAME_MAX - len(_STATE_PREFIX)))
+                cores.add(queue_name(e["name"]).rsplit("/", 1)[-1])
+        return cores
+    except Exception:  # noqa: BLE001 — best-effort; see the docstring
+        return set()
+
+
+def _gc_telemetry_queues(sm_arn: str = "") -> None:
     """Delete telemetry queues left behind by runs that never finished cleanly.
 
     A driver killed mid-run (the server restarting kills the cli_batch
@@ -485,14 +536,28 @@ def _gc_telemetry_queues() -> None:
     retention window, are removed — so a live run's queue can never be deleted
     out from under it, even if this races one.
     """
+    keep = _active_execution_cores(sm_arn)
     try:
         sqs = _sqs()
-        names = sqs.list_queues(QueueNamePrefix="encoder-telemetry-",
-                                MaxResults=1000).get("QueueUrls") or []
+        names = []
+        # BOTH channels: telemetry (worker -> control plane) and Batch state
+        # (EventBridge -> control plane). Same lifetime, same failure mode — a
+        # killed driver never runs its own delete — so one sweep covers both.
+        for prefix in ("encoder-telemetry-", _STATE_PREFIX):
+            names += sqs.list_queues(QueueNamePrefix=prefix,
+                                     MaxResults=1000).get("QueueUrls") or []
     except Exception:  # noqa: BLE001 — housekeeping is best-effort
         return
     now = time.time()
     for url in names:
+        # KEEP-LIST FIRST. "Empty and old" is no longer sufficient evidence that
+        # a queue is abandoned: the drain thread now holds a healthy queue at
+        # zero messages, so a run lasting longer than the retention window would
+        # look exactly like an orphan and be deleted out from under itself.
+        # Same lesson as the MinIO staging GC, which passes ActiveDistPrefixes
+        # for precisely this reason.
+        if any(c and c in url for c in keep):
+            continue
         try:
             a = sqs.get_queue_attributes(
                 QueueUrl=url,
@@ -506,6 +571,36 @@ def _gc_telemetry_queues() -> None:
             if empty and age > float(_TELEMETRY_RETENTION_S):
                 sqs.delete_queue(QueueUrl=url)
         except Exception:  # noqa: BLE001 — one bad queue must not stop the sweep
+            continue
+    _gc_state_rules(sm_arn)
+
+
+def _gc_state_rules(sm_arn: str = "") -> None:
+    """Delete EventBridge rules left behind by killed drivers.
+
+    Separate from the queue sweep because a rule is invisible to SQS listing —
+    deleting only the queue would leave the rule matching events forever, with
+    nowhere to deliver them. A rule with no targets is by definition orphaned:
+    _create_state_channel always attaches one, and _delete_state_channel removes
+    targets before the rule, so a target-less rule is either mid-teardown or
+    abandoned. Either way it is safe to remove.
+    """
+    try:
+        events = _events()
+        rules = events.list_rules(NamePrefix=_STATE_PREFIX,
+                                  Limit=100).get("Rules") or []
+    except Exception:  # noqa: BLE001 — best-effort
+        return
+    keep = _active_execution_cores(sm_arn)
+    for r in rules:
+        name = r.get("Name")
+        if not name or any(c and c in name for c in keep):
+            continue
+        try:
+            if events.list_targets_by_rule(Rule=name).get("Targets"):
+                continue  # live, or a run we must not disturb
+            events.delete_rule(Name=name)
+        except Exception:  # noqa: BLE001 — one bad rule must not stop the sweep
             continue
 
 
@@ -722,6 +817,216 @@ def _queue_depth(sqs, url: str) -> int:
         return 0
 
 
+# ---------------------------------------------------------------------------
+# Batch state, event-driven (#188 step 1)
+#
+# Stage state used to be POLLED from three places at once — Batch job status,
+# Step Functions history, and the worker's own markers — which observe the same
+# run through channels with different latencies and so disagree about the
+# present tense. That skew is what produced the reversals the _emit_stage
+# chokepoint now has to defend against.
+#
+# EventBridge emits a Batch Job State Change event at each transition. Verified
+# on this account against a live 336-chunk run before this was built:
+#
+#   jobName                        present on 100% of events, all statuses
+#   container.containerInstanceArn present on 100% of STARTING/RUNNING/SUCCEEDED
+#   container.logStreamName        present on 100% of those
+#   attempts, exitCode, stoppedAt  present on 100% of SUCCEEDED (n=122)
+#   latency vs the job's stoppedAt min 0.3s, median 0.6s, max 5.5s
+#
+# The STARTING result specifically contradicts what polling showed: a
+# describe_jobs poll catches placement as a race and often has no instance arn,
+# while the EVENT is emitted with placement already recorded. Host colouring
+# therefore needs no lookup at all.
+#
+# A STANDARD queue, deliberately not FIFO: EventBridge's own delivery is
+# unordered, so FIFO would only preserve the order EventBridge happened to
+# enqueue in — an ordering guarantee over already-shuffled input. Ordering is
+# handled where it belongs, in _emit_stage.
+# ---------------------------------------------------------------------------
+
+_STATE_PREFIX = "encoder-state-"
+# An EventBridge rule name is capped at 64 characters, tighter than SQS's 80.
+# Both names are built from ONE trimmed core so they cannot drift apart.
+_EB_RULE_NAME_MAX = 64
+
+
+def _state_names(exec_name: str) -> tuple[str, str]:
+    """(rule_name, queue_name) for one execution. Single definition of both."""
+    core = trim_execution_name(exec_name, _EB_RULE_NAME_MAX - len(_STATE_PREFIX))
+    return _STATE_PREFIX + core, _STATE_PREFIX + core
+
+
+def _create_state_channel(exec_name: str) -> str | None:
+    """Create this execution's EventBridge rule + queue. Returns the queue URL.
+
+    Scoped by a jobName SUFFIX pattern, so the rule matches only this
+    execution's jobs — verified with test-event-pattern, including a negative
+    control against another execution's name. That scoping is what keeps
+    concurrent runs from having to filter each other's events out.
+
+    Best-effort: on any failure the caller keeps polling, exactly as before.
+    """
+    rule, queue = _state_names(exec_name)
+    try:
+        sqs, events = _sqs(), _events()
+        url = sqs.create_queue(
+            QueueName=queue,
+            Attributes={"MessageRetentionPeriod": _TELEMETRY_RETENTION_S,
+                        "VisibilityTimeout": _TELEMETRY_VISIBILITY_S,
+                        "ReceiveMessageWaitTimeSeconds": "1"},
+        )["QueueUrl"]
+        qarn = sqs.get_queue_attributes(
+            QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        rarn = events.put_rule(
+            Name=rule,
+            EventPattern=json.dumps({
+                "source": ["aws.batch"],
+                "detail-type": ["Batch Job State Change"],
+                "detail": {"jobName": [{"suffix": exec_name}]},
+            }),
+        )["RuleArn"]
+        # EventBridge can only deliver if the queue lets it, scoped to THIS rule.
+        sqs.set_queue_attributes(QueueUrl=url, Attributes={"Policy": json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Service": "events.amazonaws.com"},
+                "Action": "sqs:SendMessage",
+                "Resource": qarn,
+                "Condition": {"ArnEquals": {"aws:SourceArn": rarn}},
+            }],
+        })})
+        events.put_targets(Rule=rule, Targets=[{"Id": "1", "Arn": qarn}])
+        return url
+    except Exception as e:  # noqa: BLE001 — degrade to polling, never fail a run
+        print(f"!!! Batch state events unavailable ({type(e).__name__}: {e}); "
+              f"falling back to polling job status", file=sys.stderr, flush=True)
+        return None
+
+
+def _delete_state_channel(exec_name: str, url: str | None) -> None:
+    """Tear down rule + targets + queue. Targets must go before the rule."""
+    rule, _ = _state_names(exec_name)
+    try:
+        _events().remove_targets(Rule=rule, Ids=["1"])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _events().delete_rule(Name=rule)
+    except Exception:  # noqa: BLE001
+        pass
+    if url:
+        try:
+            _sqs().delete_queue(QueueUrl=url)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _event_epoch(body: dict, detail: dict) -> float:
+    """When the TRANSITION happened, in epoch seconds, or 0 if unknown.
+
+    Prefers the job's own stoppedAt/startedAt over the envelope `time`, because
+    those are Batch's record of the transition itself rather than when
+    EventBridge got round to describing it.
+    """
+    for k in ("stoppedAt", "startedAt"):
+        v = detail.get(k)
+        if isinstance(v, (int, float)) and v:
+            return v / 1000.0
+    t = body.get("time")
+    if isinstance(t, str) and t:
+        try:
+            from datetime import datetime
+            return datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").timestamp() - \
+                time.timezone
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _log_state_event(body: dict, detail: dict, st: str, key: str,
+                     applied: bool) -> None:
+    """One line per Batch state event, with WALL CLOCK time and the delivery lag.
+
+    Every event, including the ones suppressed as stale — a suppressed event is
+    precisely what you want to see when a cell looks wrong, and omitting them
+    would hide the evidence. ~1,300 lines on a 336-chunk run, written to the
+    per-job log on disk, so a timing question can be answered after the fact
+    instead of by reproducing it.
+
+    `lag` is delivery latency: now, minus when Batch says the transition
+    happened. That is the number that tells you whether a late-looking cell is
+    the channel or the encoder.
+    """
+    when = _event_epoch(body, detail)
+    now = time.time()
+    lag = f"{now - when:+.1f}s" if when else "  n/a"
+    wall = time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now % 1 * 1000):03d}"
+    host = (detail.get("container") or {}).get("containerInstanceArn") or ""
+    print(f"[state] {wall} lag={lag:>7} {st:<8} "
+          f"{'' if applied else 'SUPPRESSED '}{key}"
+          f"{' host=' + host.rsplit('/', 1)[-1][:12] if host else ''}",
+          flush=True)
+
+
+def _drain_state(url: str | None, log_state: dict) -> int:
+    """Apply queued Batch state transitions. Returns how many were applied.
+
+    Replaces the per-poll `list_jobs` census for the common case. Every
+    transition goes through _emit_stage, which is what makes an out-of-order
+    delivery harmless — EventBridge is at-least-once and unordered, so this
+    channel needs the same guard as every other one, not a weaker one.
+    """
+    if not url:
+        return 0
+    sqs = _sqs()
+    applied = 0
+    hosts: list = []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < _TELEMETRY_DRAIN_BUDGET_S:
+        try:
+            resp = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10,
+                                       WaitTimeSeconds=1 if not applied else 0)
+        except ClientError:
+            break
+        msgs = resp.get("Messages") or []
+        if not msgs:
+            break
+        try:
+            sqs.delete_message_batch(
+                QueueUrl=url,
+                Entries=[{"Id": str(n), "ReceiptHandle": m["ReceiptHandle"]}
+                         for n, m in enumerate(msgs)])
+        except ClientError:
+            pass  # redelivery is harmless: _emit_stage suppresses the repeat
+        for m in msgs:
+            try:
+                body = json.loads(m.get("Body") or "{}")
+                d = body.get("detail") or {}
+            except ValueError:
+                continue
+            key = _stage_key_for_job(d.get("jobName", ""))
+            st = _EVENT_STAGE_STATUS.get(d.get("status", ""))
+            if not key or not st:
+                continue
+            ok = _emit_stage(key, st, 100.0 if st == "done" else 0.0)
+            applied += 1 if ok else 0
+            _log_state_event(body, d, st, key, ok)
+            # The instance is IN the event from STARTING onward, so a chunk is
+            # coloured by the same message that says it started — no
+            # describe_jobs, and no window where a running cell is uncoloured.
+            arn = (d.get("container") or {}).get("containerInstanceArn")
+            if arn and st in ("starting", "running", "done"):
+                hosts.append((d.get("jobName", ""), arn))
+    for jobname, arn in hosts:
+        _tag_host_from_arn(jobname, arn, log_state)
+    if applied:
+        log_state["_state_applied"] = log_state.get("_state_applied", 0) + applied
+    return applied
+
+
 def _stage_key_for_job(jobname: str) -> str | None:
     """`encode:` stage key for a variant Batch job, or None if it isn't one.
 
@@ -758,6 +1063,14 @@ _BATCH_STAGE_STATUS = {
 # Stage statuses that must never be walked back: once a chunk is finished, a
 # later poll seeing a stale RUNNING (or a retry attempt) must not un-finish it.
 _TERMINAL_STAGE = {"done", "failed"}
+
+# Batch job status -> stage status for the EVENT path, derived from the mapping
+# the poll already used so the grid renders identically whichever channel
+# delivered the transition. Defined HERE, after its base: it was originally
+# placed next to the event code above, which made cli_batch raise NameError on
+# import — the orchestrator would not have started at all.
+_EVENT_STAGE_STATUS = dict(_BATCH_STAGE_STATUS, RUNNABLE="queued",
+                           SUBMITTED="queued")
 
 
 def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
@@ -1285,7 +1598,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # Sweep queues stranded by earlier runs that were killed mid-flight. Done at
     # submit rather than on a timer: it is the one moment we are already talking
     # to SQS and are not on the latency-sensitive poll path.
-    _gc_telemetry_queues()
+    _gc_telemetry_queues(args.state_machine_arn)
     resp = sfn.start_execution(**kwargs)
     print(resp["executionArn"], flush=True)
     return 0
@@ -1671,6 +1984,8 @@ def cmd_poll(args: argparse.Namespace) -> int:
     # _start_telemetry_drain for why the coupling mattered.
     tel_stop = _start_telemetry_drain(tel_url, log_state)
     tel_silent_s = 0
+    state_url = _create_state_channel(exec_name)
+    last_census = 0.0
 
     print(f">>> Polling execution {args.execution_arn}", flush=True)
     elapsed = 0
@@ -1712,10 +2027,27 @@ def cmd_poll(args: argparse.Namespace) -> int:
         # complete continuously, so most polls had streams to drain and the grid
         # sat 35-73 completions behind Batch (#187) — showing holes for work that
         # had already finished.
+        # Batch state transitions, event-driven. Runs BEFORE the census so the
+        # census sees state the events have already applied and stays quiet.
         try:
-            _sync_stages_from_batch(exec_name, log_state)
+            _drain_state(state_url, log_state)
         except Exception:  # noqa: BLE001 — never break polling over the grid
             pass
+        # The census is now a BACKSTOP, not the primary path. EventBridge is
+        # at-least-once but not guaranteed-delivery, so a periodic full scan
+        # still catches a transition that never arrived. Rate-limited because it
+        # is the expensive call this issue set out to remove — every poll was
+        # ~0.8s of list_jobs to re-derive state the events already delivered.
+        #
+        # When events are NOT available it falls back to every poll, which is
+        # exactly the old behaviour.
+        census_gap = _CENSUS_BACKSTOP_S if state_url else 0
+        if time.monotonic() - last_census >= census_gap:
+            last_census = time.monotonic()
+            try:
+                _sync_stages_from_batch(exec_name, log_state)
+            except Exception:  # noqa: BLE001 — never break polling over the grid
+                pass
         # If the queue exists but has produced NOTHING while containers are
         # demonstrably running, the workers are not publishing (missing IAM, an
         # image predating the sink, a queue-name mismatch). Say so and put the
@@ -1771,6 +2103,12 @@ def cmd_poll(args: argparse.Namespace) -> int:
                 pass
             _delete_telemetry_queue(tel_url)
             tel_url = None
+            try:
+                _drain_state(state_url, log_state)   # last transitions
+            except Exception:  # noqa: BLE001
+                pass
+            _delete_state_channel(exec_name, state_url)
+            state_url = None
             if status == "SUCCEEDED":
                 # Safety net: the packaging sub-stages come from live tailing;
                 # if the last tail poll missed a "done" marker, force them
@@ -1799,6 +2137,7 @@ def cmd_poll(args: argparse.Namespace) -> int:
     if tel_stop is not None:
         tel_stop.set()
     _delete_telemetry_queue(tel_url)
+    _delete_state_channel(exec_name, state_url)
     print("!!! poll timed out", file=sys.stderr)
     return 3
 

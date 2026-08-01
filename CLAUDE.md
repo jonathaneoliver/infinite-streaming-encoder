@@ -179,6 +179,37 @@ of `cli_batch`'s drop decisions, which each used to carry their own literal list
 marker and every consumer forwards it already. Getting it wrong that way costs
 bandwidth; getting it wrong the other way is #141.
 
+### Batch state, event-driven (cloud)
+
+Chunk state comes from **EventBridge → a per-execution SQS queue**, not from
+polling. The orchestrator creates the rule + queue at submit (scoped by a
+`jobName` suffix pattern so it matches only its own execution), drains it each
+poll, and deletes both at the end; `_gc_telemetry_queues` sweeps orphans.
+
+Verified on this account before it was built — `jobName` on every event,
+`containerInstanceArn` and `logStreamName` on 100% of STARTING/RUNNING/SUCCEEDED,
+`attempts`/`exitCode`/`stoppedAt` on 100% of SUCCEEDED, delivery median 0.6s. The
+STARTING result matters: a `describe_jobs` poll races placement and often has no
+instance arn, so host colouring needed a later backfill; the event carries it, so
+a chunk is coloured by the same message that says it started.
+
+`_sync_stages_from_batch` remains as a **backstop** on `_CENSUS_BACKSTOP_S`
+(60s), because EventBridge is at-least-once, not guaranteed-delivery. With no
+event channel it reverts to every poll — the old behaviour.
+
+**Every state event is logged** with wall-clock time and delivery lag
+(`[state] 13:24:51.123 lag=+0.6s running encode:h264:1080p:chunk7`), including
+suppressed ones, so a timing question is answered from the job log rather than
+by reproducing it.
+
+**All stage emission goes through `_emit_stage`.** Three sources announce state
+(SFN history, the Batch census, worker markers) through channels with different
+latencies, so they disagree about the present tense. The chokepoint refuses to
+announce anything but `done` over an existing `done`. `failed` is deliberately
+not final — the state machine's Retry resubmits a new Batch job, so
+`failed → running` is real. Guarding at call sites was tried twice and failed
+twice: each time a different source was still speaking unguarded.
+
 **`internal/api/handlers.go`** — the HTTP surface. Routes defined in `NewServer`:
 - JSON API: `GET /api/sources`, `GET/POST` under `/api/encode`, `/api/jobs`, `/api/jobs/{id}/logs`, `/api/outputs`, `/api/outputs/{name}`, `/api/outputs/{name}/playlists`, `/api/outputs/{name}/logs`.
 - SSE: `GET /api/jobs/stream` — emits the full current job list immediately, then streams updates from `Manager.Subscribe()`.

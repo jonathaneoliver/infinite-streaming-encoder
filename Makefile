@@ -131,6 +131,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build, to
 	if ! command -v ruff >/dev/null 2>&1; then echo "skipped (pip install ruff)"; \
 	elif out=$$(ruff check --select F821 scripts/ 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py imports     '; \
+	if out=$$(cd scripts && python3 -c 'import infinite_streaming_encoder.cli_batch, infinite_streaming_encoder.cli_local, infinite_streaming_encoder.cli_phase, infinite_streaming_encoder.telemetry, infinite_streaming_encoder.progress' 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py telemetry   '; \
 	if out=$$(python3 scripts/test_telemetry.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \

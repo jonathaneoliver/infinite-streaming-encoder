@@ -85,9 +85,23 @@ def queue_name(execution_name: str) -> str:
     the tail instead would let two executions of the same job share a queue.
     """
     room = _SQS_NAME_MAX - len(_QUEUE_PREFIX) - len(_QUEUE_SUFFIX)
-    if len(execution_name) > room:
-        execution_name = execution_name[:room - 7] + execution_name[-7:]
-    return _QUEUE_PREFIX + execution_name + _QUEUE_SUFFIX
+    return _QUEUE_PREFIX + trim_execution_name(execution_name, room) + _QUEUE_SUFFIX
+
+
+def trim_execution_name(execution_name: str, room: int) -> str:
+    """Fit an execution name into `room` characters without losing uniqueness.
+
+    Shared because more than one AWS resource is named after an execution and
+    they have DIFFERENT length limits — SQS allows 80 characters, an EventBridge
+    rule only 64 — so the trim cannot live inside any one of them.
+
+    The READABLE HEAD gives way; the trailing 6-hex suffix is preserved, because
+    that suffix is the only thing distinguishing two executions of the same job.
+    Trimming the tail instead would silently collapse them onto one resource.
+    """
+    if len(execution_name) <= room:
+        return execution_name
+    return execution_name[:room - 7] + execution_name[-7:]
 
 # How many markers may be PACKED into one message, and how long the oldest may
 # wait for company. Only heartbeats ever wait — events flush on arrival (see
