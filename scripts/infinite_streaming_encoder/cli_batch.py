@@ -70,6 +70,10 @@ def _ecs():
     return boto3.client("ecs", region_name=_region())
 
 
+def _ec2():
+    return boto3.client("ec2", region_name=_region())
+
+
 def _sqs():
     return boto3.client("sqs", region_name=_region())
 
@@ -2181,6 +2185,110 @@ def _collect_exec_jobs(exec_name: str) -> list:
     return jobs
 
 
+def _emit_machine_rental(exec_name: str, jobs: list) -> None:
+    """Report what was RENTED, against what was allocated (#195).
+
+    ENCODER-COST sums each JOB's reserved vCPU x its duration. AWS bills for
+    instance lifetime, and everything between the two is invisible to a
+    job-derived figure because no job is running during any of it: EC2 boot, ECS
+    registration, image pull, idle before the first chunk lands, and the idle
+    tail before Batch scales the instance down.
+
+    Both numbers are printed side by side so the gap is the headline rather than
+    something to be inferred.
+
+    Honest about what it cannot know, rather than quietly wrong:
+      * an instance shared with a CONCURRENT run has its idle attributed here in
+        full, because this execution cannot see the other one's jobs. Marked (*).
+      * an instance still alive when the run ends has no termination time, so its
+        lifetime is measured to now and marked (~) — it will grow after we look.
+    """
+    by_inst: dict = {}
+    for job in jobs:
+        arn = (job.get("container") or {}).get("containerInstanceArn")
+        st, sp = job.get("startedAt"), job.get("stoppedAt")
+        if not arn or not isinstance(st, (int, float)) or not isinstance(sp, (int, float)):
+            continue
+        iid = _ec2_for_container_instance(arn)
+        if not iid or not iid.startswith("i-"):
+            continue
+        a = by_inst.setdefault(iid, {"first": st, "last": sp, "vcpu_s": 0.0, "n": 0})
+        a["first"] = min(a["first"], st)
+        a["last"] = max(a["last"], sp)
+        a["vcpu_s"] += _job_vcpu(job) * (sp - st) / 1000.0
+        a["n"] += 1
+    if not by_inst:
+        return
+    try:
+        from infinite_streaming_encoder.cloud.inventory import _vcpus_for_type
+        ec2 = _ec2()
+        desc = ec2.describe_instances(InstanceIds=list(by_inst))
+    except Exception:  # noqa: BLE001 — reporting is best-effort
+        return
+    import datetime
+    now = time.time()
+    rows = []
+    for r in desc.get("Reservations", []):
+        for i in r.get("Instances", []):
+            iid = i["InstanceId"]
+            a = by_inst.get(iid)
+            if not a:
+                continue
+            launch = i.get("LaunchTime")
+            launch = launch.timestamp() if hasattr(launch, "timestamp") else None
+            if launch is None:
+                continue
+            # A terminated instance carries its end time inside the human-readable
+            # reason string; there is no structured field for it.
+            end, alive = None, i.get("State", {}).get("Name") not in ("terminated", "shutting-down")
+            tr = i.get("StateTransitionReason", "")
+            if "(" in tr and ")" in tr:
+                try:
+                    end = datetime.datetime.strptime(
+                        tr[tr.index("(") + 1:tr.index(")")],
+                        "%Y-%m-%d %H:%M:%S %Z").replace(
+                        tzinfo=datetime.timezone.utc).timestamp()
+                except ValueError:
+                    end = None
+            if end is None:
+                end, alive = now, True
+            rows.append({
+                "id": iid, "type": i.get("InstanceType", "?"),
+                "vcpu": _vcpus_for_type(i.get("InstanceType")),
+                "life": end - launch,
+                "before": max(0.0, a["first"] / 1000.0 - launch),
+                "after": max(0.0, end - a["last"] / 1000.0),
+                "busy": max(0.0, (a["last"] - a["first"]) / 1000.0),
+                "vcpu_s": a["vcpu_s"], "n": a["n"], "alive": alive,
+            })
+    if not rows:
+        return
+    rows.sort(key=lambda r: -r["life"])
+    machine_vcpu_s = sum(r["life"] * r["vcpu"] for r in rows)
+    alloc_vcpu_s = sum(r["vcpu_s"] for r in rows)
+    _narrate("")
+    _narrate("machine rental — what was rented, vs what jobs allocated")
+    _narrate(f"  {'instance':<21}{'type':<13}{'vCPU':>5}{'life':>8}"
+             f"{'idle pre':>10}{'idle post':>11}{'busy%':>7}  chunks")
+    for r in rows:
+        pct = (r["busy"] / r["life"] * 100.0) if r["life"] else 0.0
+        flag = "~" if r["alive"] else " "
+        _narrate(f"  {r['id']:<21}{r['type']:<13}{r['vcpu']:>5}"
+                 f"{r['life']:>7.0f}s{r['before']:>9.0f}s{r['after']:>10.0f}s"
+                 f"{pct:>6.0f}%{flag} {r['n']}")
+    waste = machine_vcpu_s - alloc_vcpu_s
+    pct = (waste / machine_vcpu_s * 100.0) if machine_vcpu_s else 0.0
+    _narrate(f"  machine vCPU-hours {machine_vcpu_s / 3600:.2f}  vs allocated "
+             f"{alloc_vcpu_s / 3600:.2f}  -> {pct:.0f}% paid for and not allocated")
+    _narrate("  (~ still running, so its lifetime is measured to now and will grow;"
+             " an instance shared with a concurrent run has that run's time counted"
+             " as idle here)")
+    print(f"[[ENCODER-MACHINES exec={exec_name} instances={len(rows)} "
+          f"machine_vcpu_h={machine_vcpu_s / 3600:.3f} "
+          f"allocated_vcpu_h={alloc_vcpu_s / 3600:.3f} "
+          f"unallocated_pct={pct:.1f}]]", flush=True)
+
+
 def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
     """At job end, sum the execution's Batch compute and emit two markers the
     control plane consumes: ENCODER-COST (spot-vs-on-demand savings, accumulated
@@ -2224,6 +2332,10 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
     print(f"[[ENCODER-STATS exec={exec_name} wall_s={wall_s:.1f} vcpu_h={vh:.3f} "
           f"longest_s={longest_s:.1f} slowest={slowest or '-'} jobs={n} "
           f"max_vcpus={max_vcpus}]]", flush=True)
+    try:
+        _emit_machine_rental(exec_name, jobs)
+    except Exception:  # noqa: BLE001 — never fail a finished run over reporting
+        pass
     conc = (vcpu_s / wall_s) if wall_s else 0.0
     eff = (conc / max_vcpus * 100.0) if max_vcpus else 0.0
     _narrate(f"💰 saved ${saved:.2f} using spot — {vh:.1f} vCPU-hr "
