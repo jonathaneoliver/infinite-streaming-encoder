@@ -1484,6 +1484,15 @@ def _emit_plan(variants: "list | None" = None,
 # "entered" event surface — re-announcing a finished chunk as queued, which is a
 # filled cell going blank.
 _STAGE_STATE: dict[str, str] = {}
+# _emit_stage does a read-modify-write — read the previous status, decide, then
+# store — and that is NOT atomic just because dict operations are.
+#
+# It became reachable from two threads the moment each queue got its own drain.
+# Without this lock, two drains can both read the same `prev`, both pass the
+# guard, and both write: the later writer wins regardless of order, which walks
+# a cell backwards. That is the exact defect the guard exists to prevent, so
+# leaving it unsynchronised would defeat it in precisely the case it matters.
+_STAGE_LOCK = threading.Lock()
 # Last percent announced per key. Only the WORKER knows progress: a Batch event
 # and the census both carry status and nothing else, so they pass percent=None
 # and this supplies the last real value rather than asserting a zero.
@@ -1541,6 +1550,13 @@ def _emit_stage(key: str, status: str, percent: float | None = 0.0,
     and reversals continued, because _translate_events was marking chunks done
     from SFN history through a channel the check could not see.
     """
+    with _STAGE_LOCK:
+        return _emit_stage_locked(key, status, percent, src)
+
+
+def _emit_stage_locked(key: str, status: str, percent: float | None,
+                       src: str) -> bool:
+    """The body of _emit_stage. Callers must hold _STAGE_LOCK."""
     prev = _STAGE_STATE.get(key)
     if prev in _FINAL_STAGE and status not in _FINAL_STAGE:
         return False
