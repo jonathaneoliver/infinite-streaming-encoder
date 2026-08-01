@@ -2690,6 +2690,7 @@ function updateJobRow(row, j) {
                 + `<span class="job-prog-pct">${p}%</span>`
                 + `<div class="job-prog-bar"><div style="width:${p}%"></div></div>`
                 + (sub ? `<span class="job-prog-sub">${sub}</span>` : '')
+                + _unallocSpark(j)
                 + `</div>`;
             progEl.style.display = '';
         } else {
@@ -2921,23 +2922,51 @@ applyFleetCollapse('local');
 // a run is in flight.
 const _UNALLOC_SAMPLE_MS = 5000;
 const _UNALLOC_MAX = 240;          // 240 x 5s = 20 minutes, about one run
-window.__unalloc = window.__unalloc || { hist: [], last: 0 };
+// PER JOB, not fleet-wide: this sits beside that job's own % complete, and two
+// concurrent encodes each have their own backlog. Summing them would produce a
+// number that belongs to neither.
+window.__unalloc = window.__unalloc || { by: {}, last: 0 };
+
+function _unallocCount(j) {
+    let n = 0;
+    for (const s of (j.stages || [])) {
+        if (!String(s.key || '').startsWith('encode:')) continue;
+        if (s.status === 'pending' || s.status === 'queued') n++;
+    }
+    return n;
+}
+
+// The backlog sparkline that sits beside a job's own % complete.
+//
+// The percent says how much work is DONE; this says how much has not even been
+// given a machine yet. They answer different questions, and the second one is
+// what tells you whether a stalled-looking run is short of capacity rather than
+// slow — while this stays flat and high, the compute environment is at its vCPU
+// ceiling and no chunk can start however healthy the fleet looks.
+//
+// Hidden until it has two samples (nothing to draw) and once it reaches 0 and
+// stays there — a flat zero line is noise on a job that is simply finishing.
+function _unallocSpark(j) {
+    const h = ((window.__unalloc || {}).by || {})[j.id] || [];
+    if (h.length < 2) return '';
+    const cur = h[h.length - 1];
+    if (!cur && !h.some(v => v > 0)) return '';
+    return `<span class="job-prog-sub" title="Chunks submitted but not yet placed on a machine. Reaches 0 when every chunk has one; stays flat and high when Batch is at its vCPU ceiling.">`
+        + `${_sparkline(h, '#7fd1e0', { min: 0, w: 54, h: 13 })} `
+        + `<span style="color:#ccc">${cur}</span> unplaced</span>`;
+}
 
 function _sampleUnallocated(all) {
     const now = Date.now();
     if (now - window.__unalloc.last < _UNALLOC_SAMPLE_MS) return;
     window.__unalloc.last = now;
-    let n = 0;
+    const by = window.__unalloc.by;
     for (const j of all) {
         if (j.status !== 'running' && j.status !== 'queued') continue;
-        for (const s of (j.stages || [])) {
-            if (!String(s.key || '').startsWith('encode:')) continue;
-            if (s.status === 'pending' || s.status === 'queued') n++;
-        }
+        const h = (by[j.id] = by[j.id] || []);
+        h.push(_unallocCount(j));
+        if (h.length > _UNALLOC_MAX) h.shift();
     }
-    const h = window.__unalloc.hist;
-    h.push(n);
-    if (h.length > _UNALLOC_MAX) h.shift();
 }
 
 function renderJobs() {
@@ -3520,21 +3549,7 @@ function _sparkline(vals, color, opts) {
 
 function _fleetSparks(fleet) {
     const history = (fleet || {}).history;
-    // The unallocated series is client-side and starts filling immediately, so
-    // the row must be able to render before the server's fleet history has two
-    // samples — a fresh run is precisely when "how many chunks still have no
-    // machine" is the number being watched.
-    const unalloc = (window.__unalloc || {}).hist || [];
-    const unCell = unalloc.length >= 2
-        ? `<div style="font-size:11px;color:#888">chunks awaiting a machine<br>` +
-          `${_sparkline(unalloc, '#7fd1e0', { min: 0 })} ` +
-          `<span style="color:#ccc">${unalloc[unalloc.length - 1]}</span></div>`
-        : '';
-    if (!history || history.length < 2) {
-        return unCell
-            ? `<div style="display:flex;gap:26px;flex-wrap:wrap;margin:4px 0 14px">${unCell}</div>`
-            : '';
-    }
+    if (!history || history.length < 2) return '';
     const util = history.map(s => Math.round((s.util || 0) * 100));
     const used = history.map(s => s.used || 0);
     const jobs = history.map(s => (s.queued || 0) + (s.running || 0));
@@ -3564,7 +3579,6 @@ function _fleetSparks(fleet) {
       ${cwCpu}
       ${cwMem}
       ${cell('jobs queued+running', _sparkline(jobs, '#e0883a', { min: 0 }), jobs[jobs.length - 1])}
-      ${unCell}
       ${cell('$/hr', _sparkline(cost, '#6ab04c', { min: 0 }), '$' + (cost[cost.length - 1] || 0).toFixed(2))}
     </div>`;
 }
