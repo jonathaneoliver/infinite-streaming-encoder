@@ -1143,7 +1143,7 @@ def _drain_state(url: str | None, log_state: dict) -> int:
             st = _EVENT_STAGE_STATUS.get(d.get("status", ""))
             if not key or not st:
                 continue
-            ok = _emit_stage(key, st, 100.0 if st == "done" else 0.0)
+            ok = _emit_stage(key, st, 100.0 if st == "done" else None)
             applied += 1 if ok else 0
             _log_state_event(body, d, st, key, ok)
             # The instance is IN the event from STARTING onward, so a chunk is
@@ -1273,7 +1273,7 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
                 newly_announced.append(j["jobId"])
             was_known = key in _STAGE_STATE
             if _emit_stage(key, stage_status,
-                           100.0 if stage_status == "done" else 0.0,
+                           100.0 if stage_status == "done" else None,
                            src="census") and was_known:
                 repairs += 1
 
@@ -1454,6 +1454,10 @@ def _emit_plan(variants: "list | None" = None,
 # "entered" event surface — re-announcing a finished chunk as queued, which is a
 # filled cell going blank.
 _STAGE_STATE: dict[str, str] = {}
+# Last percent announced per key. Only the WORKER knows progress: a Batch event
+# and the census both carry status and nothing else, so they pass percent=None
+# and this supplies the last real value rather than asserting a zero.
+_STAGE_PCT: dict[str, float] = {}
 
 # `done` is the only status that may never be walked back. A SUCCEEDED Batch job
 # never re-runs, so anything arriving afterwards is stale by construction.
@@ -1464,7 +1468,7 @@ _STAGE_STATE: dict[str, str] = {}
 _FINAL_STAGE = {"done"}
 
 
-def _emit_stage(key: str, status: str, percent: float = 0.0,
+def _emit_stage(key: str, status: str, percent: float | None = 0.0,
                 src: str = "") -> bool:
     """Announce a stage transition. Returns False if it was suppressed as stale.
 
@@ -1476,7 +1480,23 @@ def _emit_stage(key: str, status: str, percent: float = 0.0,
     prev = _STAGE_STATE.get(key)
     if prev in _FINAL_STAGE and status not in _FINAL_STAGE:
         return False
+    # percent=None means "I do not know" — carry the last known value forward.
+    #
+    # Batch events and the census know STATUS and nothing else. They used to
+    # pass 0.0, which is not ignorance but a claim, and it clobbered the live
+    # percent the worker had already reported: a chunk at 40% dropped to 0 and
+    # climbed again the moment its RUNNING event landed. The worker emits its
+    # first progress marker as ffmpeg starts, while the event lags 0.2-2.4s, so
+    # the worker routinely gets there first and was routinely overwritten.
+    if percent is None:
+        percent = _STAGE_PCT.get(key, 0.0)
+    # Never let a non-terminal announcement lower the bar either. Two workers
+    # cannot report one chunk, but a redelivered marker can arrive late.
+    elif (status not in _FINAL_STAGE and status == prev
+            and percent < _STAGE_PCT.get(key, 0.0)):
+        percent = _STAGE_PCT[key]
     _STAGE_STATE[key] = status
+    _STAGE_PCT[key] = percent
     print(f"[[ENCODER-STAGE key={key} status={status} percent={percent:.1f}]]",
           flush=True)
     # The BACKSTOP is logged whenever it actually changes something, because

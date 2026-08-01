@@ -46,6 +46,13 @@ def emit(key, status, percent=0.0):
 
 def reset():
     cli_batch._STAGE_STATE.clear()
+    cli_batch._STAGE_PCT.clear()
+
+
+def pct_of(out):
+    import re
+    m = re.search(r"percent=([\d.]+)", out)
+    return float(m.group(1)) if m else None
 
 
 def test_done_is_never_walked_back():
@@ -113,6 +120,50 @@ def test_state_survives_across_emitters():
     # as if from _drain_telemetry, a stale worker marker arriving later
     ok, _ = emit("encode:h264:396p:chunk2", "running", 18.4)
     assert not ok, "a done from one emitter was invisible to another"
+
+
+def test_a_status_only_source_never_lowers_the_percent():
+    """A Batch event knows STATUS and nothing else.
+
+    It used to pass 0.0, which is a CLAIM rather than ignorance, and it clobbered
+    the live percent the worker had already reported — a chunk at 40% dropped to
+    0 and climbed again the moment its RUNNING event landed. The worker emits its
+    first progress marker as ffmpeg starts while the event lags 0.2-2.4s, so the
+    worker routinely got there first and was routinely overwritten.
+    """
+    reset()
+    emit("encode:h264:1080p:chunk4", "running", 40.0)          # worker
+    ok, out = emit("encode:h264:1080p:chunk4", "running", None)  # Batch event
+    assert ok
+    assert pct_of(out) == 40.0, f"status-only source reset the bar: {out}"
+
+
+def test_a_late_duplicate_marker_never_lowers_the_percent():
+    """Redelivery is possible on both channels; a stale percent must not win."""
+    reset()
+    emit("encode:h264:1080p:chunk4", "running", 60.0)
+    ok, out = emit("encode:h264:1080p:chunk4", "running", 18.4)
+    assert ok
+    assert pct_of(out) == 60.0, f"a late marker walked the bar back: {out}"
+
+
+def test_percent_still_advances_and_completes():
+    reset()
+    for want in (0.0, 12.0, 55.0):
+        _, out = emit("encode:h264:1080p:chunk4", "running", want)
+        assert pct_of(out) == want, f"progress stopped advancing at {want}"
+    _, out = emit("encode:h264:1080p:chunk4", "done", 100.0)
+    assert pct_of(out) == 100.0
+
+
+def test_a_retry_may_reset_the_percent():
+    """A new attempt legitimately starts from zero — the status CHANGES first,
+    so the monotonic guard (which only applies within one status) lets it."""
+    reset()
+    emit("encode:h264:1080p:chunk4", "running", 70.0)
+    emit("encode:h264:1080p:chunk4", "failed", 0.0)
+    ok, out = emit("encode:h264:1080p:chunk4", "running", 0.0)
+    assert ok and pct_of(out) == 0.0, f"a retry could not restart: {out}"
 
 
 def test_state_channel_names_fit_the_tighter_limit():
