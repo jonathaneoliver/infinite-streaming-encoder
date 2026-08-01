@@ -1060,11 +1060,20 @@ def _stage_key_for_job(jobname: str) -> str | None:
     """`encode:` stage key for a variant Batch job, or None if it isn't one.
 
     Mirrors encode_variants.variant_stage_key, which is what the workers emit and
-    what the Go control plane keys stages by. Only variant jobs are mapped:
-    mezzanine/audio/package-all are long-running and are observed reliably by log
-    tailing, and one package-all job backs THREE stages (package/fragments/hls),
-    so it has no single key to sync.
+    what the Go control plane keys stages by.
+
+    package-all is still absent, deliberately: ONE such job backs THREE stages
+    (package / fragments / hls), so it has no single key and its sub-stages come
+    from tailing the running container.
+
+    mezzanine and audio ARE mapped, because they used to reach the grid only via
+    _translate_events reading Step Functions history — and that was the last
+    reason for a third source of stage state to exist.
     """
+    if jobname.startswith("mezz-"):
+        return "mezzanine"
+    if jobname.startswith("audio-"):
+        return "audio"
     m = _CHUNK_JOBNAME_RE.match(jobname)
     if m:
         return f"encode:{m.group(1)}:{m.group(2)}:chunk{int(m.group(3))}"
@@ -1080,6 +1089,12 @@ _STAGE_LINE_RE = re.compile(r"^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=
 
 # Batch job status -> the stage status the UI grid renders.
 _BATCH_STAGE_STATUS = {
+    # RUNNABLE/SUBMITTED are here so the FALLBACK census still shows a chunk as
+    # queued. They cost nothing: _exec_jobs_snapshot buckets every status from
+    # one scan. Without them, a run with no event channel would leave chunks at
+    # `pending` until they started, because _translate_events no longer speaks.
+    "SUBMITTED": "queued",
+    "RUNNABLE": "queued",
     "RUNNING": "running",
     # STARTING = placed on an instance, creating the container / pulling the
     # image, not yet encoding. Distinct from queued (waiting for a slot, no
@@ -1665,7 +1680,20 @@ def _whole_identity(input_json: str) -> tuple[str, str] | None:
 
 
 def _translate_events(events: list[dict], seen: set[int]) -> None:
-    """Translate Step Functions history events into ENCODER-STAGE markers.
+    """Narrate Step Functions history. NO stage state — see below.
+
+    This used to announce stage state too (queued on enter, done on exit), which
+    made it a THIRD source alongside the Batch census and the worker's markers.
+    All three watch the same run through channels with different latencies, so
+    they disagree about the present tense — and SFN history is the slowest of
+    them, so it was routinely the one re-announcing a finished chunk as queued.
+    That is the reversal chased through three separate fixes.
+
+    Batch events now carry every transition this could report, including
+    mezzanine and audio (the last stages that reached the grid only from here).
+    So this keeps the two things history is genuinely the best source for: the
+    human narration line per step, and spot-reclaim reporting off the exit
+    events. One source of state, not three.
     `seen` tracks already-emitted event ids so repeat polls don't double-emit.
 
     Mezzanine / Audio map by state name via _STEP_TO_STAGE. Each variant is
@@ -1741,40 +1769,34 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
             name = ev.get("stateEnteredEventDetails", {}).get("name", "")
             key = _STEP_TO_STAGE.get(name)
             if key:
-                _emit_stage(key, "queued", 0.0)
                 _narrate(f"▶ {key.replace(':', ' ')} submitted")
             elif name == "EncodeChunk":
                 idn = chunk_enter.get(ev["id"])
                 if idn:
                     c, t, ci = idn
-                    _emit_stage(f"encode:{c}:{t}:chunk{ci}", "queued", 0.0)
                     _narrate(f"▶ encode {c} {t} chunk{ci} submitted")
             elif name == "EncodeWhole":
                 idn = whole_enter.get(ev["id"])
                 if idn:
                     c, t = idn
-                    _emit_stage(f"encode:{c}:{t}", "queued", 0.0)
                     _narrate(f"▶ encode {c} {t} submitted")
 
         elif etype == "TaskStateExited":
             name = ev.get("stateExitedEventDetails", {}).get("name", "")
             key = _STEP_TO_STAGE.get(name)
             if key:
-                _emit_stage(key, "done", 100.0)
                 _narrate(f"✓ {key.replace(':', ' ')} done")
                 _report_reclaims(ev, key.replace(':', ' '))
             elif name == "EncodeChunk":
                 idn = _enter_of(ev, chunk_enter)
                 if idn:
                     c, t, ci = idn
-                    _emit_stage(f"encode:{c}:{t}:chunk{ci}", "done", 100.0)
                     _narrate(f"✓ encode {c} {t} chunk{ci} done")
                     # reclaims handled off TaskSucceeded (ResultPath:null here)
             elif name == "EncodeWhole":
                 idn = _enter_of(ev, whole_enter)
                 if idn:
                     c, t = idn
-                    _emit_stage(f"encode:{c}:{t}", "done", 100.0)
                     _narrate(f"✓ encode {c} {t} done")
 
         elif etype == "TaskSucceeded":
