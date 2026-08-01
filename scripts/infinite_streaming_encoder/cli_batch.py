@@ -634,27 +634,16 @@ def _drain_telemetry(url: str | None, log_state: dict) -> int:
                     now_ms - sent_ms > _TELEMETRY_GAUGE_MAX_AGE_S * 1000.0):
                 continue  # stale gauge — see _TELEMETRY_GAUGE_MAX_AGE_S
             if sm := _STAGE_LINE_RE.match(body):
-                key, st = sm.group(1), sm.group(2)
-                seen = log_state.setdefault("_stage_status", {})
-                # DO NOT let a queued marker un-finish a chunk.
-                #
-                # This is the cross-source race, and FIFO cannot help with it:
-                # the queue orders itself, but it competes with
-                # _sync_stages_from_batch, which reads Batch status directly and
-                # is therefore FASTER. When the drain runs behind, a worker's old
-                # "running 18%" surfaces after Batch has reported SUCCEEDED — and
-                # internal/encode/job.go assigns Status and Percent
-                # unconditionally, so the cell visibly goes done -> running and
-                # the global percentage drops. Measured live: 30 reversals in 150
-                # seconds.
-                #
-                # Safe because a Batch job reaches SUCCEEDED/FAILED exactly once
-                # and never leaves it: its internal retry attempts happen while
-                # the job is still RUNNING, so this cannot hide a real retry.
-                if seen.get(key) in _TERMINAL_STAGE and st not in _TERMINAL_STAGE:
+                # Through the chokepoint, so this marker is judged against what
+                # the OTHER emitters have already said — including a `done` that
+                # came from Step Functions history, which a check local to this
+                # function could not see. That blind spot is why reversals
+                # survived the first attempt at fixing them.
+                if not _emit_stage(sm.group(1), sm.group(2), float(sm.group(3))):
                     suppressed += 1
                     continue
-                seen[key] = st
+                handled += 1
+                continue
             print(body, flush=True)
             handled += 1
 
@@ -665,7 +654,7 @@ def _drain_telemetry(url: str | None, log_state: dict) -> int:
     # backlog went unnoticed until the grid visibly stalled.
     now = time.monotonic()
     # Running total the poll loop reads to decide whether the queue is silent.
-    # Must be the DRAIN's own count: _stage_status is populated by the Batch
+    # Must be the DRAIN's own count: _STAGE_STATE is populated by the Batch
     # backstop too, so it cannot distinguish "telemetry is working" from
     # "telemetry is dead and Batch is covering for it".
     log_state["_tel_handled"] = log_state.get("_tel_handled", 0) + handled
@@ -753,7 +742,7 @@ def _stage_key_for_job(jobname: str) -> str | None:
 
 # A forwarded worker STAGE line, so its status can be recorded alongside the
 # Batch-derived ones — see _sync_stages_from_batch on why they must not fight.
-_STAGE_LINE_RE = re.compile(r"^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=")
+_STAGE_LINE_RE = re.compile(r"^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=([0-9.]+)\]\]")
 
 # Batch job status -> the stage status the UI grid renders.
 _BATCH_STAGE_STATUS = {
@@ -798,16 +787,19 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
     is skipped here and only the gaps — chunks whose logs have not been ingested
     yet, or that were never observed RUNNING at all — are filled in.
     """
-    seen = log_state.setdefault("_stage_status", {})
     newly_announced: list[str] = []
     for status, stage_status in _BATCH_STAGE_STATUS.items():
         for j in _list_exec_jobs(exec_name, status):
             key = _stage_key_for_job(j.get("jobName", ""))
             if key is None:
                 continue
-            if seen.get(key) == stage_status or seen.get(key) in _TERMINAL_STAGE:
+            # _STAGE_STATE, not a private map. Sharing it with the other two
+            # emitters is what stops this backstop clobbering a live percent:
+            # the worker announces "running 0.6%", this sees the SAME "running"
+            # already recorded, and stays quiet instead of re-stamping 0.0.
+            prev = _STAGE_STATE.get(key)
+            if prev == stage_status or prev in _TERMINAL_STAGE:
                 continue
-            seen[key] = stage_status
             if stage_status in ("running", "starting", "done") and j.get("jobId"):
                 # Try STARTING as well as RUNNING. Measured, a STARTING job
                 # carries containerInstanceArn only SOMETIMES — the status flips
@@ -818,9 +810,7 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
                 # cell is usually machine-coloured, occasionally neutral for a
                 # poll — never wrong, just sometimes late.
                 newly_announced.append(j["jobId"])
-            pct = 100.0 if stage_status == "done" else 0.0
-            print(f"[[ENCODER-STAGE key={key} status={stage_status} "
-                  f"percent={pct:.1f}]]", flush=True)
+            _emit_stage(key, stage_status, 100.0 if stage_status == "done" else 0.0)
 
     # Colour the chunks we just announced, in the same pass — including the ones
     # we are announcing as DONE. A chunk that starts and finishes between polls
@@ -875,9 +865,11 @@ def _tail_progress(stream: str, label: str, log_state: dict,
         if is_gauge(msg) and not live:
             continue  # a finished job's sample is stale — see the docstring
         if sm := _STAGE_LINE_RE.match(msg):
-            # The worker reported this stage itself, with a live percent. Record
-            # it so the Batch-derived backstop leaves it alone.
-            log_state.setdefault("_stage_status", {})[sm.group(1)] = sm.group(2)
+            # Same chokepoint as the queue path. The fallback must obey the same
+            # rule or turning it on would reintroduce the reversals it exists to
+            # cover for. _emit_stage prints it, so skip the verbatim forward.
+            _emit_stage(sm.group(1), sm.group(2), float(sm.group(3)))
+            continue
         if msg.startswith("[[ENCODER-"):
             # Forward EVERY marker verbatim, not a whitelist. This used to pass
             # only ENCODER-BOOT and ENCODER-STAGE, which meant each new marker
@@ -978,9 +970,44 @@ def _emit_plan(variants: "list | None" = None,
     print(f"[[ENCODER-PLAN {json.dumps(stages)}]]", flush=True)
 
 
-def _emit_stage(key: str, status: str, percent: float = 0.0) -> None:
+# Last status announced per stage key. The ONE place that knows what the grid
+# currently shows, because three independent sources emit stage state and each
+# used to decide alone whether it was allowed to speak:
+#
+#   _translate_events      Step Functions history (queued on enter, done on exit)
+#   _sync_stages_from_batch  Batch job status  (the authoritative census)
+#   _drain_telemetry       the worker's own markers, carrying live percent
+#
+# They observe the same run through channels with DIFFERENT latencies, so they
+# routinely disagree about the present tense. SFN history in particular lags
+# Batch, so a chunk can be marked done by the census and only afterwards have its
+# "entered" event surface — re-announcing a finished chunk as queued, which is a
+# filled cell going blank.
+_STAGE_STATE: dict[str, str] = {}
+
+# `done` is the only status that may never be walked back. A SUCCEEDED Batch job
+# never re-runs, so anything arriving afterwards is stale by construction.
+#
+# `failed` is deliberately NOT included: the state machine's Retry block
+# resubmits a NEW Batch job, so failed -> running is a real transition and
+# blocking it would freeze the cell on a dead attempt.
+_FINAL_STAGE = {"done"}
+
+
+def _emit_stage(key: str, status: str, percent: float = 0.0) -> bool:
+    """Announce a stage transition. Returns False if it was suppressed as stale.
+
+    Every stage emission in this process goes through here — that is the point.
+    Guarding at the call sites is what failed: the drain grew a terminal check,
+    and reversals continued, because _translate_events was marking chunks done
+    from SFN history through a channel the check could not see.
+    """
+    if _STAGE_STATE.get(key) in _FINAL_STAGE and status not in _FINAL_STAGE:
+        return False
+    _STAGE_STATE[key] = status
     print(f"[[ENCODER-STAGE key={key} status={status} percent={percent:.1f}]]",
           flush=True)
+    return True
 
 
 def _emit_reused(key: str) -> None:
@@ -1701,7 +1728,7 @@ def cmd_poll(args: argparse.Namespace) -> int:
         # which is most of them.
         if tel_url and not log_state.get("_tel_handled"):
             started = any(v in ("running", "done")
-                          for v in log_state.get("_stage_status", {}).values())
+                          for v in _STAGE_STATE.values())
             tel_silent_s += interval_s if started else 0
             if tel_silent_s >= _TELEMETRY_SILENT_GIVEUP_S:
                 print(f"!!! telemetry queue silent for {tel_silent_s}s of "
