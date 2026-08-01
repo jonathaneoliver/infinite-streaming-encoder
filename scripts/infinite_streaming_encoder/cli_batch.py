@@ -620,23 +620,32 @@ def _gc_state_rules(sm_arn: str = "") -> None:
         if not name or any(c and c in name for c in keep):
             continue
         try:
-            if events.list_targets_by_rule(Rule=name).get("Targets"):
-                continue  # live, or a run we must not disturb
-            # A target-less rule looks orphaned, but there is a RACE: another
-            # job's submit creates its rule and attaches the target a moment
-            # later, and its execution does not exist yet — so the keep-list
-            # cannot protect it and this sweep would delete a rule that is about
-            # to become live, silently costing that run its state events.
+            # AGE, not targets. Having a target used to mean "live, leave it
+            # alone", which is wrong and left five rules behind: a run that is
+            # CANCELLED never reaches _delete_state_channel, so its rule keeps
+            # both its target and its existence forever. Target presence
+            # distinguishes "configured" from "half-built", not "live" from
+            # "abandoned" — the keep-list above is what says live.
             #
-            # The queue is created BEFORE the rule and carries a timestamp, so it
-            # is the evidence the rule lacks. A young queue means a young rule.
+            # The race the target check was really guarding is a rule created by
+            # another submit moments ago, whose execution does not exist yet and
+            # so cannot be in the keep-list. The queue is created BEFORE the rule
+            # and carries a timestamp, so it is the evidence the rule lacks: a
+            # young queue means a young rule, and no queue at all means genuinely
+            # orphaned.
             try:
                 a = sqs.get_queue_attributes(
                     QueueUrl=sqs.get_queue_url(QueueName=name)["QueueUrl"],
                     AttributeNames=["CreatedTimestamp"])["Attributes"]
                 if time.time() - float(a["CreatedTimestamp"]) < _STATE_RULE_MIN_AGE_S:
                     continue
-            except Exception:  # noqa: BLE001 — no queue at all: genuinely orphaned
+            except Exception:  # noqa: BLE001 — no queue: nothing left to protect
+                pass
+            # Targets must go before the rule; a rule with targets cannot be
+            # deleted, which is the other reason the old branch never cleaned up.
+            try:
+                events.remove_targets(Rule=name, Ids=["1"])
+            except Exception:  # noqa: BLE001 — may already have none
                 pass
             events.delete_rule(Name=name)
         except Exception:  # noqa: BLE001 — one bad rule must not stop the sweep
