@@ -137,6 +137,45 @@ def test_no_instances_reports_nothing_rather_than_zeroes():
     assert out.strip() == "", f"expected silence, got: {out}"
 
 
+def test_the_idle_share_is_returned_for_the_efficiency_line():
+    """The report is also a VALUE, not only a printed table.
+
+    The efficiency line carries "% machine idle" beside "% of ceiling busy", and
+    those answer different questions: a run can have every box busy (high eff)
+    while half the rented time ran nothing (high idle). Returning the number is
+    what lets the two sit together.
+    """
+    _stub_inventory({"c7g.2xlarge": 8})
+    orig = (cli_batch._ec2, cli_batch._ec2_for_container_instance,
+            cli_batch._job_vcpu)
+    cli_batch._ec2 = lambda: FakeEC2(
+        [inst("i-ccc", "c7g.2xlarge", launch_s=900, term_s=1200)])
+    cli_batch._ec2_for_container_instance = lambda arn: arn.rsplit("/", 1)[-1]
+    cli_batch._job_vcpu = lambda j: 2.0
+    try:
+        with redirect_stdout(io.StringIO()):
+            pct = cli_batch._emit_machine_rental("e", [job("i-ccc", 1000, 1100)])
+    finally:
+        (cli_batch._ec2, cli_batch._ec2_for_container_instance,
+         cli_batch._job_vcpu) = orig
+    # machine 300s x 8 = 2400 vCPU-s; allocated 100s x 2 = 200 -> 91.7% idle
+    assert pct is not None, "no idle share returned"
+    assert 91 < pct < 93, f"idle share {pct}, expected ~91.7"
+
+
+def test_no_instances_returns_none_not_zero():
+    """None means "unknown"; 0.0 would claim a perfectly-utilised fleet."""
+    _stub_inventory({})
+    orig = cli_batch._ec2
+    cli_batch._ec2 = lambda: FakeEC2([])
+    try:
+        with redirect_stdout(io.StringIO()):
+            pct = cli_batch._emit_machine_rental("e", [])
+    finally:
+        cli_batch._ec2 = orig
+    assert pct is None, f"expected None for an unmeasurable run, got {pct}"
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

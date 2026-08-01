@@ -2205,6 +2205,12 @@ def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "",
 # Blended Graviton per-vCPU-hour rates, us-west-2 (c7g/c8g .2xlarge/.4xlarge).
 # cloud-batch always runs on the SPOT compute env, so every run's savings = the
 # on-demand price it avoided. Estimates — good enough for "saved by spot".
+# Above this, the idle share is called out in words rather than left as a
+# figure in a line of figures. Short runs sit high by nature — a fixed ~110s of
+# boot and scale-down is most of a 4-minute instance — so this is set where it
+# means something for a run of real length.
+_IDLE_WARN_PCT = 35.0
+
 _SPOT_VCPU_HR = 0.011
 _ONDEMAND_VCPU_HR = 0.037
 
@@ -2258,7 +2264,7 @@ def _collect_exec_jobs(exec_name: str) -> list:
     return jobs
 
 
-def _emit_machine_rental(exec_name: str, jobs: list) -> None:
+def _emit_machine_rental(exec_name: str, jobs: list) -> float | None:
     """Report what was RENTED, against what was allocated (#195).
 
     ENCODER-COST sums each JOB's reserved vCPU x its duration. AWS bills for
@@ -2291,13 +2297,13 @@ def _emit_machine_rental(exec_name: str, jobs: list) -> None:
         a["vcpu_s"] += _job_vcpu(job) * (sp - st) / 1000.0
         a["n"] += 1
     if not by_inst:
-        return
+        return None
     try:
         from infinite_streaming_encoder.cloud.inventory import _vcpus_for_type
         ec2 = _ec2()
         desc = ec2.describe_instances(InstanceIds=list(by_inst))
     except Exception:  # noqa: BLE001 — reporting is best-effort
-        return
+        return None
     import datetime
     now = time.time()
     rows = []
@@ -2335,7 +2341,7 @@ def _emit_machine_rental(exec_name: str, jobs: list) -> None:
                 "vcpu_s": a["vcpu_s"], "n": a["n"], "alive": alive,
             })
     if not rows:
-        return
+        return None
     rows.sort(key=lambda r: -r["life"])
     machine_vcpu_s = sum(r["life"] * r["vcpu"] for r in rows)
     alloc_vcpu_s = sum(r["vcpu_s"] for r in rows)
@@ -2360,6 +2366,7 @@ def _emit_machine_rental(exec_name: str, jobs: list) -> None:
           f"machine_vcpu_h={machine_vcpu_s / 3600:.3f} "
           f"allocated_vcpu_h={alloc_vcpu_s / 3600:.3f} "
           f"unallocated_pct={pct:.1f}]]", flush=True)
+    return pct
 
 
 def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
@@ -2406,15 +2413,26 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
           f"longest_s={longest_s:.1f} slowest={slowest or '-'} jobs={n} "
           f"max_vcpus={max_vcpus}]]", flush=True)
     try:
-        _emit_machine_rental(exec_name, jobs)
+        idle_pct = _emit_machine_rental(exec_name, jobs)
     except Exception:  # noqa: BLE001 — never fail a finished run over reporting
-        pass
+        idle_pct = None
     conc = (vcpu_s / wall_s) if wall_s else 0.0
     eff = (conc / max_vcpus * 100.0) if max_vcpus else 0.0
     _narrate(f"💰 saved ${saved:.2f} using spot — {vh:.1f} vCPU-hr "
              f"(${spot:.2f} spot vs ${ondemand:.2f} on-demand)")
+    # `idle` is a DIFFERENT question from `eff` and both are worth showing.
+    #   eff  — of the compute environment's ceiling, how much was in use
+    #   idle — of the machine time actually RENTED, how much ran no job at all
+    # A run can be efficient by the first measure and wasteful by the second:
+    # every box busy, each one paid for through its boot and its scale-down tail.
+    idle_txt = f" · {idle_pct:.0f}% machine idle" if idle_pct is not None else ""
     _narrate(f"📊 {n} jobs · {vh:.1f} vCPU-hr · avg {conc:.0f} vCPUs busy "
-             f"({eff:.0f}% of {max_vcpus}) · slowest chunk {longest_s / 60:.1f} min")
+             f"({eff:.0f}% of {max_vcpus}){idle_txt} · slowest chunk "
+             f"{longest_s / 60:.1f} min")
+    if idle_pct is not None and idle_pct >= _IDLE_WARN_PCT:
+        _narrate(f"    ({idle_pct:.0f}% of rented machine time ran no job — boot, "
+                 f"image pull and the scale-down tail. See the machine rental "
+                 f"table above for where it went.)")
 
 
 def cmd_poll(args: argparse.Namespace) -> int:
