@@ -315,13 +315,24 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("unknown target %q — use local or cloud", cfg.Target), http.StatusBadRequest)
 		return
 	}
+	// Resolve the requested names against what is actually in SOURCE_DIR, and
+	// encode the resolved names rather than the submitted ones. Config.Files is
+	// trusted the whole way down — joined into paths, folded into output dir
+	// names, passed as argv to the orchestrators — and this is the only place a
+	// caller can put a string into it. An unknown name fails the whole request
+	// here, before any of the selection has started.
+	files, err := s.Manager.ResolveSourceFiles(cfg.Files)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	// One job per file: each selected file becomes its own independent job, so
 	// they run concurrently (up to MAX_CONCURRENT), each with its own log,
 	// history, cancel and retry — instead of a single batched job that processes
 	// the files strictly sequentially. Returns the list of created jobs (the UI
 	// tracks them via the SSE stream, so it doesn't depend on this body).
-	jobs := make([]*encode.Job, 0, len(cfg.Files))
-	for _, f := range cfg.Files {
+	jobs := make([]*encode.Job, 0, len(files))
+	for _, f := range files {
 		c := cfg
 		c.Files = []string{f}
 		jobs = append(jobs, s.Manager.Submit(c))
@@ -991,6 +1002,19 @@ func isVideo(ext string) bool {
 // fleet.
 const runPythonCloudTimeout = 25 * time.Second
 
+// cloudVal marks an argument whose content came from a request. runPythonCloud
+// checks every one of them and passes plain strings — the flags and subcommands
+// written in this file — through untouched.
+//
+// The distinction has to be carried by the CALLER, because it cannot be
+// recovered from the argv. Two earlier attempts inferred it and both were
+// wrong: position ("odd indices are values") silently skipped `--arn` and
+// `--id`, whose values sit at an even index behind a subcommand; and a set of
+// known-literal spellings skipped any value that happened to BE one, so a
+// `--job-id` of "--sweep-all" passed the check and then told cleanup.py to
+// sweep the whole account.
+type cloudVal string
+
 // Reject an argument value that would be read as a FLAG rather than a value.
 //
 // exec.CommandContext takes an argv slice and never invokes a shell, so classic
@@ -1000,24 +1024,42 @@ const runPythonCloudTimeout = 25 * time.Second
 // option. A crafted value could therefore suppress the flag it was meant to fill
 // or introduce a different one.
 //
-// Values are caller-supplied identifiers — job ids, ARNs, S3 prefixes — none of
-// which legitimately start with "-", so refusing them costs nothing.
+// The rule is deliberately narrow rather than a strict identifier allowlist.
+// These values are S3 prefixes and execution ARNs derived from SOURCE FILENAMES,
+// which legitimately carry spaces, parentheses and non-ASCII; an allowlist tight
+// enough to look reassuring would break the UI's delete button on exactly those
+// jobs. With no shell in the picture the only thing that must not get through is
+// a leading "-" (plus control characters, which nothing legitimate contains and
+// which would corrupt the job log they end up in).
 func validCloudArg(a string) bool {
-	return !strings.HasPrefix(a, "-")
-}
-
-func runPythonCloud(module string, args ...string) ([]byte, error) {
-	// The module name is always a compile-time constant at every call site; the
-	// ARGS are what carry user input, so they are what is checked.
-	for i, a := range args {
-		// Odd positions are values; even are the flags this function's callers
-		// wrote themselves. Check everything anyway — it is cheaper than
-		// reasoning about which is which at each call site.
-		if !validCloudArg(a) && i%2 == 1 {
-			return nil, fmt.Errorf("refusing argument %d: value may not start with '-'", i)
+	if a == "" || a[0] == '-' || a[0] == ' ' {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if a[i] < 0x20 || a[i] == 0x7f { // control chars; UTF-8 bytes are >= 0x80
+			return false
 		}
 	}
-	fullArgs := append([]string{"-m", "infinite_streaming_encoder.cloud." + module, "--json"}, args...)
+	return true
+}
+
+func runPythonCloud(module string, args ...any) ([]byte, error) {
+	// The module name is always a compile-time constant at every call site; the
+	// ARGS are what carry user input, so they are what is checked.
+	fullArgs := []string{"-m", "infinite_streaming_encoder.cloud." + module, "--json"}
+	for i, a := range args {
+		switch v := a.(type) {
+		case cloudVal:
+			if !validCloudArg(string(v)) {
+				return nil, fmt.Errorf("refusing argument %d: %q is not a valid value", i, string(v))
+			}
+			fullArgs = append(fullArgs, string(v))
+		case string:
+			fullArgs = append(fullArgs, v) // a literal written in this file
+		default:
+			return nil, fmt.Errorf("argument %d: unsupported type %T", i, a)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), runPythonCloudTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "python3", fullArgs...)
@@ -1251,11 +1293,13 @@ func (s *Server) awsClearAll(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) awsCleanupJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if id == "" || strings.ContainsAny(id, "/\\") {
+	// runPythonCloud refuses a flag-shaped value too, but that surfaces as a 502.
+	// Checking here as well is what makes it a 400 — this is the client's error.
+	if id == "" || strings.ContainsAny(id, "/\\") || !validCloudArg(id) {
 		http.Error(w, "invalid job id", 400)
 		return
 	}
-	out, err := runPythonCloud("cleanup", "--job-id", id)
+	out, err := runPythonCloud("cleanup", "--job-id", cloudVal(id))
 	if err != nil {
 		http.Error(w, err.Error(), 502)
 		return
@@ -1276,7 +1320,7 @@ func (s *Server) awsDeleteS3Prefix(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `bad request: {"prefix": "..."} required`, 400)
 		return
 	}
-	out, err := runPythonCloud("cleanup", "--delete-prefix", body.Prefix)
+	out, err := runPythonCloud("cleanup", "--delete-prefix", cloudVal(body.Prefix))
 	if err != nil {
 		http.Error(w, err.Error(), 502)
 		return
@@ -1443,7 +1487,7 @@ func (s *Server) awsStopExecution(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid execution arn", 400)
 		return
 	}
-	out, err := runPythonCloud("batch_admin", "stop-execution", "--arn", body.Arn)
+	out, err := runPythonCloud("batch_admin", "stop-execution", "--arn", cloudVal(body.Arn))
 	if err != nil {
 		http.Error(w, err.Error(), 502)
 		return
@@ -1461,11 +1505,11 @@ func (s *Server) awsTerminateBatchJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `bad request: {"id": "..."} required`, 400)
 		return
 	}
-	if strings.ContainsAny(body.ID, "/\\ ") {
+	if strings.ContainsAny(body.ID, "/\\ ") || !validCloudArg(body.ID) {
 		http.Error(w, "invalid job id", 400)
 		return
 	}
-	out, err := runPythonCloud("batch_admin", "terminate-job", "--id", body.ID)
+	out, err := runPythonCloud("batch_admin", "terminate-job", "--id", cloudVal(body.ID))
 	if err != nil {
 		http.Error(w, err.Error(), 502)
 		return
