@@ -1241,7 +1241,7 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
     yet, or that were never observed RUNNING at all — are filled in.
     """
     newly_announced: list[str] = []
-    repaired = 0
+    repairs = 0
     for status, stage_status in _BATCH_STAGE_STATUS.items():
         for j in _list_exec_jobs(exec_name, status):
             key = _stage_key_for_job(j.get("jobName", ""))
@@ -1264,9 +1264,11 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
                 # cell is usually machine-coloured, occasionally neutral for a
                 # poll — never wrong, just sometimes late.
                 newly_announced.append(j["jobId"])
-            repaired += 1 if _emit_stage(
-                key, stage_status,
-                100.0 if stage_status == "done" else 0.0, src="census") else 0
+            was_known = key in _STAGE_STATE
+            if _emit_stage(key, stage_status,
+                           100.0 if stage_status == "done" else 0.0,
+                           src="census") and was_known:
+                repairs += 1
 
     # Colour the chunks we just announced, in the same pass — including the ones
     # we are announcing as DONE. A chunk that starts and finishes between polls
@@ -1284,9 +1286,11 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
     # when we waited for their log marker. Describing just the newly-announced
     # ids keeps the host no later than the status it belongs to. Bounded by the
     # number of NEW jobs per poll, not the ladder size.
-    if repaired:
-        _narrate(f"[census] repaired {repaired} stage(s) the event path missed "
-                 f"— see the [census] lines above")
+    if repairs:
+        # Only the genuine losses are escalated. Seeding is silent in the
+        # summary: 44 seed lines on a healthy run would train you to ignore this.
+        _narrate(f"[census] REPAIRED {repairs} stage(s) the event path never "
+                 f"delivered — see the [census] REPAIRED lines above")
     if newly_announced:
         batch = _batch()
         for i in range(0, len(newly_announced), 100):  # describe_jobs caps at 100
@@ -1478,7 +1482,19 @@ def _emit_stage(key: str, status: str, percent: float = 0.0,
     # `prev` value says whether this was a repair (prev is behind) or a race
     # (prev is ahead, which _FINAL_STAGE would have blocked).
     if src == "census":
-        print(f"[census] {time.strftime('%H:%M:%S')} repaired {key}: "
+        # Distinguish the two cases, because they mean opposite things and
+        # conflating them makes the signal useless.
+        #
+        # prev unset = the census simply got there FIRST. Normal at fan-out: it
+        # runs on the first poll while the first events are still in flight
+        # (measured: census at 14:16:21, first events 14:16:51). Both sources
+        # agree; nothing was missed.
+        #
+        # prev set = the event path delivered an EARLIER state and then never
+        # delivered this one. That is a genuinely lost transition, and the one
+        # worth investigating.
+        kind = "seeded" if prev is None else "REPAIRED"
+        print(f"[census] {time.strftime('%H:%M:%S')} {kind} {key}: "
               f"{prev or 'unset'} -> {status}", flush=True)
     return True
 
