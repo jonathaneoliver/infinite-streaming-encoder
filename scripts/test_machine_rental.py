@@ -158,9 +158,14 @@ def test_the_idle_share_is_returned_for_the_efficiency_line():
     finally:
         (cli_batch._ec2, cli_batch._ec2_for_container_instance,
          cli_batch._job_vcpu) = orig
-    # machine 300s x 8 = 2400 vCPU-s; allocated 100s x 2 = 200 -> 91.7% idle
-    assert pct is not None, "no idle share returned"
-    assert 91 < pct < 93, f"idle share {pct}, expected ~91.7"
+    # machine 300s x 8 = 2400 vCPU-s = 0.667 h; allocated 100s x 2 = 200 -> 91.7% idle
+    assert pct is not None, "nothing returned"
+    idle, machine_vh = pct
+    assert 91 < idle < 93, f"idle share {idle}, expected ~91.7"
+    # the machine hours are what the COST is billed on — allocated would be 0.056
+    assert 0.66 < machine_vh < 0.67, (
+        f"machine vCPU-hours {machine_vh}, expected ~0.667; billing on this "
+        f"rather than allocation is the whole point")
 
 
 def test_no_instances_returns_none_not_zero():
@@ -173,7 +178,10 @@ def test_no_instances_returns_none_not_zero():
             pct = cli_batch._emit_machine_rental("e", [])
     finally:
         cli_batch._ec2 = orig
-    assert pct is None, f"expected None for an unmeasurable run, got {pct}"
+    assert pct is None, (
+        f"expected None for an unmeasurable run, got {pct} — the caller falls "
+        f"back to allocated hours and labels the basis, which needs None to "
+        f"distinguish 'not measured' from 'measured as zero'")
 
 
 def main() -> int:

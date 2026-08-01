@@ -2264,7 +2264,7 @@ def _collect_exec_jobs(exec_name: str) -> list:
     return jobs
 
 
-def _emit_machine_rental(exec_name: str, jobs: list) -> float | None:
+def _emit_machine_rental(exec_name: str, jobs: list) -> tuple | None:
     """Report what was RENTED, against what was allocated (#195).
 
     ENCODER-COST sums each JOB's reserved vCPU x its duration. AWS bills for
@@ -2366,7 +2366,7 @@ def _emit_machine_rental(exec_name: str, jobs: list) -> float | None:
           f"machine_vcpu_h={machine_vcpu_s / 3600:.3f} "
           f"allocated_vcpu_h={alloc_vcpu_s / 3600:.3f} "
           f"unallocated_pct={pct:.1f}]]", flush=True)
-    return pct
+    return pct, machine_vcpu_s / 3600.0
 
 
 def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
@@ -2399,7 +2399,27 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
                 slowest = _stage_from_jobname(job.get("jobName", "")) or job.get("jobName", "")
     vh = vcpu_s / 3600.0
     wall_s = (mx - mn) / 1000.0 if mn is not None else 0.0
-    spot, ondemand = vh * _SPOT_VCPU_HR, vh * _ONDEMAND_VCPU_HR
+
+    # Rental FIRST, because cost is billed on it.
+    #
+    # This used to price the run from `vh` — the sum of each JOB's reserved vCPU
+    # times its duration. AWS does not bill for allocation; it bills for the
+    # instance, from launch to termination, including boot, image pull, and the
+    # scale-down tail after the last chunk. On a measured run that gap was 52%,
+    # so the reported spot cost was roughly half of what was actually spent.
+    #
+    # Falls back to allocated hours when the rental cannot be measured (no host
+    # resolves), and says which basis was used rather than leaving two very
+    # different numbers looking identical.
+    try:
+        rental = _emit_machine_rental(exec_name, jobs)
+    except Exception:  # noqa: BLE001 — never fail a finished run over reporting
+        rental = None
+    idle_pct, machine_vh = rental if rental else (None, None)
+    billed_vh = machine_vh if machine_vh else vh
+    basis = "rented" if machine_vh else "allocated"
+
+    spot, ondemand = billed_vh * _SPOT_VCPU_HR, billed_vh * _ONDEMAND_VCPU_HR
     saved = ondemand - spot
     try:
         from infinite_streaming_encoder.cloud.compute_env import get_vcpus
@@ -2407,19 +2427,19 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
     except Exception:  # noqa: BLE001 — best-effort
         max_vcpus = 0
     print(f"[[ENCODER-COST exec={exec_name} spot_usd={spot:.4f} "
-          f"ondemand_usd={ondemand:.4f} saved_usd={saved:.4f} vcpu_hours={vh:.2f}]]",
-          flush=True)
+          f"ondemand_usd={ondemand:.4f} saved_usd={saved:.4f} "
+          f"vcpu_hours={billed_vh:.2f}]]", flush=True)
     print(f"[[ENCODER-STATS exec={exec_name} wall_s={wall_s:.1f} vcpu_h={vh:.3f} "
           f"longest_s={longest_s:.1f} slowest={slowest or '-'} jobs={n} "
           f"max_vcpus={max_vcpus}]]", flush=True)
-    try:
-        idle_pct = _emit_machine_rental(exec_name, jobs)
-    except Exception:  # noqa: BLE001 — never fail a finished run over reporting
-        idle_pct = None
     conc = (vcpu_s / wall_s) if wall_s else 0.0
     eff = (conc / max_vcpus * 100.0) if max_vcpus else 0.0
-    _narrate(f"💰 saved ${saved:.2f} using spot — {vh:.1f} vCPU-hr "
-             f"(${spot:.2f} spot vs ${ondemand:.2f} on-demand)")
+    _narrate(f"💰 saved ${saved:.2f} using spot — {billed_vh:.1f} vCPU-hr "
+             f"{basis} (${spot:.2f} spot vs ${ondemand:.2f} on-demand)")
+    if machine_vh and vh:
+        _narrate(f"    (billed on machine lifetime, not allocation: {machine_vh:.1f} "
+                 f"vCPU-hr rented vs {vh:.1f} allocated — the difference is boot, "
+                 f"image pull and the scale-down tail)")
     # `idle` is a DIFFERENT question from `eff` and both are worth showing.
     #   eff  — of the compute environment's ceiling, how much was in use
     #   idle — of the machine time actually RENTED, how much ran no job at all

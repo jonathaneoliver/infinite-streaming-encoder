@@ -197,6 +197,10 @@ var (
 	// floor, job count, and the compute-env max vCPUs). The Job derives avg
 	// concurrency + efficiency from these. Keyed by exec for idempotent reattach.
 	statsMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STATS exec=(\S+) wall_s=([0-9.]+) vcpu_h=([0-9.]+) longest_s=([0-9.]+) slowest=(\S+) jobs=(\d+) max_vcpus=(\d+)\]\]$`)
+	// ENCODER-MACHINES reports what was RENTED against what jobs allocated —
+	// the boot, image pull and scale-down tail that a job-derived cost figure
+	// cannot see (#195). Captured so the per-output stats can show it.
+	machinesMarkerRe = regexp.MustCompile(`^\[\[ENCODER-MACHINES exec=(\S+) instances=(\d+) machine_vcpu_h=([0-9.]+) allocated_vcpu_h=([0-9.]+) unallocated_pct=([0-9.]+)\]\]$`)
 	// ENCODER-FLEET reports one distributed-local worker box's live CPU: busy =
 	// logical cores currently busy (from /proc/stat), perf = its perf-core target
 	// (4/4/8). Emitted by cli_local_dist from the workers' Temporal heartbeats,
@@ -645,6 +649,17 @@ func (j *Job) parseMarker(line string) bool {
 		j.recordCost(m[1], spot, ondemand, saved, vh)
 		return true
 	}
+	if m := machinesMarkerRe.FindStringSubmatch(line); m != nil {
+		inst, _ := strconv.Atoi(m[2])
+		mh, _ := strconv.ParseFloat(m[3], 64)
+		ah, _ := strconv.ParseFloat(m[4], 64)
+		idle, _ := strconv.ParseFloat(m[5], 64)
+		j.mu.Lock()
+		j.Instances, j.MachineVCPUHours = inst, mh
+		j.AllocatedVCPUHours, j.IdlePct = ah, idle
+		j.mu.Unlock()
+		return true
+	}
 	if m := statsMarkerRe.FindStringSubmatch(line); m != nil {
 		wall, _ := strconv.ParseFloat(m[2], 64)
 		vcpuH, _ := strconv.ParseFloat(m[3], 64)
@@ -1033,9 +1048,16 @@ type Job struct {
 
 	// Spot-vs-on-demand cost (from ENCODER-COST). SpotUSD is what this job cost
 	// on the spot fleet; SavedUSD = OnDemandUSD - SpotUSD (what spot avoided).
-	SpotUSD     float64 `json:"spot_usd,omitempty"`
-	OnDemandUSD float64 `json:"ondemand_usd,omitempty"`
-	SavedUSD    float64 `json:"saved_usd,omitempty"`
+	// Machine rental vs allocation (from ENCODER-MACHINES). MachineVCPUHours is
+	// what was rented — instance lifetimes — against AllocatedVCPUHours, the sum
+	// of each job's reservation. IdlePct is the share that ran no job at all.
+	MachineVCPUHours   float64 `json:"machine_vcpu_hours,omitempty"`
+	AllocatedVCPUHours float64 `json:"allocated_vcpu_hours,omitempty"`
+	IdlePct            float64 `json:"idle_pct,omitempty"`
+	Instances          int     `json:"instances,omitempty"`
+	SpotUSD            float64 `json:"spot_usd,omitempty"`
+	OnDemandUSD        float64 `json:"ondemand_usd,omitempty"`
+	SavedUSD           float64 `json:"saved_usd,omitempty"`
 	// CommercialUSD / MediaConvertUSD are what this job's output ladder would have
 	// cost on hosted transcoders (a generic commercial cloud encoder, and AWS
 	// MediaConvert) — comparison baselines against our own spot/local cost. Both
@@ -2141,6 +2163,97 @@ func (m *Manager) writeHistory(job *Job) {
 	m.writeTimingSummary(f, job)
 
 	fmt.Fprintf(f, "\n---\n\n")
+}
+
+// PhaseStat is one row of the phase rollup: a stage, or a whole rung's chunks
+// collapsed into one line.
+//
+// Three different times, because they answer different questions and are
+// routinely conflated:
+//
+//	SpanS     first start -> last end. Real elapsed, so parallel chunks count once.
+//	JobWallS  sum of per-stage Batch wall clock. Includes container start, the
+//	          mezzanine fetch and the upload.
+//	WorkerS   the worker's OWN timer over the same phases. The gap against
+//	          JobWallS is the non-encoding overhead.
+//
+// Cores is CPUS/WorkerS — what the phase actually used against what it reserved.
+type PhaseStat struct {
+	Phase    string  `json:"phase"`
+	N        int     `json:"n"`
+	SpanS    float64 `json:"span_s"`
+	JobWallS float64 `json:"job_wall_s"`
+	WorkerS  float64 `json:"worker_s,omitempty"`
+	CPUS     float64 `json:"cpu_s,omitempty"`
+	Cores    float64 `json:"cores,omitempty"`
+	PeakMiB  float64 `json:"peak_mib,omitempty"`
+}
+
+// PhaseRollup aggregates the job's stages by phase, collapsing a rung's chunks
+// into one row. Shared by the on-disk timing summary and the per-output stats
+// sidecar so the two can never disagree.
+func (j *Job) PhaseRollup() []PhaseStat {
+	j.mu.Lock()
+	stages := append([]StageProgress(nil), j.Stages...)
+	history := append([]FileStages(nil), j.StagesHistory...)
+	j.mu.Unlock()
+	var all []StageProgress
+	for _, h := range history {
+		all = append(all, h.Stages...)
+	}
+	all = append(all, stages...)
+
+	type agg struct {
+		n              int
+		first, last    time.Time
+		jobWall        time.Duration
+		cpu, work, mem float64
+	}
+	groups := map[string]*agg{}
+	var order []string
+	for _, st := range all {
+		g := st.Key
+		if i := strings.LastIndex(g, ":chunk"); i > 0 {
+			g = g[:i]
+		}
+		a := groups[g]
+		if a == nil {
+			a = &agg{}
+			groups[g] = a
+			order = append(order, g)
+		}
+		a.n++
+		a.cpu += st.CPUSeconds
+		a.work += st.WorkerSeconds
+		if st.PeakMemMiB > a.mem {
+			a.mem = st.PeakMemMiB
+		}
+		if st.StartedAt != nil {
+			if a.first.IsZero() || st.StartedAt.Before(a.first) {
+				a.first = *st.StartedAt
+			}
+			if st.EndedAt != nil {
+				a.jobWall += st.EndedAt.Sub(*st.StartedAt)
+				if st.EndedAt.After(a.last) {
+					a.last = *st.EndedAt
+				}
+			}
+		}
+	}
+	out := make([]PhaseStat, 0, len(order))
+	for _, g := range order {
+		a := groups[g]
+		row := PhaseStat{Phase: g, N: a.n, JobWallS: a.jobWall.Seconds(),
+			WorkerS: a.work, CPUS: a.cpu, PeakMiB: a.mem}
+		if !a.first.IsZero() && !a.last.IsZero() {
+			row.SpanS = a.last.Sub(a.first).Seconds()
+		}
+		if a.work > 0 {
+			row.Cores = a.cpu / a.work
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
