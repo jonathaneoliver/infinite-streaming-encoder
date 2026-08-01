@@ -1146,6 +1146,10 @@ type Job struct {
 	mu       sync.Mutex
 	logLines []string
 	// Diagnostic stream: its own file, never trimmed. See appendDiag.
+	// Guarded by diagMu, deliberately NOT j.mu. Writing under j.mu meant every
+	// diagnostic line — ~3,300 on a 336-chunk run, to an external volume —
+	// blocked upsertStage and the SSE marshal for the length of a disk write.
+	diagMu    sync.Mutex
 	diagPath  string
 	diagFile  *os.File
 	cancelled bool
@@ -1227,8 +1231,11 @@ func (j *Job) AppendLog(line string) {
 // mid-flight, and a buffer held until terminal loses exactly those. The file
 // handle is opened once and closed by closeDiag on the terminal path.
 func (j *Job) appendDiag(line string) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
+	// diagMu, NOT j.mu. Diagnostics must never make the job's own state slower
+	// to read or write: j.mu serialises stage updates and the SSE marshal, and
+	// holding it across a disk write put every one of those behind file I/O.
+	j.diagMu.Lock()
+	defer j.diagMu.Unlock()
 	if j.diagFile == nil {
 		if j.diagPath == "" {
 			return // no path configured; drop rather than guess a location
@@ -1243,8 +1250,8 @@ func (j *Job) appendDiag(line string) {
 }
 
 func (j *Job) closeDiag() {
-	j.mu.Lock()
-	defer j.mu.Unlock()
+	j.diagMu.Lock()
+	defer j.diagMu.Unlock()
 	if j.diagFile != nil {
 		_ = j.diagFile.Close()
 		j.diagFile = nil
