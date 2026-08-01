@@ -213,14 +213,6 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    two displays read alike. Usually over the MACHINE's colour, though Batch
    records placement around the same moment it flips to STARTING, so for a poll
    or two the hatch can be neutral before the host arrives. */
-/* Hatch on the CELL, not on the fill — a starting chunk is placed but has
-   encoded nothing, so its bar must stay empty. Hatching the fill instead meant
-   filling it to 100%, which read as a finished cell that then reset to 0. */
-.chunk-cell.chunk-cell-starting {
-    background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.30) 0 5px, transparent 5px 10px); }
-.chunk-cell-fill.chunk-starting {
-    background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.35) 0 6px, transparent 6px 12px);
-    opacity: 0.65; }
 .stage-bar-fill.stage-fill-reclaimed { background: #ef476f; animation: reclaimpulse 1s ease-in-out infinite; }
 @keyframes reclaimpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
@@ -2613,7 +2605,6 @@ function updateStagesTable(row, stages) {
                 // the fleet view hatches a booting box rather than filling its bar.
                 const _wantW = (reused || st === 'reclaimed'
                     ? 100 : st === 'starting' ? 0 : prog).toFixed(1) + '%';
-                cell.classList.toggle('chunk-cell-starting', st === 'starting');
                 // Only touch the DOM when the value actually changes. Writing the
                 // same width every tick is not free — it invalidates style on a
                 // cell that has not moved, and on a settled chunk there is nothing
@@ -2656,7 +2647,7 @@ function updateStagesTable(row, stages) {
                     + (st === 'failed' ? ' chunk-failed'
                         : st === 'reclaimed' ? ' chunk-reclaimed'
                             : reused ? ' chunk-reused'
-                                : st === 'starting' ? ' chunk-starting' : '');
+                                : '');
                 // The fill COLOUR is the machine this chunk ran on — bold and
                 // unmissable so co-located chunks pop; red/reused states keep their
                 // class colour (clear the inline so the class wins).

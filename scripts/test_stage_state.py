@@ -166,6 +166,45 @@ def test_a_retry_may_reset_the_percent():
     assert ok and pct_of(out) == 0.0, f"a retry could not restart: {out}"
 
 
+def test_a_late_running_event_cannot_reduce_the_bar():
+    """The case reported directly: a RUNNING event arriving after progress.
+
+    The event carries no percent, so it must not reset one — and it must not
+    change the rendered width at all.
+    """
+    reset()
+    emit("encode:h264:1080p:chunk2", "starting", None)
+    emit("encode:h264:1080p:chunk2", "running", 45.0)      # worker progress
+    ok, out = emit("encode:h264:1080p:chunk2", "running", None)  # late event
+    assert ok and pct_of(out) == 45.0, f"late RUNNING reduced the bar: {out}"
+
+
+def test_a_late_starting_event_cannot_blank_a_running_cell():
+    """`starting` renders EMPTY regardless of percent, so carrying the percent
+    forward is not enough — the STATUS itself must not go backwards."""
+    reset()
+    emit("encode:h264:1080p:chunk3", "running", 60.0)
+    ok, out = emit("encode:h264:1080p:chunk3", "starting", None)
+    assert not ok, f"a late STARTING blanked a progressing cell: {out}"
+
+
+def test_lifecycle_cannot_run_backwards():
+    reset()
+    emit("encode:h264:720p:chunk0", "running", 30.0)
+    for backwards in ("queued", "starting", "pending"):
+        ok, _ = emit("encode:h264:720p:chunk0", backwards, None)
+        assert not ok, f"running -> {backwards} was allowed"
+
+
+def test_interrupts_are_still_allowed_from_running():
+    """A reclaim or failure is not progress going backwards — it really happened."""
+    for interrupt in ("reclaimed", "failed"):
+        reset()
+        emit("encode:h264:720p:chunk0", "running", 30.0)
+        ok, _ = emit("encode:h264:720p:chunk0", interrupt, 0.0)
+        assert ok, f"{interrupt} was wrongly suppressed"
+
+
 def test_state_channel_names_fit_the_tighter_limit():
     """Both names are built from ONE core sized to the EventBridge limit (64),
     which is tighter than SQS's 80 — so they can never drift apart."""

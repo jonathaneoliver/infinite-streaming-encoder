@@ -1470,6 +1470,25 @@ _STAGE_PCT: dict[str, float] = {}
 # blocking it would freeze the cell on a dead attempt.
 _FINAL_STAGE = {"done"}
 
+# Lifecycle order. A cell may not move BACKWARDS along it.
+#
+# Guarding `done` alone was not enough. Every channel here is unordered —
+# EventBridge is at-least-once with no ordering guarantee, and the census reads a
+# snapshot that may already be stale by the time it emits — so a RUNNING event
+# can land after the worker has reported 40%, and a STARTING event can land
+# after RUNNING. Carrying the percent forward fixed the first case for the bar,
+# but not the second: `starting` renders EMPTY whatever the percent is, so a late
+# STARTING blanked a cell that was visibly progressing.
+#
+# So the rule is about the lifecycle, not about one field.
+_STAGE_RANK = {
+    "pending": 0, "queued": 1, "starting": 2,
+    "running": 3, "reclaimed": 3, "failed": 4, "done": 5,
+}
+# Statuses that may always be announced: they are interruptions, not progress,
+# and a chunk genuinely can go from running to reclaimed or failed.
+_STAGE_INTERRUPTS = {"failed", "reclaimed"}
+
 
 def _rendered_width(status: str | None, percent: float | None) -> float:
     """What the UI actually paints, mirroring static/index.html.
@@ -1497,6 +1516,13 @@ def _emit_stage(key: str, status: str, percent: float | None = 0.0,
     """
     prev = _STAGE_STATE.get(key)
     if prev in _FINAL_STAGE and status not in _FINAL_STAGE:
+        return False
+    # No going backwards. `failed` is exempt as the PREVIOUS state, because the
+    # state machine's Retry resubmits a new Batch job and failed -> running is
+    # real; and interrupts are exempt as the NEW state, because a running chunk
+    # genuinely can be reclaimed.
+    if (prev is not None and prev != "failed" and status not in _STAGE_INTERRUPTS
+            and _STAGE_RANK.get(status, 0) < _STAGE_RANK.get(prev, 0)):
         return False
     # percent=None means "I do not know" — carry the last known value forward.
     #
