@@ -159,6 +159,30 @@ def _short_label(jobname: str) -> str:
             }.get(jobname.split("-", 1)[0], jobname.split("-", 1)[0])
 
 
+def _set_host(key: str, inst: str, log_state: dict, src: str) -> None:
+    """Colour one stage by machine, deduped, and SAY SO when the colour changes.
+
+    Both the event path and the describe_jobs path land here, so this is the one
+    place that can tell a first colouring from a RECOLOURING. The distinction is
+    what makes "is something messing up my chunk colours?" answerable:
+
+      * first colouring (was unset) is normal and silent
+      * a change from one machine to ANOTHER is not — a chunk runs on one box,
+        so it means two sources disagree, or a retry moved it. Either way it is
+        a visible cell changing colour, and it is now logged with both values
+        and which source did it.
+    """
+    seen_key = "_host:" + key
+    prev = log_state.get(seen_key)
+    if prev == inst:
+        return
+    log_state[seen_key] = inst
+    if prev:
+        print(f"[host] {time.strftime('%H:%M:%S')} RECOLOUR {key}: "
+              f"{prev} -> {inst} (via {src})", flush=True)
+    _emit_host(key, inst)
+
+
 def _tag_host_from_arn(jobname: str, ci_arn: str, log_state: dict) -> None:
     """Colour a job's stage keys from an arn we were HANDED rather than looked up.
 
@@ -171,10 +195,7 @@ def _tag_host_from_arn(jobname: str, ci_arn: str, log_state: dict) -> None:
     if not inst:
         return
     for key in _host_stage_keys(jobname):
-        seen_key = "_host:" + key
-        if log_state.get(seen_key) != inst:
-            log_state[seen_key] = inst
-            _emit_host(key, inst)
+        _set_host(key, inst, log_state, "event")
 
 
 def _tag_hosts_for_jobs(described_jobs: list, log_state: dict) -> None:
@@ -191,10 +212,7 @@ def _tag_hosts_for_jobs(described_jobs: list, log_state: dict) -> None:
         if not inst:
             continue
         for key in keys:
-            seen_key = "_host:" + key
-            if log_state.get(seen_key) != inst:
-                log_state[seen_key] = inst
-                _emit_host(key, inst)
+            _set_host(key, inst, log_state, "poll")
 
 
 # One scan of this execution's jobs, shared by every caller within a poll.
@@ -876,6 +894,20 @@ def _queue_depth(sqs, url: str) -> int:
 # ---------------------------------------------------------------------------
 
 _STATE_PREFIX = "encoder-state-"
+# Dead-letter queue for EventBridge deliveries that fail after its retries.
+#
+# SHARED and long-lived, not per-execution: a per-run DLQ would be torn down with
+# its channel, deleting the evidence it exists to preserve — the failures worth
+# investigating are exactly the ones you notice after the run looked wrong.
+#
+# Named OUTSIDE both sweep prefixes on purpose. "encoder-state-dlq" would match
+# the orphan sweep's `encoder-state-` prefix and be deleted whenever it was
+# empty, which is most of the time.
+_DLQ_NAME = "encoder-eventbridge-dlq"
+# 14 days, the SQS maximum. A dropped transition shows up as one stuck cell,
+# which may not be noticed for days; short retention would expire the evidence
+# before anyone asked the question.
+_DLQ_RETENTION_S = "1209600"
 # An EventBridge rule name is capped at 64 characters, tighter than SQS's 80.
 # Both names are built from ONE trimmed core so they cannot drift apart.
 _EB_RULE_NAME_MAX = 64
@@ -885,6 +917,64 @@ def _state_names(exec_name: str) -> tuple[str, str]:
     """(rule_name, queue_name) for one execution. Single definition of both."""
     core = trim_execution_name(exec_name, _EB_RULE_NAME_MAX - len(_STATE_PREFIX))
     return _STATE_PREFIX + core, _STATE_PREFIX + core
+
+
+def _ensure_state_dlq() -> str:
+    """Create-or-get the shared DLQ. Returns its ARN, or "" if unavailable.
+
+    Idempotent: CreateQueue returns the existing queue when the attributes match.
+    Failure is not fatal — the target simply gets no DLQ, which is the behaviour
+    before this existed.
+    """
+    try:
+        sqs = _sqs()
+        url = sqs.create_queue(
+            QueueName=_DLQ_NAME,
+            Attributes={"MessageRetentionPeriod": _DLQ_RETENTION_S},
+        )["QueueUrl"]
+        arn = sqs.get_queue_attributes(
+            QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        # Allow any of OUR rules to dead-letter here, so the policy does not need
+        # rewriting per execution.
+        acct, region = arn.split(":")[4], arn.split(":")[3]
+        sqs.set_queue_attributes(QueueUrl=url, Attributes={"Policy": json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Service": "events.amazonaws.com"},
+                "Action": "sqs:SendMessage",
+                "Resource": arn,
+                "Condition": {"ArnLike": {"aws:SourceArn":
+                              f"arn:aws:events:{region}:{acct}:rule/{_STATE_PREFIX}*"}},
+            }],
+        })})
+        return arn
+    except Exception:  # noqa: BLE001 — no DLQ is not a failure
+        return ""
+
+
+def _report_dlq(where: str) -> None:
+    """Say how many deliveries EventBridge failed to make. Best-effort.
+
+    A DLQ nobody reads is worse than no DLQ — it manufactures confidence that
+    losses would have been noticed. This is the read. Silence means zero, and it
+    is checked at the END of a run, when a stuck cell would already be visible
+    and the question "was that a lost event?" is the one being asked.
+    """
+    try:
+        sqs = _sqs()
+        url = sqs.get_queue_url(QueueName=_DLQ_NAME)["QueueUrl"]
+        n = int(sqs.get_queue_attributes(
+            QueueUrl=url,
+            AttributeNames=["ApproximateNumberOfMessages"],
+        )["Attributes"]["ApproximateNumberOfMessages"])
+    except Exception:  # noqa: BLE001 — best-effort
+        return
+    if n:
+        _narrate(f"!!! {n} Batch state event(s) undelivered ({where}) — "
+                 f"EventBridge dead-lettered them to {_DLQ_NAME}. Any chunk stuck "
+                 f"mid-state is explained by this; the 60s census should have "
+                 f"repaired it.")
 
 
 def _create_state_channel(exec_name: str) -> str | None:
@@ -927,7 +1017,13 @@ def _create_state_channel(exec_name: str) -> str | None:
                 "Condition": {"ArnEquals": {"aws:SourceArn": rarn}},
             }],
         })})
-        events.put_targets(Rule=rule, Targets=[{"Id": "1", "Arn": qarn}])
+        target = {"Id": "1", "Arn": qarn}
+        dlq = _ensure_state_dlq()
+        if dlq:
+            # Without this a delivery that fails after EventBridge's retries is
+            # dropped silently, and the only symptom is one cell stuck forever.
+            target["DeadLetterConfig"] = {"Arn": dlq}
+        events.put_targets(Rule=rule, Targets=[target])
         return url
     except Exception as e:  # noqa: BLE001 — degrade to polling, never fail a run
         print(f"!!! Batch state events unavailable ({type(e).__name__}: {e}); "
@@ -1145,6 +1241,7 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
     yet, or that were never observed RUNNING at all — are filled in.
     """
     newly_announced: list[str] = []
+    repaired = 0
     for status, stage_status in _BATCH_STAGE_STATUS.items():
         for j in _list_exec_jobs(exec_name, status):
             key = _stage_key_for_job(j.get("jobName", ""))
@@ -1167,7 +1264,9 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
                 # cell is usually machine-coloured, occasionally neutral for a
                 # poll — never wrong, just sometimes late.
                 newly_announced.append(j["jobId"])
-            _emit_stage(key, stage_status, 100.0 if stage_status == "done" else 0.0)
+            repaired += 1 if _emit_stage(
+                key, stage_status,
+                100.0 if stage_status == "done" else 0.0, src="census") else 0
 
     # Colour the chunks we just announced, in the same pass — including the ones
     # we are announcing as DONE. A chunk that starts and finishes between polls
@@ -1185,6 +1284,9 @@ def _sync_stages_from_batch(exec_name: str, log_state: dict) -> None:
     # when we waited for their log marker. Describing just the newly-announced
     # ids keeps the host no later than the status it belongs to. Bounded by the
     # number of NEW jobs per poll, not the ladder size.
+    if repaired:
+        _narrate(f"[census] repaired {repaired} stage(s) the event path missed "
+                 f"— see the [census] lines above")
     if newly_announced:
         batch = _batch()
         for i in range(0, len(newly_announced), 100):  # describe_jobs caps at 100
@@ -1351,7 +1453,8 @@ _STAGE_STATE: dict[str, str] = {}
 _FINAL_STAGE = {"done"}
 
 
-def _emit_stage(key: str, status: str, percent: float = 0.0) -> bool:
+def _emit_stage(key: str, status: str, percent: float = 0.0,
+                src: str = "") -> bool:
     """Announce a stage transition. Returns False if it was suppressed as stale.
 
     Every stage emission in this process goes through here — that is the point.
@@ -1359,11 +1462,24 @@ def _emit_stage(key: str, status: str, percent: float = 0.0) -> bool:
     and reversals continued, because _translate_events was marking chunks done
     from SFN history through a channel the check could not see.
     """
-    if _STAGE_STATE.get(key) in _FINAL_STAGE and status not in _FINAL_STAGE:
+    prev = _STAGE_STATE.get(key)
+    if prev in _FINAL_STAGE and status not in _FINAL_STAGE:
         return False
     _STAGE_STATE[key] = status
     print(f"[[ENCODER-STAGE key={key} status={status} percent={percent:.1f}]]",
           flush=True)
+    # The BACKSTOP is logged whenever it actually changes something, because
+    # "is the poll fighting the events?" is otherwise unanswerable — a census
+    # emission looks identical to an event one in the grid.
+    #
+    # When events are healthy this should be SILENT: every key already carries
+    # the state the census finds, so the caller skips it before reaching here.
+    # Any line at all means the event path missed that transition, and the
+    # `prev` value says whether this was a repair (prev is behind) or a race
+    # (prev is ahead, which _FINAL_STAGE would have blocked).
+    if src == "census":
+        print(f"[census] {time.strftime('%H:%M:%S')} repaired {key}: "
+              f"{prev or 'unset'} -> {status}", flush=True)
     return True
 
 
