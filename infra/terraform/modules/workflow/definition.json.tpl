@@ -27,6 +27,7 @@
         },
         "ContainerOverrides": {
           "Environment": [
+            { "Name": "ENCODER_TELEMETRY_EXEC", "Value.$": "$$.Execution.Name" },
             { "Name": "JOB_ID", "Value.$": "$$.Execution.Name" }
           ]
         }
@@ -71,6 +72,11 @@
                 "Parameters": {
                   "s3_mezz.$": "$.s3_mezz",
                   "s3_out.$": "$.s3_prefix"
+                },
+                "ContainerOverrides": {
+                  "Environment": [
+                    { "Name": "ENCODER_TELEMETRY_EXEC", "Value.$": "$$.Execution.Name" }
+                  ]
                 }
               },
               "End": true
@@ -149,6 +155,7 @@
                       },
                       "ContainerOverrides": {
                         "Environment": [
+                          { "Name": "ENCODER_TELEMETRY_EXEC", "Value.$": "$$.Execution.Name" },
                           { "Name": "TWO_PASS", "Value.$": "$.two_pass" },
                           { "Name": "EXTRA_ARGS", "Value.$": "$.extra_args" },
                           { "Name": "CHUNK_DURATION_S", "Value.$": "$.chunk_duration" },
@@ -229,6 +236,7 @@
                             },
                             "ContainerOverrides": {
                               "Environment": [
+                                { "Name": "ENCODER_TELEMETRY_EXEC", "Value.$": "$$.Execution.Name" },
                                 { "Name": "TWO_PASS", "Value.$": "$.two_pass" },
                                 { "Name": "EXTRA_ARGS", "Value.$": "$.extra_args" },
                                 { "Name": "CHUNK_DURATION_S", "Value.$": "$.chunk_duration" },
@@ -301,6 +309,7 @@
                 },
                 "ContainerOverrides": {
                   "Environment": [
+                    { "Name": "ENCODER_TELEMETRY_EXEC", "Value.$": "$$.Execution.Name" },
                     { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
                     { "Name": "PARTIAL_DURATION", "Value.$": "$.partial_duration" }
                   ]
@@ -341,6 +350,7 @@
                 },
                 "ContainerOverrides": {
                   "Environment": [
+                    { "Name": "ENCODER_TELEMETRY_EXEC", "Value.$": "$$.Execution.Name" },
                     { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
                     { "Name": "PARTIAL_DURATION", "Value.$": "$.partial_duration" }
                   ]
@@ -381,6 +391,7 @@
                 },
                 "ContainerOverrides": {
                   "Environment": [
+                    { "Name": "ENCODER_TELEMETRY_EXEC", "Value.$": "$$.Execution.Name" },
                     { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
                     { "Name": "PARTIAL_DURATION", "Value.$": "$.partial_duration" }
                   ]

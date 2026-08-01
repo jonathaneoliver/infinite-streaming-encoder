@@ -1,0 +1,431 @@
+"""One way for a worker to say something to the control plane.
+
+Every worker in this system produces the same thing — a stream of
+`[[ENCODER-…]]` markers — but each deployment moves them differently:
+
+    single-container local   worker stdout -> `docker logs -f` -> Go server
+    local-dist (Temporal)    worker stdout -> temporal_worker  -> heartbeat /
+                             activity result -> orchestrator -> Go server
+    cloud (Batch)            worker stdout -> CloudWatch -> orchestrator
+                             polls, re-prints -> Go server
+
+Before this module the choice of transport was made independently at every
+emission site, by whoever wrote that marker. That is how #141 happened: VMAF was
+computed per chunk and thrown away, because the relay forwarded a whitelist and
+nobody added the new marker to it. The same shape nearly recurred with
+ENCODER-FLEET.
+
+So: emit through `emit()` and the marker travels on whatever transports this
+process has. Adding a marker never again requires knowing how many pipes exist.
+
+STDOUT IS ALWAYS ONE OF THEM. It is not a legacy path — it is what makes the
+abstraction safe to adopt:
+
+  * it is the only transport that needs no configuration, no IAM and no network,
+    so a sink that fails to initialise degrades to "exactly what happened
+    before" rather than to silence;
+  * on the single-container path it is load-bearing for restart resilience —
+    `docker logs -f` is what lets the Go server reattach to an encode that
+    outlived it (see CLAUDE.md, "Worker containers");
+  * on local-dist it IS the sink: temporal_worker reads its child's stdout and
+    routes each marker onto the heartbeat or the activity result.
+
+A sink is therefore always an ADDITIONAL, lower-latency or lower-cost channel —
+never a replacement. Losing one degrades performance, never correctness.
+
+Sinks are selected from the environment so a file like cli_local.py, which runs
+both as the local orchestrator and as the Batch worker entrypoint, needs no
+knowledge of which role it is in: the orchestrator simply has no queue
+configured and `emit()` is precisely `print()`.
+
+SCOPE — this abstracts ONE hop: worker -> control plane. The orchestrators
+(cli_batch, cli_local_dist) also print `[[ENCODER-…]]` markers, but those travel
+control plane -> Go server over a pipe the Go server is already attached to.
+That hop has exactly one transport and no reachability problem, so it stays a
+plain `print`. Routing it through here would also be a live hazard on the cloud
+path: cli_batch is the CONSUMER of the queue, and giving it a sink would let it
+republish what it just drained.
+"""
+from __future__ import annotations
+
+import atexit
+import os
+import sys
+import re
+import threading
+import time
+import uuid
+
+# The Step Functions execution this worker belongs to, injected by the workflow
+# definition as $$.Execution.Name. Its presence is what enables the SQS sink;
+# absent everywhere else, which is what makes emit() a plain print on the local
+# paths.
+_EXEC_ENV = "ENCODER_TELEMETRY_EXEC"
+
+_QUEUE_PREFIX = "encoder-telemetry-"
+# FIFO queues MUST carry this suffix, and it counts against the 80-char limit.
+_QUEUE_SUFFIX = ".fifo"
+# SQS hard limit on queue names. Not advisory — CreateQueue rejects longer.
+_SQS_NAME_MAX = 80
+
+
+def queue_name(execution_name: str) -> str:
+    """The telemetry queue for one Step Functions execution.
+
+    CONTRACT. The worker derives its queue from this, and so does the
+    orchestrator that creates, drains and deletes it. Deriving it separately in
+    either place is how you get a worker publishing into the void while the
+    orchestrator polls an empty queue it created itself — with no error on
+    either side, because both operations succeed.
+
+    Execution names run to 67 characters ({jobid}-{stem} capped at 60, plus a
+    6-hex uniqueness suffix), which with the prefix overflows the 80-char SQS
+    limit. The trailing suffix is what makes the name unique, so when trimming
+    is needed the READABLE HEAD gives way and the suffix is preserved — trimming
+    the tail instead would let two executions of the same job share a queue.
+    """
+    room = _SQS_NAME_MAX - len(_QUEUE_PREFIX) - len(_QUEUE_SUFFIX)
+    return _QUEUE_PREFIX + trim_execution_name(execution_name, room) + _QUEUE_SUFFIX
+
+
+def trim_execution_name(execution_name: str, room: int) -> str:
+    """Fit an execution name into `room` characters without losing uniqueness.
+
+    Shared because more than one AWS resource is named after an execution and
+    they have DIFFERENT length limits — SQS allows 80 characters, an EventBridge
+    rule only 64 — so the trim cannot live inside any one of them.
+
+    The READABLE HEAD gives way; the trailing 6-hex suffix is preserved, because
+    that suffix is the only thing distinguishing two executions of the same job.
+    Trimming the tail instead would silently collapse them onto one resource.
+    """
+    if len(execution_name) <= room:
+        return execution_name
+    return execution_name[:room - 7] + execution_name[-7:]
+
+# How many markers may be PACKED into one message, and how long the oldest may
+# wait for company. Only heartbeats ever wait — events flush on arrival (see
+# _Publisher.add) — so this window trades heartbeat latency for message count,
+# and message count is what the consumer is limited by.
+_BATCH_MAX = 10
+_BATCH_MAX_AGE_S = 3.0
+
+# SQS caps a SendMessageBatch payload at 256 KiB total. Markers are ~100 bytes,
+# so this only ever trips on something malformed; truncating beats failing the
+# whole batch and losing the nine well-formed markers travelling with it.
+_MAX_BODY = 200_000
+
+# Enough to notice the channel is down without turning a per-chunk failure into
+# thousands of duplicate lines in the log we are trying to read.
+_MAX_WARNINGS = 3
+
+
+# ---------------------------------------------------------------------------
+# Marker taxonomy
+#
+# Every consumer has to answer the same question — "may I drop this?" — and
+# before this each answered it with its own hardcoded tuple of marker names:
+# temporal_worker excluded STAGE and FLEET from its activity-result relay,
+# cli_batch skipped FLEET on a finished stream, and cli_batch's queue drain
+# skipped a stale FLEET. One concept, three literals, and every new marker had
+# to be added to all three by hand. That is #141's mechanism, not a hypothetical.
+#
+# So classify centrally, and make the DEFAULT the safe one: a marker nobody has
+# classified is a RECORD, and records are never dropped. Getting it wrong that
+# way costs a little bandwidth. Getting it wrong the other way threw away 465
+# computed VMAF scores on a 3-hour encode.
+# ---------------------------------------------------------------------------
+
+MARKER_PREFIX = "[[ENCODER-"
+
+#: Superseded by the next value of the same key, and duplicated by a state
+#: channel on both distributed paths (Batch job status / Temporal history). Safe
+#: to drop; a late copy actively fights the live value with stale data.
+CLASS_LIVE = "live"
+#: A point-in-time sample whose meaning depends on WHEN it arrives — the control
+#: plane stamps arrival time. Safe to drop, and must be dropped when stale,
+#: because replaying one registers an old reading as the machine's current state.
+CLASS_GAUGE = "gauge"
+#: Measured once and unrecoverable without re-encoding. Never dropped.
+CLASS_RECORD = "record"
+
+_CLASS_BY_NAME = {
+    "STAGE": CLASS_LIVE,
+    "FLEET": CLASS_GAUGE,
+}
+
+
+def is_marker(line: str) -> bool:
+    """True if `line` is an `[[ENCODER-…]]` marker."""
+    return line.startswith(MARKER_PREFIX)
+
+
+def marker_class(line: str) -> str:
+    """CLASS_LIVE / CLASS_GAUGE / CLASS_RECORD for one marker line.
+
+    Unknown markers are records — see the note above. This is the property that
+    makes adding a marker safe by default: write it, and every consumer already
+    forwards it.
+    """
+    name = line[len(MARKER_PREFIX):].split(" ", 1)[0].rstrip("]")
+    return _CLASS_BY_NAME.get(name, CLASS_RECORD)
+
+
+def is_record(line: str) -> bool:
+    """True if losing this marker loses data that cannot be recomputed."""
+    return marker_class(line) == CLASS_RECORD
+
+
+def is_gauge(line: str) -> bool:
+    """True if this marker's value is only meaningful at its moment of arrival."""
+    return marker_class(line) == CLASS_GAUGE
+
+
+_HEARTBEAT_RE = re.compile(
+    r"^\[\[ENCODER-STAGE key=\S+ status=running percent=(?!0\.0\]|100\.0\])")
+
+
+def is_heartbeat(line: str) -> bool:
+    """True if this marker is a mid-progress tick rather than an EVENT.
+
+    The distinction the UI cares about is not gauge-vs-record, it is
+    "did something happen" versus "how far along is it". A chunk STARTING and a
+    chunk FINISHING must be prompt — they are what the grid is really showing.
+    The percentages in between can lag a few seconds without anyone noticing.
+
+    So this is what decides whether a marker waits in the publisher's buffer or
+    goes out immediately. Everything that is not a heartbeat — status
+    transitions, and every record — bypasses the buffer.
+
+    A FLEET sample counts as a heartbeat too (it is a gauge; see marker_class),
+    which is handled by the caller rather than this regex.
+    """
+    return bool(_HEARTBEAT_RE.match(line)) or is_gauge(line)
+
+
+class _Sink:
+    """A side-channel for markers. Never raises; never blocks the encode."""
+
+    def send(self, markers: list[str]) -> None:  # pragma: no cover - interface
+        raise NotImplementedError
+
+    def close(self) -> None:  # pragma: no cover - interface
+        pass
+
+
+# Identifies THIS worker process, so the consumer can order a publisher's own
+# markers without caring how many other workers are publishing concurrently.
+# Ordering only ever matters within one publisher: a stage key belongs to
+# exactly one chunk, which is exactly one process.
+_PUB_ID = uuid.uuid4().hex[:12]
+
+
+class _SqsSink(_Sink):
+    """Publish markers to a per-execution SQS queue.
+
+    One queue per Step Functions execution, so the orchestrator polling it is the
+    only consumer and can delete everything it receives. A single shared queue
+    would put concurrent runs in competition: SQS returns a SAMPLE of available
+    messages, so an orchestrator whose run is small would repeatedly draw another
+    run's messages, be unable to delete them, and starve.
+    """
+
+    def __init__(self, queue_name: str) -> None:
+        import boto3  # local import: the local paths must not need boto3
+
+        region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+        self._sqs = boto3.client("sqs", region_name=region)
+        # Resolve once. If the queue is missing this raises and the caller
+        # disables the sink — stdout still carries everything.
+        self._url = self._sqs.get_queue_url(QueueName=queue_name)["QueueUrl"]
+        self._warned = 0
+
+    def send(self, markers: list[tuple[int, str]]) -> None:
+        """Publish this worker's buffered markers as ONE packed message.
+
+        Not one message per marker. The consumer is the bottleneck, and its
+        ceiling is set by ROUND TRIPS, not bytes: SQS caps ReceiveMessage at 10
+        messages, so 10 markers cost a receive plus a delete — about 80
+        markers/second against us-west-2 from a home connection. Peak production
+        is the same order, so one-marker-per-message built a backlog that never
+        drained (3,292 still queued with every chunk finished).
+
+        Packing moves the whole run under that ceiling: markers are ~100 bytes
+        against a 256 KiB message, so a packed message carries a worker's whole
+        flush window and one receive returns ten of them. Ordering is unaffected
+        — markers inside a body are already in emission order, and the queue is
+        FIFO across bodies.
+        """
+        # `pub`+`seq` ride as MESSAGE ATTRIBUTES, deliberately not in the marker
+        # text: the marker format is a contract with the Go scanner's regexes,
+        # and sequencing is a property of the transport, not of the measurement.
+        # A consumer on any other transport neither sees nor needs them.
+        if not markers:
+            return
+        body = "\n".join(m for _, m in markers)[:_MAX_BODY]
+        first_seq = markers[0][0]
+        entries = [
+            {
+                "Id": "0",
+                "MessageBody": body,
+                "MessageAttributes": {
+                    "pub": {"DataType": "String", "StringValue": _PUB_ID},
+                    # The seq of the FIRST marker in the body. Ordering within a
+                    # body is inherent, so the consumer's guard works per
+                    # message, not per marker.
+                    "seq": {"DataType": "Number", "StringValue": str(first_seq)},
+                },
+                # FIFO ordering is guaranteed WITHIN a message group, and groups
+                # are still consumed in parallel. The publisher is exactly the
+                # right group: a stage key belongs to one chunk, which is one
+                # process, so this orders everything that needs ordering while
+                # leaving 336 chunks free to interleave.
+                "MessageGroupId": _PUB_ID,
+                # Explicit, NOT ContentBasedDeduplication. Content-based dedup
+                # would hash the body and silently swallow a legitimately
+                # repeated marker inside its 5-minute window — two identical
+                # FLEET samples from a steady box, or the same percent reported
+                # twice. Silent data loss is the exact failure class this whole
+                # module exists to remove. (seq) makes every message unique.
+                "MessageDeduplicationId": f"{_PUB_ID}-{first_seq}",
+            }
+        ]
+        try:
+            self._sqs.send_message_batch(QueueUrl=self._url, Entries=entries)
+        except Exception as e:  # noqa: BLE001 — telemetry must never fail a run
+            self._warn(f"send failed: {type(e).__name__}: {e}")
+
+    def _warn(self, msg: str) -> None:
+        if self._warned >= _MAX_WARNINGS:
+            return
+        self._warned += 1
+        tail = " (further warnings suppressed)" if self._warned == _MAX_WARNINGS else ""
+        print(f"[telemetry] {msg}{tail}", file=sys.stderr, flush=True)
+
+
+class _Publisher:
+    """Buffers markers and hands them to a sink in batches.
+
+    Flushing is done by a daemon thread rather than opportunistically on the next
+    emit(). A chunk's LAST markers — ENCODER-TIMING, ENCODER-SPEED — are followed
+    by no further emissions, so an emit-driven flush would hold exactly the
+    records that cannot be reconstructed until process exit, and lose them
+    outright if the container is killed (spot reclaim) before atexit runs.
+    """
+
+    def __init__(self, sink: _Sink) -> None:
+        self._sink = sink
+        self._buf: list[tuple[int, str]] = []
+        self._lock = threading.Lock()
+        self._oldest = 0.0
+        self._warned = 0
+        # Emission order, which is the ONLY record of true ordering. SQS
+        # standard queues do not preserve it, and SentTimestamp is assigned on
+        # arrival — with up to _BATCH_MAX_AGE_S of buffering, two markers can
+        # reach the queue in the wrong order or in the same millisecond.
+        self._seq = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="telemetry-flush")
+        self._thread.start()
+        atexit.register(self.close)
+
+    def add(self, marker: str) -> None:
+        with self._lock:
+            if not self._buf:
+                self._oldest = time.monotonic()
+            self._seq += 1
+            self._buf.append((self._seq, marker))
+            full = len(self._buf) >= _BATCH_MAX
+        # An EVENT goes out now, carrying whatever heartbeats were waiting with
+        # it — chunk start and chunk end are what the grid is actually showing,
+        # and a chunk that finishes must not sit in a buffer. Heartbeats alone
+        # wait for the timer, which is what keeps the message count down.
+        if full or not is_heartbeat(marker):
+            self.flush()
+
+    def flush(self) -> None:
+        with self._lock:
+            batch, self._buf = self._buf[:_BATCH_MAX], self._buf[_BATCH_MAX:]
+            self._oldest = time.monotonic() if self._buf else 0.0
+        if not batch:
+            return
+        try:
+            self._sink.send(batch)
+        except Exception as e:  # noqa: BLE001 — see below
+            # Guarded HERE, not only inside each sink. flush() is called from
+            # add(), which sits directly in the encode's call path, so an
+            # unguarded sink turns a telemetry outage into a failed encode. The
+            # batch is dropped rather than requeued: markers are only worth
+            # sending while they are current, and a sink that is down would
+            # otherwise grow the buffer without bound for the rest of the run.
+            self._warn(f"{type(e).__name__}: {e}")
+
+    def _warn(self, msg: str) -> None:
+        if self._warned >= _MAX_WARNINGS:
+            return
+        self._warned += 1
+        tail = " (further warnings suppressed)" if self._warned == _MAX_WARNINGS else ""
+        print(f"[telemetry] dropped a batch: {msg}{tail}",
+              file=sys.stderr, flush=True)
+
+    def _loop(self) -> None:
+        while not self._stop.wait(_BATCH_MAX_AGE_S / 2):
+            with self._lock:
+                due = bool(self._buf) and (
+                    time.monotonic() - self._oldest >= _BATCH_MAX_AGE_S)
+            if due:
+                self.flush()
+
+    def close(self) -> None:
+        self._stop.set()
+        # Drain fully: the buffer may hold more than one batch if the sink was
+        # slower than the encode produced markers.
+        while True:
+            with self._lock:
+                if not self._buf:
+                    break
+            self.flush()
+        self._sink.close()
+
+
+# Resolved once, lazily, on first emit. None = stdout only.
+_publisher: _Publisher | None = None
+_init_done = False
+
+
+def _publisher_for_env() -> _Publisher | None:
+    exec_name = os.environ.get(_EXEC_ENV, "").strip()
+    if not exec_name:
+        return None
+    try:
+        return _Publisher(_SqsSink(queue_name(exec_name)))
+    except Exception as e:  # noqa: BLE001 — no side channel is not a failure
+        # Deliberately not fatal. The worker keeps printing to stdout, the
+        # orchestrator keeps its CloudWatch fallback, and the run is slower to
+        # report rather than broken.
+        print(f"[telemetry] disabled ({type(e).__name__}: {e}); "
+              f"markers go to stdout only", file=sys.stderr, flush=True)
+        return None
+
+
+def emit(marker: str) -> None:
+    """Emit one `[[ENCODER-…]]` marker on every transport this process has."""
+    global _publisher, _init_done
+    print(marker, flush=True)
+    if not _init_done:
+        _init_done = True
+        _publisher = _publisher_for_env()
+    if _publisher is not None:
+        _publisher.add(marker)
+
+
+def flush() -> None:
+    """Block until buffered markers have been handed to the sink.
+
+    Call at the end of a phase. atexit covers the normal path, but a worker that
+    is SIGKILLed — which on spot capacity is routine, not exceptional — never
+    runs atexit handlers.
+    """
+    if _publisher is not None:
+        _publisher.flush()

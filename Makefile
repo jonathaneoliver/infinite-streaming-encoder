@@ -124,9 +124,21 @@ check:                ## run the same static checks CI runs (gofmt/vet/build, to
 	printf '  sfn scopes     '; \
 	if out=$$(python3 scripts/check_sfn_scopes.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  go test        '; \
+	if out=$$(go test -race ./... 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py undefined   '; \
 	if ! command -v ruff >/dev/null 2>&1; then echo "skipped (pip install ruff)"; \
 	elif out=$$(ruff check --select F821 scripts/ 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py imports     '; \
+	if out=$$(cd scripts && python3 -c 'import infinite_streaming_encoder.cli_batch, infinite_streaming_encoder.cli_local, infinite_streaming_encoder.cli_phase, infinite_streaming_encoder.telemetry, infinite_streaming_encoder.progress' 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py telemetry   '; \
+	if out=$$(python3 scripts/test_telemetry.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py stagestate  '; \
+	if out=$$(python3 scripts/test_stage_state.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  python compile '; \
 	if out=$$(cd scripts && python3 -m compileall -q infinite_streaming_encoder 2>&1); then echo "ok"; \
@@ -225,7 +237,18 @@ down:
 stop:
 	$(COMPOSE_BASE) stop server 2>/dev/null || docker stop $(CONTAINER_NAME) 2>/dev/null || true
 
-restart: stop run
+# Guarded, because bouncing the server mid-encode LOSES that job's progress
+# state. The work itself survives — cloud chunks keep running in Batch, local
+# ones in their detached containers — but the server rebuilds a cloud job's
+# stages by replaying the execution, and the replay does not recover everything:
+# a job observed at 336/336 came back as 159/336 and stayed there. No compute is
+# wasted and nothing is re-encoded; the run's progress display is simply wrong
+# from then on.
+#
+# FORCE=1 skips the check for when you know the job is expendable.
+restart:
+	@if [ -z "$(FORCE)" ]; then $(MAKE) --no-print-directory require-idle || 	  { echo "    (set FORCE=1 to restart anyway — the running job's progress display will be lost)"; exit 1; }; fi
+	@$(MAKE) --no-print-directory stop run
 
 logs:
 	docker logs -f $(CONTAINER_NAME)

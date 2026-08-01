@@ -135,7 +135,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .stages-table tbody tr:hover { background: rgba(67,97,238,0.16); }
 .stages-table tbody tr:hover td.stage-label { color: #dfe6f2; }
 .stage-bar-track { height: 6px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
-.stage-bar-fill { height: 100%; background: #4361ee; transition: width 0.3s ease; }
+/* No transition, same as .chunk-cell-fill: render the reported percent, never
+   animate between two reported values. */
+.stage-bar-fill { height: 100%; background: #4361ee; }
 .stage-bar-fill.stage-fill-done { background: #06d6a0; }
 .stage-bar-fill.stage-fill-failed { background: #ef476f; }
 .stage-bar-fill.stage-fill-skipped { background: repeating-linear-gradient(45deg, #555 0 6px, #444 6px 12px); }
@@ -192,7 +194,12 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    inline elements ignore both (unlike the whole-variant fill, which is a div).
    The fill's COLOUR is the machine the chunk ran on (set inline in JS) so
    co-located chunks are unmistakable; width is progress; red states win. */
-.chunk-cell-fill { display: block; height: 100%; width: 0; background: #4361ee; transition: width 0.3s ease; }
+/* No transition. The fill renders the REPORTED percent directly — 0, 50, 100 —
+   and never animates between two reported values. A transition here meant every
+   width write took 0.3s to land, so a cell recreated by any rebuild swept from
+   nothing to its real width and a chunk that finished long ago appeared to
+   re-fill. Progress markers arrive often enough to read as motion on their own. */
+.chunk-cell-fill { display: block; height: 100%; width: 0; background: #4361ee; }
 .chunk-cell-fill.chunk-failed { background: #ef476f; }
 /* reclaimed = AWS took the spot instance; red + pulse (encoding thrown away,
    waiting to restart on fresh capacity) until the retry begins encoding. */
@@ -2434,11 +2441,44 @@ function updateStagesTable(row, stages) {
         if (pa !== pb) return pa - pb;
         return pa === 3 ? _rowHeight(b) - _rowHeight(a) : 0;
     });
-    // Structural signature: rebuild the tbody only when the row set changes.
+    // Structural signature: which ROWS exist, deliberately WITHOUT each row's
+    // cell count. The count used to be part of it, so every time one more chunk
+    // stage arrived for a variant the signature changed and the entire tbody was
+    // rebuilt — all rows, every cell recreated at width:0 and animating back, so
+    // chunks that finished long ago visibly repainted. Instrumentation caught it
+    // exactly: rows:19 delta:0 with the 2160p row going ":12" -> ":16" -> ":17"
+    // -> ":23" in 23 milliseconds, i.e. four full-table rebuilds for four new
+    // cells. Cell counts are now reconciled per row, in place, below.
+    // Nor the concat flag. A variant's concat stage gets absorbed into its group
+    // near the end of that variant, flipping r.concat and — while it was in the
+    // signature — rebuilding the entire table at exactly the moment the encode
+    // finished, blanking every settled cell. It has no structural effect: the row
+    // template never reads it, because the join is drawn as a solid bar with no
+    // separate glyph. A signature exists to answer "did the DOM shape change",
+    // and this never changed it.
     const sig = rows.map(r => r.kind === 'chunks'
-        ? 'c:' + r.codec + ':' + r.tier + ':' + r.cells.length + (r.concat ? ':j' : '')
+        ? 'c:' + r.codec + ':' + r.tier
         : r.s.key).join(',');
     if (tbody.dataset.sig !== sig) {
+        // Rebuilding destroys every cell and recreates it at width:0, so each one
+        // animates back from nothing — chunks that finished long ago visibly
+        // repaint. Record WHY, because the trigger was not obvious: the signature
+        // covers the row set and each row's cell COUNT, and a chunk row's count
+        // grows as its stages arrive, so any late-arriving stage rebuilds the
+        // whole table. Kept as a ring buffer on window plus a console line, so a
+        // repaint someone notices can be traced to the row that caused it.
+        const _prevSig = tbody.dataset.sig || '';
+        if (_prevSig) {
+            const a = _prevSig.split(','), b = sig.split(',');
+            const added = b.filter(x => !a.includes(x));
+            const removed = a.filter(x => !b.includes(x));
+            const rec = { t: new Date().toISOString(), rows: b.length,
+                          delta: b.length - a.length,
+                          added: added.slice(0, 5), removed: removed.slice(0, 5) };
+            (window.__gridRebuilds = window.__gridRebuilds || []).push(rec);
+            if (window.__gridRebuilds.length > 200) window.__gridRebuilds.shift();
+            uiLog('grid-rebuild', rec);
+        }
         tbody.innerHTML = rows.map(r => {
             if (r.kind === 'stage') {
                 // Normalize a raw whole-variant encode key ("encode:h264:720p")
@@ -2462,6 +2502,34 @@ function updateStagesTable(row, stages) {
                 <td class="stage-pct chunk-count"></td></tr>`;
         }).join('');
         tbody.dataset.sig = sig;
+    }
+
+    // Reconcile each chunk row's cells against the DOM without touching the ones
+    // already there. Appending only the missing keys is what keeps a settled
+    // cell settled — rebuilding the row (even just this row) would restart every
+    // fill animation in it.
+    for (const r of rows) {
+        if (r.kind !== 'chunks') continue;
+        const grid = tbody.querySelector(
+            `tr[data-chunk-group="${r.codec}:${r.tier}"] .chunk-grid`);
+        if (!grid) continue;
+        const have = new Set([...grid.children].map(el => el.dataset.chunkKey));
+        const want = new Set(r.cells.map(c => c.key));
+        if (have.size === want.size && [...want].every(k => have.has(k))) continue;
+        for (const c of r.cells) {
+            if (have.has(c.key)) continue;
+            const cell = document.createElement('span');
+            cell.className = 'chunk-cell';
+            cell.dataset.chunkKey = c.key;
+            cell.title = 'chunk ' + c.index;
+            cell.innerHTML = '<span class="chunk-cell-fill"></span>';
+            grid.appendChild(cell);
+        }
+        // A key that vanished (a plan revision) is dropped rather than left
+        // behind as a cell nothing will ever update.
+        for (const el of [...grid.children]) {
+            if (!want.has(el.dataset.chunkKey)) el.remove();
+        }
     }
 
     // Per-tick update.
@@ -2518,15 +2586,71 @@ function updateStagesTable(row, stages) {
                 // no-instance blue — see .chunk-reused. Overrides the machine tint.
                 const reused = !!c.s.reused;
                 // reclaimed → fill red (waiting to restart); else show progress.
-                fill.style.width = (reused || st === 'reclaimed' ? 100 : prog).toFixed(1) + '%';
+                //
+                // 'starting' used to fill to 100% and let the hatch carry the
+                // meaning. That read as a COMPLETED cell: a full machine-coloured
+                // pill that then dropped back to 0 and climbed again. It was
+                // tolerable only while STARTING was rarely observed — describe_jobs
+                // polling raced placement, so most chunks appeared to jump straight
+                // to running. Driving state from Batch EVENTS delivers STARTING for
+                // every chunk, so every cell started flashing full-width first.
+                //
+                // Now the fill stays empty and the hatch moves to the CELL, so a
+                // starting chunk reads as "placed, not yet encoding" — the same way
+                // the fleet view hatches a booting box rather than filling its bar.
+                const _wantW = (reused || st === 'reclaimed'
+                    ? 100 : st === 'starting' ? 0 : prog).toFixed(1) + '%';
+                // Only touch the DOM when the value actually changes. Writing the
+                // same width every tick is not free — it invalidates style on a
+                // cell that has not moved, and on a settled chunk there is nothing
+                // to redraw. Counted so a redraw someone SEES can be checked
+                // against whether we wrote anything at all.
+                if (fill.style.width !== _wantW) {
+                    // Report any write that makes a cell show LESS colour. The
+                    // server logs the same thing for its own emissions ([fill]);
+                    // between them, "a cell filled then zeroed" is attributable
+                    // to either the data or this renderer, rather than argued
+                    // about. A cell being CREATED reads as 0 -> n and is not a
+                    // regression, so compare only against a width we already set.
+                    // EVERY width change this renderer makes, both directions.
+                    // Only logging shrinks names the victim without naming the
+                    // culprit — "filled then zeroed" needs the fill on record too.
+                    //
+                    // Bounded per cell rather than globally: the reported problem
+                    // is at cell STARTUP ("once it fills with progress it seems
+                    // fine"), so the first handful of transitions per cell is
+                    // exactly the interesting part, and capping there keeps a
+                    // 336-chunk run from flooding the log channel.
+                    const _prevW = parseFloat(fill.style.width);
+                    const _newW = parseFloat(_wantW);
+                    window.__cellLogN = window.__cellLogN || {};
+                    const _seen = window.__cellLogN[c.key] || 0;
+                    if (_seen < 12) {
+                        window.__cellLogN[c.key] = _seen + 1;
+                        uiLog('cell-width', {
+                            key: c.key, from: isNaN(_prevW) ? null : _prevW,
+                            to: _newW, n: _seen + 1,
+                            down: !isNaN(_prevW) && _newW < _prevW - 0.05,
+                            status: st, pct: c.s.percent,
+                            inst: c.s.instance || '', reused: !!c.s.reused,
+                        });
+                    }
+                    fill.style.width = _wantW;
+                    window.__cellWrites = (window.__cellWrites || 0) + 1;
+                }
                 fill.className = 'chunk-cell-fill'
                     + (st === 'failed' ? ' chunk-failed'
                         : st === 'reclaimed' ? ' chunk-reclaimed'
-                            : reused ? ' chunk-reused' : '');
+                            : reused ? ' chunk-reused'
+                                : '');
                 // The fill COLOUR is the machine this chunk ran on — bold and
                 // unmissable so co-located chunks pop; red/reused states keep their
                 // class colour (clear the inline so the class wins).
-                fill.style.background = (isRed || reused) ? '' : (instanceColor(c.s.instance) || '#4361ee');
+                const _wantBg = (isRed || reused) ? '' : (instanceColor(c.s.instance) || '#4361ee');
+                if (fill.style.background !== _wantBg) {
+                    fill.style.background = _wantBg;
+                    window.__cellPaints = (window.__cellPaints || 0) + 1;
+                }
             }
             cell.title = stageTooltip(c.s, 'chunk ' + c.index) + (c.s.reused ? ' · reused from prior staging' : '');
         }
@@ -2566,6 +2690,7 @@ function updateJobRow(row, j) {
                 + `<span class="job-prog-pct">${p}%</span>`
                 + `<div class="job-prog-bar"><div style="width:${p}%"></div></div>`
                 + (sub ? `<span class="job-prog-sub">${sub}</span>` : '')
+                + _unallocSpark(j)
                 + `</div>`;
             progEl.style.display = '';
         } else {
@@ -2781,9 +2906,73 @@ function applyFleetCollapse(key) {
 applyFleetCollapse('cloud');
 applyFleetCollapse('local');
 
+// Chunks submitted but not yet placed on a machine — the backlog Batch has not
+// been able to start. Counts `pending` + `queued`: a chunk reaching `starting`
+// carries a containerInstanceArn (verified 100% of STARTING events in #188), so
+// that is exactly the moment it stops being unallocated.
+//
+// Reaching 0 means every chunk has a machine, which is the thing worth watching:
+// while it stays flat and high, the compute environment is at its vCPU ceiling
+// and more chunks cannot start no matter how the fleet is behaving.
+//
+// Client-side and rate-limited, deliberately. The other sparklines come from the
+// server's 2h inventory history because they describe the FLEET; this describes
+// the JOB, and the page already receives every stage over SSE. The cost is that
+// the series resets on reload — acceptable for a number that only matters while
+// a run is in flight.
+const _UNALLOC_SAMPLE_MS = 5000;
+const _UNALLOC_MAX = 240;          // 240 x 5s = 20 minutes, about one run
+// PER JOB, not fleet-wide: this sits beside that job's own % complete, and two
+// concurrent encodes each have their own backlog. Summing them would produce a
+// number that belongs to neither.
+window.__unalloc = window.__unalloc || { by: {}, last: 0 };
+
+function _unallocCount(j) {
+    let n = 0;
+    for (const s of (j.stages || [])) {
+        if (!String(s.key || '').startsWith('encode:')) continue;
+        if (s.status === 'pending' || s.status === 'queued') n++;
+    }
+    return n;
+}
+
+// The backlog sparkline that sits beside a job's own % complete.
+//
+// The percent says how much work is DONE; this says how much has not even been
+// given a machine yet. They answer different questions, and the second one is
+// what tells you whether a stalled-looking run is short of capacity rather than
+// slow — while this stays flat and high, the compute environment is at its vCPU
+// ceiling and no chunk can start however healthy the fleet looks.
+//
+// Hidden until it has two samples (nothing to draw) and once it reaches 0 and
+// stays there — a flat zero line is noise on a job that is simply finishing.
+function _unallocSpark(j) {
+    const h = ((window.__unalloc || {}).by || {})[j.id] || [];
+    if (h.length < 2) return '';
+    const cur = h[h.length - 1];
+    if (!cur && !h.some(v => v > 0)) return '';
+    return `<span class="job-prog-sub" title="Chunks submitted but not yet placed on a machine. Reaches 0 when every chunk has one; stays flat and high when Batch is at its vCPU ceiling.">`
+        + `${_sparkline(h, '#7fd1e0', { min: 0, w: 54, h: 13 })} `
+        + `<span style="color:#ccc">${cur}</span> unplaced</span>`;
+}
+
+function _sampleUnallocated(all) {
+    const now = Date.now();
+    if (now - window.__unalloc.last < _UNALLOC_SAMPLE_MS) return;
+    window.__unalloc.last = now;
+    const by = window.__unalloc.by;
+    for (const j of all) {
+        if (j.status !== 'running' && j.status !== 'queued') continue;
+        const h = (by[j.id] = by[j.id] || []);
+        h.push(_unallocCount(j));
+        if (h.length > _UNALLOC_MAX) h.shift();
+    }
+}
+
 function renderJobs() {
     const list = document.getElementById('jobs-list');
     const all = Object.values(jobs);
+    _sampleUnallocated(all);
     renderJobsOverview(all);
     syncFleetPanels();
 
@@ -2793,41 +2982,52 @@ function renderJobs() {
     }
     if (list.querySelector('.no-files')) list.innerHTML = '';
 
-    // Group by fleet so cloud and local jobs cluster under the sections above.
-    // Headers appear only when BOTH fleets have jobs (a single-target run reads
-    // like the old flat list). Reordering uses appendChild, which MOVES existing
-    // rows — preserving each row's DOM and its open log viewer.
-    const groups = [
-        { key: 'cloud', label: '☁ Cloud (AWS Batch)', jobs: all.filter(_isCloudJob) },
-        { key: 'local', label: '🖥 Local (all machines)', jobs: all.filter(j => !_isCloudJob(j)) },
-    ];
-    const showHeaders = groups.every(g => g.jobs.length > 0);
+    // ONE chronological list, newest first — cloud and local interleaved rather
+    // than clustered into per-fleet sections. Grouping split a single session's
+    // work into two piles ordered independently, so the job you just started
+    // could sit below older ones from the other fleet. What you almost always
+    // want is "what happened most recently", regardless of where it ran; the
+    // per-row target badge already says which fleet each job is on.
+    //
+    // Reordering uses appendChild, which MOVES existing rows — preserving each
+    // row's DOM and its open log viewer.
+    for (const stale of [...list.querySelectorAll('.jobs-group-hdr')]) stale.remove();
+
+    const ordered = all.slice().sort((a, b) => {
+        const ta = new Date(a.started_at).getTime() || 0;
+        const tb = new Date(b.started_at).getTime() || 0;
+        // Ties broken by id (a monotonic ms timestamp) so equal start times —
+        // two targets submitted in the same request — keep a stable order
+        // instead of swapping on every poll.
+        return tb - ta || String(b.id).localeCompare(String(a.id));
+    });
+
     const seen = new Set();
-    for (const g of groups) {
-        let hdr = document.getElementById('jobs-group-' + g.key);
-        if (!g.jobs.length || !showHeaders) {
-            if (hdr) hdr.remove();
+    let expected = list.firstElementChild;   // where the next row SHOULD sit
+    for (const j of ordered) {
+        seen.add(j.id);
+        let row = document.getElementById('job-' + j.id);
+        if (!row) {
+            const tmp = document.createElement('div');
+            tmp.innerHTML = jobRowHtml(j);
+            row = tmp.firstElementChild;
+        }
+        // Move ONLY when the row is not already in the right place. appendChild
+        // on an attached node MOVES it, and moving a node forces layout and a
+        // repaint of its entire subtree — for a job row that is a stage table
+        // with hundreds of chunk cells. Doing that unconditionally every poll
+        // repainted the whole grid on every tick even when no cell had changed:
+        // measured 22 seconds with zero data changes while the grid was visibly
+        // re-rendering.
+        if (row !== expected) {
+            // Not where it belongs: put it before the node that is. `expected`
+            // stays put — the next row goes before it too.
+            list.insertBefore(row, expected);
         } else {
-            if (!hdr) {
-                hdr = document.createElement('div');
-                hdr.id = 'jobs-group-' + g.key;
-                hdr.className = 'jobs-group-hdr';
-            }
-            hdr.textContent = `${g.label} · ${g.jobs.length}`;
-            list.appendChild(hdr); // move into position
+            // Already correct; advance to the next slot without touching the DOM.
+            expected = expected.nextElementSibling;
         }
-        g.jobs.sort((a, b) => new Date(b.started_at) - new Date(a.started_at));
-        for (const j of g.jobs) {
-            seen.add(j.id);
-            let row = document.getElementById('job-' + j.id);
-            if (!row) {
-                const tmp = document.createElement('div');
-                tmp.innerHTML = jobRowHtml(j);
-                row = tmp.firstElementChild;
-            }
-            list.appendChild(row); // move into grouped order (preserves DOM/logs)
-            updateJobRow(row, j);
-        }
+        updateJobRow(row, j);
     }
 
     // Drop any rows whose job is no longer in the set.
@@ -2993,7 +3193,10 @@ async function refreshAws() {
         const res = await fetch('/api/aws/inventory');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
-        _awsFleet = data.fleet || [];
+        // fleet_cpu = per-machine CPU array; data.fleet stays the summary object
+        // that renderFleet/_fleetSparks read. They used to share one key, so
+        // whichever arrived last won and the other rendered blank.
+        _awsFleet = data.fleet_cpu || [];
         renderAws(data);
         if (lastEl) {
             lastEl.textContent = 'updated ' + new Date().toLocaleTimeString();
@@ -3153,6 +3356,54 @@ function _jobFriendly(name) {
 
 // Colour a fleet-packing segment by the codec in the Batch job name.
 function _hashStr(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return Math.abs(h); }
+// A shade of the MACHINE's colour for one chunk/job on that machine.
+//
+// The fleet rows and the chunk plot are read together — "which box ran this
+// chunk" is the question — so a chunk takes its host's hue and varies only in
+// lightness. Adjacent chunks on one box stay individually visible, while every
+// chunk on that box still reads as belonging to it.
+//
+// Replaces colouring cloud chunks by CODEC hue, which shared no colour with the
+// machine row above them, and flat host-colour on local, where neighbouring
+// chunks were indistinguishable except for the divider.
+function _shadeOfHost(hostColor, key) {
+    if (!hostColor) return null;
+    const hsl = _toHsl(hostColor);
+    if (!hsl) return hostColor;
+    // Quantised to 6 discrete steps across 34-64% rather than a continuous
+    // hash: a raw hash produced neighbours like 36% and 37%, which are the same
+    // colour to the eye. Stepping guarantees any two different shades are
+    // visibly apart. Keyed by hash (not list index) so a chunk keeps its shade
+    // across polls — index-based would repaint chunks whenever the list
+    // reorders, which reads as flicker.
+    // 34-64% keeps every step legible against the #20252f track: lighter washes
+    // out the white label, darker merges into the idle segment.
+    const STEPS = 6;
+    const light = 34 + (_hashStr(key || '') % STEPS) * (30 / (STEPS - 1));
+    return `hsl(${hsl.h}, ${hsl.s}%, ${light}%)`;
+}
+
+// #rrggbb (the instance palette) or an existing hsl() -> {h,s,l}. Null if neither.
+function _toHsl(c) {
+    const m = /^hsl\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%/.exec(c);
+    if (m) return { h: +m[1], s: +m[2], l: +m[3] };
+    const hex = /^#([0-9a-f]{6})$/i.exec(c);
+    if (!hex) return null;
+    const n = parseInt(hex[1], 16);
+    const r = ((n >> 16) & 255) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255;
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+    let h = 0;
+    if (d) {
+        if (mx === r) h = ((g - b) / d + (g < b ? 6 : 0));
+        else if (mx === g) h = (b - r) / d + 2;
+        else h = (r - g) / d + 4;
+        h *= 60;
+    }
+    const l = (mx + mn) / 2;
+    const sat = d ? d / (1 - Math.abs(2 * l - 1)) : 0;
+    return { h: Math.round(h), s: Math.round(sat * 100), l: Math.round(l * 100) };
+}
+
 function _jobColor(name) {
     name = name || '';
     // Codec picks the HUE (so codec stays recognisable at a glance); a hash of
@@ -3172,7 +3423,40 @@ const _FLEET_STATE = {
     booting: { c: '#d0a24a', t: '◦ booting', tip: 'EC2 up — OS boot + ECS agent register + first image pull happen here' },
     pulling: { c: '#4a90d9', t: '⋯ pulling image', tip: 'task placed — pulling image / starting container' },
     idle:    { c: '#d0a24a', t: '◦ idle', tip: 'running but no jobs — a scale-down candidate' },
+    // A box on its way OUT. Both used to render as "booting", because an
+    // instance that has left the ECS cluster looks identical to one that has not
+    // joined it yet — so scale-down was displayed as scale-up.
+    draining: { c: '#8a94a2', t: '↓ draining', tip: 'ECS is draining this box — finishing work, no new tasks placed' },
+    leaving:  { c: '#8a94a2', t: '↓ leaving', tip: 'deregistered from ECS and being scaled down — EC2 shutdown pending' },
 };
+// Post a diagnostic to the server so it lands in `docker logs`.
+//
+// Some faults only exist in the browser — the chunk grid repainting settled
+// cells, for one — and the console is not somewhere anyone can read after the
+// fact, or ask about later. Batched on a 2s timer so a burst of rebuilds is one
+// request, capped so a runaway loop in here cannot become unbounded log volume,
+// and fire-and-forget so logging can never break the page it is instrumenting.
+let _uiLogQueue = [];
+let _uiLogTimer = null;
+let _uiLogDropped = 0;
+function uiLog(kind, data) {
+    if (_uiLogQueue.length >= 20) { _uiLogDropped++; return; }
+    // Stamp the build THIS PAGE loaded. A tab open across a deploy keeps running
+    // the JavaScript it already has — no-cache governs new requests, not a live
+    // tab — so a stale page reports symptoms the deployed code no longer has.
+    // That happened: rebuild events still carried the old signature format after
+    // the fix shipped, which reads as "the fix did not work" rather than "this
+    // tab predates it". The stamp makes the difference visible in the log.
+    _uiLogQueue.push({ kind, rev: (window.__buildRev || 'unknown'), ...data });
+    if (_uiLogTimer) return;
+    _uiLogTimer = setTimeout(() => {
+        const batch = _uiLogQueue; _uiLogQueue = []; _uiLogTimer = null;
+        const dropped = _uiLogDropped; _uiLogDropped = 0;
+        const body = JSON.stringify(dropped ? { batch, dropped } : { batch });
+        fetch('/api/ui-log', { method: 'POST', body }).catch(() => {});
+    }, 2000);
+}
+
 function _fleetInstanceRow(i, maxV) {
     const cap = i.vcpus || 0;
     const used = i.used_vcpus || 0;
@@ -3186,7 +3470,10 @@ function _fleetInstanceRow(i, maxV) {
     // A track-coloured right border puts a vertical break between adjacent jobs
     // so you can see each one (esp. when they differ in vCPU width).
     const divider = 'border-right:2px solid #20252f;';
-    let parts = jobs.map(j => seg(cap ? (j.vcpu || 0) / cap * 100 : 0, _jobColor(j.name),
+    // Host colour first — the chunk segments below are shades of it.
+    const hostColor = i.id ? instanceColor(i.id) : null;
+    const chunkColor = j => _shadeOfHost(hostColor, j.name) || _jobColor(j.name);
+    let parts = jobs.map(j => seg(cap ? (j.vcpu || 0) / cap * 100 : 0, chunkColor(j),
         `${_jobFriendly(j.name)} — ${j.vcpu} vCPU${starting(j) ? ' (starting — pulling image)' : ''}`,
         divider + (starting(j) ? 'opacity:.5;' + stripe('rgba(255,255,255,.3)') : ''))).join('');
 
@@ -3198,6 +3485,8 @@ function _fleetInstanceRow(i, maxV) {
     const S = _FLEET_STATE[st];
     const badge = (S && !jobs.length) ? ` <span style="color:${S.c};font-size:11px" title="${S.tip}">${S.t}</span>` : '';
 
+    // Only warming-up states get the striped bar; draining/leaving are winding
+    // down and would read as starting up.
     if ((st === 'booting' || st === 'pulling') && !jobs.length && cap) {
         // Warming-up box with no job yet: striped full-width bar, not flat idle.
         parts = seg(100, '#20252f', S.tip, stripe(S.c + '55'));
@@ -3207,11 +3496,13 @@ function _fleetInstanceRow(i, maxV) {
 
     const rightLabel = jobs.length
         ? `${used}/${cap} vCPU · ${jobs.length} job${jobs.length > 1 ? 's' : ''}`
-        : (st === 'booting' ? 'booting' : st === 'pulling' ? 'pulling image' : `idle (${cap} vCPU)`);
+        : (st === 'booting' ? 'booting' : st === 'pulling' ? 'pulling image'
+           : st === 'draining' ? 'draining' : st === 'leaving' ? 'leaving'
+           : `idle (${cap} vCPU)`);
     // Inline list of what this box is running right now (friendly names + dot).
     const jobList = jobs.length
         ? `<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:#9aa;margin-top:3px">`
-          + jobs.map(j => `<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${_jobColor(j.name)};vertical-align:middle;margin-right:4px;${starting(j) ? 'opacity:.5' : ''}"></span>`
+          + jobs.map(j => `<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${chunkColor(j)};vertical-align:middle;margin-right:4px;${starting(j) ? 'opacity:.5' : ''}"></span>`
               + `${escapeHtml(_jobFriendly(j.name))} <span style="color:#666">${j.vcpu}v${starting(j) ? ' · starting' : ''}</span></span>`).join('')
           + `</div>`
         : '';
@@ -3224,10 +3515,7 @@ function _fleetInstanceRow(i, maxV) {
     // lagged, so a fresh box gets the number first, the line a poll later).
     // Same source and same renderer as the local fleet — see _cpuSparkHtml.
     const cpuSpark = _cpuSparkHtml(_fleetEntry(_awsFleet, i.id), 120);
-    // Swatch keyed by the SAME instanceColor() the chunk plot uses, so a box
-    // here and its chunks below share one colour — the machine a chunk ran on is
-    // traceable to this fleet row at a glance.
-    const hostColor = i.id ? instanceColor(i.id) : null;
+    // (hostColor computed above — the chunk segments are shades of it.)
     const swatch = hostColor
         ? `<span title="machine ${escapeHtml(i.id)} — matches its chunk colour in the plot" style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${hostColor};vertical-align:middle;margin-right:6px"></span>`
         : '';
@@ -3298,7 +3586,23 @@ function _fleetSparks(fleet) {
 let _lastFleet = null;
 function renderFleet(fleet, instances) {
     _lastFleet = { fleet, instances };
-    const running = (instances || []).filter(i => i.state === 'running');
+    // Oldest box first, by launch time. The inventory returns instances in
+    // whatever order EC2 hands them back, which is arbitrary and free to change
+    // between polls — so a box you were watching jumped position for no reason.
+    // Ordering by age means a box running since the start keeps its place and
+    // newly scaled-up ones append at the bottom.
+    //
+    // NOTE the matching change in encode.FleetCPU orders the CPU/sparkline data,
+    // NOT these rows: the rows come from the inventory's instance list, so the
+    // ordering has to be applied here too or it has no visible effect.
+    const _launched = i => {
+        const t = Date.parse(i.launched_at || '');
+        if (!isNaN(t)) return t;
+        // No timestamp: fall back to age (bigger age = launched earlier).
+        return Date.now() - (Number(i.age_seconds) || 0) * 1000;
+    };
+    const running = (instances || []).filter(i => i.state === 'running')
+        .sort((a, b) => _launched(a) - _launched(b) || String(a.id).localeCompare(String(b.id)));
     const total = fleet.total_vcpus || 0, used = fleet.used_vcpus || 0;
     const idle = (fleet.idle_vcpus != null) ? fleet.idle_vcpus : Math.max(0, total - used);
     const pct = total ? Math.round(used / total * 100) : 0;
@@ -3522,7 +3826,8 @@ function _localFleetRow(inst, maxCores) {
     let parts, rightLabel;
     if (chunks.length) {
         const used = Math.min(cap, chunks.length * 2);
-        parts = chunks.map(c => seg(cap ? 2 / cap * 100 : 0, color, _localChunkFriendly(c), divider)).join('');
+        parts = chunks.map(c => seg(cap ? 2 / cap * 100 : 0, _shadeOfHost(color, c) || color,
+            _localChunkFriendly(c), divider)).join('');
         if (cap - used > 0) parts += seg((cap - used) / cap * 100, '#20252f', `${cap - used} idle core${cap - used > 1 ? 's' : ''}`);
         rightLabel = `${used}/${cap} cores · ${chunks.length} chunk${chunks.length > 1 ? 's' : ''}`;
     } else {
@@ -4365,6 +4670,13 @@ async function loadVersion() {
         const j = await res.json();
         const local = j.local || {};
         const cloud = j.cloud || {};
+        // Which build the SERVER is on, versus which this page loaded with. They
+        // differ whenever a tab stays open across a deploy, and that difference
+        // has already been mistaken for a fix not working.
+        if (!window.__buildRev) window.__buildRev = local.revision || 'unknown';
+        else if (local.revision && local.revision !== window.__buildRev) {
+            uiLog('stale-page', { pageRev: window.__buildRev, serverRev: local.revision });
+        }
 
         // Gate the cloud-batch target: if this host has no cloud config
         // (STATE_MACHINE_ARN), disable the option and explain via hover, so the

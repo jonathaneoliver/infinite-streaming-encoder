@@ -349,7 +349,14 @@ def _enrich_fleet(batch_jobs: list[dict], instances: list[dict]) -> dict[str, An
     instance (ecs.describe_container_instances).
     """
     active = [j for j in batch_jobs if not j.get("error")]
-    ids = [j["id"] for j in active]
+    # DEDUPED. batch.describe_jobs rejects the WHOLE call with
+    # "Jobs contains duplicates." if an id repeats, and batch_jobs can repeat one
+    # — a job observed under two statuses across paginated list calls, or listed
+    # twice as it transitions. One duplicate therefore cost the entire job ->
+    # instance mapping, so every box rendered with no chunks on it and the fleet
+    # looked idle while it was flat out encoding. dict.fromkeys keeps first-seen
+    # order, which the callers below rely on.
+    ids = list(dict.fromkeys(j["id"] for j in active))
     running = [i for i in instances if i.get("state") == "running"]
     for inst in instances:
         inst["vcpus"] = _vcpus_for_type(inst.get("type"))
@@ -361,6 +368,9 @@ def _enrich_fleet(batch_jobs: list[dict], instances: list[dict]) -> dict[str, An
 
     by_id = {j["id"]: j for j in active}
     arns_by_cluster: dict[str, set] = {}
+    # Which reads failed, surfaced on the payload so the UI can tell "no jobs"
+    # from "could not determine jobs" — they look identical today.
+    degraded: list[str] = []
     try:
         batch = batch_client()
         for i in range(0, len(ids), 100):
@@ -387,8 +397,11 @@ def _enrich_fleet(batch_jobs: list[dict], instances: list[dict]) -> dict[str, An
                     cluster = arn.split("/")[-2]
                     arns_by_cluster.setdefault(cluster, set()).add(arn)
                     jm["_ci_arn"] = arn
-    except ClientError:
-        pass
+    except ClientError as e:
+        # Leaves every job without vcpu/_ci_arn, so no instance gets a job list
+        # and the whole fleet renders idle. The single most visible degradation.
+        _warn("batch.describe_jobs (job -> instance mapping)", e)
+        degraded.append("job_map")
 
     ci_to_ec2: dict[str, str] = {}
     try:
@@ -400,8 +413,11 @@ def _enrich_fleet(batch_jobs: list[dict], instances: list[dict]) -> dict[str, An
                         cluster=cluster, containerInstances=al[i:i + 100]
                 ).get("containerInstances", []):
                     ci_to_ec2[ci.get("containerInstanceArn")] = ci.get("ec2InstanceId")
-    except ClientError:
-        pass
+    except ClientError as e:
+        # Jobs keep their vcpu but lose the instance they map to, so boxes show
+        # capacity with no chunks on them.
+        _warn("ecs.describe_container_instances (instance resolution)", e)
+        degraded.append("instance_map")
 
     used_by_inst: dict[str, int] = {}
     jobs_by_inst: dict[str, list] = {}
@@ -474,6 +490,27 @@ def _ecs_cluster_name() -> str | None:
 # CPUUtilization reported and what `top` shows), the control plane folds it in
 # Manager.recordFleetCPU, and the Go inventory handler merges the per-machine
 # history into each instance as cw_cpu. No lag, no cost, same meaning.
+# How long a running EC2 box may be absent from the ECS cluster listing before we
+# stop calling it "booting". OS boot + ECS agent registration is well under this;
+# past it, absence means the instance was deregistered on scale-down.
+_ECS_JOIN_GRACE_S = 300
+
+
+def _warn(what: str, err: object) -> None:
+    """Report a degraded inventory read.
+
+    Every AWS call here was previously wrapped in `except ClientError: pass`, so
+    a throttle or transient error produced a SUCCESSFUL-looking payload with data
+    missing — instances with no jobs, which the fleet view renders as "idle (N
+    vCPU)" and 0% utilisation. Three separate "the fleet just emptied / all
+    machines idle / no chunks on any box" reports turned out to be this, and none
+    of them left a trace to diagnose from. Failing loudly in the log costs
+    nothing and makes the next one a five-second answer.
+    """
+    print(f"[inventory] DEGRADED: {what}: {type(err).__name__}: {err}",
+          file=sys.stderr, flush=True)
+
+
 def _annotate_init_states(instances: list[dict]) -> None:
     """Tag each running EC2 box with its ECS lifecycle state so the fleet view
     shows what a box is doing *before* a job lands on it, not just "idle":
@@ -500,9 +537,20 @@ def _annotate_init_states(instances: list[dict]) -> None:
         if not cluster:
             return
         ecs = ecs_client()
+        # ACTIVE *and* DRAINING. list_container_instances filters to ACTIVE by
+        # default, so a box Batch is scaling down disappears from the listing the
+        # moment it starts draining — and the `ci is None` branch below then
+        # labelled it "booting", i.e. a machine on its way OUT was reported as one
+        # on its way IN, right before it vanished.
         arns: list[str] = []
-        for page in ecs.get_paginator("list_container_instances").paginate(cluster=cluster):
-            arns.extend(page.get("containerInstanceArns", []))
+        draining: set[str] = set()
+        for status in ("ACTIVE", "DRAINING"):
+            for page in ecs.get_paginator("list_container_instances").paginate(
+                    cluster=cluster, status=status):
+                got = page.get("containerInstanceArns", [])
+                arns.extend(got)
+                if status == "DRAINING":
+                    draining.update(got)
         by_ec2: dict[str, dict] = {}
         for i in range(0, len(arns), 100):
             for ci in ecs.describe_container_instances(
@@ -515,13 +563,28 @@ def _annotate_init_states(instances: list[dict]) -> None:
     for inst in running:
         ci = by_ec2.get(inst["id"])
         if ci is None:
-            inst["init_state"] = "booting"
+            # Not an ECS member. That means "hasn't joined yet" only while the box
+            # is young — boot + agent register is a couple of minutes. An older box
+            # that is not a member has been DEREGISTERED, i.e. it is going away.
+            # Calling both "booting" made scale-down look like scale-up.
+            inst["init_state"] = ("booting"
+                                  if inst.get("age_seconds", 0) < _ECS_JOIN_GRACE_S
+                                  else "leaving")
+        elif ci.get("containerInstanceArn") in draining:
+            inst["init_state"] = "draining"
         elif not ci.get("agentConnected") or ci.get("status") == "REGISTERING":
             inst["init_state"] = "booting"
-        elif ci.get("pendingTasksCount", 0) > 0:
-            inst["init_state"] = "pulling"
         elif ci.get("runningTasksCount", 0) > 0 or inst.get("jobs"):
+            # RUNNING wins over pending. A busy box almost always has a task
+            # pending as well — the next chunk being placed — and with denser
+            # packing that is nearly every box, every poll. Checking pending
+            # first therefore labelled the whole fleet "pulling image" in the
+            # middle of an encode while it was flat out encoding.
             inst["init_state"] = "running"
+        elif ci.get("pendingTasksCount", 0) > 0:
+            # Pending with nothing running: genuinely warming up for its first
+            # task.
+            inst["init_state"] = "pulling"
         else:
             inst["init_state"] = "idle"
 

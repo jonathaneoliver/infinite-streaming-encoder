@@ -6,7 +6,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Go HTTP server + single-page UI that drives video encoding. The Go code is a thin control plane — the actual encoding work lives in the Python package under `scripts/infinite_streaming_encoder/`, each run in its own **detached sibling Docker container** (so encodes survive a restart of the server's own container). The server submits encode jobs, tails their stdout via `docker logs -f` into a log buffer, and exposes a web UI for browsing sources, kicking off jobs, and playing back the resulting HLS output.
 
-No tests exist in this repo — do not invent a test command.
+Testing is thin and deliberately targeted — there is no broad unit-test suite, so
+do not assume one and do not invent commands beyond these three:
+
+- `make check` — the static gate: gofmt/vet/build, `go test ./...`, tofu fmt,
+  the Step Functions checks, `ruff` F821, python compile, page JS.
+- `go test ./...` — currently only `internal/encode/chunkplan_test.go`, which
+  pins the Go chunk planner to golden vectors generated from the Python one.
+  Both paths must cut a clip in the same places or local and cloud encodes stop
+  being comparable.
+- `make smoke` — a REAL short encode end to end (synthetic 30s clip, chunked),
+  asserting the job reaches `done` AND produced playlists. `TARGET=cloud` for
+  the cloud path, `WHOLE=1` for the whole-variant path.
+
+**`make check` passing is not evidence the code runs.** #176 passed every static
+check and still broke both encode paths: a Batch job definition gained a `Ref::`
+its whole-variant caller never supplied, and a log line referenced a list the
+worker no longer built. Both were in the seams between orchestrator, worker and
+job definition. Run `make smoke` before merging anything that touches the
+chunk/dispatch contract — and `make smoke TARGET=cloud` too when the state
+machine or job definitions change, since the cloud submission path has no local
+equivalent.
 
 ## Commands
 
@@ -115,6 +135,81 @@ boto3 chain — without that guard it would resolve to real AWS S3 and start
 deleting the *cloud* bucket's staging. Manual controls: `make minio-usage` /
 `make minio-clean` and `GET /api/dist/staging` + `POST /api/dist/staging/gc`.
 
+### Worker telemetry (`[[ENCODER-*]]` markers)
+
+Every worker reports the same way — a stream of `[[ENCODER-…]]` marker lines —
+but each deployment moves them differently. `scripts/infinite_streaming_encoder/telemetry.py`
+is the one place that knows which:
+
+| path | transport |
+| --- | --- |
+| single-container local | stdout → `docker logs -f` → Go server |
+| local-dist | stdout → `temporal_worker` → activity heartbeat (live %) or activity result (records) → orchestrator |
+| cloud (Batch) | stdout → CloudWatch (fallback) **and** → per-execution SQS queue → orchestrator |
+
+Emit through `telemetry.emit()`, never `print()`. A marker added at a bare
+`print` travels on whichever transports its author happened to think about —
+that is exactly how #141 happened (VMAF computed per chunk, then dropped by a
+relay that forwarded a whitelist).
+
+**stdout is always one of the transports**, and that is what makes a sink safe
+to add: a sink that fails to initialise degrades to precisely the old
+behaviour rather than to silence. On the single-container path stdout is also
+load-bearing for restart resilience (see "Worker containers" above), and on
+local-dist it *is* the sink.
+
+Scope is one hop: **worker → control plane**. The orchestrators (`cli_batch`,
+`cli_local_dist`) also print markers, but that hop is control plane → Go server
+over a pipe the server is already attached to; it stays a plain `print`. Giving
+`cli_batch` a sink would be actively wrong — it is the queue's *consumer*.
+
+Progress percent is a **gauge**, emitted at `ENCODER_PROGRESS_INTERVAL_S`
+(default 2s, matching the local-dist heartbeat throttle) and safe to drop.
+TIMING / SPEED / VMAF are **records** — unrecoverable without re-encoding — so
+they are emitted unthrottled and flushed before a phase returns.
+
+Every consumer has to answer "may I drop this?", so the answer is classified in
+one place — `telemetry.marker_class()` → `CLASS_LIVE` (STAGE: superseded, and
+duplicated by a state channel on both distributed paths) / `CLASS_GAUGE` (FLEET:
+meaning depends on arrival time, so a replayed sample is a lie) / `CLASS_RECORD`
+(everything else). Used by `temporal_worker`'s activity-result relay and by both
+of `cli_batch`'s drop decisions, which each used to carry their own literal list.
+
+**An unclassified marker is a RECORD.** That default is the point: write a new
+marker and every consumer forwards it already. Getting it wrong that way costs
+bandwidth; getting it wrong the other way is #141.
+
+### Batch state, event-driven (cloud)
+
+Chunk state comes from **EventBridge → a per-execution SQS queue**, not from
+polling. The orchestrator creates the rule + queue at submit (scoped by a
+`jobName` suffix pattern so it matches only its own execution), drains it each
+poll, and deletes both at the end; `_gc_telemetry_queues` sweeps orphans.
+
+Verified on this account before it was built — `jobName` on every event,
+`containerInstanceArn` and `logStreamName` on 100% of STARTING/RUNNING/SUCCEEDED,
+`attempts`/`exitCode`/`stoppedAt` on 100% of SUCCEEDED, delivery median 0.6s. The
+STARTING result matters: a `describe_jobs` poll races placement and often has no
+instance arn, so host colouring needed a later backfill; the event carries it, so
+a chunk is coloured by the same message that says it started.
+
+`_sync_stages_from_batch` remains as a **backstop** on `_CENSUS_BACKSTOP_S`
+(60s), because EventBridge is at-least-once, not guaranteed-delivery. With no
+event channel it reverts to every poll — the old behaviour.
+
+**Every state event is logged** with wall-clock time and delivery lag
+(`[state] 13:24:51.123 lag=+0.6s running encode:h264:1080p:chunk7`), including
+suppressed ones, so a timing question is answered from the job log rather than
+by reproducing it.
+
+**All stage emission goes through `_emit_stage`.** Three sources announce state
+(SFN history, the Batch census, worker markers) through channels with different
+latencies, so they disagree about the present tense. The chokepoint refuses to
+announce anything but `done` over an existing `done`. `failed` is deliberately
+not final — the state machine's Retry resubmits a new Batch job, so
+`failed → running` is real. Guarding at call sites was tried twice and failed
+twice: each time a different source was still speaking unguarded.
+
 **`internal/api/handlers.go`** — the HTTP surface. Routes defined in `NewServer`:
 - JSON API: `GET /api/sources`, `GET/POST` under `/api/encode`, `/api/jobs`, `/api/jobs/{id}/logs`, `/api/outputs`, `/api/outputs/{name}`, `/api/outputs/{name}/playlists`, `/api/outputs/{name}/logs`.
 - SSE: `GET /api/jobs/stream` — emits the full current job list immediately, then streams updates from `Manager.Subscribe()`.
@@ -156,3 +251,5 @@ The EC2 user-data itself is still bash (it runs on the remote instance) — `clo
 - Host paths: the server needs both container-side paths (`SOURCE_DIR`, `OUTPUT_DIR`, `TMP_DIR` — used for all in-process file I/O) and host-side paths (`HOST_*` — used only for `-v` flags when launching workers). Workers mount host paths at the same paths the Go server uses, so script args don't need translation.
 - `move to OutputDir` only happens on success. A failed job leaves nothing in `OutputDir` (the `$TMP_DIR/<job_id>/` is unconditionally removed in `run`'s defer path).
 - The MinIO staging key (`encode.DistJobPrefix` → `jobs/<jobID>-<base>/`) is a contract between the orchestrator's `--job-prefix` and the staging GC's keep-list. Deriving it separately in either place is how you get a GC that deletes a running encode's chunks.
+- The telemetry queue name (`telemetry.queue_name()` → `encoder-telemetry-<execution>`) is the same shape of contract, between the worker that publishes and the orchestrator that creates/drains/deletes. Derive it separately and you get a worker publishing into one queue while the orchestrator polls another — with **no error on either side**, because both operations succeed. Execution names reach 67 chars against SQS's 80-char limit, so the name is trimmed; the trailing uniqueness suffix must survive the trim or two executions of the same job share a queue.
+- Emit new markers via `telemetry.emit()`, and remember `cli_batch` is the queue's consumer — it must keep using `print`.

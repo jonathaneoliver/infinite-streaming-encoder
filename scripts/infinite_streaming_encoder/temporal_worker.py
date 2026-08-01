@@ -35,6 +35,8 @@ from temporalio.client import Client
 from temporalio.common import Priority, RetryPolicy
 from temporalio.worker import Worker
 
+from infinite_streaming_encoder.telemetry import is_marker, is_record
+
 TASK_QUEUE = os.environ.get("TEMPORAL_TASK_QUEUE", "encode")
 
 # Chunk priority (Temporal priority_key: 1 = highest, dispatched first). The key
@@ -226,27 +228,30 @@ def encode_phase(spec: dict) -> list[str]:
             # history fetch then carries. The cloud path's copy lands in
             # CloudWatch rather than the job log too, so container logs are the
             # symmetric place to diff the two.
-            if last.startswith(("[[ENCODER", "[ffmpeg] ")):
+            if is_marker(last) or last.startswith("[ffmpeg] "):
                 print(last, flush=True)
-            if last.startswith("[[ENCODER"):
-                # Collect for the return value. Deliberately an EXCLUDE list,
-                # not a whitelist: the whole class of bug in #141 is that a new
-                # marker gets silently dropped until someone notices.
+            if is_marker(last):
+                # Collect for the return value. The rule is telemetry's, not
+                # ours: relay RECORDS — anything that cannot be recomputed —
+                # and let the live channels carry the rest.
                 #
-                # Excluded because the orchestrator ALREADY produces these on
-                # the Temporal path, from channels that carry them live:
-                #   STAGE — reconstructed from workflow history, plus live % on
-                #           the heartbeat. A relayed copy would arrive at
-                #           completion and fight the live value with stale data.
-                #   FLEET — emitted by _emit_fleet_cpu from heartbeat details.
-                #           CPU is a GAUGE: it is only meaningful while the
-                #           activity runs, and recordFleetCPU stamps arrival
-                #           time, so a copy relayed at completion would register
-                #           a stale reading as current. Harmless today only
-                #           because IMDS is unavailable off-EC2 so local workers
-                #           never emit it — too fragile to rely on, since a
-                #           local-dist worker CAN run on an EC2 box.
-                if not last.startswith(("[[ENCODER-STAGE ", "[[ENCODER-FLEET ")):
+                # This used to be a hardcoded exclude list here, duplicating the
+                # same judgement cli_batch makes twice more. Centralising it is
+                # what makes a NEW marker relay by default, which is precisely
+                # the guarantee #141 lacked.
+                #
+                # What the classification excludes, and why the orchestrator
+                # already has it on the Temporal path:
+                #   STAGE (live)  — reconstructed from workflow history, plus
+                #       live % on the heartbeat. A relayed copy would arrive at
+                #       completion and fight the live value with stale data.
+                #   FLEET (gauge) — emitted by _emit_fleet_cpu from heartbeat
+                #       details. recordFleetCPU stamps ARRIVAL time, so a copy
+                #       relayed at completion would register an old reading as
+                #       current. Harmless today only because IMDS is unavailable
+                #       off-EC2 so local workers never emit it — too fragile to
+                #       rely on, since a local-dist worker CAN run on EC2.
+                if is_record(last):
                     relay.append(last)
                 # cli_phase's run_ffmpeg_with_progress emits ENCODER-STAGE with the
                 # live out_time/duration %. Capture it so the orchestrator can show

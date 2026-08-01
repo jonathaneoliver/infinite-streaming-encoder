@@ -140,6 +140,12 @@ func stripANSI(s string) string {
 var (
 	planMarkerRe  = regexp.MustCompile(`^\[\[ENCODER-PLAN (.+)\]\]$`)
 	stageMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STAGE key=(\S+) status=(\S+) percent=([0-9.]+)\]\]$`)
+	// [[ENCODER-TIMING phase=variant key=encode:h264:1080p:chunk3 fetch_s=1.8
+	//   encode_s=9.2 cpu_s=18.4 mem_mib=425 total_s=11.4]]
+	// Captured as a whole so new measurements are picked up without a new
+	// regex — the worker adds fields to this marker as it learns to measure
+	// more, and a positional pattern would silently ignore them.
+	timingMarkerRe = regexp.MustCompile(`^\[\[ENCODER-TIMING (.+)\]\]$`)
 	// ENCODER-HOST reports the machine (EC2 instance-id, or a stable ARN slug)
 	// a stage's Batch job landed on — used to colour the chunk plot by instance
 	// so co-located heavy chunks are visible. Emitted once per (stage, instance).
@@ -492,6 +498,39 @@ func (j *Job) parseMarker(line string) bool {
 			j.Stages = append(j.Stages, tail...)
 		}
 		j.mu.Unlock()
+		return true
+	}
+	if m := timingMarkerRe.FindStringSubmatch(line); m != nil {
+		var key string
+		var cpu, total, mem float64
+		for _, f := range strings.Fields(m[1]) {
+			k, v, ok := strings.Cut(f, "=")
+			if !ok {
+				continue
+			}
+			switch k {
+			case "key":
+				key = v
+			case "cpu_s":
+				cpu, _ = strconv.ParseFloat(v, 64)
+			case "total_s":
+				total, _ = strconv.ParseFloat(v, 64)
+			case "mem_mib":
+				mem, _ = strconv.ParseFloat(v, 64)
+			}
+		}
+		if key != "" {
+			j.mu.Lock()
+			for i := range j.Stages {
+				if j.Stages[i].Key == key {
+					j.Stages[i].CPUSeconds = cpu
+					j.Stages[i].WorkerSeconds = total
+					j.Stages[i].PeakMemMiB = mem
+					break
+				}
+			}
+			j.mu.Unlock()
+		}
 		return true
 	}
 	if m := stageMarkerRe.FindStringSubmatch(line); m != nil {
@@ -905,6 +944,19 @@ type StageProgress struct {
 	// styles reused cells with a distinct neutral so they don't read as a
 	// freshly-encoded machine colour (or the transient no-instance blue).
 	Reused bool `json:"reused,omitempty"`
+	// CPUSeconds / WorkerSeconds / PeakMemMiB come from ENCODER-TIMING, which
+	// the worker emits from getrusage as the phase exits.
+	//
+	// WorkerSeconds is the worker's OWN wall clock for the phase, which is not
+	// the same as EndedAt-StartedAt: those bracket the whole Batch job, so they
+	// include image pull, the mezzanine fetch, and the upload. The gap between
+	// the two is exactly the non-encoding overhead, which is why both are kept.
+	//
+	// CPUSeconds against WorkerSeconds gives cores actually used — the number
+	// that says whether a reservation is earning its keep.
+	CPUSeconds    float64 `json:"cpu_seconds,omitempty"`
+	WorkerSeconds float64 `json:"worker_seconds,omitempty"`
+	PeakMemMiB    float64 `json:"peak_mem_mib,omitempty"`
 	// Timestamps of state transitions. StartedAt is set the first time
 	// the stage sees `status=running`; EndedAt is set when it reaches
 	// a terminal state (done|failed). Used to build the end-of-job
@@ -923,6 +975,29 @@ type VmafScore struct {
 	Frames   int     `json:"frames"`
 	sumMeanW float64 // Σ(chunk_mean × chunk_frames)
 	invSum   float64 // Σ(chunk inv_sum)
+}
+
+// MarshalJSON serialises a Job under its own lock.
+//
+// The SSE stream sends *Job POINTERS to subscribers, so the handler marshals
+// whatever the job holds AT SEND TIME rather than a snapshot taken when the
+// notify fired. That is deliberate — it means a frame is always the latest
+// state and can never deliver an older one after a newer one — but it also
+// means json.Marshal walks j.Stages concurrently with upsertStage mutating it.
+//
+// Without this the read is unsynchronised, and the dangerous case is not a
+// stale field: upsertStage APPENDS a StageProgress for a key it has not seen,
+// and an append can reallocate the backing array while the marshaller is
+// walking it. Appends happen while the grid is filling in, which is exactly
+// when the UI was reported showing cells briefly wrong.
+//
+// The alias type is the standard idiom to avoid recursing into this method.
+// Conversion is pointer-to-pointer, so the mutex is never copied.
+func (j *Job) MarshalJSON() ([]byte, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	type alias Job
+	return json.Marshal((*alias)(j))
 }
 
 type Job struct {
@@ -1068,8 +1143,15 @@ type Job struct {
 	// styling. Today: "spot_interrupted" | "" (generic).
 	FailureReason string `json:"failure_reason,omitempty"`
 
-	mu        sync.Mutex
-	logLines  []string
+	mu       sync.Mutex
+	logLines []string
+	// Diagnostic stream: its own file, never trimmed. See appendDiag.
+	// Guarded by diagMu, deliberately NOT j.mu. Writing under j.mu meant every
+	// diagnostic line — ~3,300 on a 336-chunk run, to an external volume —
+	// blocked upsertStage and the SSE marshal for the length of a disk write.
+	diagMu    sync.Mutex
+	diagPath  string
+	diagFile  *os.File
 	cancelled bool
 	// cloudExecArn is the SFN execution ARN of the CURRENT cloud-batch file's
 	// running execution. Persisted so Reconcile can re-attach to it after a
@@ -1109,12 +1191,70 @@ func (j *Job) IsCancelled() bool {
 	return j.cancelled
 }
 
+// Diagnostic streams: high-volume, machine-oriented lines emitted for
+// post-mortem rather than for a human watching the log viewer.
+//
+// They are kept OUT of logLines and streamed to their own file. Both halves
+// matter. A 336-chunk run emits ~1,300 [state] and ~2,000 [fill] lines against
+// a buffer that keeps the LAST 500 — so routing them through logLines both lost
+// almost all of them AND evicted the human-readable narration they were meant
+// to explain. A run was measured afterwards with 6 of its [state] lines
+// surviving.
+var diagPrefixes = []string{"[state] ", "[fill] ", "[census] ", "[host] "}
+
+func isDiagLine(line string) bool {
+	for _, p := range diagPrefixes {
+		if strings.HasPrefix(line, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func (j *Job) AppendLog(line string) {
+	if isDiagLine(line) {
+		j.appendDiag(line)
+		return
+	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.logLines = append(j.logLines, line)
 	if len(j.logLines) > 1000 {
 		j.logLines = j.logLines[len(j.logLines)-500:]
+	}
+}
+
+// appendDiag streams one diagnostic line straight to the job's .diag.log.
+//
+// Written as it arrives rather than buffered and flushed at the end: the runs
+// worth investigating are the ones that crash, get killed, or are cancelled
+// mid-flight, and a buffer held until terminal loses exactly those. The file
+// handle is opened once and closed by closeDiag on the terminal path.
+func (j *Job) appendDiag(line string) {
+	// diagMu, NOT j.mu. Diagnostics must never make the job's own state slower
+	// to read or write: j.mu serialises stage updates and the SSE marshal, and
+	// holding it across a disk write put every one of those behind file I/O.
+	j.diagMu.Lock()
+	defer j.diagMu.Unlock()
+	if j.diagFile == nil {
+		if j.diagPath == "" {
+			return // no path configured; drop rather than guess a location
+		}
+		f, err := os.OpenFile(j.diagPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return // diagnostics are never worth failing an encode for
+		}
+		j.diagFile = f
+	}
+	_, _ = j.diagFile.WriteString(line + "\n")
+}
+
+func (j *Job) closeDiag() {
+	j.diagMu.Lock()
+	defer j.diagMu.Unlock()
+	if j.diagFile != nil {
+		_ = j.diagFile.Close()
+		j.diagFile = nil
 	}
 }
 
@@ -1190,6 +1330,16 @@ type Manager struct {
 	fleetMu     sync.Mutex
 	fleetCPU    map[string][]fleetSample
 	fleetChunks map[string][]string
+	// fleetFirstSeen is when each machine first reported, used to order the
+	// fleet view oldest-first so a box that has been encoding since the start
+	// keeps its position and newly-scaled-up boxes append at the bottom.
+	//
+	// Kept separately rather than read off fleetCPU[m][0]: the sample ring is
+	// trimmed to fleetHistoryLen, so its first element is the oldest RETAINED
+	// sample, not the first ever. On a long run every machine's apparent
+	// first-seen would keep advancing and the order would churn — the exact
+	// thing this is meant to stop.
+	fleetFirstSeen map[string]time.Time
 }
 
 // fleetSample is one CPU reading for a distributed-local worker box.
@@ -1227,6 +1377,10 @@ func (m *Manager) recordFleetCPU(line string) bool {
 	if m.fleetCPU == nil {
 		m.fleetCPU = map[string][]fleetSample{}
 		m.fleetChunks = map[string][]string{}
+		m.fleetFirstSeen = map[string]time.Time{}
+	}
+	if _, seen := m.fleetFirstSeen[mm[1]]; !seen {
+		m.fleetFirstSeen[mm[1]] = time.Now()
 	}
 	// Throttle per machine. On the cloud path EVERY chunk container on a box
 	// emits this — /proc/stat is the host's, so 4 concurrent chunks all report
@@ -1255,6 +1409,24 @@ func (m *Manager) recordFleetCPU(line string) bool {
 	return true
 }
 
+// fleetEntryTTL drops a machine from the fleet view once it has been silent this
+// long. Without it m.fleetCPU only ever grows: FleetCPU skipped machines with NO
+// samples but never aged out old ones, so terminated cloud instances stayed on
+// the panel at their final reading until the server restarted. Measured on a
+// real run, the panel showed 11 machines averaging 60.3% CPU when ONE machine
+// existed at 0.7% — the other ten were terminated 11-13 minutes earlier. Before
+// a restart, entries 17 hours old were still being rendered.
+//
+// It also corrupted two things that are not the panel: localFleetPerfCores sums
+// Perf across every entry, so dead CLOUD instances inflated the LOCAL fleet's
+// core budget and shrank its wall-time projection.
+//
+// 10 minutes is deliberately generous — a machine that is encoding reports every
+// ~5s, so this only catches boxes that are genuinely gone or idle. Callers that
+// can do better should: the cloud panel cross-checks against the EC2 inventory
+// (see attachFleetCPU), which is authoritative rather than a timeout.
+const fleetEntryTTL = 10 * time.Minute
+
 // FleetCPUEntry is one machine's CPU history for the local fleet view. History is
 // the normalized busy% (busy/perf*100): 100 = the box at its perf-core target,
 // >100 = SMT/E-core spill. Latest/Perf label the current reading; AgeS flags a
@@ -1279,6 +1451,9 @@ func (m *Manager) FleetCPU() []FleetCPUEntry {
 		if len(samples) == 0 {
 			continue
 		}
+		if now.Sub(samples[len(samples)-1].T) > fleetEntryTTL {
+			continue // silent too long — see fleetEntryTTL
+		}
 		hist := make([]float64, len(samples))
 		for i, s := range samples {
 			if s.Perf > 0 {
@@ -1294,7 +1469,22 @@ func (m *Manager) FleetCPU() []FleetCPUEntry {
 			Chunks:  m.fleetChunks[machine],
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Machine < out[j].Machine })
+	// Oldest-first by when the machine first reported. Sorting by machine name
+	// (the previous behaviour) is effectively random for EC2 instance ids, so
+	// the list reshuffled every time the fleet scaled and a box you were
+	// watching jumped position. Ties and unknowns fall back to the name so the
+	// order is still deterministic.
+	sort.Slice(out, func(i, j int) bool {
+		ti, oki := m.fleetFirstSeen[out[i].Machine]
+		tj, okj := m.fleetFirstSeen[out[j].Machine]
+		if oki && okj && !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		if oki != okj {
+			return oki
+		}
+		return out[i].Machine < out[j].Machine
+	})
 	return out
 }
 
@@ -1562,6 +1752,14 @@ func (m *Manager) Submit(cfg JobConfig) *Job {
 }
 
 func (m *Manager) run(job *Job, startIdx int) {
+	// Diagnostics stream to their own file from the first line. Set here rather
+	// than at teardown so a run that crashes or is cancelled still leaves them.
+	logsDir := filepath.Join(m.TmpDir, "logs")
+	if err := os.MkdirAll(logsDir, 0o755); err == nil {
+		job.mu.Lock()
+		job.diagPath = filepath.Join(logsDir, job.ID+".diag.log")
+		job.mu.Unlock()
+	}
 	if startIdx == 0 {
 		job.Progress = "waiting for slot"
 	} else {
@@ -1876,6 +2074,7 @@ func (m *Manager) removeJobContainers(id string) {
 func (m *Manager) writeHistory(job *Job) {
 	logsDir := filepath.Join(m.TmpDir, "logs")
 	os.MkdirAll(logsDir, 0755)
+	job.closeDiag() // flush + release the diagnostic stream for this run
 
 	// Write full log to a per-job file, stripping ANSI escape codes
 	logPath := filepath.Join(logsDir, job.ID+".log")
@@ -1945,7 +2144,15 @@ func (m *Manager) writeHistory(job *Job) {
 }
 
 func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
-	if len(job.Stages) == 0 && len(job.StagesHistory) == 0 {
+	// Snapshot under the lock. This runs at job teardown, when mutation is
+	// unlikely but not impossible — and the SSE marshaller can be walking the
+	// same slices. Copying the headers is enough: the elements are only ever
+	// replaced wholesale, never mutated in place after this point.
+	job.mu.Lock()
+	stages := append([]StageProgress(nil), job.Stages...)
+	history := append([]FileStages(nil), job.StagesHistory...)
+	job.mu.Unlock()
+	if len(stages) == 0 && len(history) == 0 {
 		return
 	}
 
@@ -1957,7 +2164,7 @@ func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
 		stage     StageProgress
 	}
 	var rows []stageRow
-	for _, h := range job.StagesHistory {
+	for _, h := range history {
 		label := h.File
 		if h.TotalFiles > 1 {
 			label = fmt.Sprintf("[%d/%d] %s", h.FileIndex, h.TotalFiles, h.File)
@@ -1970,13 +2177,106 @@ func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
 	if job.TotalFiles > 1 && job.CurrentFile != "" {
 		currentLabel = fmt.Sprintf("[%d/%d] %s", job.CurrentFileIndex, job.TotalFiles, job.CurrentFile)
 	}
-	for _, s := range job.Stages {
+	for _, s := range stages {
 		rows = append(rows, stageRow{fileLabel: currentLabel, stage: s})
+	}
+
+	var table strings.Builder
+
+	// PHASE ROLLUP first. The detail table below is one row per stage, which on
+	// a 336-chunk run is 350 rows nobody reads. This aggregates by phase and is
+	// the part worth looking at.
+	//
+	// Three different times are reported because they answer different
+	// questions and are routinely confused:
+	//
+	//   span   first start -> last end for the phase. Real elapsed time, so
+	//          parallel chunks count once. This is "how long did this phase
+	//          take".
+	//   Σ job  sum of per-stage Batch wall clock. Includes container start, the
+	//          mezzanine fetch and the upload.
+	//   Σ work the worker's OWN measure of the same phases, from its timer.
+	//          The gap against Σ job is the non-encoding overhead.
+	//   Σ cpu  getrusage user+sys, so cores = Σ cpu / Σ work is what the phase
+	//          actually used against what it reserved.
+	type agg struct {
+		n              int
+		first, last    time.Time
+		jobWall        time.Duration
+		cpu, work, mem float64
+	}
+	groups := map[string]*agg{}
+	var order []string
+	for _, r := range rows {
+		st := r.stage
+		g := st.Key
+		// encode:h264:1080p:chunk3 -> encode:h264:1080p, so a rung is one row
+		// rather than 28.
+		if i := strings.LastIndex(g, ":chunk"); i > 0 {
+			g = g[:i]
+		}
+		a := groups[g]
+		if a == nil {
+			a = &agg{}
+			groups[g] = a
+			order = append(order, g)
+		}
+		a.n++
+		a.cpu += st.CPUSeconds
+		a.work += st.WorkerSeconds
+		if st.PeakMemMiB > a.mem {
+			a.mem = st.PeakMemMiB
+		}
+		if st.StartedAt != nil {
+			if a.first.IsZero() || st.StartedAt.Before(a.first) {
+				a.first = *st.StartedAt
+			}
+			if st.EndedAt != nil {
+				a.jobWall += st.EndedAt.Sub(*st.StartedAt)
+				if st.EndedAt.After(a.last) {
+					a.last = *st.EndedAt
+				}
+			}
+		}
+	}
+	table.WriteString("\n### Phase rollup\n\n")
+	table.WriteString("| Phase | n | span | Σ job wall | Σ worker | Σ cpu | cores | peak MiB |\n")
+	table.WriteString("|-------|---|------|------------|----------|-------|-------|----------|\n")
+	var totCPU, totWork float64
+	for _, g := range order {
+		a := groups[g]
+		span := "—"
+		if !a.first.IsZero() && !a.last.IsZero() {
+			span = a.last.Sub(a.first).Round(100 * time.Millisecond).String()
+		}
+		cores := "—"
+		if a.work > 0 {
+			cores = fmt.Sprintf("%.2f", a.cpu/a.work)
+		}
+		cpuStr, workStr, memStr := "—", "—", "—"
+		if a.cpu > 0 {
+			cpuStr = fmt.Sprintf("%.0fs", a.cpu)
+		}
+		if a.work > 0 {
+			workStr = fmt.Sprintf("%.0fs", a.work)
+		}
+		if a.mem > 0 {
+			memStr = fmt.Sprintf("%.0f", a.mem)
+		}
+		table.WriteString(fmt.Sprintf("| %s | %d | %s | %s | %s | %s | %s | %s |\n",
+			g, a.n, span, a.jobWall.Round(100*time.Millisecond),
+			workStr, cpuStr, cores, memStr))
+		totCPU += a.cpu
+		totWork += a.work
+	}
+	if totWork > 0 {
+		table.WriteString(fmt.Sprintf(
+			"| **total** |  |  |  | %.0fs | %.0fs | %.2f |  |\n",
+			totWork, totCPU, totCPU/totWork))
 	}
 
 	// Also dump the same summary into the per-job log file so it's
 	// trivially greppable later.
-	var table strings.Builder
 	table.WriteString("\n### Stage timing\n\n")
 	if job.TotalFiles > 1 {
 		table.WriteString("| File | Stage | Status | Started | Ended | Duration |\n")

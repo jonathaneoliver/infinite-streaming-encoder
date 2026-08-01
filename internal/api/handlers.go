@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -11,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/encode"
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/imageinfo"
@@ -28,6 +31,17 @@ type Server struct {
 	GitSha     string
 	ImageTag   string
 	CloudImage string
+	// invMu/invLast/invAt cache the last SUCCESSFUL cloud inventory. The
+	// inventory shells out to Python which makes half a dozen AWS calls, and any
+	// one of them failing — a throttle, a timeout, a transient 5xx — used to turn
+	// the whole endpoint into a 502. The page's fetch then threw and the Cloud
+	// Fleet panel rendered empty, so a momentary AWS hiccup looked like the fleet
+	// vanishing. It came back on the next poll, which is why it was only ever
+	// seen as a flicker and never diagnosed. Serving the last good payload for a
+	// short window turns that into a stale reading instead of a blank one.
+	invMu   sync.Mutex
+	invLast []byte
+	invAt   time.Time
 	// GHCRImage is the GHCR image (no tag) whose OCI labels stand in for the
 	// cloud worker image's — the worker image is an ECR ref imageinfo can't
 	// query, but publish keeps ECR + GHCR in sync by tag.
@@ -80,6 +94,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/jobs", s.listJobs)
 	s.Mux.HandleFunc("GET /api/jobs/{id}/logs", s.jobLogs)
 	s.Mux.HandleFunc("GET /api/jobs/stream", s.streamJobs)
+	s.Mux.HandleFunc("POST /api/ui-log", s.uiLog)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/cancel", s.cancelJob)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/retry", s.retryJob)
 	s.Mux.HandleFunc("POST /api/jobs/{id}/redo", s.redoJob)
@@ -968,15 +983,59 @@ func isVideo(ext string) bool {
 
 // runPythonCloud invokes `python3 -m infinite_streaming_encoder.cloud.<module> <args>` and
 // returns the captured stdout on exit-0, or an error containing stderr.
+// runPythonCloudTimeout bounds a cloud helper. The inventory normally returns in
+// ~5s but was measured at 41s under load — a dozen paginated AWS calls, any of
+// which can be slow or throttled. Unbounded, that stalls the page's poll and the
+// Cloud Fleet panel renders empty until it returns. Failing at 25s lets the
+// caller serve its cached payload instead, which is a stale fleet rather than no
+// fleet.
+const runPythonCloudTimeout = 25 * time.Second
+
+// Reject an argument value that would be read as a FLAG rather than a value.
+//
+// exec.CommandContext takes an argv slice and never invokes a shell, so classic
+// command injection is not possible here. Argument injection is: several callers
+// forward values straight from an HTTP path or JSON body (--job-id, --arn,
+// --id, --delete-prefix), and argparse treats any token starting with "-" as an
+// option. A crafted value could therefore suppress the flag it was meant to fill
+// or introduce a different one.
+//
+// Values are caller-supplied identifiers — job ids, ARNs, S3 prefixes — none of
+// which legitimately start with "-", so refusing them costs nothing.
+func validCloudArg(a string) bool {
+	return !strings.HasPrefix(a, "-")
+}
+
 func runPythonCloud(module string, args ...string) ([]byte, error) {
+	// The module name is always a compile-time constant at every call site; the
+	// ARGS are what carry user input, so they are what is checked.
+	for i, a := range args {
+		// Odd positions are values; even are the flags this function's callers
+		// wrote themselves. Check everything anyway — it is cheaper than
+		// reasoning about which is which at each call site.
+		if !validCloudArg(a) && i%2 == 1 {
+			return nil, fmt.Errorf("refusing argument %d: value may not start with '-'", i)
+		}
+	}
 	fullArgs := append([]string{"-m", "infinite_streaming_encoder.cloud." + module, "--json"}, args...)
-	cmd := exec.Command("python3", fullArgs...)
+	ctx, cancel := context.WithTimeout(context.Background(), runPythonCloudTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "python3", fullArgs...)
 	// The Python modules read AWS_REGION, S3_BUCKET, etc. from the
 	// server process's environment — same vars the encoder has been
 	// forwarding into worker containers all along.
 	cmd.Env = os.Environ()
 	out, err := cmd.Output()
 	if err != nil {
+		// Timeout FIRST. CommandContext KILLS the process on deadline, which
+		// surfaces as an ExitError with code -1 and empty stderr — so testing
+		// ExitError first reported a real timeout as `exited -1:` with nothing
+		// after the colon, reading like an unexplained crash. Observed exactly
+		// that in the log before this was reordered.
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("python3 -m infinite_streaming_encoder.cloud.%s timed out after %s",
+				module, runPythonCloudTimeout)
+		}
 		if ee, ok := err.(*exec.ExitError); ok {
 			return nil, fmt.Errorf("python3 -m infinite_streaming_encoder.cloud.%s exited %d: %s",
 				module, ee.ExitCode(), strings.TrimSpace(string(ee.Stderr)))
@@ -986,12 +1045,35 @@ func runPythonCloud(module string, args ...string) ([]byte, error) {
 	return out, nil
 }
 
+// invStaleWindow is how long a cached inventory may stand in for a failed read.
+// Long enough to ride out a throttle or a slow call (the poll is every few
+// seconds), short enough that a genuinely broken inventory surfaces rather than
+// being papered over indefinitely.
+const invStaleWindow = 2 * time.Minute
+
 func (s *Server) awsInventory(w http.ResponseWriter, r *http.Request) {
 	out, err := runPythonCloud("inventory")
 	if err != nil {
+		// Log it: this path was previously silent, so the fleet blanking left no
+		// trace at all and could not be told apart from the fleet being empty.
+		log.Printf("[inventory] read FAILED: %v", err)
+		s.invMu.Lock()
+		cached, at := s.invLast, s.invAt
+		s.invMu.Unlock()
+		if cached != nil && time.Since(at) < invStaleWindow {
+			log.Printf("[inventory] serving cached payload from %s ago instead of blanking the panel",
+				time.Since(at).Round(time.Second))
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Inventory-Stale", time.Since(at).Round(time.Second).String())
+			w.Write(s.attachFleetCPU(cached))
+			return
+		}
 		http.Error(w, err.Error(), 502)
 		return
 	}
+	s.invMu.Lock()
+	s.invLast, s.invAt = out, time.Now()
+	s.invMu.Unlock()
 	out = s.attachFleetCPU(out)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(out)
@@ -1019,12 +1101,102 @@ func (s *Server) attachFleetCPU(out []byte) []byte {
 	if json.Unmarshal(out, &doc) != nil {
 		return out
 	}
-	doc["fleet"] = fleet
+	// Under fleet_cpu, NOT fleet. The cloud inventory already uses "fleet" for its
+	// summary object (total_vcpus, utilization, history, spend_24h_usd), which the
+	// UI's _fleetSparks reads for the utilisation/jobs/cost sparklines. Writing the
+	// per-machine array over that key clobbered the summary whenever any machine
+	// had reported — so the sparklines vanished exactly while an encode was
+	// running — and left _awsFleet holding a dict when nothing had reported.
+	// Either way one of the two consumers got the wrong shape.
+	//
+	// The local endpoint (/api/dist/workers) has no summary and keeps "fleet" for
+	// its array, so the shared-shape intent still holds: both targets expose the
+	// same per-machine array, just under the key that is free on each.
+	doc["fleet_cpu"] = filterToLiveInstances(fleet, doc["instances"])
 	merged, err := json.Marshal(doc)
 	if err != nil {
 		return out
 	}
 	return merged
+}
+
+// filterToLiveInstances drops fleet rows for instances that no longer exist.
+//
+// The CPU marker pipeline has no way to learn that a box was terminated — the
+// last sample simply stops arriving — so a scaled-down instance stayed on the
+// panel at its final reading. Measured on a real run: the panel showed 11
+// machines averaging 60.3% when ONE existed at 0.7%, the other ten having been
+// terminated 11-13 minutes earlier. The average is what misleads most, since it
+// is computed over the dead.
+//
+// The answer is already in the same payload: the inventory lists every instance
+// with its EC2 state, so this is a join, not a timeout. That makes it exact
+// where encode.fleetEntryTTL can only be approximate — the TTL still runs first
+// as the backstop, and covers the local fleet, which has no EC2 inventory.
+//
+// Best-effort: if the inventory is missing or unparseable the fleet passes
+// through untouched, so a transient inventory failure never blanks the panel.
+// An inventory that parses and reports every instance terminated is NOT that
+// case — it is the authoritative "the fleet is gone", and the rows are dropped.
+func filterToLiveInstances(fleet []encode.FleetCPUEntry, instances any) []encode.FleetCPUEntry {
+	list, ok := instances.([]any)
+	if !ok || len(list) == 0 {
+		return fleet
+	}
+	live := map[string]bool{}
+	for _, it := range list {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := m["id"].(string)
+		state, _ := m["state"].(string)
+		// Anything not yet terminated counts: a "pending" box is booting to run
+		// our work and should appear as soon as it reports.
+		if id != "" && state != "terminated" && state != "shutting-down" {
+			live[id] = true
+		}
+	}
+	// NOT guarded on len(live) == 0. Reaching here means a non-empty instance
+	// list parsed cleanly and every instance is terminated — a fully scaled-down
+	// fleet, which is the normal end of every run, not a suspicious reading. An
+	// earlier version bailed out here and so kept showing the whole dead fleet in
+	// exactly the state the panel is most often looked at.
+	kept := make([]encode.FleetCPUEntry, 0, len(fleet))
+	for _, e := range fleet {
+		if live[e.Machine] {
+			kept = append(kept, e)
+		}
+	}
+	return kept
+}
+
+// uiLog records a diagnostic the PAGE observed, into the server log.
+//
+// Some faults are only visible in the browser — the chunk grid repainting cells
+// that had already settled, for instance. The data behind it is provably fine
+// (a churn detector sampling every stage every 2s for 300s of active encoding
+// found no status/percent/instance flip-flops), so the cause is in rendering,
+// and rendering leaves no trace anywhere the server can see. Console logging
+// does not help either: it requires someone to be looking at the right moment
+// and to relay it.
+//
+// So the page posts here and the event lands in `docker logs` alongside
+// everything else, where it can be read after the fact.
+//
+// Deliberately minimal and unauthenticated, like the rest of this local-only
+// surface: capped body, one line out, never fails the caller. It is a debugging
+// aid, not an ingestion endpoint — the cap is what stops a loop in the page
+// turning into unbounded log volume.
+func (s *Server) uiLog(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 8<<10))
+	line := strings.TrimSpace(string(body))
+	if line != "" {
+		// Single line: a newline in the payload would fake a log entry.
+		line = strings.ReplaceAll(line, "\n", " ")
+		log.Printf("[ui] %s", line)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // awsImageState reports the cloud worker-image + AMI state for the About tab
