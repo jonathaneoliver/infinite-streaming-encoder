@@ -1032,20 +1032,27 @@ def _create_state_channel(exec_name: str) -> str | None:
 
 
 def _delete_state_channel(exec_name: str, url: str | None) -> None:
-    """Tear down rule + targets + queue. Targets must go before the rule."""
+    """Stop the event flow. Deliberately leaves the QUEUE for the GC to sweep.
+
+    Targets must be removed before the rule — but deleting the queue here as
+    well is what produced the only two entries the DLQ has ever held, both
+    NO_RESOURCE ("the specified queue does not exist"). Removing the target
+    stops NEW matches; it does not stop EventBridge retrying deliveries it has
+    already accepted, and at teardown there are always a few in flight for jobs
+    that were terminating.
+
+    Those entries are noise, and noise in a DLQ is worse than an empty one: a
+    queue that always holds a couple of end-of-run failures trains you to ignore
+    the entry that means something. So the queue outlives the rule by design and
+    absorbs the stragglers; _gc_telemetry_queues removes it once it is empty and
+    past retention, which it already did for every other channel.
+    """
     rule, _ = _state_names(exec_name)
-    try:
-        _events().remove_targets(Rule=rule, Ids=["1"])
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        _events().delete_rule(Name=rule)
-    except Exception:  # noqa: BLE001
-        pass
-    if url:
+    for fn in (lambda: _events().remove_targets(Rule=rule, Ids=["1"]),
+               lambda: _events().delete_rule(Name=rule)):
         try:
-            _sqs().delete_queue(QueueUrl=url)
-        except Exception:  # noqa: BLE001
+            fn()
+        except Exception:  # noqa: BLE001 — teardown is best-effort
             pass
 
 
