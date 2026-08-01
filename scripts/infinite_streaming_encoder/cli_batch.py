@@ -60,7 +60,7 @@ def _s3():
     # to DOWNLOAD_CONCURRENCY threads against this client, and a pool narrower
     # than the thread count just moves the queue from the network into botocore.
     from botocore.config import Config
-    n = max(10, int(os.environ.get("DOWNLOAD_CONCURRENCY", "32")))
+    n = max(10, int(os.environ.get("DOWNLOAD_CONCURRENCY", "16")))
     return boto3.client("s3", region_name=_region(),
                         config=Config(max_pool_connections=n))
 
@@ -2166,10 +2166,24 @@ def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "",
     # transfers, and at a 28 KB median nothing crosses the 8 MB multipart
     # threshold — all that machinery does nothing but coordinate.
     #
-    # Configurable because the right width depends on the link: 16 was within
-    # 15% of 32 on the connection measured, and a different one may peak
-    # elsewhere.
-    workers = max(1, int(os.environ.get("DOWNLOAD_CONCURRENCY", "32")))
+    # 16, and NOT the 32 first chosen. That default came from a benchmark
+    # writing to container-local /tmp, which is not where this writes — the real
+    # destination is TMP_DIR, a bind-mounted external volume. Measured against
+    # the actual destination, three runs each:
+    #
+    #    6 threads  30.6 MB/s      16 threads  36.4 MB/s   <- plateau
+    #    8 threads  33.8 MB/s      24 threads  35.2 MB/s
+    #   12 threads  35.7 MB/s      32 threads   8.4 MB/s   <- cliff, reproducible
+    #
+    # 32 is not gradual degradation, it is a 4x collapse, and it is what the
+    # first live run measured (12.4 MB/s). Concurrent writes across many files
+    # thrash a spinning volume; past ~16 the disk loses more to seeking than the
+    # extra parallelism wins.
+    #
+    # 36.4 against a 39 MB/s sequential ceiling (dd, host and container alike)
+    # means this is now disk-bound, not network-bound. More threads cannot help;
+    # a faster disk would.
+    workers = max(1, int(os.environ.get("DOWNLOAD_CONCURRENCY", "16")))
     done = {"bytes": 0, "pct": -1.0}
     lock = threading.Lock()
 
