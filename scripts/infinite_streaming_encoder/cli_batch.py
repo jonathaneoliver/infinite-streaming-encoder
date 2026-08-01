@@ -796,7 +796,8 @@ def _queue_depth(sqs, url: str) -> int:
         return 0
 
 
-def _start_telemetry_drain(url: str | None, log_state: dict):
+def _start_drain_thread(tel_url: str | None, state_url: str | None,
+                        log_state: dict):
     """Drain the queue continuously on a background thread. Returns a stop event.
 
     The drain used to run once per poll iteration, which coupled how fast a
@@ -812,16 +813,23 @@ def _start_telemetry_drain(url: str | None, log_state: dict):
     status — the terminal-status guard in _drain_telemetry remains as the
     correctness backstop rather than the primary defence.
     """
-    if not url:
+    if not (tel_url or state_url):
         return None
     stop = threading.Event()
 
     def _loop() -> None:
         while not stop.is_set():
-            try:
-                _drain_telemetry(url, log_state)
-            except Exception:  # noqa: BLE001 — never let telemetry kill the run
-                pass
+            # BOTH channels on this thread. State events were originally drained
+            # from the poll loop instead, and the per-event lag logging showed
+            # what that cost: +2.9s to +7.3s against the 0.6s EventBridge
+            # actually delivers in. The events were never slow; they were sitting
+            # in the queue waiting for the next poll cycle.
+            for fn, url in ((_drain_state, state_url),
+                            (_drain_telemetry, tel_url)):
+                try:
+                    fn(url, log_state)
+                except Exception:  # noqa: BLE001 — never let a drain kill the run
+                    pass
             stop.wait(_TELEMETRY_DRAIN_IDLE_S)
 
     threading.Thread(target=_loop, daemon=True, name="telemetry-drain").start()
@@ -2003,9 +2011,9 @@ def cmd_poll(args: argparse.Namespace) -> int:
     tel_url = _create_telemetry_queue(exec_name)
     # Continuous, on its own thread — NOT once per poll iteration. See
     # _start_telemetry_drain for why the coupling mattered.
-    tel_stop = _start_telemetry_drain(tel_url, log_state)
-    tel_silent_s = 0
     state_url = _create_state_channel(exec_name)
+    tel_stop = _start_drain_thread(tel_url, state_url, log_state)
+    tel_silent_s = 0
     last_census = 0.0
 
     print(f">>> Polling execution {args.execution_arn}", flush=True)
@@ -2048,12 +2056,6 @@ def cmd_poll(args: argparse.Namespace) -> int:
         # complete continuously, so most polls had streams to drain and the grid
         # sat 35-73 completions behind Batch (#187) — showing holes for work that
         # had already finished.
-        # Batch state transitions, event-driven. Runs BEFORE the census so the
-        # census sees state the events have already applied and stays quiet.
-        try:
-            _drain_state(state_url, log_state)
-        except Exception:  # noqa: BLE001 — never break polling over the grid
-            pass
         # The census is now a BACKSTOP, not the primary path. EventBridge is
         # at-least-once but not guaranteed-delivery, so a periodic full scan
         # still catches a transition that never arrived. Rate-limited because it

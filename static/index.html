@@ -213,6 +213,11 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    two displays read alike. Usually over the MACHINE's colour, though Batch
    records placement around the same moment it flips to STARTING, so for a poll
    or two the hatch can be neutral before the host arrives. */
+/* Hatch on the CELL, not on the fill — a starting chunk is placed but has
+   encoded nothing, so its bar must stay empty. Hatching the fill instead meant
+   filling it to 100%, which read as a finished cell that then reset to 0. */
+.chunk-cell.chunk-cell-starting {
+    background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.30) 0 5px, transparent 5px 10px); }
 .chunk-cell-fill.chunk-starting {
     background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.35) 0 6px, transparent 6px 12px);
     opacity: 0.65; }
@@ -2594,10 +2599,21 @@ function updateStagesTable(row, stages) {
                 // no-instance blue — see .chunk-reused. Overrides the machine tint.
                 const reused = !!c.s.reused;
                 // reclaimed → fill red (waiting to restart); else show progress.
-                // 'starting' has no meaningful progress yet, so fill the cell and
-                // let the hatch carry the meaning rather than showing a 0% sliver.
-                const _wantW = (reused || st === 'reclaimed' || st === 'starting'
-                    ? 100 : prog).toFixed(1) + '%';
+                //
+                // 'starting' used to fill to 100% and let the hatch carry the
+                // meaning. That read as a COMPLETED cell: a full machine-coloured
+                // pill that then dropped back to 0 and climbed again. It was
+                // tolerable only while STARTING was rarely observed — describe_jobs
+                // polling raced placement, so most chunks appeared to jump straight
+                // to running. Driving state from Batch EVENTS delivers STARTING for
+                // every chunk, so every cell started flashing full-width first.
+                //
+                // Now the fill stays empty and the hatch moves to the CELL, so a
+                // starting chunk reads as "placed, not yet encoding" — the same way
+                // the fleet view hatches a booting box rather than filling its bar.
+                const _wantW = (reused || st === 'reclaimed'
+                    ? 100 : st === 'starting' ? 0 : prog).toFixed(1) + '%';
+                cell.classList.toggle('chunk-cell-starting', st === 'starting');
                 // Only touch the DOM when the value actually changes. Writing the
                 // same width every tick is not free — it invalidates style on a
                 // cell that has not moved, and on a settled chunk there is nothing
