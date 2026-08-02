@@ -25,7 +25,22 @@ locals {
     { name = "S3_BUCKET", value = var.s3_bucket },
     { name = "AWS_REGION", value = var.region },
     { name = "PYTHONUNBUFFERED", value = "1" },
+    # Per-INSTANCE mezzanine cache (#203). Points at the bind mount below, which
+    # is what makes it mean anything: cli_phase._fetch_mezz_cached is gated on
+    # this variable, but the cache it names is only shared if the containers
+    # sharing an instance also share a filesystem. Set without the mount, every
+    # chunk gets a private empty dir, misses, downloads all 474 MB anyway — and
+    # logs "caching mezzanine (first chunk on this box)" while doing it.
+    { name = "MEZZ_CACHE_DIR", value = local.mezz_cache_container_path },
   ]
+
+  # Host path on the Batch instance, bind-mounted into every phase container.
+  # Under /var/lib so it lands on the instance root volume rather than tmpfs;
+  # the AL2023 ECS AMI's root is 30 GiB gp3, which is why the cache is bounded
+  # by both a count (MEZZ_CACHE_KEEP, default 2) and a pre-download free-space
+  # check rather than trusted to stay small.
+  mezz_cache_host_path      = "/var/lib/encoder-cache"
+  mezz_cache_container_path = "/mnt/mezz-cache"
 
   log_group_name = "/aws/batch/infinite-streaming-encoder"
 }
@@ -77,6 +92,26 @@ locals {
     jobRoleArn       = var.task_role_arn
     executionRoleArn = var.execution_role_arn
     environment      = local.common_env
+
+    # The shared filesystem the mezzanine cache needs (#203). Every chunk on an
+    # instance is its own container, so without this they have nothing in common
+    # and each downloads the whole 474 MB mezzanine to encode 12s of it — 336
+    # times, ~159 GB per run. Declared on ALL phases, not just variant: it costs
+    # nothing on a phase that never sets a cache key, and scoping it to one job
+    # definition is the kind of asymmetry that breaks the next phase to want it.
+    #
+    # ECS creates the host dir on first use. It outlives the container, so a
+    # warm instance also hits across jobs — the mezzanine URI is content
+    # addressed (mezz/<hash>/, from sourceMezzKey), so the same source reuses it.
+    volumes = [{
+      name = "mezzcache"
+      host = { sourcePath = local.mezz_cache_host_path }
+    }]
+    mountPoints = [{
+      sourceVolume  = "mezzcache"
+      containerPath = local.mezz_cache_container_path
+      readOnly      = false
+    }]
 
     # Logs → the shared group above; Batch appends the job id to the
     # stream prefix automatically.

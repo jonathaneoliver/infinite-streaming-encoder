@@ -247,21 +247,121 @@ def _download_if_complete(s3_uri: str, dst: Path,
     return recorded == dst.stat().st_size
 
 
-def _prune_mezz_cache(cache_dir: Path, keep: int = 6) -> None:
+def _cache_keep() -> int:
+    """How many cached mezzanines to retain (MEZZ_CACHE_KEEP, default 2).
+
+    Two is the smallest number that still buys the cross-job hit: the running
+    job's mezzanine plus the previous one, so a back-to-back re-encode of the
+    same source lands warm. It was 6, which is a count-based cap on an object
+    whose size is the SOURCE's — the mezzanine is a stream copy, so it tracks the
+    input. 6 x 474 MB is 2.8 GB and fine; 6 x 10 GB (a 2-hour clip) is 61 GB and
+    fills the 30 GiB Batch root out from under the encode that filled it."""
+    try:
+        return max(1, int(os.environ.get("MEZZ_CACHE_KEEP", "") or 2))
+    except ValueError:
+        return 2
+
+
+def _evict_cache_entry(cache_dir: Path, entry: Path) -> int:
+    """Delete one cached artifact + its sidecars. Returns bytes reclaimed."""
+    freed = 0
+    for f in (entry, entry.with_suffix(".mp4.done"),
+              cache_dir / (entry.name.rsplit(".", 1)[0] + ".lock")):
+        try:
+            freed += f.stat().st_size
+        except OSError:
+            pass
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    return freed
+
+
+def _prune_mezz_cache(cache_dir: Path, keep: int | None = None) -> None:
     """Keep only the `keep` most-recent cached mezzanines — they're large. Recent
     ones (any active job's) survive, so this won't yank a symlink target from
     under a running encode in practice. Covers both the mezzanines and #109's
     per-box `vmafref-*` reference files, pruned independently."""
+    if keep is None:
+        keep = _cache_keep()
     for pat in ("mezz-*.mp4", "vmafref-*.mp4"):
         items = sorted(cache_dir.glob(pat),
                        key=lambda p: p.stat().st_mtime, reverse=True)
         for old in items[keep:]:
-            for f in (old, old.with_suffix(".mp4.done"),
-                      cache_dir / (old.name.rsplit(".", 1)[0] + ".lock")):
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
+            _evict_cache_entry(cache_dir, old)
+
+
+def _ensure_cache_room(cache_dir: Path, need_bytes: int, what: str) -> bool:
+    """Make room for a `need_bytes` download by evicting oldest-first, and report
+    whether it fits. Runs BEFORE the download, which is the whole point: the old
+    prune ran after, so it could tidy up but never prevent the write that filled
+    the disk — and a full disk fails the chunk, not just the cache.
+
+    Keeps a 20% margin because the cache shares the volume with every concurrent
+    chunk's work dir, and they are writing while we are.
+
+    False => don't cache this one. The caller downloads privately instead, which
+    is exactly the pre-cache behaviour: a clip too big to cache still encodes."""
+    margin = int(need_bytes * 1.2)
+    for _ in range(64):  # bounded: eviction is monotonic, this is a stuck-loop guard
+        try:
+            free = shutil.disk_usage(cache_dir).free
+        except OSError:
+            return True  # can't measure => don't block the encode on a guess
+        if free >= margin:
+            return True
+        items = sorted((p for pat in ("mezz-*.mp4", "vmafref-*.mp4")
+                        for p in cache_dir.glob(pat)),
+                       key=lambda p: p.stat().st_mtime)
+        if not items:
+            print(f"[phase variant] {what} too large for the cache volume "
+                  f"({need_bytes / 1048576:.0f} MB needed, {free / 1048576:.0f} MB "
+                  f"free) — downloading privately", flush=True)
+            return False
+        _evict_cache_entry(cache_dir, items[0])
+    return False
+
+
+def _object_size(uri: str) -> int:
+    """ContentLength of an S3 object, or 0 if it can't be read. 0 means "skip the
+    free-space check" rather than "empty" — a HEAD failure is not a reason to
+    refuse to encode, and the download itself will report the real error."""
+    try:
+        bucket, key = _parse(uri)
+        return int(_s3().head_object(Bucket=bucket, Key=key)["ContentLength"])
+    except Exception:  # noqa: BLE001 — sizing is best-effort
+        return 0
+
+
+def _lock_with_timeout(lockf, what: str) -> bool:
+    """Take the cache lock, giving up after MEZZ_CACHE_LOCK_TIMEOUT_S (600s).
+
+    A plain blocking flock waits forever. That is fine while the leader is alive
+    — a waiter blocked on the lock costs exactly what a waiter downloading its
+    own copy costs, and it transfers 1/Nth the bytes — but a leader killed
+    mid-download (spot reclaim, OOM) would hang every other chunk on the box for
+    the rest of the job with no upper bound.
+
+    600s is chosen to be far outside any legitimate download: at the measured
+    263 MB/s it corresponds to ~157 GB, so expiry means "dead", not "slow"."""
+    import fcntl
+    try:
+        deadline = float(os.environ.get("MEZZ_CACHE_LOCK_TIMEOUT_S", "") or 600)
+    except ValueError:
+        deadline = 600.0
+    end = time.monotonic() + deadline
+    while True:
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.monotonic() >= end:
+                print(f"[phase variant] {what} cache lock held >{deadline:.0f}s "
+                      f"— assuming the downloader died, fetching privately",
+                      flush=True)
+                return False
+            time.sleep(0.5)
 
 
 def _fetch_mezz_cached(mezz_uri: str, mezz_local: Path,
@@ -283,10 +383,18 @@ def _fetch_mezz_cached(mezz_uri: str, mezz_local: Path,
     cached = Path(cache_dir) / f"mezz-{key}.mp4"
     cached_done = cached.with_suffix(".mp4.done")
     with open(Path(cache_dir) / f"mezz-{key}.lock", "w") as lockf:
-        fcntl.flock(lockf, fcntl.LOCK_EX)
+        if not _lock_with_timeout(lockf, what):
+            # The leader is stuck or dead. Waiting on flock has no upper bound,
+            # so every chunk on this box would hang behind it. Fall back to a
+            # private download — the pre-cache behaviour, and safe even if the
+            # leader is merely slow, because we never touch its output path.
+            return _download_if_complete(mezz_uri, mezz_local)
         if cached.is_file() and cached_done.is_file():
             print(f"[phase variant] {what} served from worker cache", flush=True)
         else:
+            need = _object_size(mezz_uri)
+            if need and not _ensure_cache_room(Path(cache_dir), need, what):
+                return _download_if_complete(mezz_uri, mezz_local)
             print(f"[phase variant] caching {what} (first chunk on this box)", flush=True)
             if not _download_if_complete(mezz_uri, cached):
                 return False
