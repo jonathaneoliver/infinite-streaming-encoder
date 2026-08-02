@@ -143,6 +143,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build, to
 	printf '  py machinerent '; \
 	if out=$$(python3 scripts/test_machine_rental.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py mezzcache   '; \
+	if out=$$(python3 scripts/test_mezz_cache.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  python compile '; \
 	if out=$$(cd scripts && python3 -m compileall -q infinite_streaming_encoder 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
