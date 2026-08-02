@@ -60,7 +60,7 @@ def _s3():
     # to DOWNLOAD_CONCURRENCY threads against this client, and a pool narrower
     # than the thread count just moves the queue from the network into botocore.
     from botocore.config import Config
-    n = max(10, int(os.environ.get("DOWNLOAD_CONCURRENCY", "16")))
+    n = max(10, int(os.environ.get("DOWNLOAD_CONCURRENCY", "64")))
     return boto3.client("s3", region_name=_region(),
                         config=Config(max_pool_connections=n))
 
@@ -2166,24 +2166,34 @@ def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "",
     # transfers, and at a 28 KB median nothing crosses the 8 MB multipart
     # threshold — all that machinery does nothing but coordinate.
     #
-    # 16, and NOT the 32 first chosen. That default came from a benchmark
-    # writing to container-local /tmp, which is not where this writes — the real
-    # destination is TMP_DIR, a bind-mounted external volume. Measured against
-    # the actual destination, three runs each:
+    # 64. This default has moved twice, and BOTH earlier values were measuring
+    # the destination disk rather than this code:
     #
-    #    6 threads  30.6 MB/s      16 threads  36.4 MB/s   <- plateau
-    #    8 threads  33.8 MB/s      24 threads  35.2 MB/s
-    #   12 threads  35.7 MB/s      32 threads   8.4 MB/s   <- cliff, reproducible
+    #   32 — benchmarked against container-local /tmp, which is not where this
+    #        writes. Wrong destination.
+    #   16 — benchmarked against the real destination (TMP_DIR), which was then
+    #        an NVMe enclosure negotiating USB 2.0 at 480 Mbps. It capped every
+    #        thread count at ~36 MB/s and collapsed to 8.4 MB/s at 32 threads,
+    #        so 16 looked like a plateau with a cliff just past it.
     #
-    # 32 is not gradual degradation, it is a 4x collapse, and it is what the
-    # first live run measured (12.4 MB/s). Concurrent writes across many files
-    # thrash a spinning volume; past ~16 the disk loses more to seeking than the
-    # extra parallelism wins.
+    # With that enclosure on Thunderbolt (3.2 GB/s, ~90x) the disk contributes
+    # nothing and the transfer is round-trip bound as originally described.
+    # Re-measured through THIS function, real prefix, real destination, 1486
+    # objects / 2512 MB, repeated runs:
     #
-    # 36.4 against a 39 MB/s sequential ceiling (dd, host and container alike)
-    # means this is now disk-bound, not network-bound. More threads cannot help;
-    # a faster disk would.
-    workers = max(1, int(os.environ.get("DOWNLOAD_CONCURRENCY", "16")))
+    #     1 thread    9.1 MB/s        32 threads  71.8 / 77.6 / 77.7 MB/s
+    #     4 threads  27.1 MB/s        64 threads  90.3 / 90.3 / 91.9 MB/s
+    #     8 threads  41.4 MB/s       128 threads  95.6 / 96.8 / 98.4 MB/s
+    #    16 threads  58.3 / 55.5 / 32.0 MB/s     192 threads  40.9 MB/s  <- cliff
+    #
+    # 64 rather than 128: 128 is ~7% faster but sits close to a collapse that is
+    # worse than doing nothing, and the knee is a property of the local network
+    # path (~730 Mbps here), so it will not sit in the same place everywhere.
+    # 64 keeps 3x headroom below the cliff for most of the gain.
+    #
+    # Note 16 is not merely slower but ERRATIC (32.0-58.3 across repeats), which
+    # is why live runs on it landed anywhere from 44 to 64 MB/s.
+    workers = max(1, int(os.environ.get("DOWNLOAD_CONCURRENCY", "64")))
     done = {"bytes": 0, "pct": -1.0}
     lock = threading.Lock()
 
