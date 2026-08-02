@@ -73,7 +73,7 @@ func main() {
 	watchInterval := flag.Duration("watch-interval", 30*time.Second, "filesystem watch polling interval")
 	defaultTarget := flag.String("default-target", env("DEFAULT_TARGET", "local"), "default encode target: local or cloud")
 	defaultCodec := flag.String("default-codec", env("DEFAULT_CODEC", "both"), "default codec: h264, hevc, both")
-	defaultLadder := flag.String("default-ladder", env("DEFAULT_LADDER", "apple-uniq-live"), "default encoding ladder profile")
+	defaultLadder := flag.String("default-ladder", env("DEFAULT_LADDER", encode.DefaultLadderName), "default encoding ladder profile")
 	defaultMaxRes := flag.String("default-max-res", env("DEFAULT_MAX_RES", ""), "default max resolution (empty = no limit)")
 	defaultMinRes := flag.String("default-min-res", env("DEFAULT_MIN_RES", ""), "default min resolution (empty = no floor)")
 	maxConcurrent := flag.Int("max-concurrent", intEnv("MAX_CONCURRENT", 1), "max concurrent encode jobs")

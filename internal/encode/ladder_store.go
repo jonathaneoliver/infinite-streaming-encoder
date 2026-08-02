@@ -18,6 +18,28 @@ import (
 // ladder.py reads the same file), so a rung is a [width, height, bitrate_kbps]
 // triple and burn-in geometry is derived from height on both sides.
 
+// DefaultLadderName is the ladder a job encodes with when it names none.
+//
+// It has to be defined once. The same literal used to sit in eight call sites
+// (job.go, meta.go, cost.go, ladder_store.go) plus the -default-ladder flag,
+// and #202 is exactly what that costs: a run's ladder is only worth recording
+// if the recorded name is the one that actually ran, which means the fallback
+// the recorder uses and the fallback the encoder uses must be the same value.
+//
+// Note the server flag (-default-ladder / DEFAULT_LADDER) can override the
+// default for jobs it seeds; EffectiveLadder describes what a given JobConfig
+// resolves to, which is what history.md needs.
+const DefaultLadderName = "apple-uniq-live"
+
+// EffectiveLadder is the ladder a config actually encodes with — the one it
+// names, or the default when it names none.
+func EffectiveLadder(cfg JobConfig) string {
+	if cfg.Ladder != "" {
+		return cfg.Ladder
+	}
+	return DefaultLadderName
+}
+
 // LadderDef is one ladder: per-codec rung lists plus optional VBV shaping.
 // JSON-shaped for the store file and the API.
 type LadderDef struct {
@@ -496,7 +518,7 @@ func (m *Manager) ValidateResBand(cfg JobConfig) error {
 	}
 	ladderName := cfg.Ladder
 	if ladderName == "" {
-		ladderName = "apple-uniq-live"
+		ladderName = DefaultLadderName
 	}
 	minH, minSet := resHeight(cfg.MinRes)
 	maxH, maxSet := resHeight(cfg.MaxRes)

@@ -197,6 +197,10 @@ var (
 	// floor, job count, and the compute-env max vCPUs). The Job derives avg
 	// concurrency + efficiency from these. Keyed by exec for idempotent reattach.
 	statsMarkerRe = regexp.MustCompile(`^\[\[ENCODER-STATS exec=(\S+) wall_s=([0-9.]+) vcpu_h=([0-9.]+) longest_s=([0-9.]+) slowest=(\S+) jobs=(\d+) max_vcpus=(\d+)\]\]$`)
+	// ENCODER-MACHINES reports what was RENTED against what jobs allocated —
+	// the boot, image pull and scale-down tail that a job-derived cost figure
+	// cannot see (#195). Captured so the per-output stats can show it.
+	machinesMarkerRe = regexp.MustCompile(`^\[\[ENCODER-MACHINES exec=(\S+) instances=(\d+) machine_vcpu_h=([0-9.]+) allocated_vcpu_h=([0-9.]+) unallocated_pct=([0-9.]+)\]\]$`)
 	// ENCODER-FLEET reports one distributed-local worker box's live CPU: busy =
 	// logical cores currently busy (from /proc/stat), perf = its perf-core target
 	// (4/4/8). Emitted by cli_local_dist from the workers' Temporal heartbeats,
@@ -645,6 +649,17 @@ func (j *Job) parseMarker(line string) bool {
 		j.recordCost(m[1], spot, ondemand, saved, vh)
 		return true
 	}
+	if m := machinesMarkerRe.FindStringSubmatch(line); m != nil {
+		inst, _ := strconv.Atoi(m[2])
+		mh, _ := strconv.ParseFloat(m[3], 64)
+		ah, _ := strconv.ParseFloat(m[4], 64)
+		idle, _ := strconv.ParseFloat(m[5], 64)
+		j.mu.Lock()
+		j.Instances, j.MachineVCPUHours = inst, mh
+		j.AllocatedVCPUHours, j.IdlePct = ah, idle
+		j.mu.Unlock()
+		return true
+	}
 	if m := statsMarkerRe.FindStringSubmatch(line); m != nil {
 		wall, _ := strconv.ParseFloat(m[2], 64)
 		vcpuH, _ := strconv.ParseFloat(m[3], 64)
@@ -860,7 +875,7 @@ type JobConfig struct {
 	Files []string `json:"files"`
 	Codec string   `json:"codec"`
 	// Ladder selects the bitrate ladder by name (legacy | apple | apple-uniq |
-	// any custom ladder). Empty defaults to "legacy". Threaded to the local
+	// any custom ladder). Empty means DefaultLadderName. Threaded to the local
 	// encoder via --ladder and resolved by buildSFNInput for the cloud path.
 	Ladder string `json:"ladder,omitempty"`
 	MaxRes string `json:"max_res"`
@@ -1033,9 +1048,16 @@ type Job struct {
 
 	// Spot-vs-on-demand cost (from ENCODER-COST). SpotUSD is what this job cost
 	// on the spot fleet; SavedUSD = OnDemandUSD - SpotUSD (what spot avoided).
-	SpotUSD     float64 `json:"spot_usd,omitempty"`
-	OnDemandUSD float64 `json:"ondemand_usd,omitempty"`
-	SavedUSD    float64 `json:"saved_usd,omitempty"`
+	// Machine rental vs allocation (from ENCODER-MACHINES). MachineVCPUHours is
+	// what was rented — instance lifetimes — against AllocatedVCPUHours, the sum
+	// of each job's reservation. IdlePct is the share that ran no job at all.
+	MachineVCPUHours   float64 `json:"machine_vcpu_hours,omitempty"`
+	AllocatedVCPUHours float64 `json:"allocated_vcpu_hours,omitempty"`
+	IdlePct            float64 `json:"idle_pct,omitempty"`
+	Instances          int     `json:"instances,omitempty"`
+	SpotUSD            float64 `json:"spot_usd,omitempty"`
+	OnDemandUSD        float64 `json:"ondemand_usd,omitempty"`
+	SavedUSD           float64 `json:"saved_usd,omitempty"`
 	// CommercialUSD / MediaConvertUSD are what this job's output ladder would have
 	// cost on hosted transcoders (a generic commercial cloud encoder, and AWS
 	// MediaConvert) — comparison baselines against our own spot/local cost. Both
@@ -2109,6 +2131,7 @@ func (m *Manager) writeHistory(job *Job) {
 	fmt.Fprintf(f, "- **Target:** %s\n", job.Config.Target)
 	fmt.Fprintf(f, "- **Files:** %s\n", strings.Join(job.Config.Files, ", "))
 	fmt.Fprintf(f, "- **Codec:** %s\n", job.Config.Codec)
+	fmt.Fprintf(f, "- **Ladder:** %s%s\n", EffectiveLadder(job.Config), ladderRungSummary(job))
 	if job.Config.MaxRes != "" {
 		fmt.Fprintf(f, "- **Max Res:** %s\n", job.Config.MaxRes)
 	}
@@ -2141,6 +2164,148 @@ func (m *Manager) writeHistory(job *Job) {
 	m.writeTimingSummary(f, job)
 
 	fmt.Fprintf(f, "\n---\n\n")
+}
+
+// ladderRungSummary describes the rungs a job ACTUALLY encoded, read back from
+// its stage keys ("encode:<codec>:<res>:chunk<N>"), as " (12 rungs, 234p–2160p)".
+//
+// The ladder NAME on its own is not a reproducible description of a run.
+// Ladders are user-editable through POST /api/ladders, so the definition behind
+// a name can change after the fact — and MaxRes/MinRes narrow it per job
+// anyway. The observed rungs are ground truth, and they are the thing that
+// makes two runs comparable: #202 was caught by a stage count of 252 where 336
+// was expected, which is precisely this number.
+//
+// Returns "" when no rungs are derivable (a job that failed before any encode
+// stage), so the caller degrades to the bare ladder name rather than printing
+// a misleading "0 rungs".
+func ladderRungSummary(job *Job) string {
+	job.mu.Lock()
+	stages := append([]StageProgress(nil), job.Stages...)
+	history := append([]FileStages(nil), job.StagesHistory...)
+	job.mu.Unlock()
+	for _, h := range history {
+		stages = append(stages, h.Stages...)
+	}
+
+	heights := map[int]bool{}
+	for _, s := range stages {
+		parts := strings.Split(s.Key, ":")
+		if len(parts) < 3 || parts[0] != "encode" {
+			continue
+		}
+		// parts[2] is the rung ("1080p"); tolerate anything that isn't.
+		if h, err := strconv.Atoi(strings.TrimSuffix(parts[2], "p")); err == nil && h > 0 {
+			heights[h] = true
+		}
+	}
+	if len(heights) == 0 {
+		return ""
+	}
+	lo, hi := 0, 0
+	for h := range heights {
+		if lo == 0 || h < lo {
+			lo = h
+		}
+		if h > hi {
+			hi = h
+		}
+	}
+	if lo == hi {
+		return fmt.Sprintf(" (1 rung, %dp)", lo)
+	}
+	return fmt.Sprintf(" (%d rungs, %dp–%dp)", len(heights), lo, hi)
+}
+
+// PhaseStat is one row of the phase rollup: a stage, or a whole rung's chunks
+// collapsed into one line.
+//
+// Three different times, because they answer different questions and are
+// routinely conflated:
+//
+//	SpanS     first start -> last end. Real elapsed, so parallel chunks count once.
+//	JobWallS  sum of per-stage Batch wall clock. Includes container start, the
+//	          mezzanine fetch and the upload.
+//	WorkerS   the worker's OWN timer over the same phases. The gap against
+//	          JobWallS is the non-encoding overhead.
+//
+// Cores is CPUS/WorkerS — what the phase actually used against what it reserved.
+type PhaseStat struct {
+	Phase    string  `json:"phase"`
+	N        int     `json:"n"`
+	SpanS    float64 `json:"span_s"`
+	JobWallS float64 `json:"job_wall_s"`
+	WorkerS  float64 `json:"worker_s,omitempty"`
+	CPUS     float64 `json:"cpu_s,omitempty"`
+	Cores    float64 `json:"cores,omitempty"`
+	PeakMiB  float64 `json:"peak_mib,omitempty"`
+}
+
+// PhaseRollup aggregates the job's stages by phase, collapsing a rung's chunks
+// into one row. Shared by the on-disk timing summary and the per-output stats
+// sidecar so the two can never disagree.
+func (j *Job) PhaseRollup() []PhaseStat {
+	j.mu.Lock()
+	stages := append([]StageProgress(nil), j.Stages...)
+	history := append([]FileStages(nil), j.StagesHistory...)
+	j.mu.Unlock()
+	var all []StageProgress
+	for _, h := range history {
+		all = append(all, h.Stages...)
+	}
+	all = append(all, stages...)
+
+	type agg struct {
+		n              int
+		first, last    time.Time
+		jobWall        time.Duration
+		cpu, work, mem float64
+	}
+	groups := map[string]*agg{}
+	var order []string
+	for _, st := range all {
+		g := st.Key
+		if i := strings.LastIndex(g, ":chunk"); i > 0 {
+			g = g[:i]
+		}
+		a := groups[g]
+		if a == nil {
+			a = &agg{}
+			groups[g] = a
+			order = append(order, g)
+		}
+		a.n++
+		a.cpu += st.CPUSeconds
+		a.work += st.WorkerSeconds
+		if st.PeakMemMiB > a.mem {
+			a.mem = st.PeakMemMiB
+		}
+		if st.StartedAt != nil {
+			if a.first.IsZero() || st.StartedAt.Before(a.first) {
+				a.first = *st.StartedAt
+			}
+			if st.EndedAt != nil {
+				a.jobWall += st.EndedAt.Sub(*st.StartedAt)
+				if st.EndedAt.After(a.last) {
+					a.last = *st.EndedAt
+				}
+			}
+		}
+	}
+	out := make([]PhaseStat, 0, len(order))
+	for _, g := range order {
+		a := groups[g]
+		row := PhaseStat{Phase: g, N: a.n, JobWallS: a.jobWall.Seconds(),
+			WorkerS: a.work, CPUS: a.cpu, PeakMiB: a.mem}
+		if !a.first.IsZero() && !a.last.IsZero() {
+			row.SpanS = a.last.Sub(a.first).Seconds()
+		}
+		if a.work > 0 {
+			row.Cores = a.cpu / a.work
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
@@ -2532,7 +2697,7 @@ func (m *Manager) vmafEstimates(cfg JobConfig) map[string][2]string {
 	}
 	ladderName := cfg.Ladder
 	if ladderName == "" {
-		ladderName = "apple-uniq-live"
+		ladderName = DefaultLadderName
 	}
 	out := map[string][2]string{}
 	for _, codec := range parseCodecSel(cfg.Codec) {
@@ -2556,7 +2721,7 @@ func (m *Manager) vmafEstimateArgs(cfg JobConfig) []string {
 	}
 	ladderName := cfg.Ladder
 	if ladderName == "" {
-		ladderName = "apple-uniq-live"
+		ladderName = DefaultLadderName
 	}
 	var out []string
 	for _, codec := range parseCodecSel(cfg.Codec) {
@@ -3298,7 +3463,7 @@ func parseCodecSel(sel string) []string {
 
 func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin bool, sourceWidth, sourceFps int, clipDurationS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int) {
 	if ladderName == "" {
-		ladderName = "apple-uniq-live"
+		ladderName = DefaultLadderName
 	}
 	// Every Batch SchedulingPriorityOverride for this job rides inside a 1000-wide
 	// band (priorityBase): an EARLIER queued job gets a higher band, so ALL its

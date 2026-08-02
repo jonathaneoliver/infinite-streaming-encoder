@@ -238,6 +238,64 @@ def test_events_cannot_walk_a_chunk_back_either():
     assert not ok, "an out-of-order Batch event un-finished a chunk"
 
 
+def test_concurrent_emitters_never_walk_a_cell_back():
+    """Both queues are now drained SIMULTANEOUSLY, one thread each, so
+    _emit_stage is reachable from two threads at once.
+
+    Its guard is a read-modify-write — read prev, decide, store — which is not
+    atomic merely because dict operations are. Two drains could otherwise both
+    read the same prev, both pass the guard, and both write, with the later
+    writer winning regardless of lifecycle order. That is the exact defect the
+    guard exists to prevent.
+
+    Hammers one key from two threads with a correct-order and a stale-order
+    sequence, and asserts the cell never leaves `done`.
+
+    HONEST LIMIT: this test passes with the lock removed, so it does not prove
+    the lock is necessary — only that the invariant holds. Under CPython the
+    window between the read and the write is a few bytecodes with no I/O in it,
+    so the interleaving is rare enough that hammering does not reliably produce
+    it. The lock stays because "rare under this interpreter" is not the same as
+    correct, and every reversal chased today was rare until it was not.
+    """
+    import threading
+    reset()
+    key = "encode:h264:1080p:chunk9"
+    errors = []
+
+    def forward():
+        for _ in range(300):
+            cli_batch._emit_stage(key, "running", 50.0)
+            cli_batch._emit_stage(key, "done", 100.0)
+
+    def stale():
+        for _ in range(300):
+            # a late event: must never be accepted once done is recorded
+            cli_batch._emit_stage(key, "running", 1.0)
+            cli_batch._emit_stage(key, "starting", None)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ts = [threading.Thread(target=forward), threading.Thread(target=stale)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+    if errors:
+        raise AssertionError(errors[0])
+
+    # Whatever interleaving occurred, once `done` is reached nothing may undo it.
+    assert cli_batch._STAGE_STATE[key] == "done", (
+        f"final state is {cli_batch._STAGE_STATE[key]!r}, not done")
+    lines = [l for l in buf.getvalue().splitlines() if "ENCODER-STAGE" in l]
+    seen_done = False
+    for l in lines:
+        if "status=done" in l:
+            seen_done = True
+        elif seen_done:
+            raise AssertionError(f"emitted after done: {l}")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

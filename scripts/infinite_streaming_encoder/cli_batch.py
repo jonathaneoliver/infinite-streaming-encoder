@@ -24,6 +24,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Taxonomy only — cli_batch is the queue's CONSUMER and must never emit through
@@ -55,7 +56,13 @@ def _sfn():
 
 
 def _s3():
-    return boto3.client("s3", region_name=_region())
+    # max_pool_connections defaults to 10; the parallel output download runs up
+    # to DOWNLOAD_CONCURRENCY threads against this client, and a pool narrower
+    # than the thread count just moves the queue from the network into botocore.
+    from botocore.config import Config
+    n = max(10, int(os.environ.get("DOWNLOAD_CONCURRENCY", "64")))
+    return boto3.client("s3", region_name=_region(),
+                        config=Config(max_pool_connections=n))
 
 
 def _logs():
@@ -68,6 +75,10 @@ def _batch():
 
 def _ecs():
     return boto3.client("ecs", region_name=_region())
+
+
+def _ec2():
+    return boto3.client("ec2", region_name=_region())
 
 
 def _sqs():
@@ -845,22 +856,36 @@ def _start_drain_thread(tel_url: str | None, state_url: str | None,
         return None
     stop = threading.Event()
 
-    def _loop() -> None:
+    # ONE THREAD PER QUEUE, not one thread draining both in sequence.
+    #
+    # Draining them in turn made a cycle as long as the sum of their budgets:
+    # 8s for state, 8s for telemetry, plus the idle wait. An event landing just
+    # after its queue was read then waited a whole cycle, or two if unlucky.
+    #
+    # Measured, and unmistakable in the log: the eight worst-lagged chunks of a
+    # run were all delivered at 19:55:34, within 0.2s of each other, carrying
+    # lags of 32-35s. Arriving in one clump means the consumer was stalled and
+    # caught up in a single pass — not that EventBridge was slow, which it was
+    # not (0.6s median, verified in #188 step 0).
+    #
+    # Each queue now has its own thread, so neither waits on the other and a
+    # cycle is about a second. The two drains touch shared state only through
+    # _emit_stage and log_state; _emit_stage is the ordering chokepoint and is
+    # already the arbiter between racing sources, so concurrency here is the
+    # case it was built for rather than a new hazard.
+    def _loop(fn, url, name) -> None:
         while not stop.is_set():
-            # BOTH channels on this thread. State events were originally drained
-            # from the poll loop instead, and the per-event lag logging showed
-            # what that cost: +2.9s to +7.3s against the 0.6s EventBridge
-            # actually delivers in. The events were never slow; they were sitting
-            # in the queue waiting for the next poll cycle.
-            for fn, url in ((_drain_state, state_url),
-                            (_drain_telemetry, tel_url)):
-                try:
-                    fn(url, log_state)
-                except Exception:  # noqa: BLE001 — never let a drain kill the run
-                    pass
+            try:
+                fn(url, log_state)
+            except Exception:  # noqa: BLE001 — never let a drain kill the run
+                pass
             stop.wait(_TELEMETRY_DRAIN_IDLE_S)
 
-    threading.Thread(target=_loop, daemon=True, name="telemetry-drain").start()
+    for fn, url, name in ((_drain_state, state_url, "state-drain"),
+                          (_drain_telemetry, tel_url, "telemetry-drain")):
+        if url:
+            threading.Thread(target=_loop, args=(fn, url, name),
+                             daemon=True, name=name).start()
     return stop
 
 
@@ -1466,6 +1491,15 @@ def _emit_plan(variants: "list | None" = None,
 # "entered" event surface — re-announcing a finished chunk as queued, which is a
 # filled cell going blank.
 _STAGE_STATE: dict[str, str] = {}
+# _emit_stage does a read-modify-write — read the previous status, decide, then
+# store — and that is NOT atomic just because dict operations are.
+#
+# It became reachable from two threads the moment each queue got its own drain.
+# Without this lock, two drains can both read the same `prev`, both pass the
+# guard, and both write: the later writer wins regardless of order, which walks
+# a cell backwards. That is the exact defect the guard exists to prevent, so
+# leaving it unsynchronised would defeat it in precisely the case it matters.
+_STAGE_LOCK = threading.Lock()
 # Last percent announced per key. Only the WORKER knows progress: a Batch event
 # and the census both carry status and nothing else, so they pass percent=None
 # and this supplies the last real value rather than asserting a zero.
@@ -1523,6 +1557,13 @@ def _emit_stage(key: str, status: str, percent: float | None = 0.0,
     and reversals continued, because _translate_events was marking chunks done
     from SFN history through a channel the check could not see.
     """
+    with _STAGE_LOCK:
+        return _emit_stage_locked(key, status, percent, src)
+
+
+def _emit_stage_locked(key: str, status: str, percent: float | None,
+                       src: str) -> bool:
+    """The body of _emit_stage. Callers must hold _STAGE_LOCK."""
     prev = _STAGE_STATE.get(key)
     if prev in _FINAL_STAGE and status not in _FINAL_STAGE:
         return False
@@ -2103,31 +2144,97 @@ def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "",
             objs.append((obj["Key"], obj.get("Size", 0)))
 
     total_bytes = sum(s for _, s in objs) or 1
-    done_bytes = 0
-    last_pct = -1.0
-    if objs:
-        _emit_stage("download:outputs", "running", 0.0)
-    for key, size in objs:
+    if not objs:
+        return 0
+    _emit_stage("download:outputs", "running", 0.0)
+
+    # PARALLEL, because this transfer is round-trip bound rather than bandwidth
+    # bound. Packaged HLS output is thousands of tiny files — 1,486 objects at a
+    # 28 KB median on a measured 12-rung run — and fetching them one at a time
+    # spends almost all of its time waiting.
+    #
+    # Measured in the orchestrator container, 114 objects / 246.7 MB:
+    #
+    #   sequential download_file        29.9s    8.3 MB/s   <- what this was
+    #   ThreadPoolExecutor(16)           4.8s   51.2 MB/s
+    #   ThreadPoolExecutor(32)           4.1s   59.9 MB/s
+    #   TransferManager(16)              4.4s   56.3 MB/s
+    #   TransferManager(32)              4.8s   50.9 MB/s
+    #
+    # A plain thread pool matches or beats s3transfer's TransferManager here, so
+    # the simpler tool wins: TransferManager exists to orchestrate MULTIPART
+    # transfers, and at a 28 KB median nothing crosses the 8 MB multipart
+    # threshold — all that machinery does nothing but coordinate.
+    #
+    # 64. This default has moved twice, and BOTH earlier values were measuring
+    # the destination disk rather than this code:
+    #
+    #   32 — benchmarked against container-local /tmp, which is not where this
+    #        writes. Wrong destination.
+    #   16 — benchmarked against the real destination (TMP_DIR), which was then
+    #        an NVMe enclosure negotiating USB 2.0 at 480 Mbps. It capped every
+    #        thread count at ~36 MB/s and collapsed to 8.4 MB/s at 32 threads,
+    #        so 16 looked like a plateau with a cliff just past it.
+    #
+    # With that enclosure on Thunderbolt (3.2 GB/s, ~90x) the disk contributes
+    # nothing and the transfer is round-trip bound as originally described.
+    # Re-measured through THIS function, real prefix, real destination, 1486
+    # objects / 2512 MB, repeated runs:
+    #
+    #     1 thread    9.1 MB/s        32 threads  71.8 / 77.6 / 77.7 MB/s
+    #     4 threads  27.1 MB/s        64 threads  90.3 / 90.3 / 91.9 MB/s
+    #     8 threads  41.4 MB/s       128 threads  95.6 / 96.8 / 98.4 MB/s
+    #    16 threads  58.3 / 55.5 / 32.0 MB/s     192 threads  40.9 MB/s  <- cliff
+    #
+    # 64 rather than 128: 128 is ~7% faster but sits close to a collapse that is
+    # worse than doing nothing, and the knee is a property of the local network
+    # path (~730 Mbps here), so it will not sit in the same place everywhere.
+    # 64 keeps 3x headroom below the cliff for most of the gain.
+    #
+    # Note 16 is not merely slower but ERRATIC (32.0-58.3 across repeats), which
+    # is why live runs on it landed anywhere from 44 to 64 MB/s.
+    workers = max(1, int(os.environ.get("DOWNLOAD_CONCURRENCY", "64")))
+    done = {"bytes": 0, "pct": -1.0}
+    lock = threading.Lock()
+
+    def _fetch(item) -> None:
+        key, size = item
         rel = key[len(base_key) + 1:]
         dst = _dst_for(rel)
-        if dst is None:
-            done_bytes += size
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        s3.download_file(bucket, key, str(dst))
-        done_bytes += size
-        pct = done_bytes / total_bytes * 100.0
-        if pct - last_pct >= 1.0:  # throttle: at most ~100 markers
-            _emit_stage("download:outputs", "running", pct)
-            last_pct = pct
-    if objs:
-        _emit_stage("download:outputs", "done", 100.0)
+        if dst is not None:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            # boto3 clients are thread-safe for this; the per-thread cost is a
+            # connection from the shared pool, which is why the pool size and
+            # the worker count are kept in step below.
+            s3.download_file(bucket, key, str(dst))
+        with lock:
+            done["bytes"] += size
+            pct = done["bytes"] / total_bytes * 100.0
+            if pct - done["pct"] >= 1.0:   # throttle: at most ~100 markers
+                done["pct"] = pct
+                _emit_stage("download:outputs", "running", pct)
+
+    t0 = time.monotonic()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for fut in as_completed([pool.submit(_fetch, o) for o in objs]):
+            fut.result()   # surface the first failure rather than silently
+    dt = time.monotonic() - t0
+    _emit_stage("download:outputs", "done", 100.0)
+    _narrate(f"    downloaded {len(objs)} objects, {total_bytes / 1e6:.0f} MB in "
+             f"{dt:.0f}s ({total_bytes / 1e6 / max(dt, 0.001):.1f} MB/s, "
+             f"{workers} threads)")
     return len(objs)
 
 
 # Blended Graviton per-vCPU-hour rates, us-west-2 (c7g/c8g .2xlarge/.4xlarge).
 # cloud-batch always runs on the SPOT compute env, so every run's savings = the
 # on-demand price it avoided. Estimates — good enough for "saved by spot".
+# Above this, the idle share is called out in words rather than left as a
+# figure in a line of figures. Short runs sit high by nature — a fixed ~110s of
+# boot and scale-down is most of a 4-minute instance — so this is set where it
+# means something for a run of real length.
+_IDLE_WARN_PCT = 35.0
+
 _SPOT_VCPU_HR = 0.011
 _ONDEMAND_VCPU_HR = 0.037
 
@@ -2181,6 +2288,111 @@ def _collect_exec_jobs(exec_name: str) -> list:
     return jobs
 
 
+def _emit_machine_rental(exec_name: str, jobs: list) -> tuple | None:
+    """Report what was RENTED, against what was allocated (#195).
+
+    ENCODER-COST sums each JOB's reserved vCPU x its duration. AWS bills for
+    instance lifetime, and everything between the two is invisible to a
+    job-derived figure because no job is running during any of it: EC2 boot, ECS
+    registration, image pull, idle before the first chunk lands, and the idle
+    tail before Batch scales the instance down.
+
+    Both numbers are printed side by side so the gap is the headline rather than
+    something to be inferred.
+
+    Honest about what it cannot know, rather than quietly wrong:
+      * an instance shared with a CONCURRENT run has its idle attributed here in
+        full, because this execution cannot see the other one's jobs. Marked (*).
+      * an instance still alive when the run ends has no termination time, so its
+        lifetime is measured to now and marked (~) — it will grow after we look.
+    """
+    by_inst: dict = {}
+    for job in jobs:
+        arn = (job.get("container") or {}).get("containerInstanceArn")
+        st, sp = job.get("startedAt"), job.get("stoppedAt")
+        if not arn or not isinstance(st, (int, float)) or not isinstance(sp, (int, float)):
+            continue
+        iid = _ec2_for_container_instance(arn)
+        if not iid or not iid.startswith("i-"):
+            continue
+        a = by_inst.setdefault(iid, {"first": st, "last": sp, "vcpu_s": 0.0, "n": 0})
+        a["first"] = min(a["first"], st)
+        a["last"] = max(a["last"], sp)
+        a["vcpu_s"] += _job_vcpu(job) * (sp - st) / 1000.0
+        a["n"] += 1
+    if not by_inst:
+        return None
+    try:
+        from infinite_streaming_encoder.cloud.inventory import _vcpus_for_type
+        ec2 = _ec2()
+        desc = ec2.describe_instances(InstanceIds=list(by_inst))
+    except Exception:  # noqa: BLE001 — reporting is best-effort
+        return None
+    import datetime
+    now = time.time()
+    rows = []
+    for r in desc.get("Reservations", []):
+        for i in r.get("Instances", []):
+            iid = i["InstanceId"]
+            a = by_inst.get(iid)
+            if not a:
+                continue
+            launch = i.get("LaunchTime")
+            launch = launch.timestamp() if hasattr(launch, "timestamp") else None
+            if launch is None:
+                continue
+            # A terminated instance carries its end time inside the human-readable
+            # reason string; there is no structured field for it.
+            end, alive = None, i.get("State", {}).get("Name") not in ("terminated", "shutting-down")
+            tr = i.get("StateTransitionReason", "")
+            if "(" in tr and ")" in tr:
+                try:
+                    end = datetime.datetime.strptime(
+                        tr[tr.index("(") + 1:tr.index(")")],
+                        "%Y-%m-%d %H:%M:%S %Z").replace(
+                        tzinfo=datetime.timezone.utc).timestamp()
+                except ValueError:
+                    end = None
+            if end is None:
+                end, alive = now, True
+            rows.append({
+                "id": iid, "type": i.get("InstanceType", "?"),
+                "vcpu": _vcpus_for_type(i.get("InstanceType")),
+                "life": end - launch,
+                "before": max(0.0, a["first"] / 1000.0 - launch),
+                "after": max(0.0, end - a["last"] / 1000.0),
+                "busy": max(0.0, (a["last"] - a["first"]) / 1000.0),
+                "vcpu_s": a["vcpu_s"], "n": a["n"], "alive": alive,
+            })
+    if not rows:
+        return None
+    rows.sort(key=lambda r: -r["life"])
+    machine_vcpu_s = sum(r["life"] * r["vcpu"] for r in rows)
+    alloc_vcpu_s = sum(r["vcpu_s"] for r in rows)
+    _narrate("")
+    _narrate("machine rental — what was rented, vs what jobs allocated")
+    _narrate(f"  {'instance':<21}{'type':<13}{'vCPU':>5}{'life':>8}"
+             f"{'idle pre':>10}{'idle post':>11}{'busy%':>7}  chunks")
+    for r in rows:
+        pct = (r["busy"] / r["life"] * 100.0) if r["life"] else 0.0
+        flag = "~" if r["alive"] else " "
+        _narrate(f"  {r['id']:<21}{r['type']:<13}{r['vcpu']:>5}"
+                 f"{r['life']:>7.0f}s{r['before']:>9.0f}s{r['after']:>10.0f}s"
+                 f"{pct:>6.0f}%{flag} {r['n']}")
+    waste = machine_vcpu_s - alloc_vcpu_s
+    pct = (waste / machine_vcpu_s * 100.0) if machine_vcpu_s else 0.0
+    _narrate(f"  machine vCPU-hours {machine_vcpu_s / 3600:.2f}  vs allocated "
+             f"{alloc_vcpu_s / 3600:.2f}  -> {pct:.0f}% paid for and not allocated")
+    _narrate("  (~ still running, so its lifetime is measured to now and will grow;"
+             " an instance shared with a concurrent run has that run's time counted"
+             " as idle here)")
+    print(f"[[ENCODER-MACHINES exec={exec_name} instances={len(rows)} "
+          f"machine_vcpu_h={machine_vcpu_s / 3600:.3f} "
+          f"allocated_vcpu_h={alloc_vcpu_s / 3600:.3f} "
+          f"unallocated_pct={pct:.1f}]]", flush=True)
+    return pct, machine_vcpu_s / 3600.0
+
+
 def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
     """At job end, sum the execution's Batch compute and emit two markers the
     control plane consumes: ENCODER-COST (spot-vs-on-demand savings, accumulated
@@ -2211,7 +2423,27 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
                 slowest = _stage_from_jobname(job.get("jobName", "")) or job.get("jobName", "")
     vh = vcpu_s / 3600.0
     wall_s = (mx - mn) / 1000.0 if mn is not None else 0.0
-    spot, ondemand = vh * _SPOT_VCPU_HR, vh * _ONDEMAND_VCPU_HR
+
+    # Rental FIRST, because cost is billed on it.
+    #
+    # This used to price the run from `vh` — the sum of each JOB's reserved vCPU
+    # times its duration. AWS does not bill for allocation; it bills for the
+    # instance, from launch to termination, including boot, image pull, and the
+    # scale-down tail after the last chunk. On a measured run that gap was 52%,
+    # so the reported spot cost was roughly half of what was actually spent.
+    #
+    # Falls back to allocated hours when the rental cannot be measured (no host
+    # resolves), and says which basis was used rather than leaving two very
+    # different numbers looking identical.
+    try:
+        rental = _emit_machine_rental(exec_name, jobs)
+    except Exception:  # noqa: BLE001 — never fail a finished run over reporting
+        rental = None
+    idle_pct, machine_vh = rental if rental else (None, None)
+    billed_vh = machine_vh if machine_vh else vh
+    basis = "rented" if machine_vh else "allocated"
+
+    spot, ondemand = billed_vh * _SPOT_VCPU_HR, billed_vh * _ONDEMAND_VCPU_HR
     saved = ondemand - spot
     try:
         from infinite_streaming_encoder.cloud.compute_env import get_vcpus
@@ -2219,17 +2451,32 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
     except Exception:  # noqa: BLE001 — best-effort
         max_vcpus = 0
     print(f"[[ENCODER-COST exec={exec_name} spot_usd={spot:.4f} "
-          f"ondemand_usd={ondemand:.4f} saved_usd={saved:.4f} vcpu_hours={vh:.2f}]]",
-          flush=True)
+          f"ondemand_usd={ondemand:.4f} saved_usd={saved:.4f} "
+          f"vcpu_hours={billed_vh:.2f}]]", flush=True)
     print(f"[[ENCODER-STATS exec={exec_name} wall_s={wall_s:.1f} vcpu_h={vh:.3f} "
           f"longest_s={longest_s:.1f} slowest={slowest or '-'} jobs={n} "
           f"max_vcpus={max_vcpus}]]", flush=True)
     conc = (vcpu_s / wall_s) if wall_s else 0.0
     eff = (conc / max_vcpus * 100.0) if max_vcpus else 0.0
-    _narrate(f"💰 saved ${saved:.2f} using spot — {vh:.1f} vCPU-hr "
-             f"(${spot:.2f} spot vs ${ondemand:.2f} on-demand)")
+    _narrate(f"💰 saved ${saved:.2f} using spot — {billed_vh:.1f} vCPU-hr "
+             f"{basis} (${spot:.2f} spot vs ${ondemand:.2f} on-demand)")
+    if machine_vh and vh:
+        _narrate(f"    (billed on machine lifetime, not allocation: {machine_vh:.1f} "
+                 f"vCPU-hr rented vs {vh:.1f} allocated — the difference is boot, "
+                 f"image pull and the scale-down tail)")
+    # `idle` is a DIFFERENT question from `eff` and both are worth showing.
+    #   eff  — of the compute environment's ceiling, how much was in use
+    #   idle — of the machine time actually RENTED, how much ran no job at all
+    # A run can be efficient by the first measure and wasteful by the second:
+    # every box busy, each one paid for through its boot and its scale-down tail.
+    idle_txt = f" · {idle_pct:.0f}% machine idle" if idle_pct is not None else ""
     _narrate(f"📊 {n} jobs · {vh:.1f} vCPU-hr · avg {conc:.0f} vCPUs busy "
-             f"({eff:.0f}% of {max_vcpus}) · slowest chunk {longest_s / 60:.1f} min")
+             f"({eff:.0f}% of {max_vcpus}){idle_txt} · slowest chunk "
+             f"{longest_s / 60:.1f} min")
+    if idle_pct is not None and idle_pct >= _IDLE_WARN_PCT:
+        _narrate(f"    ({idle_pct:.0f}% of rented machine time ran no job — boot, "
+                 f"image pull and the scale-down tail. See the machine rental "
+                 f"table above for where it went.)")
 
 
 def cmd_poll(args: argparse.Namespace) -> int:

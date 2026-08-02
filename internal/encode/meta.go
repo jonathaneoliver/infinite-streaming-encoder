@@ -95,7 +95,7 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 	}
 	ladderName := cfg.Ladder
 	if ladderName == "" {
-		ladderName = "apple-uniq-live"
+		ladderName = DefaultLadderName
 	}
 	var def LadderDef
 	if m.Ladders != nil {
