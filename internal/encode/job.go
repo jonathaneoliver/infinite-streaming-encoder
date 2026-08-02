@@ -2132,6 +2132,7 @@ func (m *Manager) writeHistory(job *Job) {
 	fmt.Fprintf(f, "- **Files:** %s\n", strings.Join(job.Config.Files, ", "))
 	fmt.Fprintf(f, "- **Codec:** %s\n", job.Config.Codec)
 	fmt.Fprintf(f, "- **Ladder:** %s%s\n", EffectiveLadder(job.Config), ladderRungSummary(job))
+	fmt.Fprintf(f, "- **Chunking:** %s\n", chunkModeLabel(job.Config.ChunkDuration))
 	if job.Config.MaxRes != "" {
 		fmt.Fprintf(f, "- **Max Res:** %s\n", job.Config.MaxRes)
 	}
@@ -2155,6 +2156,7 @@ func (m *Manager) writeHistory(job *Job) {
 		fmt.Fprintf(f, "- **Error:** %s\n", job.Error)
 	}
 	fmt.Fprintf(f, "- **Log:** [%s.log](logs/%s.log)\n", job.ID, job.ID)
+	writeConfigBlock(f, job.Config)
 
 	// Timing summary — per-stage wall-clock, so the user can see
 	// where the job's total duration went. Particularly useful for
@@ -2164,6 +2166,49 @@ func (m *Manager) writeHistory(job *Job) {
 	m.writeTimingSummary(f, job)
 
 	fmt.Fprintf(f, "\n---\n\n")
+}
+
+// writeConfigBlock records the COMPLETE encode configuration into history.md as
+// the JSON body that would resubmit the job through POST /api/encode.
+//
+// The prose lines above it are a readable summary of the options people usually
+// care about. This block exists because that summary is a hand-maintained list,
+// and a hand-maintained list is exactly what fails: #202 was a rerun rebuilt
+// from history.md that silently used the default ladder, and the very next rerun
+// — after the ladder line was added — silently used dynamic chunking instead of
+// the fixed 12s the original ran with, cutting 41 chunks where the run being
+// reproduced had 336. Two different fields, same root cause: the record was a
+// subset of the config, and nothing made the omission visible.
+//
+// Marshalling JobConfig itself inverts that. A new option is recorded from the
+// day the field lands rather than the day someone notices a rerun didn't match.
+//
+// Three fields are resolved to their effective values first, because for them an
+// absent value does not mean "no value" — it means a default applied elsewhere
+// (DefaultLadderName, "dynamic", burn-in on). Recording them raw would leave the
+// reader deducing the default from code, which is the thing that went wrong.
+// Every other omitempty field is honestly absent-means-default.
+func writeConfigBlock(f *os.File, cfg JobConfig) {
+	cfg.Ladder = EffectiveLadder(cfg)
+	// "" -> "dynamic" only. NOT chunkModeLabel, which renders a fixed size as
+	// "12s" — a display string that fails ParseFloat on the way back in and
+	// silently becomes the 30s default. The block has to round-trip, so every
+	// value written here must be one variantChunkSeconds accepts.
+	if cfg.ChunkDuration == "" {
+		cfg.ChunkDuration = "dynamic"
+	}
+	burnin := cfg.BurninEnabled()
+	cfg.Burnin = &burnin
+
+	body, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		// Never fail the history entry over its appendix; the prose above is
+		// still the record, and a marshal error here is worth saying out loud.
+		fmt.Fprintf(f, "\n<!-- config not recorded: %v -->\n", err)
+		return
+	}
+	fmt.Fprintf(f, "\n<details><summary>Full config (POST /api/encode)</summary>\n\n"+
+		"```json\n%s\n```\n\n</details>\n", body)
 }
 
 // ladderRungSummary describes the rungs a job ACTUALLY encoded, read back from
