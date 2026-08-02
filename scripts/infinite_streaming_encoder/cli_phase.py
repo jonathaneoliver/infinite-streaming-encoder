@@ -36,7 +36,9 @@ import resource
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from infinite_streaming_encoder.audio import AudioSpec, create_audio
@@ -169,18 +171,41 @@ class _Xfer:
             emit_stage(key, "running", lo + pct / 100.0 * (hi - lo))
 
 
+def _pooled_s3(workers: int):
+    """One S3 client whose connection pool is sized to `workers`.
+
+    Two things this fixes for a parallel fetch. boto3's default pool is 10
+    connections, so N threads above that serialise on the pool rather than on
+    the network — the worker count and the pool size have to move together.
+    And `_s3()` builds a NEW client per call, which is fine once and is not fine
+    672 times inside a download loop; sharing one client across the pool drops
+    that entirely. Clients are thread-safe for the operations used here."""
+    if boto3 is None:
+        raise RuntimeError("boto3 not installed — required for phase commands")
+    from botocore.config import Config
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    endpoint = os.environ.get("S3_ENDPOINT_URL")
+    cfg = {"max_pool_connections": max(10, workers)}
+    if endpoint:
+        return boto3.client("s3", endpoint_url=endpoint, region_name=region,
+                            config=Config(s3={"addressing_style": "path"}, **cfg))
+    return boto3.client("s3", region_name=region, config=Config(**cfg))
+
+
 def _download(uri: str, dst: Path, progress: bool = True,
-              stage: tuple[str, float, float] | None = None) -> None:
+              stage: tuple[str, float, float] | None = None,
+              client=None) -> None:
+    s3 = client or _s3()
     bucket, key = _parse(uri)
     dst.parent.mkdir(parents=True, exist_ok=True)
     cb = None
     if progress:
         try:
-            total = _s3().head_object(Bucket=bucket, Key=key)["ContentLength"]
+            total = s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
             cb = _Xfer(f"downloading {Path(key).name}", total, stage=stage)
         except Exception:  # noqa: BLE001 — progress is best-effort
             cb = None
-    _s3().download_file(bucket, key, str(dst), Callback=cb)
+    s3.download_file(bucket, key, str(dst), Callback=cb)
 
 
 def _upload(src: Path, uri: str, progress: bool = True,
@@ -224,7 +249,8 @@ def _upload_with_done(local: Path, s3_uri: str,
 
 
 def _download_if_complete(s3_uri: str, dst: Path,
-                          stage: tuple[str, float, float] | None = None) -> bool:
+                          stage: tuple[str, float, float] | None = None,
+                          client=None, progress: bool = True) -> bool:
     """Download `s3_uri` + its .done sidecar into dst. Returns True iff
     both landed and the .done recorded size matches the file size.
 
@@ -233,11 +259,11 @@ def _download_if_complete(s3_uri: str, dst: Path,
     fails, the object was overwritten mid-upload or partial and the
     downstream phase should abort rather than continue.
     """
-    _download(s3_uri, dst, stage=stage)
+    _download(s3_uri, dst, progress=progress, stage=stage, client=client)
     marker_s3 = s3_uri + ".done"
     marker_local = dst.with_suffix(dst.suffix + ".done")
     try:
-        _download(marker_s3, marker_local, progress=False)
+        _download(marker_s3, marker_local, progress=False, client=client)
     except ClientError:
         return False
     try:
@@ -1188,37 +1214,90 @@ def phase_package_all(args: argparse.Namespace) -> int:
     labels_present: list[str] = []
 
     # The package stage goes "running" the moment the job starts and its bar
-    # advances as each variant is fetched (0->90%), so the long download + concat
-    # isn't a dark gap before Shaka runs; package() finishes the remaining 90->100.
+    # advances as each OBJECT is fetched (0->90%), so the download + concat isn't
+    # a dark gap before Shaka runs; package() finishes the remaining 90->100.
+    # Per-object rather than per-variant now that the fetch is parallel: variants
+    # no longer complete in order, so a per-variant bar would sit still and then
+    # jump twelve times.
     chunked_bases = [b for b in sorted(chunk_last) if b not in whole_labels]
-    total_dl = len(whole_labels) + len(chunked_bases)
-    done_dl = 0
 
-    def _dl_progress() -> None:
-        pct = (done_dl / total_dl * 90.0) if total_dl else 0.0
-        emit_stage(f"package:{args.codec}", "running", pct)
+    # Fetch every object this phase needs in ONE parallel pass.
+    #
+    # This used to be a nested serial loop — for each rung, for each chunk,
+    # download and wait. With 12 rungs x 28 chunks that is 336 sequential
+    # round-trips, and _download_if_complete fetches a .done sidecar too, so 672.
+    # The chunks are small (a 234p chunk is ~0.1 MB), so each one was paying
+    # round-trip latency rather than moving bytes: measured at ~23 MB/s in-region,
+    # where the same instance sustains an order of magnitude more with concurrency.
+    # That is the whole of the "packaging is I/O bound at 0.03-0.05 cores"
+    # observation in #197 — not a property of packaging, just a serial loop.
+    #
+    # Downloading every rung up front rather than rung-at-a-time raises peak disk
+    # by roughly one rung's chunks: the joined variants all have to coexist for
+    # package() anyway, and concat is a stream copy, so the totals are within a
+    # rung of each other either way.
+    fetch_workers = max(1, int(os.environ.get("PACKAGE_FETCH_CONCURRENCY", "") or 32))
+    s3c = _pooled_s3(fetch_workers)
 
-    _dl_progress()
-
-    # Whole variants: download the joined mp4 directly.
+    wanted: list[tuple[str, Path, str | None]] = []  # (uri, dst, whole-label)
     for label in sorted(whole_labels):
-        uri = args.s3_variants.rstrip("/") + f"/{args.codec}_{label}.mp4"
-        if _download_if_complete(uri, work / f"{args.codec}_{label}.mp4"):
-            labels_present.append(label)
-        done_dl += 1
-        _dl_progress()
+        wanted.append((args.s3_variants.rstrip("/") + f"/{args.codec}_{label}.mp4",
+                       work / f"{args.codec}_{label}.mp4", label))
+    for base in chunked_bases:
+        for i in range(chunk_last[base] + 1):
+            name = f"{args.codec}_{base}_chunk{i:03d}.mp4"
+            wanted.append((args.s3_variants.rstrip("/") + f"/{name}", work / name, None))
 
-    # Chunked variants: pull every chunk, concat locally (stream copy), then
-    # drop the chunk files so they don't inflate disk during packaging.
+    total_objs = len(wanted)
+    got = {"n": 0, "pct": -1.0}
+    lock = threading.Lock()
+    complete: dict[str, bool] = {}
+
+    def _fetch(item: tuple[str, Path, str | None]) -> None:
+        uri, dst, _label = item
+        # progress=False: a per-object byte bar from 32 threads at once is noise,
+        # and the phase already reports its own 0->90% below.
+        ok = _download_if_complete(uri, dst, client=s3c, progress=False)
+        with lock:
+            complete[uri] = ok
+            got["n"] += 1
+            pct = got["n"] / total_objs * 90.0
+            if pct - got["pct"] >= 1.0:  # throttle: at most ~90 markers
+                got["pct"] = pct
+                emit_stage(f"package:{args.codec}", "running", pct)
+
+    emit_stage(f"package:{args.codec}", "running", 0.0)
+    t_fetch = time.monotonic()
+    with ThreadPoolExecutor(max_workers=fetch_workers) as pool:
+        for fut in as_completed([pool.submit(_fetch, w) for w in wanted]):
+            fut.result()  # surface the first failure rather than silently skipping
+    dt_fetch = time.monotonic() - t_fetch
+    fetched_bytes = sum(d.stat().st_size for _u, d, _l in wanted if d.is_file())
+    print(f"[phase package-all] fetched {total_objs} objects, "
+          f"{fetched_bytes / 1e6:.0f} MB in {dt_fetch:.0f}s "
+          f"({fetched_bytes / 1e6 / max(dt_fetch, 0.001):.1f} MB/s, "
+          f"{fetch_workers} threads)", flush=True)
+
+    # A whole variant that didn't land is simply absent (it may not exist for
+    # this codec); a missing CHUNK is a real error, because the SFN has already
+    # barriered on every chunk job succeeding before this phase runs.
+    for uri, _dst, label in wanted:
+        if label is not None and complete.get(uri):
+            labels_present.append(label)
     for base in chunked_bases:
         n = chunk_last[base] + 1
         for i in range(n):
             name = f"{args.codec}_{base}_chunk{i:03d}.mp4"
             uri = args.s3_variants.rstrip("/") + f"/{name}"
-            if not _download_if_complete(uri, work / name):
+            if not complete.get(uri):
                 print(f"error: chunk {name} missing/incomplete under "
                       f"{args.s3_variants}", file=sys.stderr)
                 return 1
+
+    # Join each rung (stream copy), then drop its chunks so they don't inflate
+    # disk during packaging.
+    for base in chunked_bases:
+        n = chunk_last[base] + 1
         concat_chunks(work, args.codec, base, n)
         print(f"[phase package-all] joined {n} chunk(s) -> "
               f"{args.codec}_{base}.mp4", flush=True)
@@ -1227,8 +1306,6 @@ def phase_package_all(args: argparse.Namespace) -> int:
             (work / name).unlink(missing_ok=True)
             (work / f"{name}.done").unlink(missing_ok=True)
         labels_present.append(base)
-        done_dl += 1
-        _dl_progress()
 
     labels_present = sorted(set(labels_present))
     if not labels_present:
