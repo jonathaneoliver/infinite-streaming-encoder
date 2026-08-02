@@ -30,6 +30,13 @@ locals {
 resource "aws_s3_bucket_lifecycle_configuration" "staging" {
   bucket = var.s3_bucket
 
+  # This bucket has S3 versioning enabled (or suspended) — created outside this
+  # stack. On such a bucket, expiring or deleting the "current" object only lays
+  # a delete marker; the prior version becomes noncurrent and keeps billing, and
+  # the marker itself lingers. So each prefix needs THREE things: expire the
+  # current version, expire noncurrent versions, and reap the leftover delete
+  # markers. AWS rejects `expired_object_delete_marker` in the same rule as an
+  # `expiration { days }`, so the marker reap is a separate rule per prefix (#212).
   rule {
     id     = "expire-job-staging"
     status = "Enabled"
@@ -42,9 +49,31 @@ resource "aws_s3_bucket_lifecycle_configuration" "staging" {
       days = var.staging_retention_days
     }
 
+    # Noncurrent versions (left behind when a current object is overwritten or
+    # deleted on a versioned bucket) free no space until expired. 1 day: staging
+    # is transient, nothing needs an old version.
+    noncurrent_version_expiration {
+      noncurrent_days = 1
+    }
+
     # Failed multipart uploads bill silently until aborted — sweep them.
     abort_incomplete_multipart_upload {
       days_after_initiation = 3
+    }
+  }
+
+  # Reap delete markers left with no noncurrent versions under them — otherwise
+  # every expiry/clear on the versioned bucket leaves a marker behind forever.
+  rule {
+    id     = "reap-job-staging-delete-markers"
+    status = "Enabled"
+
+    filter {
+      prefix = "jobs/"
+    }
+
+    expiration {
+      expired_object_delete_marker = true
     }
   }
 
@@ -63,8 +92,25 @@ resource "aws_s3_bucket_lifecycle_configuration" "staging" {
       days = var.mezz_cache_retention_days
     }
 
+    noncurrent_version_expiration {
+      noncurrent_days = 1
+    }
+
     abort_incomplete_multipart_upload {
       days_after_initiation = 3
+    }
+  }
+
+  rule {
+    id     = "reap-mezz-cache-delete-markers"
+    status = "Enabled"
+
+    filter {
+      prefix = "mezz/"
+    }
+
+    expiration {
+      expired_object_delete_marker = true
     }
   }
 }

@@ -179,7 +179,15 @@ def _s3_bucket_from_env() -> str | None:
 
 def _delete_s3_prefix(bucket: str, prefix: str, report: CleanupReport,
                       job_id: str | None, keep_logs: bool = False) -> None:
-    """Recursively delete every object under prefix. Does nothing if empty.
+    """Recursively delete every object under prefix — VERSION-AWARE (#212).
+
+    Enumerates `list_object_versions` and deletes each `{Key, VersionId}`,
+    including delete markers. A versionless `delete_objects` on a
+    versioning-enabled or -suspended bucket does NOT free bytes — it only lays
+    a delete marker over the current version, so repeated Emergency Clears pile
+    up markers while the data (and its cost) persists. Deleting by version
+    reclaims real storage and clears markers. It behaves identically on a
+    never-versioned bucket, where every VersionId is the literal "null".
 
     When `keep_logs=True`, objects under `<prefix>logs/` and the
     `<prefix>_FAILED` marker are skipped — the idea is to drop the
@@ -187,27 +195,56 @@ def _delete_s3_prefix(bucket: str, prefix: str, report: CleanupReport,
     preserving the kilobyte-scale evidence the user needs to debug.
     """
     s3 = s3_client()
-    paginator = s3.get_paginator("list_objects_v2")
-    total = 0
+    paginator = s3.get_paginator("list_object_versions")
     logs_prefix = f"{prefix}logs/"
     failed_marker = f"{prefix}_FAILED"
+    objects = 0        # non-marker versions removed — the ones that free bytes
+    markers = 0        # delete markers cleared
+    batch: list[dict] = []
+    first_error: dict | None = None
+
+    def _keep(key: str) -> bool:
+        return keep_logs and (key.startswith(logs_prefix) or key == failed_marker)
+
+    def _flush() -> None:
+        # S3 caps a single delete_objects call at 1000 keys.
+        nonlocal batch, first_error
+        if not batch:
+            return
+        resp = s3.delete_objects(Bucket=bucket,
+                                 Delete={"Objects": batch, "Quiet": True})
+        errs = resp.get("Errors") or []
+        if errs and first_error is None:
+            first_error = errs[0]
+        batch = []
+
     try:
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            contents = page.get("Contents", [])
-            if not contents:
-                continue
-            keys = []
-            for obj in contents:
-                key = obj["Key"]
-                if keep_logs and (key.startswith(logs_prefix) or key == failed_marker):
+            for ver in page.get("Versions", []):
+                if _keep(ver["Key"]):
                     continue
-                keys.append({"Key": key})
-            if not keys:
-                continue
-            s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
-            total += len(keys)
-        if total > 0:
-            detail = f"{total} object(s)"
+                batch.append({"Key": ver["Key"], "VersionId": ver["VersionId"]})
+                objects += 1
+                if len(batch) == 1000:
+                    _flush()
+            for dm in page.get("DeleteMarkers", []):
+                if _keep(dm["Key"]):
+                    continue
+                batch.append({"Key": dm["Key"], "VersionId": dm["VersionId"]})
+                markers += 1
+                if len(batch) == 1000:
+                    _flush()
+        _flush()
+        if first_error is not None:
+            report.actions.append(ResourceAction(
+                kind="s3_prefix", id=f"s3://{bucket}/{prefix}",
+                job_id=job_id, action="failed",
+                detail=f"partial delete failure, first: {first_error}",
+            ))
+        elif objects or markers:
+            detail = f"{objects} object version(s)"
+            if markers:
+                detail += f" + {markers} delete marker(s)"
             if keep_logs:
                 detail += " (kept logs/ + _FAILED)"
             report.actions.append(ResourceAction(
