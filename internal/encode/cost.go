@@ -39,7 +39,7 @@ func (m *Manager) projectCloudCost(cfg JobConfig, sourceWidth, fps int, duration
 	}
 	ladderName := cfg.Ladder
 	if ladderName == "" {
-		ladderName = "apple-uniq-live"
+		ladderName = DefaultLadderName
 	}
 	for _, c := range parseCodecSel(cfg.Codec) {
 		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
@@ -86,7 +86,7 @@ func (m *Manager) projectLocalWallSeconds(cfg JobConfig, sourceWidth, fps int, d
 	}
 	ladderName := cfg.Ladder
 	if ladderName == "" {
-		ladderName = "apple-uniq-live"
+		ladderName = DefaultLadderName
 	}
 	cores := m.localFleetPerfCores()
 	if cores <= 0 {
@@ -202,7 +202,7 @@ func (m *Manager) projectSaaSCosts(cfg JobConfig, sourceWidth, fps int, duration
 	}
 	ladderName := cfg.Ladder
 	if ladderName == "" {
-		ladderName = "apple-uniq-live"
+		ladderName = DefaultLadderName
 	}
 	minutes := durationS / 60.0
 	cMult := float64(_fpsMult(fps)) * _bitrateMult(srcMbps)

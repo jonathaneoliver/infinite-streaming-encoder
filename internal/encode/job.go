@@ -875,7 +875,7 @@ type JobConfig struct {
 	Files []string `json:"files"`
 	Codec string   `json:"codec"`
 	// Ladder selects the bitrate ladder by name (legacy | apple | apple-uniq |
-	// any custom ladder). Empty defaults to "legacy". Threaded to the local
+	// any custom ladder). Empty means DefaultLadderName. Threaded to the local
 	// encoder via --ladder and resolved by buildSFNInput for the cloud path.
 	Ladder string `json:"ladder,omitempty"`
 	MaxRes string `json:"max_res"`
@@ -2131,6 +2131,7 @@ func (m *Manager) writeHistory(job *Job) {
 	fmt.Fprintf(f, "- **Target:** %s\n", job.Config.Target)
 	fmt.Fprintf(f, "- **Files:** %s\n", strings.Join(job.Config.Files, ", "))
 	fmt.Fprintf(f, "- **Codec:** %s\n", job.Config.Codec)
+	fmt.Fprintf(f, "- **Ladder:** %s%s\n", EffectiveLadder(job.Config), ladderRungSummary(job))
 	if job.Config.MaxRes != "" {
 		fmt.Fprintf(f, "- **Max Res:** %s\n", job.Config.MaxRes)
 	}
@@ -2163,6 +2164,57 @@ func (m *Manager) writeHistory(job *Job) {
 	m.writeTimingSummary(f, job)
 
 	fmt.Fprintf(f, "\n---\n\n")
+}
+
+// ladderRungSummary describes the rungs a job ACTUALLY encoded, read back from
+// its stage keys ("encode:<codec>:<res>:chunk<N>"), as " (12 rungs, 234p–2160p)".
+//
+// The ladder NAME on its own is not a reproducible description of a run.
+// Ladders are user-editable through POST /api/ladders, so the definition behind
+// a name can change after the fact — and MaxRes/MinRes narrow it per job
+// anyway. The observed rungs are ground truth, and they are the thing that
+// makes two runs comparable: #202 was caught by a stage count of 252 where 336
+// was expected, which is precisely this number.
+//
+// Returns "" when no rungs are derivable (a job that failed before any encode
+// stage), so the caller degrades to the bare ladder name rather than printing
+// a misleading "0 rungs".
+func ladderRungSummary(job *Job) string {
+	job.mu.Lock()
+	stages := append([]StageProgress(nil), job.Stages...)
+	history := append([]FileStages(nil), job.StagesHistory...)
+	job.mu.Unlock()
+	for _, h := range history {
+		stages = append(stages, h.Stages...)
+	}
+
+	heights := map[int]bool{}
+	for _, s := range stages {
+		parts := strings.Split(s.Key, ":")
+		if len(parts) < 3 || parts[0] != "encode" {
+			continue
+		}
+		// parts[2] is the rung ("1080p"); tolerate anything that isn't.
+		if h, err := strconv.Atoi(strings.TrimSuffix(parts[2], "p")); err == nil && h > 0 {
+			heights[h] = true
+		}
+	}
+	if len(heights) == 0 {
+		return ""
+	}
+	lo, hi := 0, 0
+	for h := range heights {
+		if lo == 0 || h < lo {
+			lo = h
+		}
+		if h > hi {
+			hi = h
+		}
+	}
+	if lo == hi {
+		return fmt.Sprintf(" (1 rung, %dp)", lo)
+	}
+	return fmt.Sprintf(" (%d rungs, %dp–%dp)", len(heights), lo, hi)
 }
 
 // PhaseStat is one row of the phase rollup: a stage, or a whole rung's chunks
@@ -2645,7 +2697,7 @@ func (m *Manager) vmafEstimates(cfg JobConfig) map[string][2]string {
 	}
 	ladderName := cfg.Ladder
 	if ladderName == "" {
-		ladderName = "apple-uniq-live"
+		ladderName = DefaultLadderName
 	}
 	out := map[string][2]string{}
 	for _, codec := range parseCodecSel(cfg.Codec) {
@@ -2669,7 +2721,7 @@ func (m *Manager) vmafEstimateArgs(cfg JobConfig) []string {
 	}
 	ladderName := cfg.Ladder
 	if ladderName == "" {
-		ladderName = "apple-uniq-live"
+		ladderName = DefaultLadderName
 	}
 	var out []string
 	for _, codec := range parseCodecSel(cfg.Codec) {
@@ -3411,7 +3463,7 @@ func parseCodecSel(sel string) []string {
 
 func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin bool, sourceWidth, sourceFps int, clipDurationS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int) {
 	if ladderName == "" {
-		ladderName = "apple-uniq-live"
+		ladderName = DefaultLadderName
 	}
 	// Every Batch SchedulingPriorityOverride for this job rides inside a 1000-wide
 	// band (priorityBase): an EARLIER queued job gets a higher band, so ALL its
