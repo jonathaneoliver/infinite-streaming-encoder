@@ -3766,22 +3766,32 @@ function _fleetLanesHtml() {
     // Is the run still going? Decides whether an unterminated box is still
     // billing or simply unobserved — see the tailTo comment below.
     const jobLive = (typeof _jobRunning === 'function') ? _jobRunning(job) : false;
-    let coldMs = 0, gapMs = 0, gapN = 0, freed = [], billedMs = 0, workMs = 0;
+    // Three buckets, and together they ARE the waste total — so they have to be
+    // reported together. Showing only cold start and gaps left the largest one
+    // (the tail after the last job: the fan-in barrier plus scale-down) as an
+    // unexplained remainder the reader had to compute by subtraction.
+    let coldMs = 0, gapMs = 0, gapN = 0, tailMs = 0, freed = [], billedMs = 0, workMs = 0;
     const rows = lanes.map(L => {
         const host = (typeof instanceColor === 'function') ? instanceColor(L.id) : '#4a90d9';
         const v = L.vcpus || 0;
         const segs = [];
         const never = !L.merged.length;   // rented, never ran anything
-        if (L.launch && !never && L.merged[0][0] - L.launch > 1500) {
-            segs.push({ a: L.launch, b: L.merged[0][0], s: 'boot' });
-            coldMs += (L.merged[0][0] - L.launch) * v;
+        // Accumulate every sliver, draw only what is visible. The 1500ms floor
+        // stops the lane filling with hairlines, but a bucket that skipped them
+        // would not sum to the waste total, and a breakdown that does not
+        // reconcile invites the reader to distrust all of it.
+        if (L.launch && !never && L.merged[0][0] > L.launch) {
+            const d = L.merged[0][0] - L.launch;
+            coldMs += d * v;
+            if (d > 1500) segs.push({ a: L.launch, b: L.merged[0][0], s: 'boot' });
         }
         L.merged.forEach(([a, b], k) => {
             segs.push({ a, b, s: 'busy' });
             const next = L.merged[k + 1];
-            if (next && next[0] - b > 1500) {
-                segs.push({ a: b, b: next[0], s: 'idle' });
-                gapMs += (next[0] - b) * v; gapN++;
+            if (next && next[0] > b) {
+                const d = next[0] - b;
+                gapMs += d * v;
+                if (d > 1500) { segs.push({ a: b, b: next[0], s: 'idle' }); gapN++; }
             }
         });
         // With no work, "last end" is the launch — the whole lifetime is the tail.
@@ -3799,14 +3809,23 @@ function _fleetLanesHtml() {
         // Undercounting with the gap marked unknown is recoverable; doubling
         // the bill is not.
         const tailTo = L.gone || (jobLive ? now : null);
-        if (tailTo && tailTo - lastEnd > 1500) segs.push({ a: lastEnd, b: tailTo, s: 'idle' });
+        if (tailTo && tailTo > lastEnd) {
+            const d = tailTo - lastEnd;
+            tailMs += d * v;
+            if (d > 1500) segs.push({ a: lastEnd, b: tailTo, s: 'idle' });
+        }
         if (L.gone) freed.push(L.gone - lastEnd);
 
         // Billed = launch (or first work, if we never saw it boot) -> freed.
         // Not "how long it worked", and never past what we actually observed.
         const billFrom = L.launch || (never ? lastEnd : L.merged[0][0]);
-        const billMs = Math.max(0, (tailTo || lastEnd) - billFrom);
         const busyMs = L.merged.reduce((n, [a, b]) => n + (b - a), 0);
+        // Never let billed fall below busy. A termination timestamp that lands
+        // before the last recorded work — clock skew between EC2 and the stage
+        // stream, or a stage still open when the box went away — would otherwise
+        // produce negative waste and a negative idle%, and the three buckets
+        // below would stop summing to the total.
+        const billMs = Math.max(busyMs, Math.max(0, (tailTo || lastEnd) - billFrom));
         billedMs += billMs * v; workMs += busyMs * v;
         const wastePct = billMs ? Math.round((1 - busyMs / billMs) * 100) : 0;
 
@@ -3877,6 +3896,7 @@ function _fleetLanesHtml() {
       <div style="margin-top:9px;font-size:11px;color:#8a94a2;display:flex;gap:18px;flex-wrap:wrap;font-variant-numeric:tabular-nums">
         <span>of which — cold start <b style="color:${BOOT}">${(coldMs / 3600000).toFixed(2)}</b></span>
         <span>mid-run gaps <b style="color:#c58b82">${(gapMs / 3600000).toFixed(2)}</b> across ${gapN}</span>
+        <span>after last job <b style="color:${IDLE}">${(tailMs / 3600000).toFixed(2)}</b></span>
         <span>idle&nbsp;&rarr;&nbsp;freed ${freedTxt}</span>
       </div>
     </div>`;
