@@ -2884,7 +2884,13 @@ function renderJobsOverview(all) {
 function _cloudActive() {
     if (Object.values(jobs).some(j => _isCloudJob(j) && _jobRunning(j))) return true;
     const insts = (_lastFleet && _lastFleet.instances) || [];
-    return insts.some(i => i.state === 'running');
+    if (insts.some(i => i.state === 'running')) return true;
+    // Keep the panel up while the machine timeline still has something to show.
+    // Hiding it the moment the last box dies would discard the chart exactly when
+    // it becomes most useful: "how long from idle to freed" is only answerable
+    // once they ARE freed. The lanes expire themselves (_FLEET_LANE_KEEP_MS), so
+    // this holds the panel open for the post-run review and then lets it go.
+    return _fleetLanes.size > 0;
 }
 function syncFleetPanels() {
     const cp = document.getElementById('jobs-cloud-fleet-panel');
@@ -3588,25 +3594,30 @@ let _lastFleet = null;
 //
 // The per-instance rows above answer "what is on this box right now". They
 // cannot answer WHEN, and three questions about the bill are all when-questions:
-// is a box idle MID-run (a scheduling gap, not just the ends), how long from its
-// last job finishing to it actually being freed, and does Batch cold-start boxes
-// LATE — after the fleet is already at capacity — paying boot + image pull for
-// capacity that arrives too late to help.
+// is a box idle MID-run (a scheduling gap, not just at the ends), how long from
+// its last job finishing to it actually being freed, and does Batch cold-start
+// boxes LATE — after the fleet is already at capacity — paying boot + image pull
+// for capacity that arrives too late to help.
 //
 // A run's machine vCPU-hours is the area under these lanes, so this is the shape
 // of the bill. The rental table in the job log reports life / idle-pre /
-// idle-post / busy% per instance, which is that area already collapsed to
-// scalars — 84% busy reads the same whether it was one long stall or forty
-// small gaps, and those want opposite fixes.
+// idle-post / busy% per instance: that same area already collapsed to scalars,
+// where 84% busy reads identically whether it was one long stall or forty small
+// gaps. Those want opposite fixes.
 //
-// History is accumulated CLIENT-SIDE from the polls this page already makes;
-// there is no per-instance time series on the server. So the lanes cover the
-// period the page has been open, and a reload starts them over. Time before the
-// first poll that saw a box is drawn as explicitly unobserved rather than
-// guessed — the one thing worse than no chart is a chart that invents a boundary.
-const _fleetLanes = new Map();     // id -> {type, vcpus, launch, samples, gone}
-const _FLEET_LANE_KEEP_MS = 45 * 60 * 1000;   // keep freed boxes on screen this long
-const _FLEET_LANE_BOOT_GRACE_MS = 150 * 1000; // launch->first-sample we'll call "boot"
+// Busy intervals come from the JOB'S OWN STAGES, not from polling. Every stage
+// already carries instance + started_at + ended_at, so the lanes cover the whole
+// run the moment the page opens and work on a finished job. The first cut of
+// this sampled the AWS inventory instead and could only ever draw from the
+// moment you happened to open the page — on a live run that left every lane
+// empty except a stub at the right-hand edge.
+//
+// Polling still supplies the two things stages cannot know: when a box BOOTED
+// (before any stage landed on it) and when it was FREED (it vanishes from the
+// inventory). Both are live-only, so they fill in when the page is open and are
+// simply absent otherwise — drawn as nothing rather than guessed.
+const _fleetSeen = new Map();   // id -> {launch, vcpus, type, gone}
+const _FLEET_LANE_KEEP_MS = 45 * 60 * 1000;
 
 function _recordFleetLanes(instances) {
     const now = Date.now();
@@ -3614,144 +3625,150 @@ function _recordFleetLanes(instances) {
     (instances || []).forEach(i => {
         if (!i.id) return;
         live.add(i.id);
-        let L = _fleetLanes.get(i.id);
-        if (!L) {
-            const lt = Date.parse(i.launched_at || '');
-            L = {
-                type: i.type || '', vcpus: i.vcpus || 0,
-                launch: !isNaN(lt) ? lt : now - (Number(i.age_seconds) || 0) * 1000,
-                samples: [], gone: null,
-            };
-            _fleetLanes.set(i.id, L);
-        }
-        L.gone = null;   // reappeared (a poll can miss a box without it dying)
-        L.vcpus = i.vcpus || L.vcpus;
-        // Busy = at least one job PLACED here. A job still pulling its image is
-        // "boot" rather than "busy": the box is rented and not encoding, which
-        // is the distinction the whole chart exists to make.
-        const jobs = i.jobs || [];
-        const anyRunning = jobs.some(j =>
-            !/^(STARTING|STARTUP|PROVISIONING|PENDING|SUBMITTED|RUNNABLE)$/i.test(j.status || ''));
-        const st = (i.state === 'pending') ? 'boot'
-            : anyRunning ? 'busy'
-                : jobs.length ? 'boot' : 'idle';
-        const last = L.samples[L.samples.length - 1];
-        if (!last || last.s !== st) L.samples.push({ t: now, s: st });
-        else last.until = now;   // extend rather than push a sample per poll
+        const lt = Date.parse(i.launched_at || '');
+        const rec = _fleetSeen.get(i.id) || {};
+        rec.launch = rec.launch || (!isNaN(lt) ? lt : now - (Number(i.age_seconds) || 0) * 1000);
+        rec.vcpus = i.vcpus || rec.vcpus || 0;
+        rec.type = i.type || rec.type || '';
+        rec.gone = null;
+        _fleetSeen.set(i.id, rec);
     });
-    // Vanished from the inventory => terminated. This is the only signal we get
-    // for "freed", and it is what makes the idle->freed interval measurable.
-    _fleetLanes.forEach((L, id) => {
-        if (!live.has(id) && L.gone == null) L.gone = now;
-        if (L.gone && now - L.gone > _FLEET_LANE_KEEP_MS) _fleetLanes.delete(id);
+    // Vanishing from the inventory is the only "terminated" signal available,
+    // and it is what makes idle -> freed measurable at all.
+    _fleetSeen.forEach((rec, id) => {
+        if (!live.has(id) && rec.gone == null) rec.gone = now;
+        if (rec.gone && now - rec.gone > _FLEET_LANE_KEEP_MS) _fleetSeen.delete(id);
     });
 }
 
-function _fleetLaneSegments(L, now) {
-    const segs = [];
-    const first = L.samples[0];
-    if (!first) return segs;
-    if (first.t - L.launch > 2000) {
-        // Did we watch this box boot, or did the page open after it was already
-        // working? Only the former is a cold start we can claim.
-        segs.push({ from: L.launch, to: first.t,
-            s: (first.t - L.launch) <= _FLEET_LANE_BOOT_GRACE_MS ? 'boot' : 'unseen' });
-    }
-    for (let k = 0; k < L.samples.length; k++) {
-        const s = L.samples[k], next = L.samples[k + 1];
-        segs.push({ from: s.t, to: next ? next.t : (L.gone || Math.max(s.until || 0, now)), s: s.s });
-    }
-    return segs.filter(g => g.to > g.from);
+// The job to chart: a running cloud job if there is one, else the most recent
+// job that placed stages on named instances.
+function _laneJob() {
+    const all = Object.values((typeof jobs === 'object' && jobs) ? jobs : {})
+        .filter(j => _laneStages(j).length);
+    if (!all.length) return null;
+    const run = all.filter(j => typeof _jobRunning === 'function' ? _jobRunning(j) : false);
+    const pick = (run.length ? run : all);
+    return pick.sort((a, b) =>
+        Date.parse(b.started_at || 0) - Date.parse(a.started_at || 0))[0];
+}
+
+function _laneStages(job) {
+    if (!job) return [];
+    const hist = (job.stages_history || []).flatMap(h => h.stages || []);
+    return [...(job.stages || []), ...hist].filter(s => s && s.instance && s.started_at);
 }
 
 function _fleetLanesHtml() {
-    if (!_fleetLanes.size) return '';
+    const job = _laneJob();
+    const stages = _laneStages(job);
+    if (!stages.length) return '';
     const now = Date.now();
-    const lanes = [..._fleetLanes.entries()]
-        .map(([id, L]) => ({ id, L, segs: _fleetLaneSegments(L, now) }))
-        .filter(x => x.segs.length)
-        .sort((a, b) => a.L.launch - b.L.launch || a.id.localeCompare(b.id));
+
+    // Merge each instance's stage intervals — chunks overlap on a box, and the
+    // question is "did this machine have ANY work", not how much.
+    const byInst = new Map();
+    stages.forEach(s => {
+        const a = Date.parse(s.started_at);
+        if (isNaN(a)) return;
+        const b = s.ended_at ? Date.parse(s.ended_at) : now;
+        if (!byInst.has(s.instance)) byInst.set(s.instance, []);
+        byInst.get(s.instance).push([a, Math.max(b, a)]);
+    });
+
+    const lanes = [...byInst.entries()].map(([id, iv]) => {
+        iv.sort((x, y) => x[0] - y[0]);
+        const merged = [];
+        iv.forEach(([a, b]) => {
+            const last = merged[merged.length - 1];
+            if (last && a <= last[1]) last[1] = Math.max(last[1], b);
+            else merged.push([a, b]);
+        });
+        const seen = _fleetSeen.get(id) || {};
+        return { id, merged, launch: seen.launch || null, gone: seen.gone || null,
+            vcpus: seen.vcpus || 0, type: seen.type || '' };
+    }).filter(L => L.merged.length);
     if (!lanes.length) return '';
 
-    const t0 = Math.min(...lanes.map(x => x.L.launch));
-    const t1 = Math.max(now, ...lanes.map(x => x.segs[x.segs.length - 1].to));
+    lanes.sort((a, b) => (a.launch || a.merged[0][0]) - (b.launch || b.merged[0][0])
+        || a.id.localeCompare(b.id));
+    const t0 = Math.min(...lanes.map(L => L.launch || L.merged[0][0]));
+    const t1 = Math.max(now, ...lanes.map(L => Math.max(L.gone || 0, L.merged[L.merged.length - 1][1])));
     const span = Math.max(1, t1 - t0);
     const pos = t => (t - t0) / span * 100;
 
-    const COLORS = { boot: '#d0a24a', idle: '#2f3542', unseen: 'transparent' };
-    const stripes = 'background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.10) 0 5px,transparent 5px 10px)';
+    const BOOT = '#d0a458', IDLE = '#2f3542';
+    const stripes = 'background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.13) 0 5px,transparent 5px 10px)';
     const fmt = ms => ms < 90000 ? `${Math.round(ms / 1000)}s`
         : `${Math.floor(ms / 60000)}m${String(Math.round(ms % 60000 / 1000)).padStart(2, '0')}s`;
 
-    let coldTotal = 0, gapTotal = 0, gapCount = 0, freedShown = [];
-    const rows = lanes.map(({ id, L, segs }) => {
-        // Host colour, so a lane matches that machine's chunks in the grid above.
-        const host = (typeof instanceColor === 'function' && id) ? instanceColor(id) : '#4a90d9';
-        const firstBusy = segs.find(g => g.s === 'busy');
-        const lastBusy = [...segs].reverse().find(g => g.s === 'busy');
-        if (firstBusy) {
-            segs.forEach(g => {
-                if (g.s === 'boot' && g.to <= firstBusy.from) coldTotal += (g.to - g.from) * (L.vcpus || 0);
-                // A gap BETWEEN jobs is the interesting idle: not boot, not the tail.
-                if (g.s === 'idle' && lastBusy && g.from > firstBusy.from && g.to < lastBusy.to) {
-                    gapTotal += (g.to - g.from) * (L.vcpus || 0); gapCount++;
-                }
-            });
-            if (L.gone && lastBusy) freedShown.push(L.gone - lastBusy.to);
+    let coldMs = 0, gapMs = 0, gapN = 0, freed = [];
+    const rows = lanes.map(L => {
+        const host = (typeof instanceColor === 'function') ? instanceColor(L.id) : '#4a90d9';
+        const segs = [];
+        if (L.launch && L.merged[0][0] - L.launch > 1500) {
+            segs.push({ a: L.launch, b: L.merged[0][0], s: 'boot' });
+            coldMs += (L.merged[0][0] - L.launch) * (L.vcpus || 0);
         }
+        L.merged.forEach(([a, b], k) => {
+            segs.push({ a, b, s: 'busy' });
+            const next = L.merged[k + 1];
+            if (next && next[0] - b > 1500) {
+                segs.push({ a: b, b: next[0], s: 'idle' });
+                gapMs += (next[0] - b) * (L.vcpus || 0); gapN++;
+            }
+        });
+        const lastEnd = L.merged[L.merged.length - 1][1];
+        const tailTo = L.gone || now;
+        if (tailTo - lastEnd > 1500) segs.push({ a: lastEnd, b: tailTo, s: 'idle' });
+        if (L.gone) freed.push(L.gone - lastEnd);
+
         const bars = segs.map(g => {
-            const w = (g.to - g.from) / span * 100;
+            const w = (g.b - g.a) / span * 100;
             if (w <= 0) return '';
-            const bg = g.s === 'busy' ? host : COLORS[g.s];
-            const extra = g.s === 'boot' ? stripes
-                : g.s === 'unseen' ? 'border-top:1px dashed #4a5164;border-bottom:1px dashed #4a5164;'
-                    : '';
-            const label = g.s === 'unseen' ? 'not observed (page opened later)' : g.s;
-            return `<div style="position:absolute;left:${pos(g.from)}%;width:${w}%;top:0;bottom:0;`
-                + `background:${bg};${extra}" title="${escapeHtml(`${label} · ${fmt(g.to - g.from)}`)}"></div>`;
+            const bg = g.s === 'busy' ? host : g.s === 'boot' ? BOOT : IDLE;
+            return `<div style="position:absolute;left:${pos(g.a)}%;width:${w}%;top:0;bottom:0;`
+                + `background:${bg};${g.s === 'boot' ? stripes : ''}" `
+                + `title="${escapeHtml(`${g.s} · ${fmt(g.b - g.a)}`)}"></div>`;
         }).join('');
-        const freed = L.gone
-            ? `<span style="color:#7f8899" title="terminated">freed ${fmt(L.gone - (lastBusy ? lastBusy.to : L.launch))} after last job</span>`
-            : `<span style="color:#5d6675">up</span>`;
+        const tail = L.gone
+            ? `<span style="color:#7f8899">freed ${fmt(L.gone - lastEnd)} after last job</span>`
+            : `<span style="color:#5d6675">idle ${fmt(now - lastEnd)}</span>`;
         return `<div style="display:flex;align-items:center;gap:8px">
-            <div style="width:186px;flex:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:#9aa3b0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-                 title="${escapeHtml(id + ' · ' + L.type)}">${escapeHtml(id)}</div>
-            <div style="width:66px;flex:none;font-size:10.5px;color:#6f7887;font-variant-numeric:tabular-nums">${L.vcpus || '?'} vCPU</div>
+            <div style="width:184px;flex:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:#9aa3b0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(L.id + ' ' + L.type)}">${escapeHtml(L.id)}</div>
+            <div style="width:62px;flex:none;font-size:10.5px;color:#6f7887;font-variant-numeric:tabular-nums">${L.vcpus || '?'} vCPU</div>
             <div style="position:relative;flex:1;height:15px;background:#20252f;border-radius:3px;overflow:hidden">${bars}</div>
-            <div style="width:150px;flex:none;font-size:10.5px;text-align:right">${freed}</div>
+            <div style="width:158px;flex:none;font-size:10.5px;text-align:right">${tail}</div>
         </div>`;
     }).join('');
 
-    // Axis: a tick roughly every fifth of the span, labelled from t0.
     const ticks = [0, .25, .5, .75, 1].map(f =>
         `<div style="position:absolute;left:${f * 100}%;transform:translateX(${f === 0 ? '0' : f === 1 ? '-100%' : '-50%'});color:#6f7887;font-size:10px;font-variant-numeric:tabular-nums">${fmt(span * f)}</div>`).join('');
-
     const key = (c, t, extra) =>
         `<span style="display:inline-flex;align-items:center;gap:5px"><i style="width:11px;height:11px;border-radius:2px;background:${c};${extra || ''}"></i>${t}</span>`;
-    const freedTxt = freedShown.length
-        ? `${fmt(freedShown.reduce((a, b) => a + b, 0) / freedShown.length)} avg (${freedShown.length} freed)`
+    const freedTxt = freed.length
+        ? `${fmt(freed.reduce((a, b) => a + b, 0) / freed.length)} avg (${freed.length})`
         : 'none freed yet';
 
     return `<div style="margin-top:16px;border-top:1px solid #2a303c;padding-top:12px">
       <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:9px">
         <div style="font-size:12px;color:#ccc;font-weight:600">Machine timeline</div>
-        <div style="font-size:11px;color:#7f8899">when each box was booting, working, or rented and idle — since this page was opened</div>
+        <div style="font-size:11px;color:#7f8899">when each box was booting, working, or rented and idle</div>
       </div>
       <div style="display:flex;gap:14px;flex-wrap:wrap;font-size:10.5px;color:#8a94a2;margin-bottom:10px">
         ${key('#4a90d9', 'encoding (host colour)')}
-        ${key(COLORS.boot, 'booting / pulling image', stripes)}
-        ${key(COLORS.idle, 'rented, no job')}
-        ${key('transparent', 'not observed', 'border:1px dashed #4a5164')}
+        ${key(BOOT, 'booting / pulling image', stripes)}
+        ${key(IDLE, 'rented, no job')}
       </div>
-      <div style="display:flex;flex-direction:column;gap:5px;overflow-x:auto">${rows}</div>
+      <div style="display:flex;flex-direction:column;gap:5px">${rows}</div>
       <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
-        <div style="width:186px;flex:none"></div><div style="width:66px;flex:none"></div>
+        <div style="width:184px;flex:none"></div><div style="width:62px;flex:none"></div>
         <div style="position:relative;flex:1;height:14px">${ticks}</div>
-        <div style="width:150px;flex:none"></div>
+        <div style="width:158px;flex:none"></div>
       </div>
       <div style="margin-top:9px;font-size:11px;color:#8a94a2;display:flex;gap:18px;flex-wrap:wrap;font-variant-numeric:tabular-nums">
-        <span>cold start <b style="color:#d0a24a">${(coldTotal / 3600000).toFixed(2)}</b> vCPU-h</span>
-        <span>mid-run idle <b style="color:#c4785b">${(gapTotal / 3600000).toFixed(2)}</b> vCPU-h across ${gapCount} gap${gapCount === 1 ? '' : 's'}</span>
+        <span>cold start <b style="color:${BOOT}">${(coldMs / 3600000).toFixed(2)}</b> vCPU-h</span>
+        <span>mid-run idle <b style="color:#c4785b">${(gapMs / 3600000).toFixed(2)}</b> vCPU-h across ${gapN} gap${gapN === 1 ? '' : 's'}</span>
         <span>idle&nbsp;&rarr;&nbsp;freed ${freedTxt}</span>
       </div>
     </div>`;
@@ -3808,6 +3825,10 @@ function renderFleet(fleet, instances) {
         const rows = running.map(i => _fleetInstanceRow(i, maxV)).join('');
         panelHtml = bar + _fleetSparks(fleet) + note + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
     }
+    // Appended in BOTH branches, including "No active fleet": the timeline is
+    // most useful once the boxes are gone, because that is when idle -> freed
+    // becomes measurable at all.
+    panelHtml += lanesHtml;
 
     const el = document.getElementById('aws-fleet');
     if (el) el.innerHTML = panelHtml;
