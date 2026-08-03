@@ -3628,17 +3628,33 @@ function _recordFleetLanes(instances) {
     const live = new Set();
     (instances || []).forEach(i => {
         if (!i.id) return;
-        live.add(i.id);
         const lt = Date.parse(i.launched_at || '');
         const rec = _fleetSeen.get(i.id) || {};
         rec.launch = rec.launch || (!isNaN(lt) ? lt : now - (Number(i.age_seconds) || 0) * 1000);
         rec.vcpus = i.vcpus || rec.vcpus || 0;
         rec.type = i.type || rec.type || '';
-        rec.gone = null;
+        // The inventory RETURNS terminated instances (see _describe_app_instances),
+        // so "still in the payload" never meant "still running" — and treating it
+        // that way is why every lane read "still on" until the run ended and the
+        // orchestrator's rental summary arrived. terminated_at is the exact
+        // instant billing stopped, parsed from StateTransitionReason, so a box
+        // released mid-run now shows up on the very next poll.
+        const ta = Date.parse(i.terminated_at || '');
+        if (!isNaN(ta)) {
+            rec.gone = ta;
+        } else if (i.state === 'terminated' || i.state === 'shutting-down') {
+            // Terminated but EC2 gave no parseable time: it is gone, we just
+            // cannot say precisely when. Better an approximate boundary than
+            // billing it forever.
+            rec.gone = rec.gone || now;
+        } else {
+            live.add(i.id);
+            rec.gone = null;
+        }
         _fleetSeen.set(i.id, rec);
     });
-    // Vanishing from the inventory is the only "terminated" signal available,
-    // and it is what makes idle -> freed measurable at all.
+    // Fallback for a box that disappears from the payload entirely without ever
+    // being reported terminated — it cannot still be running, so stop the meter.
     _fleetSeen.forEach((rec, id) => {
         if (!live.has(id) && rec.gone == null) rec.gone = now;
         if (rec.gone && now - rec.gone > _FLEET_LANE_KEEP_MS) _fleetSeen.delete(id);
