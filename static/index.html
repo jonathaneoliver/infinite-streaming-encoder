@@ -3676,6 +3676,8 @@ function _fleetLanesHtml() {
         byInst.get(s.instance).push([a, Math.max(b, a)]);
     });
 
+    // Per-instance rental rows from the job itself, keyed by id.
+    const rental = new Map(((job || {}).rentals || []).map(r => [r.id, r]));
     const lanes = [...byInst.entries()].map(([id, iv]) => {
         iv.sort((x, y) => x[0] - y[0]);
         const merged = [];
@@ -3684,61 +3686,136 @@ function _fleetLanesHtml() {
             if (last && a <= last[1]) last[1] = Math.max(last[1], b);
             else merged.push([a, b]);
         });
+        // Prefer the orchestrator's own rental record (ENCODER-RENTAL): it is
+        // EC2's launch time and EC2's termination time, computed by the same
+        // pass that prints the rental table, and it persists with the job. The
+        // live inventory is only a fallback while a run is in flight — it has no
+        // termination at all (terminated boxes are filtered out of it) and it is
+        // cached, which is how an earlier version of this chart drew 723s
+        // lifetimes for machines that lived 377s.
+        const r = rental.get(id);
         const seen = _fleetSeen.get(id) || {};
-        return { id, merged, launch: seen.launch || null, gone: seen.gone || null,
-            vcpus: seen.vcpus || 0, type: seen.type || '' };
-    }).filter(L => L.merged.length);
+        return {
+            id, merged,
+            launch: (r && r.launched_at) ? r.launched_at * 1000 : (seen.launch || null),
+            gone: (r && r.ended_at && !r.alive) ? r.ended_at * 1000 : (seen.gone || null),
+            vcpus: (r && r.vcpus) || seen.vcpus || 0,
+            type: (r && r.type) || seen.type || '',
+        };
+    });
+    // A rented box that ran NOTHING has no stages, so it would never appear
+    // above — and it is the purest form of the waste this chart is for: Batch
+    // booted it, you paid for it, no chunk ever landed on it. Usually that means
+    // capacity that arrived after the queue had already drained.
+    rental.forEach((r, id) => {
+        if (byInst.has(id) || !r.launched_at) return;
+        lanes.push({
+            id, merged: [], vcpus: r.vcpus || 0, type: r.type || '',
+            launch: r.launched_at * 1000,
+            gone: (r.ended_at && !r.alive) ? r.ended_at * 1000 : null,
+        });
+    });
     if (!lanes.length) return '';
 
-    lanes.sort((a, b) => (a.launch || a.merged[0][0]) - (b.launch || b.merged[0][0])
-        || a.id.localeCompare(b.id));
-    const t0 = Math.min(...lanes.map(L => L.launch || L.merged[0][0]));
-    const t1 = Math.max(now, ...lanes.map(L => Math.max(L.gone || 0, L.merged[L.merged.length - 1][1])));
+    // A lane's own start: its launch if known, else its first piece of work.
+    const laneStart = L => L.launch || (L.merged.length ? L.merged[0][0] : now);
+    const laneEnd = L => Math.max(L.gone || 0, L.merged.length ? L.merged[L.merged.length - 1][1] : 0, laneStart(L));
+
+    lanes.sort((a, b) => laneStart(a) - laneStart(b) || a.id.localeCompare(b.id));
+    const t0 = Math.min(...lanes.map(laneStart));
+    const t1 = Math.max(now, ...lanes.map(laneEnd));
     const span = Math.max(1, t1 - t0);
     const pos = t => (t - t0) / span * 100;
 
-    const BOOT = '#d0a458', IDLE = '#2f3542';
+    // You are billed from launch to termination, whatever the box is doing. So
+    // billed-vs-not is the primary axis and productive-vs-wasted is the second,
+    // not the other way round. The first cut had this backwards: idle was
+    // #2f3542 on a #20252f track, so the money being wasted rendered as empty
+    // background and the only thing that stood out was the work you wanted.
+    //
+    // Now the track IS "not billed" — darker than any state — so every pixel
+    // with colour in it is a pixel you paid for, and idle is the loudest thing
+    // on the lane because it is the only part you can act on.
+    const TRACK = '#12161b';   // not billed: before launch, after termination
+    const BOOT = '#d0a458';    // billed, not yet useful — booting / pulling image
+    const IDLE = '#96453a';    // billed, doing nothing — the actionable one
     const stripes = 'background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.13) 0 5px,transparent 5px 10px)';
     const fmt = ms => ms < 90000 ? `${Math.round(ms / 1000)}s`
         : `${Math.floor(ms / 60000)}m${String(Math.round(ms % 60000 / 1000)).padStart(2, '0')}s`;
 
-    let coldMs = 0, gapMs = 0, gapN = 0, freed = [];
+    // Is the run still going? Decides whether an unterminated box is still
+    // billing or simply unobserved — see the tailTo comment below.
+    const jobLive = (typeof _jobRunning === 'function') ? _jobRunning(job) : false;
+    let coldMs = 0, gapMs = 0, gapN = 0, freed = [], billedMs = 0, workMs = 0;
     const rows = lanes.map(L => {
         const host = (typeof instanceColor === 'function') ? instanceColor(L.id) : '#4a90d9';
+        const v = L.vcpus || 0;
         const segs = [];
-        if (L.launch && L.merged[0][0] - L.launch > 1500) {
+        const never = !L.merged.length;   // rented, never ran anything
+        if (L.launch && !never && L.merged[0][0] - L.launch > 1500) {
             segs.push({ a: L.launch, b: L.merged[0][0], s: 'boot' });
-            coldMs += (L.merged[0][0] - L.launch) * (L.vcpus || 0);
+            coldMs += (L.merged[0][0] - L.launch) * v;
         }
         L.merged.forEach(([a, b], k) => {
             segs.push({ a, b, s: 'busy' });
             const next = L.merged[k + 1];
             if (next && next[0] - b > 1500) {
                 segs.push({ a: b, b: next[0], s: 'idle' });
-                gapMs += (next[0] - b) * (L.vcpus || 0); gapN++;
+                gapMs += (next[0] - b) * v; gapN++;
             }
         });
-        const lastEnd = L.merged[L.merged.length - 1][1];
-        const tailTo = L.gone || now;
-        if (tailTo - lastEnd > 1500) segs.push({ a: lastEnd, b: tailTo, s: 'idle' });
+        // With no work, "last end" is the launch — the whole lifetime is the tail.
+        const lastEnd = never ? L.launch : L.merged[L.merged.length - 1][1];
+        // Where does billing stop? Only three answers are honest:
+        //   - we watched it vanish from the inventory  -> L.gone
+        //   - the run is still going                   -> now
+        //   - otherwise                                -> WE DO NOT KNOW
+        //
+        // The third case has to be unknown, not `now`. /api/aws/inventory is
+        // cached, so a box can read as "running" for minutes after EC2 has
+        // terminated it — extrapolating to now billed six phantom minutes
+        // against seven boxes and reported 59% waste on a run whose real figure
+        // was 41%. EC2 confirmed 377s lifetimes the chart was drawing as 723s.
+        // Undercounting with the gap marked unknown is recoverable; doubling
+        // the bill is not.
+        const tailTo = L.gone || (jobLive ? now : null);
+        if (tailTo && tailTo - lastEnd > 1500) segs.push({ a: lastEnd, b: tailTo, s: 'idle' });
         if (L.gone) freed.push(L.gone - lastEnd);
+
+        // Billed = launch (or first work, if we never saw it boot) -> freed.
+        // Not "how long it worked", and never past what we actually observed.
+        const billFrom = L.launch || (never ? lastEnd : L.merged[0][0]);
+        const billMs = Math.max(0, (tailTo || lastEnd) - billFrom);
+        const busyMs = L.merged.reduce((n, [a, b]) => n + (b - a), 0);
+        billedMs += billMs * v; workMs += busyMs * v;
+        const wastePct = billMs ? Math.round((1 - busyMs / billMs) * 100) : 0;
 
         const bars = segs.map(g => {
             const w = (g.b - g.a) / span * 100;
             if (w <= 0) return '';
             const bg = g.s === 'busy' ? host : g.s === 'boot' ? BOOT : IDLE;
+            const what = g.s === 'busy' ? 'encoding' : g.s === 'boot' ? 'booting / pulling image' : 'RENTED, NO JOB';
             return `<div style="position:absolute;left:${pos(g.a)}%;width:${w}%;top:0;bottom:0;`
                 + `background:${bg};${g.s === 'boot' ? stripes : ''}" `
-                + `title="${escapeHtml(`${g.s} · ${fmt(g.b - g.a)}`)}"></div>`;
+                + `title="${escapeHtml(`${what} · ${fmt(g.b - g.a)} · ${(((g.b - g.a) * v) / 3600000).toFixed(3)} vCPU-h`)}"></div>`;
         }).join('');
-        const tail = L.gone
-            ? `<span style="color:#7f8899">freed ${fmt(L.gone - lastEnd)} after last job</span>`
-            : `<span style="color:#5d6675">idle ${fmt(now - lastEnd)}</span>`;
+        // Where the meter stops. Without this the eye cannot tell a box that was
+        // released from one that is still running off the right-hand edge.
+        const cap = L.gone
+            ? `<div style="position:absolute;left:${pos(L.gone)}%;top:-2px;bottom:-2px;width:2px;background:#e6e9ef" title="terminated — billing stops"></div>`
+            : '';
+        const tail = never
+            ? `<span style="color:${IDLE}"><b>${fmt(billMs)} billed, never ran a job</b></span>`
+            : L.gone
+            ? `<span style="color:#7f8899">${fmt(billMs)} billed · <b style="color:${wastePct >= 40 ? IDLE : '#8a94a2'}">${wastePct}%</b> idle</span>`
+            : jobLive
+                ? `<span style="color:#c58b82">${fmt(billMs)} billed · <b>${wastePct}%</b> idle · still on</span>`
+                : `<span style="color:#6f7887">&ge;${fmt(billMs)} billed · freed time unknown</span>`;
         return `<div style="display:flex;align-items:center;gap:8px">
             <div style="width:184px;flex:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:#9aa3b0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(L.id + ' ' + L.type)}">${escapeHtml(L.id)}</div>
-            <div style="width:62px;flex:none;font-size:10.5px;color:#6f7887;font-variant-numeric:tabular-nums">${L.vcpus || '?'} vCPU</div>
-            <div style="position:relative;flex:1;height:15px;background:#20252f;border-radius:3px;overflow:hidden">${bars}</div>
-            <div style="width:158px;flex:none;font-size:10.5px;text-align:right">${tail}</div>
+            <div style="width:62px;flex:none;font-size:10.5px;color:#6f7887;font-variant-numeric:tabular-nums">${v || '?'} vCPU</div>
+            <div style="position:relative;flex:1;height:15px;background:${TRACK};border-radius:3px;overflow:visible">${bars}${cap}</div>
+            <div style="width:196px;flex:none;font-size:10.5px;text-align:right;font-variant-numeric:tabular-nums">${tail}</div>
         </div>`;
     }).join('');
 
@@ -3750,25 +3827,36 @@ function _fleetLanesHtml() {
         ? `${fmt(freed.reduce((a, b) => a + b, 0) / freed.length)} avg (${freed.length})`
         : 'none freed yet';
 
+    const wasteMs = Math.max(0, billedMs - workMs);
+    const wastePctAll = billedMs ? Math.round(wasteMs / billedMs * 100) : 0;
+
     return `<div style="margin-top:16px;border-top:1px solid #2a303c;padding-top:12px">
-      <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:9px">
+      <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px">
         <div style="font-size:12px;color:#ccc;font-weight:600">Machine timeline</div>
-        <div style="font-size:11px;color:#7f8899">when each box was booting, working, or rented and idle</div>
+        <div style="font-size:11px;color:#7f8899">you pay from launch to termination — colour is billed, track is not. Idle here means NO job on the box; the rental table\u0027s figure is stricter (it counts partly-allocated boxes too).</div>
       </div>
-      <div style="display:flex;gap:14px;flex-wrap:wrap;font-size:10.5px;color:#8a94a2;margin-bottom:10px">
+      <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:10px;font-variant-numeric:tabular-nums">
+        <div style="font-size:19px;color:#e6e9ef;font-weight:600">${(billedMs / 3600000).toFixed(2)} <span style="font-size:12px;font-weight:400;color:#8a94a2">vCPU-h billed</span></div>
+        <div style="font-size:13px;color:${IDLE}">${(wasteMs / 3600000).toFixed(2)} vCPU-h (${wastePctAll}%) with no job at all</div>
+      </div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;font-size:10.5px;color:#8a94a2;margin-bottom:10px;align-items:center">
+        <span style="color:#6f7887">paying:</span>
         ${key('#4a90d9', 'encoding (host colour)')}
         ${key(BOOT, 'booting / pulling image', stripes)}
-        ${key(IDLE, 'rented, no job')}
+        ${key(IDLE, '<b style="color:#c58b82">rented, no job</b>')}
+        <span style="color:#6f7887;margin-left:6px">not paying:</span>
+        ${key(TRACK, 'not launched / terminated', 'border:1px solid #2a303c')}
+        <span style="display:inline-flex;align-items:center;gap:5px"><i style="width:2px;height:12px;background:#e6e9ef"></i>billing stops</span>
       </div>
       <div style="display:flex;flex-direction:column;gap:5px">${rows}</div>
       <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
         <div style="width:184px;flex:none"></div><div style="width:62px;flex:none"></div>
         <div style="position:relative;flex:1;height:14px">${ticks}</div>
-        <div style="width:158px;flex:none"></div>
+        <div style="width:196px;flex:none"></div>
       </div>
       <div style="margin-top:9px;font-size:11px;color:#8a94a2;display:flex;gap:18px;flex-wrap:wrap;font-variant-numeric:tabular-nums">
-        <span>cold start <b style="color:${BOOT}">${(coldMs / 3600000).toFixed(2)}</b> vCPU-h</span>
-        <span>mid-run idle <b style="color:#c4785b">${(gapMs / 3600000).toFixed(2)}</b> vCPU-h across ${gapN} gap${gapN === 1 ? '' : 's'}</span>
+        <span>of which — cold start <b style="color:${BOOT}">${(coldMs / 3600000).toFixed(2)}</b></span>
+        <span>mid-run gaps <b style="color:#c58b82">${(gapMs / 3600000).toFixed(2)}</b> across ${gapN}</span>
         <span>idle&nbsp;&rarr;&nbsp;freed ${freedTxt}</span>
       </div>
     </div>`;

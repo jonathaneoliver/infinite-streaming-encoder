@@ -201,6 +201,17 @@ var (
 	// the boot, image pull and scale-down tail that a job-derived cost figure
 	// cannot see (#195). Captured so the per-output stats can show it.
 	machinesMarkerRe = regexp.MustCompile(`^\[\[ENCODER-MACHINES exec=(\S+) instances=(\d+) machine_vcpu_h=([0-9.]+) allocated_vcpu_h=([0-9.]+) unallocated_pct=([0-9.]+)\]\]$`)
+	// ENCODER-RENTAL is the per-instance detail behind ENCODER-MACHINES: exact
+	// launch and termination for one box. The aggregate says 41% of the fleet was
+	// rented-and-unallocated; this says which box and when, which is what the UI
+	// needs to place lanes on a shared time axis.
+	//
+	// `end` is the load-bearing field. It is the one fact the browser cannot get
+	// for itself — /api/aws/inventory drops terminated instances and is cached,
+	// so a client can only infer "freed" from a box ceasing to appear, and that
+	// inference billed six phantom minutes against machines EC2 had already
+	// reclaimed. alive=1 means end is "as of now" and will grow.
+	rentalMarkerRe = regexp.MustCompile(`^\[\[ENCODER-RENTAL exec=(\S+) id=(\S+) type=(\S+) vcpu=(\d+) launch=(\d+) end=(\d+) alive=([01]) chunks=(\d+)\]\]$`)
 	// ENCODER-FLEET reports one distributed-local worker box's live CPU: busy =
 	// logical cores currently busy (from /proc/stat), perf = its perf-core target
 	// (4/4/8). Emitted by cli_local_dist from the workers' Temporal heartbeats,
@@ -660,6 +671,34 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Unlock()
 		return true
 	}
+	if m := rentalMarkerRe.FindStringSubmatch(line); m != nil {
+		vcpu, _ := strconv.Atoi(m[4])
+		launch, _ := strconv.ParseInt(m[5], 10, 64)
+		end, _ := strconv.ParseInt(m[6], 10, 64)
+		chunks, _ := strconv.Atoi(m[8])
+		row := MachineRental{
+			ID: m[2], Type: m[3], VCPUs: vcpu,
+			LaunchedAt: launch, EndedAt: end,
+			Alive: m[7] == "1", Chunks: chunks,
+		}
+		j.mu.Lock()
+		// Re-emitted on every rental summary as a run progresses, so replace the
+		// row for this instance rather than appending a duplicate with a stale
+		// end time.
+		replaced := false
+		for i := range j.Rentals {
+			if j.Rentals[i].ID == row.ID {
+				j.Rentals[i] = row
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			j.Rentals = append(j.Rentals, row)
+		}
+		j.mu.Unlock()
+		return true
+	}
 	if m := statsMarkerRe.FindStringSubmatch(line); m != nil {
 		wall, _ := strconv.ParseFloat(m[2], 64)
 		vcpuH, _ := strconv.ParseFloat(m[3], 64)
@@ -945,6 +984,24 @@ type JobConfig struct {
 	UseSpot *bool `json:"use_spot,omitempty"`
 }
 
+// MachineRental is one instance's slice of a cloud run: which box, how big, and
+// the two instants that bound what you were charged for. Times are unix seconds,
+// matching the marker; the UI converts.
+//
+// Alive means EndedAt is "as of the last rental summary" rather than a real
+// termination, so it will grow. That distinction has to survive to the client:
+// treating an un-terminated box as billing up to the present is how a timeline
+// ends up charging for machines EC2 has already reclaimed.
+type MachineRental struct {
+	ID         string `json:"id"`
+	Type       string `json:"type"`
+	VCPUs      int    `json:"vcpus"`
+	LaunchedAt int64  `json:"launched_at"`
+	EndedAt    int64  `json:"ended_at"`
+	Alive      bool   `json:"alive,omitempty"`
+	Chunks     int    `json:"chunks,omitempty"`
+}
+
 type StageProgress struct {
 	Key     string  `json:"key"`
 	Label   string  `json:"label"`
@@ -1055,9 +1112,16 @@ type Job struct {
 	AllocatedVCPUHours float64 `json:"allocated_vcpu_hours,omitempty"`
 	IdlePct            float64 `json:"idle_pct,omitempty"`
 	Instances          int     `json:"instances,omitempty"`
-	SpotUSD            float64 `json:"spot_usd,omitempty"`
-	OnDemandUSD        float64 `json:"ondemand_usd,omitempty"`
-	SavedUSD           float64 `json:"saved_usd,omitempty"`
+	// Rentals is the per-instance detail behind those aggregates (ENCODER-RENTAL):
+	// which box, and exactly when it appeared and went away. The UI's machine
+	// timeline needs absolute launch/end to place lanes on a shared axis — a
+	// lifetime alone cannot say when a box appeared relative to the others, and
+	// the browser cannot source termination for itself (the inventory endpoint
+	// drops terminated instances and is cached).
+	Rentals     []MachineRental `json:"rentals,omitempty"`
+	SpotUSD     float64         `json:"spot_usd,omitempty"`
+	OnDemandUSD float64         `json:"ondemand_usd,omitempty"`
+	SavedUSD    float64         `json:"saved_usd,omitempty"`
 	// CommercialUSD / MediaConvertUSD are what this job's output ladder would have
 	// cost on hosted transcoders (a generic commercial cloud encoder, and AWS
 	// MediaConvert) — comparison baselines against our own spot/local cost. Both

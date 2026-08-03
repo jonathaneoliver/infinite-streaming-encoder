@@ -2358,6 +2358,12 @@ def _emit_machine_rental(exec_name: str, jobs: list) -> tuple | None:
             rows.append({
                 "id": iid, "type": i.get("InstanceType", "?"),
                 "vcpu": _vcpus_for_type(i.get("InstanceType")),
+                # Absolute launch/end, not just the derived durations: the UI's
+                # machine timeline needs to place each box on a shared axis, and
+                # a lifetime alone cannot say WHEN a box appeared relative to the
+                # others. Without these the chart can only infer "first appeared"
+                # from when a chunk landed, which hides the boot entirely.
+                "launch": launch, "end": end,
                 "life": end - launch,
                 "before": max(0.0, a["first"] / 1000.0 - launch),
                 "after": max(0.0, end - a["last"] / 1000.0),
@@ -2390,6 +2396,24 @@ def _emit_machine_rental(exec_name: str, jobs: list) -> tuple | None:
           f"machine_vcpu_h={machine_vcpu_s / 3600:.3f} "
           f"allocated_vcpu_h={alloc_vcpu_s / 3600:.3f} "
           f"unallocated_pct={pct:.1f}]]", flush=True)
+    # Per-instance rows, so the UI's machine timeline can place each box on a
+    # shared axis with exact boot and termination. Everything here was already
+    # computed for the table above and then discarded — the aggregate marker
+    # says 41% of the fleet was unallocated but not WHICH box, or when.
+    #
+    # Termination matters most. It is the one fact the browser cannot get for
+    # itself: /api/aws/inventory drops terminated instances, so a client polling
+    # it can only infer "freed" from a box no longer appearing, and the response
+    # is cached — long enough to bill six phantom minutes against machines EC2
+    # had already reclaimed. Relaying `end` removes the guess.
+    #
+    # A plain print, not telemetry.emit(): this is the orchestrator, one hop from
+    # the Go server over a pipe it is already attached to (see CLAUDE.md).
+    for r in rows:
+        print(f"[[ENCODER-RENTAL exec={exec_name} id={r['id']} "
+              f"type={r['type']} vcpu={r['vcpu']} "
+              f"launch={r['launch']:.0f} end={r['end']:.0f} "
+              f"alive={1 if r['alive'] else 0} chunks={r['n']}]]", flush=True)
     return pct, machine_vcpu_s / 3600.0
 
 
