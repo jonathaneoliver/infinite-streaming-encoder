@@ -2981,6 +2981,10 @@ function renderJobs() {
     _sampleUnallocated(all);
     renderJobsOverview(all);
     syncFleetPanels();
+    // Stage data just changed, so the machine timeline is out of date. It is
+    // drawn from stages, not from the inventory, so it has no reason to wait for
+    // the 10s AWS poll that renderFleet rides on.
+    refreshFleetLanes();
 
     if (all.length === 0) {
         list.innerHTML = '<div class="no-files">No jobs yet</div>';
@@ -3862,6 +3866,18 @@ function _fleetLanesHtml() {
     </div>`;
 }
 
+// The timeline is drawn from job STAGES, which arrive on the SSE stream, but it
+// used to be rendered only by renderFleet — which runs on the AWS inventory
+// poll, every 10s. So a chart whose data was already current visibly trailed the
+// chunk grid beside it by up to a poll. Redraw it on the job stream instead, and
+// let the inventory keep its own slower cadence for the rows above.
+function refreshFleetLanes() {
+    const html = _fleetLanesHtml();
+    document.querySelectorAll('.fleet-lanes').forEach(el => {
+        if (el.innerHTML !== html) el.innerHTML = html;
+    });
+}
+
 function renderFleet(fleet, instances) {
     _lastFleet = { fleet, instances };
     _recordFleetLanes(instances);
@@ -3916,7 +3932,12 @@ function renderFleet(fleet, instances) {
     // Appended in BOTH branches, including "No active fleet": the timeline is
     // most useful once the boxes are gone, because that is when idle -> freed
     // becomes measurable at all.
-    panelHtml += lanesHtml;
+    //
+    // Wrapped in a class, not an id — this same HTML is injected into two
+    // containers (the AWS tab and the Jobs panel), so an id would be duplicated.
+    // The wrapper lets refreshFleetLanes() redraw just the timeline without
+    // rebuilding the instance rows above it.
+    panelHtml += `<div class="fleet-lanes">${lanesHtml}</div>`;
 
     const el = document.getElementById('aws-fleet');
     if (el) el.innerHTML = panelHtml;
