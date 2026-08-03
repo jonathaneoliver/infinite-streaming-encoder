@@ -2364,6 +2364,14 @@ def _emit_machine_rental(exec_name: str, jobs: list) -> tuple | None:
                 # others. Without these the chart can only infer "first appeared"
                 # from when a chunk landed, which hides the boot entirely.
                 "launch": launch, "end": end,
+                # When Batch work actually began and ended on this box. NOT the
+                # same as the first/last STAGE: a job keeps running after its
+                # stage closes — pkgall's stages total 73s against a 177s job,
+                # the rest being the parallel fetch and the packaged-output
+                # upload. A timeline drawn from stages alone paints that ~104s
+                # as idle, which is how a 3m40s tail came to read as over five
+                # minutes. These are Batch's own startedAt/stoppedAt.
+                "first_job": a["first"] / 1000.0, "last_job": a["last"] / 1000.0,
                 "life": end - launch,
                 "before": max(0.0, a["first"] / 1000.0 - launch),
                 "after": max(0.0, end - a["last"] / 1000.0),
@@ -2413,6 +2421,7 @@ def _emit_machine_rental(exec_name: str, jobs: list) -> tuple | None:
         print(f"[[ENCODER-RENTAL exec={exec_name} id={r['id']} "
               f"type={r['type']} vcpu={r['vcpu']} "
               f"launch={r['launch']:.0f} end={r['end']:.0f} "
+              f"first_job={r['first_job']:.0f} last_job={r['last_job']:.0f} "
               f"alive={1 if r['alive'] else 0} chunks={r['n']}]]", flush=True)
     return pct, machine_vcpu_s / 3600.0
 

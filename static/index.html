@@ -3715,6 +3715,21 @@ function _fleetLanesHtml() {
         // lifetimes for machines that lived 377s.
         const r = rental.get(id);
         const seen = _fleetSeen.get(id) || {};
+        // Stages close before their Batch job does. pkgall's stages total 73s
+        // against a 177s job — the rest is the parallel fetch and the packaged
+        // output upload, real work on this box with no stage open. Drawn from
+        // stages alone that ~104s reads as idle, which made a 3m40s tail look
+        // like over five minutes. Batch's own startedAt/stoppedAt bound the
+        // work honestly, so stretch the ends to them when they reach further.
+        if (r && r.last_job_at) {
+            const lj = r.last_job_at * 1000;
+            const tail = merged[merged.length - 1];
+            if (tail && lj > tail[1]) tail[1] = lj;
+        }
+        if (r && r.first_job_at) {
+            const fj = r.first_job_at * 1000;
+            if (merged.length && fj < merged[0][0]) merged[0][0] = fj;
+        }
         return {
             id, merged,
             launch: (r && r.launched_at) ? r.launched_at * 1000 : (seen.launch || null),

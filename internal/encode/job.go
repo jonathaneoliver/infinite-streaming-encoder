@@ -211,7 +211,7 @@ var (
 	// so a client can only infer "freed" from a box ceasing to appear, and that
 	// inference billed six phantom minutes against machines EC2 had already
 	// reclaimed. alive=1 means end is "as of now" and will grow.
-	rentalMarkerRe = regexp.MustCompile(`^\[\[ENCODER-RENTAL exec=(\S+) id=(\S+) type=(\S+) vcpu=(\d+) launch=(\d+) end=(\d+) alive=([01]) chunks=(\d+)\]\]$`)
+	rentalMarkerRe = regexp.MustCompile(`^\[\[ENCODER-RENTAL exec=(\S+) id=(\S+) type=(\S+) vcpu=(\d+) launch=(\d+) end=(\d+) first_job=(\d+) last_job=(\d+) alive=([01]) chunks=(\d+)\]\]$`)
 	// ENCODER-FLEET reports one distributed-local worker box's live CPU: busy =
 	// logical cores currently busy (from /proc/stat), perf = its perf-core target
 	// (4/4/8). Emitted by cli_local_dist from the workers' Temporal heartbeats,
@@ -675,11 +675,14 @@ func (j *Job) parseMarker(line string) bool {
 		vcpu, _ := strconv.Atoi(m[4])
 		launch, _ := strconv.ParseInt(m[5], 10, 64)
 		end, _ := strconv.ParseInt(m[6], 10, 64)
-		chunks, _ := strconv.Atoi(m[8])
+		firstJob, _ := strconv.ParseInt(m[7], 10, 64)
+		lastJob, _ := strconv.ParseInt(m[8], 10, 64)
+		chunks, _ := strconv.Atoi(m[10])
 		row := MachineRental{
 			ID: m[2], Type: m[3], VCPUs: vcpu,
 			LaunchedAt: launch, EndedAt: end,
-			Alive: m[7] == "1", Chunks: chunks,
+			FirstJobAt: firstJob, LastJobAt: lastJob,
+			Alive: m[9] == "1", Chunks: chunks,
 		}
 		j.mu.Lock()
 		// Re-emitted on every rental summary as a run progresses, so replace the
@@ -998,8 +1001,14 @@ type MachineRental struct {
 	VCPUs      int    `json:"vcpus"`
 	LaunchedAt int64  `json:"launched_at"`
 	EndedAt    int64  `json:"ended_at"`
-	Alive      bool   `json:"alive,omitempty"`
-	Chunks     int    `json:"chunks,omitempty"`
+	// When Batch work began and ended on this box — NOT the first/last stage.
+	// A job outlives its stage: pkgall's stages total 73s against a 177s job,
+	// the remainder being the parallel fetch and the packaged-output upload.
+	// A timeline drawn from stages alone paints that as idle.
+	FirstJobAt int64 `json:"first_job_at,omitempty"`
+	LastJobAt  int64 `json:"last_job_at,omitempty"`
+	Alive      bool  `json:"alive,omitempty"`
+	Chunks     int   `json:"chunks,omitempty"`
 }
 
 type StageProgress struct {
