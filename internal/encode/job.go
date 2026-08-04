@@ -903,6 +903,16 @@ type JobConfig struct {
 	Padding       string `json:"padding"`
 	KeepMezzanine bool   `json:"keep_mezzanine"`
 	ForceReencode bool   `json:"force_reencode"`
+	// SkipMediaDownload leaves a cloud run's segments in S3 and brings back only
+	// manifests and metadata — ~4 MB instead of ~2.6 GB (#214). Egress is billed
+	// per GB past a 100 GB/month allowance and was 3x the compute on the 1-3 Aug
+	// bill; during iteration almost every downloaded ladder is superseded within
+	// hours. Fetch the media later from the Outputs tab.
+	//
+	// A pointer so nil means "use the server default" (SKIP_OUTPUT_MEDIA), and an
+	// explicit true/false from the client wins. Cloud-batch only — the local and
+	// local-dist paths write straight to disk with no egress to avoid.
+	SkipMediaDownload *bool `json:"skip_media_download,omitempty"`
 	// Burnin toggles the per-variant burnt-in text overlay (timecode / rate /
 	// codec+res / encoder / watermark labels, plus the PADDING label). On by
 	// default — a pointer so nil (older persisted jobs, or a client that omits
@@ -1291,6 +1301,12 @@ func (j *Job) LogLines() []string {
 type Manager struct {
 	mu   sync.Mutex
 	jobs []*Job
+
+	// In-flight on-demand media fetches, keyed by output dir name (#214). Its
+	// own lock because a fetch runs for minutes and must not block job
+	// bookkeeping. See remote.go.
+	fetchMu sync.Mutex
+	fetches map[string]*FetchState
 
 	SourceDir   string
 	OutputDir   string
@@ -3278,6 +3294,9 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		"--output-stem", job.Config.OutputStem(filename)}
 	if job.Config.OutputTag != "" {
 		pollArgs = append(pollArgs, "--output-tag", job.Config.OutputTag)
+	}
+	if m.skipMediaDownload(job.Config) {
+		pollArgs = append(pollArgs, "--no-media")
 	}
 	poll := exec.Command("python3", append([]string{"-m", "infinite_streaming_encoder.cli_batch"}, pollArgs...)...)
 	poll.Env = os.Environ()

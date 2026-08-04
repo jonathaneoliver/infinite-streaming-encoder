@@ -89,6 +89,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/outputs/{name}/ladder", s.ladder)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/logs", s.outputLogs)
 	s.Mux.HandleFunc("POST /api/outputs/{name}/promote", s.promoteOutput)
+	s.Mux.HandleFunc("POST /api/outputs/{name}/fetch", s.fetchOutput)
 	s.Mux.HandleFunc("GET /api/promote", s.getPromote)
 	s.Mux.HandleFunc("POST /api/encode", s.startEncode)
 	s.Mux.HandleFunc("GET /api/jobs", s.listJobs)
@@ -563,6 +564,17 @@ type outputDir struct {
 	HlsFormat   string   `json:"hls_format"`
 	Partial     string   `json:"partial"`
 	Padding     string   `json:"padding"`
+	// Remote is set when this output's media is still in S3 (#214) — the
+	// manifests are local, the segments are not. The UI shows Download instead
+	// of Play, because /content/ serves from disk and every segment would 404.
+	Remote *encode.RemoteInfo `json:"remote,omitempty"`
+	// RemoteExpired distinguishes "fetch it" from "too late" without making the
+	// UI parse timestamps.
+	RemoteExpired bool `json:"remote_expired,omitempty"`
+	// Fetch is the in-flight (or last failed) on-demand download. An output
+	// mid-fetch is neither remote nor complete; Play stays disabled until it
+	// clears.
+	Fetch *encode.FetchState `json:"fetch,omitempty"`
 }
 
 // getLadders returns all ladder definitions (built-in + user-defined) keyed by
@@ -661,6 +673,23 @@ func (s *Server) promoteOutput(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, results)
 }
 
+// fetchOutput starts an on-demand download of an output whose media was left in
+// S3 by a metadata-only run (#214). Returns immediately: the transfer runs in
+// the background and its progress rides the outputs listing.
+//
+// A second click while one is running is deliberately NOT an error — the button
+// must be safe to press twice — so ErrFetchInFlight returns 200 with the
+// existing state rather than a 4xx the UI would have to special-case.
+func (s *Server) fetchOutput(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	err := s.Manager.FetchOutput(name)
+	if err != nil && err != encode.ErrFetchInFlight {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, s.Manager.FetchStateFor(name))
+}
+
 func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {
 	entries, err := os.ReadDir(s.Manager.OutputDir)
 	if err != nil {
@@ -683,10 +712,13 @@ func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {
 		dirPath := filepath.Join(s.Manager.OutputDir, e.Name())
 		size, count := dirStats(dirPath)
 		meta := parseOutputMeta(e.Name(), dirPath)
+		remote := encode.ReadRemote(dirPath)
 		dirs = append(dirs, outputDir{
 			Name: e.Name(), Size: size, NumFiles: count, ModTime: info.ModTime().UnixMilli(),
 			Codec: meta.codec, Resolutions: meta.resolutions, HlsFormat: meta.hlsFormat,
 			Partial: meta.partial, Padding: meta.padding,
+			Remote: remote, RemoteExpired: remote.Expired(),
+			Fetch: s.Manager.FetchStateFor(e.Name()),
 		})
 	}
 	writeJSON(w, dirs)

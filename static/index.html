@@ -26,6 +26,16 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .btn-play:hover { background: #1a2a4a; color: #4cc9f0; }
 .btn-promote { color: #2a9d8f; cursor: pointer; font-size: 0.95rem; padding: 4px 7px; border-radius: 4px; margin-left: 2px; }
 .btn-promote:hover { background: #14332c; color: #4ecdc4; }
+/* #214 — Download replaces Play while an output's media is still in S3. */
+.btn-fetch { color: #e9c46a; cursor: pointer; font-size: 0.95rem; padding: 4px 7px; border-radius: 4px; }
+.btn-fetch:hover { background: #3a3320; color: #f4d787; }
+.btn-fetch.busy, .btn-fetch.disabled { cursor: default; opacity: 0.55; }
+.btn-fetch.busy:hover, .btn-fetch.disabled:hover { background: none; color: #e9c46a; }
+.badge-remote { display: inline-block; margin-left: 8px; padding: 1px 6px; border-radius: 3px;
+                font-size: 0.72rem; background: #3a3320; color: #e9c46a; vertical-align: middle; }
+.badge-remote.busy { background: #1e3348; color: #7db8e8; }
+.badge-remote.failed { background: #4a2020; color: #e88; }
+.badge-remote.expired { background: #333; color: #999; text-decoration: line-through; }
 .src-badge-slot { flex: 0 0 96px; display: inline-flex; align-items: center; }
 .file-size { color: #888; font-size: 0.85rem; width: 80px; text-align: right; }
 .file-count { color: #666; font-size: 0.8rem; margin-left: 12px; }
@@ -1911,9 +1921,34 @@ async function loadOutputs() {
         // Outputs feed the per-source picker badges (issue #114) — refresh them
         // once the list lands, whichever tab is showing.
         refreshSourceBadges();
+        _scheduleFetchPoll();
     } catch (e) {
         document.getElementById('outputs-list').innerHTML = '<div class="no-files">Failed to load outputs</div>';
     }
+}
+
+// #214: while any output's media is downloading from S3, re-poll so the percent
+// advances and the row flips to Play on its own. Self-cancelling — the timer
+// only re-arms while something is in flight, so an idle Outputs tab is silent.
+let _fetchPollTimer = null;
+function _scheduleFetchPoll() {
+    const busy = outputDirs.some(d => d.fetch && d.fetch.state === 'fetching');
+    if (_fetchPollTimer) { clearTimeout(_fetchPollTimer); _fetchPollTimer = null; }
+    if (busy) _fetchPollTimer = setTimeout(loadOutputs, 2000);
+}
+
+// Start an on-demand media download. Safe to click twice: the server treats a
+// second request as a no-op and returns the running state.
+async function fetchOutput(name, el) {
+    if (el) { el.classList.add('busy'); el.innerHTML = '&#8987;'; }
+    try {
+        const r = await fetch(`/api/outputs/${encodeURIComponent(name)}/fetch`,
+                              { method: 'POST' });
+        if (!r.ok) { alert(`Download failed: ${await r.text()}`); }
+    } catch (e) {
+        alert(`Download failed: ${e}`);
+    }
+    loadOutputs();
 }
 
 // Promote destinations (from /api/promote). Empty => promote not configured, so
@@ -2004,19 +2039,61 @@ function renderOutputs() {
     ` + sorted.map((d, i) => `
         <div class="output-grid output-dir" onclick="toggleOutputDetail(${i}, '${escapeAttr(d.name)}')" oncontextmenu="showContextMenu(event, '${escapeAttr(d.name)}')">
             <span class="out-chev" id="outchev-${i}" title="Expand ladder">&#9656;</span>
-            <span class="output-dir-name">${escapeHtml(d.name)}</span>
+            <span class="output-dir-name">${escapeHtml(d.name)}${_remoteBadge(d)}</span>
             <span>${renderCodecBadge(d)}</span>
             <span>${renderResBadges(d)}</span>
             <span>${renderFormatBadge(d)}</span>
             <span class="output-dir-stats">${formatSize(d.size)}</span>
             <span class="file-date">${formatDate(d.mod_time)}</span>
-            <span>
-                <span class="btn-play" onclick="event.stopPropagation(); playOutputMaster('${escapeAttr(d.name)}')" title="Play">&#9654;</span>
-                ${_promoteDests.length ? `<span class="btn-promote" onclick="event.stopPropagation(); promoteOutput('${escapeAttr(d.name)}', this)" title="Promote to ${_promoteDests.length} live location(s)">&#8681;</span>` : ''}
-            </span>
+            <span>${_outputActions(d)}</span>
         </div>
         <div class="output-details" id="outdet-${i}" style="display:none"></div>
     `).join('');
+}
+
+// #214 — an output whose media is still in S3. The badge says so next to the
+// name; the action cell offers Download in place of Play.
+//
+// Play MUST NOT be offered: it points hls.js at /content/<dir>/<playlist>.m3u8,
+// which the Go file server reads off local disk. With manifests present but no
+// segments the playlist loads and every part 404s, which is worse than not
+// offering it at all.
+function _remoteBadge(d) {
+    const f = d.fetch;
+    if (f && f.state === 'fetching') {
+        return `<span class="badge-remote busy">downloading ${(f.percent || 0).toFixed(0)}%</span>`;
+    }
+    if (f && f.state === 'failed') {
+        return `<span class="badge-remote failed" title="${escapeAttr(f.error || '')}">download failed</span>`;
+    }
+    if (!d.remote) return '';
+    if (d.remote_expired) {
+        return `<span class="badge-remote expired" title="S3 staging expired ${escapeAttr(d.remote.expires_at)} — the media is gone">expired</span>`;
+    }
+    return `<span class="badge-remote" title="${d.remote.pending_files} media objects still in S3. Expires ${escapeAttr(d.remote.expires_at)}">in S3 &middot; ${formatSize(d.remote.pending_bytes)}</span>`;
+}
+
+function _outputActions(d) {
+    const n = escapeAttr(d.name);
+    const f = d.fetch;
+    if (f && f.state === 'fetching') {
+        return `<span class="btn-fetch busy" title="Downloading ${(f.percent || 0).toFixed(0)}% — this row updates itself">&#8987;</span>`;
+    }
+    if (d.remote && d.remote_expired) {
+        return `<span class="btn-fetch disabled" title="S3 staging expired ${escapeAttr(d.remote.expires_at)}; the media is gone and cannot be fetched">&#10007;</span>`;
+    }
+    if (d.remote) {
+        // Show the cost before the click: egress is ~$0.09/GB past the monthly
+        // 100 GB allowance, so a full ladder is real money, not a free button.
+        const gb = (d.remote.pending_bytes || 0) / 1e9;
+        const cost = gb > 0.01 ? ` (~$${(gb * 0.09).toFixed(2)} egress)` : '';
+        return `<span class="btn-fetch" onclick="event.stopPropagation(); fetchOutput('${n}', this)"
+                      title="Download ${formatSize(d.remote.pending_bytes)} from S3${cost}. Expires ${escapeAttr(d.remote.expires_at)}">&#11015;</span>`;
+    }
+    // Local: Play, and Promote — which rsyncs the tree, so it is equally
+    // meaningless without the media.
+    return `<span class="btn-play" onclick="event.stopPropagation(); playOutputMaster('${n}')" title="Play">&#9654;</span>`
+        + (_promoteDests.length ? `<span class="btn-promote" onclick="event.stopPropagation(); promoteOutput('${n}', this)" title="Promote to ${_promoteDests.length} live location(s)">&#8681;</span>` : '');
 }
 
 // #60: fold a package open in place (inline ladder table) instead of drilling
