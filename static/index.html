@@ -3881,6 +3881,21 @@ function _fleetLanesHtml() {
         ? `${fmt(freed.reduce((a, b) => a + b, 0) / freed.length)} avg (${freed.length})`
         : 'none freed yet';
 
+    // Efficiency: CPU actually BURNED against vCPU-seconds RENTED. Distinct from
+    // the idle figure beside it, and stricter — idle asks "did a job exist on
+    // this box", this asks "did the box do arithmetic".
+    //
+    // Measured 51-56% across six runs, and the gap is NOT slack inside the
+    // containers: per-rung utilisation of reserved vCPU runs at 99% overall,
+    // with six of twelve rungs exceeding their reservation (the cgroup is CPU
+    // shares, not a hard quota, so a job bursts into idle capacity on its box).
+    // So every point of the loss is fleet-level: boot, image pull, the fan-in
+    // wait, the scale-down tail, and scheduling gaps. There is nothing to win
+    // inside a container, which is worth knowing before anyone tries.
+    const cpuS = stages.reduce((n, st) => n + (Number(st.cpu_seconds) || 0), 0);
+    const rentedS = billedMs / 1000;
+    const effPct = rentedS > 0 ? cpuS / rentedS * 100 : 0;
+
     const wasteMs = Math.max(0, billedMs - workMs);
     const wastePctAll = billedMs ? Math.round(wasteMs / billedMs * 100) : 0;
 
@@ -3891,6 +3906,7 @@ function _fleetLanesHtml() {
       </div>
       <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:10px;font-variant-numeric:tabular-nums">
         <div style="font-size:19px;color:#e6e9ef;font-weight:600">${(billedMs / 3600000).toFixed(2)} <span style="font-size:12px;font-weight:400;color:#8a94a2">vCPU-h billed</span></div>
+        ${cpuS > 0 ? `<div style="font-size:13px;color:#e6e9ef" title="CPU seconds actually burned by ffmpeg, over vCPU-seconds rented. Containers run at ~99% of their reserved vCPU, so the shortfall is fleet idle — boot, image pull, the fan-in wait and the scale-down tail — not slack inside a job.">${effPct.toFixed(0)}% <span style="color:#8a94a2">efficient</span> <span style="color:#6f7887">(${(cpuS / 3600).toFixed(2)} vCPU-h of real CPU)</span></div>` : ''}
         <div style="font-size:13px;color:${IDLE}">${(wasteMs / 3600000).toFixed(2)} vCPU-h (${wastePctAll}%) with no job at all</div>
       </div>
       <div style="display:flex;gap:14px;flex-wrap:wrap;font-size:10.5px;color:#8a94a2;margin-bottom:10px;align-items:center">
