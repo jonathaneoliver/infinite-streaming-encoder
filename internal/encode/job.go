@@ -3712,7 +3712,10 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	}
 	sort.SliceStable(order, func(a, b int) bool { return scores[order[a]] > scores[order[b]] })
 	for rank, vi := range order {
-		within := 999 - rank
+		// 998, not 999: the top of the band is reserved for audio (see
+		// prio_audio). Ranks stay strictly decreasing and a ladder has <= ~40
+		// variants, so nothing collides.
+		within := 998 - rank
 		if within < 1 {
 			within = 1
 		}
@@ -3759,8 +3762,21 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		// Banded priorities for the fixed phases (chunks carry their own banded
 		// priority per variant). Keeps a job's whole pipeline in one band so an
 		// earlier job's package isn't starved by a later job's chunks.
-		"prio_mezz":  clampPrio(priorityBase + 99),
-		"prio_audio": clampPrio(priorityBase + 55),
+		"prio_mezz": clampPrio(priorityBase + 99),
+		// Audio outranks every variant, and has to.
+		//
+		// It runs in the same FanOut Parallel as the Variants map, so packaging
+		// cannot start until BOTH finish — but at base+55 it sat below all 336
+		// chunk jobs and was placed near the end. Measured on run
+		// 1785781612611: the last chunk container stopped at 18:34:26.969 and
+		// audio, an ~11s job with no dependency on any chunk, stopped at
+		// 18:34:33.224. Six seconds of a 42.9s fan-in gap spent waiting for a
+		// job that could have run at the very start.
+		//
+		// It is one small job per run, so promoting it above the ladder costs
+		// the heaviest variant a few seconds of queue position at most, and buys
+		// that back many times over by removing audio from the critical path.
+		"prio_audio": clampPrio(priorityBase + 999),
 		"prio_pkg":   clampPrio(priorityBase + 45),
 		// NOTE: two_pass + chunk_* are per-variant now (see the variant struct),
 		// not top-level — variants differ in codec/pass AND chunk length.
