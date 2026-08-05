@@ -883,7 +883,17 @@ async def _emit_temporal_progress(handle, EventType, emitted: dict, client=None)
         if et == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
             aid = e.activity_task_scheduled_event_attributes.activity_id
             sched[e.event_id] = aid
-            states.setdefault(aid, "running")
+            # SCHEDULED means QUEUED, not running. This used to say "running",
+            # so every chunk lit up the moment the workflow fanned out and the
+            # grid claimed work was underway while nothing was executing —
+            # 30 chunks at once on a 3-machine farm. It also made the machine
+            # timeline look broken rather than honest: a box legitimately had no
+            # lane yet, because it genuinely had not started anything, while the
+            # grid beside it showed its rungs "running".
+            #
+            # Promotion to running happens in _emit_fleet_cpu, off the pending
+            # activity actually reaching STARTED on a worker.
+            states.setdefault(aid, "queued")
         elif et == EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED:
             a = e.activity_task_started_event_attributes
             aid = sched.get(a.scheduled_event_id)
@@ -945,6 +955,7 @@ def _activity_markers(attrs, client) -> list[str]:
 # worker right now (vs SCHEDULED = still queued). Stable enum value.
 _PA_STARTED = 2
 _HOST_SEEN: dict = {}   # chunk activity_id -> machine, to dedup ENCODER-HOST
+_RUN_SEEN: dict = {}    # activity_id -> 1 once promoted queued -> running
 
 
 async def _emit_fleet_cpu(handle, client) -> None:
@@ -963,6 +974,16 @@ async def _emit_fleet_cpu(handle, client) -> None:
     pcv = client.data_converter.payload_converter
     agg: dict = {}   # machine -> {"busy", "perf", "chunks": [activity_id, ...]}
     for pa in getattr(raw, "pending_activities", []):
+        # A STARTED pending activity is one a worker is executing RIGHT NOW.
+        # Promote its stage here — for every activity kind, and before the
+        # machine checks below, which `continue` when identity is unknown. An
+        # activity with no reported identity is still running.
+        _aid = getattr(pa, "activity_id", "") or ""
+        if getattr(pa, "state", 0) == _PA_STARTED and _aid:
+            _k = _stage_key_for(_aid)
+            if _k and _RUN_SEEN.get(_aid) != 1:
+                _RUN_SEEN[_aid] = 1
+                emit_stage(_k, "running", 0.0)
         machine = getattr(pa, "last_worker_identity", "") or ""
         cpu = None
         hb = getattr(pa, "heartbeat_details", None)
