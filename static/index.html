@@ -2964,7 +2964,13 @@ function renderJobsOverview(all) {
 function _cloudActive() {
     if (Object.values(jobs).some(j => _isCloudJob(j) && _jobRunning(j))) return true;
     const insts = (_lastFleet && _lastFleet.instances) || [];
-    return insts.some(i => i.state === 'running');
+    if (insts.some(i => i.state === 'running')) return true;
+    // Keep the panel up while the machine timeline still has something to show.
+    // Hiding it the moment the last box dies would discard the chart exactly when
+    // it becomes most useful: "how long from idle to freed" is only answerable
+    // once they ARE freed. The lanes expire themselves (_FLEET_LANE_KEEP_MS), so
+    // this holds the panel open for the post-run review and then lets it go.
+    return _fleetSeen.size > 0;
 }
 function syncFleetPanels() {
     const cp = document.getElementById('jobs-cloud-fleet-panel');
@@ -3055,6 +3061,10 @@ function renderJobs() {
     _sampleUnallocated(all);
     renderJobsOverview(all);
     syncFleetPanels();
+    // Stage data just changed, so the machine timeline is out of date. It is
+    // drawn from stages, not from the inventory, so it has no reason to wait for
+    // the 10s AWS poll that renderFleet rides on.
+    refreshFleetLanes();
 
     if (all.length === 0) {
         list.innerHTML = '<div class="no-files">No jobs yet</div>';
@@ -3664,8 +3674,428 @@ function _fleetSparks(fleet) {
 }
 
 let _lastFleet = null;
+// --- fleet swim lanes -------------------------------------------------------
+//
+// The per-instance rows above answer "what is on this box right now". They
+// cannot answer WHEN, and three questions about the bill are all when-questions:
+// is a box idle MID-run (a scheduling gap, not just at the ends), how long from
+// its last job finishing to it actually being freed, and does Batch cold-start
+// boxes LATE — after the fleet is already at capacity — paying boot + image pull
+// for capacity that arrives too late to help.
+//
+// A run's machine vCPU-hours is the area under these lanes, so this is the shape
+// of the bill. The rental table in the job log reports life / idle-pre /
+// idle-post / busy% per instance: that same area already collapsed to scalars,
+// where 84% busy reads identically whether it was one long stall or forty small
+// gaps. Those want opposite fixes.
+//
+// Busy intervals come from the JOB'S OWN STAGES, not from polling. Every stage
+// already carries instance + started_at + ended_at, so the lanes cover the whole
+// run the moment the page opens and work on a finished job. The first cut of
+// this sampled the AWS inventory instead and could only ever draw from the
+// moment you happened to open the page — on a live run that left every lane
+// empty except a stub at the right-hand edge.
+//
+// Polling still supplies the two things stages cannot know: when a box BOOTED
+// (before any stage landed on it) and when it was FREED (it vanishes from the
+// inventory). Both are live-only, so they fill in when the page is open and are
+// simply absent otherwise — drawn as nothing rather than guessed.
+const _fleetSeen = new Map();   // id -> {launch, vcpus, type, gone}
+const _FLEET_LANE_KEEP_MS = 45 * 60 * 1000;
+
+function _recordFleetLanes(instances) {
+    const now = Date.now();
+    const live = new Set();
+    (instances || []).forEach(i => {
+        if (!i.id) return;
+        const lt = Date.parse(i.launched_at || '');
+        const rec = _fleetSeen.get(i.id) || {};
+        rec.launch = rec.launch || (!isNaN(lt) ? lt : now - (Number(i.age_seconds) || 0) * 1000);
+        rec.vcpus = i.vcpus || rec.vcpus || 0;
+        rec.type = i.type || rec.type || '';
+        // The inventory RETURNS terminated instances (see _describe_app_instances),
+        // so "still in the payload" never meant "still running" — and treating it
+        // that way is why every lane read "still on" until the run ended and the
+        // orchestrator's rental summary arrived. terminated_at is the exact
+        // instant billing stopped, parsed from StateTransitionReason, so a box
+        // released mid-run now shows up on the very next poll.
+        const ta = Date.parse(i.terminated_at || '');
+        if (!isNaN(ta)) {
+            rec.gone = ta;
+        } else if (i.state === 'terminated' || i.state === 'shutting-down') {
+            // Terminated but EC2 gave no parseable time: it is gone, we just
+            // cannot say precisely when. Better an approximate boundary than
+            // billing it forever.
+            rec.gone = rec.gone || now;
+        } else {
+            live.add(i.id);
+            rec.gone = null;
+        }
+        _fleetSeen.set(i.id, rec);
+    });
+    // Fallback for a box that disappears from the payload entirely without ever
+    // being reported terminated — it cannot still be running, so stop the meter.
+    _fleetSeen.forEach((rec, id) => {
+        if (!live.has(id) && rec.gone == null) rec.gone = now;
+        if (rec.gone && now - rec.gone > _FLEET_LANE_KEEP_MS) _fleetSeen.delete(id);
+    });
+}
+
+// The job to chart: a running cloud job if there is one, else the most recent
+// job that placed stages on named instances.
+function _isLocalDistJob(j) {
+    const t = String((j.config || {}).target || '');
+    return t.includes('local') || t.includes('dist');
+}
+
+function _laneJob(local) {
+    const all = Object.values((typeof jobs === 'object' && jobs) ? jobs : {})
+        .filter(j => _laneStages(j).length)
+        .filter(j => local === undefined || _isLocalDistJob(j) === !!local);
+    if (!all.length) return null;
+    const run = all.filter(j => typeof _jobRunning === 'function' ? _jobRunning(j) : false);
+    const pick = (run.length ? run : all);
+    return pick.sort((a, b) =>
+        Date.parse(b.started_at || 0) - Date.parse(a.started_at || 0))[0];
+}
+
+function _laneStages(job) {
+    if (!job) return [];
+    const hist = (job.stages_history || []).flatMap(h => h.stages || []);
+    return [...(job.stages || []), ...hist].filter(s => s && s.instance && s.started_at);
+}
+
+// opts.local switches the framing. On cloud these lanes are about MONEY: you pay
+// from launch to termination whatever the box does, so the axis is billed-vs-not
+// and idle is the loudest colour. On the farm you own the machines — nothing is
+// rented and there is no launch or termination to draw — so the question changes
+// to "did all three stay busy, and where did the run wait". Same lanes, same
+// stage data, different headline.
+function _fleetLanesHtml(opts) {
+    const local = !!(opts && opts.local);
+    const job = _laneJob(local);
+    const stages = _laneStages(job);
+    if (!stages.length) return '';
+    const now = Date.now();
+
+    // Merge each instance's stage intervals — chunks overlap on a box, and the
+    // question is "did this machine have ANY work", not how much.
+    const byInst = new Map();
+    stages.forEach(s => {
+        const a = Date.parse(s.started_at);
+        if (isNaN(a)) return;
+        const b = s.ended_at ? Date.parse(s.ended_at) : now;
+        if (!byInst.has(s.instance)) byInst.set(s.instance, []);
+        byInst.get(s.instance).push([a, Math.max(b, a)]);
+    });
+
+    // Per-instance rental rows from the job itself, keyed by id.
+    const rental = new Map(((job || {}).rentals || []).map(r => [r.id, r]));
+    const lanes = [...byInst.entries()].map(([id, iv]) => {
+        iv.sort((x, y) => x[0] - y[0]);
+        const merged = [];
+        iv.forEach(([a, b]) => {
+            const last = merged[merged.length - 1];
+            if (last && a <= last[1]) last[1] = Math.max(last[1], b);
+            else merged.push([a, b]);
+        });
+        // Prefer the orchestrator's own rental record (ENCODER-RENTAL): it is
+        // EC2's launch time and EC2's termination time, computed by the same
+        // pass that prints the rental table, and it persists with the job. The
+        // live inventory is only a fallback while a run is in flight — it has no
+        // termination at all (terminated boxes are filtered out of it) and it is
+        // cached, which is how an earlier version of this chart drew 723s
+        // lifetimes for machines that lived 377s.
+        // A farm machine is OWNED: there is no launch to wait for and no
+        // termination to stop a meter, so its lane is simply the window in which
+        // it had work. Rental and inventory data belong to EC2 — on the local
+        // path they would be stale ids from an earlier cloud run.
+        const r = local ? null : rental.get(id);
+        const seen = local ? {} : (_fleetSeen.get(id) || {});
+        // Stages close before their Batch job does. pkgall's stages total 73s
+        // against a 177s job — the rest is the parallel fetch and the packaged
+        // output upload, real work on this box with no stage open. Drawn from
+        // stages alone that ~104s reads as idle, which made a 3m40s tail look
+        // like over five minutes. Batch's own startedAt/stoppedAt bound the
+        // work honestly, so stretch the ends to them when they reach further.
+        if (r && r.last_job_at) {
+            const lj = r.last_job_at * 1000;
+            const tail = merged[merged.length - 1];
+            if (tail && lj > tail[1]) tail[1] = lj;
+        }
+        if (r && r.first_job_at) {
+            const fj = r.first_job_at * 1000;
+            if (merged.length && fj < merged[0][0]) merged[0][0] = fj;
+        }
+        return {
+            id, merged,
+            launch: (r && r.launched_at) ? r.launched_at * 1000 : (seen.launch || null),
+            gone: (r && r.ended_at && !r.alive) ? r.ended_at * 1000 : (seen.gone || null),
+            vcpus: (r && r.vcpus) || seen.vcpus || 0,
+            type: (r && r.type) || seen.type || '',
+        };
+    });
+    // A rented box that ran NOTHING has no stages, so it would never appear
+    // above — and it is the purest form of the waste this chart is for: Batch
+    // booted it, you paid for it, no chunk ever landed on it. Usually that means
+    // capacity that arrived after the queue had already drained.
+    rental.forEach((r, id) => {
+        if (byInst.has(id) || !r.launched_at) return;
+        lanes.push({
+            id, merged: [], vcpus: r.vcpus || 0, type: r.type || '',
+            launch: r.launched_at * 1000,
+            gone: (r.ended_at && !r.alive) ? r.ended_at * 1000 : null,
+        });
+    });
+    if (!lanes.length) return '';
+
+    // A lane's own start: its launch if known, else its first piece of work.
+    const laneStart = L => L.launch || (L.merged.length ? L.merged[0][0] : now);
+    const laneEnd = L => Math.max(L.gone || 0, L.merged.length ? L.merged[L.merged.length - 1][1] : 0, laneStart(L));
+
+    // Is the run still going? Decides whether an unterminated box is still
+    // billing or simply unobserved — see the tailTo comment below.
+    const jobLive = (typeof _jobRunning === 'function') ? _jobRunning(job) : false;
+    // The horizon local lanes are measured against: the whole JOB, ending when
+    // the job does.
+    //
+    // Deliberately not "the last chunk". After the encodes finish the job runs
+    // on through packaging, download and the move, and the farm machines sit
+    // idle for all of it — which is exactly the local twin of the cloud fan-in,
+    // and worth seeing rather than cropping out. Measuring to the last chunk
+    // would show three machines at ~100% and hide the tail entirely.
+    //
+    // It stops at the job's own end, so once the job is done the chart is
+    // static: a finished run reads the same an hour later as it did on
+    // completion.
+    const jobEnd = Date.parse((job || {}).ended_at || '');
+    const runEnd = jobLive ? now
+        : (!isNaN(jobEnd) ? jobEnd
+           : Math.max(...lanes.map(L =>
+               L.merged.length ? L.merged[L.merged.length - 1][1] : 0), t0 + 1));
+    // Three buckets, and together they ARE the waste total — so they have to be
+    // reported together. Showing only cold start and gaps left the largest one
+    // (the tail after the last job: the fan-in barrier plus scale-down) as an
+    // unexplained remainder the reader had to compute by subtraction.
+
+    lanes.sort((a, b) => laneStart(a) - laneStart(b) || a.id.localeCompare(b.id));
+    const t0 = Math.min(...lanes.map(laneStart));
+    // The axis stops where the work does on local, and at `now` on cloud. A
+    // cloud box is still costing money after its last job, so the chart must
+    // keep drawing; a farm machine is not, so extending the axis to now would
+    // just widen an empty right-hand margin every poll — the timeline growing
+    // while nothing happens.
+    const t1 = local
+        ? Math.max(runEnd, ...lanes.map(laneEnd), t0 + 1)
+        : Math.max(now, ...lanes.map(laneEnd));
+    const span = Math.max(1, t1 - t0);
+    const pos = t => (t - t0) / span * 100;
+
+    // You are billed from launch to termination, whatever the box is doing. So
+    // billed-vs-not is the primary axis and productive-vs-wasted is the second,
+    // not the other way round. The first cut had this backwards: idle was
+    // #2f3542 on a #20252f track, so the money being wasted rendered as empty
+    // background and the only thing that stood out was the work you wanted.
+    //
+    // Now the track IS "not billed" — darker than any state — so every pixel
+    // with colour in it is a pixel you paid for, and idle is the loudest thing
+    // on the lane because it is the only part you can act on.
+    const TRACK = '#12161b';   // not billed: before launch, after termination
+    const BOOT = '#d0a458';    // billed, not yet useful — booting / pulling image
+    const IDLE = '#96453a';    // billed, doing nothing — the actionable one
+    const stripes = 'background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.13) 0 5px,transparent 5px 10px)';
+    const fmt = ms => ms < 90000 ? `${Math.round(ms / 1000)}s`
+        : `${Math.floor(ms / 60000)}m${String(Math.round(ms % 60000 / 1000)).padStart(2, '0')}s`;
+
+    let coldMs = 0, gapMs = 0, gapN = 0, tailMs = 0, freed = [], billedMs = 0, workMs = 0;
+    const rows = lanes.map(L => {
+        const host = (typeof instanceColor === 'function') ? instanceColor(L.id) : '#4a90d9';
+        // Weight by vCPU on cloud (you rent vCPU-hours) and by 1 on the farm
+        // (you own whole machines, so the unit is machine-seconds). Without this
+        // every local total is zero, since local lanes carry no vCPU count.
+        const v = local ? 1 : (L.vcpus || 0);
+        const segs = [];
+        const never = !L.merged.length;   // rented, never ran anything
+        // Accumulate every sliver, draw only what is visible. The 1500ms floor
+        // stops the lane filling with hairlines, but a bucket that skipped them
+        // would not sum to the waste total, and a breakdown that does not
+        // reconcile invites the reader to distrust all of it.
+        if (L.launch && !never && L.merged[0][0] > L.launch) {
+            const d = L.merged[0][0] - L.launch;
+            coldMs += d * v;
+            if (d > 1500) segs.push({ a: L.launch, b: L.merged[0][0], s: 'boot' });
+        }
+        L.merged.forEach(([a, b], k) => {
+            segs.push({ a, b, s: 'busy' });
+            const next = L.merged[k + 1];
+            if (next && next[0] > b) {
+                const d = next[0] - b;
+                gapMs += d * v;
+                if (d > 1500) { segs.push({ a: b, b: next[0], s: 'idle' }); gapN++; }
+            }
+        });
+        // With no work, "last end" is the launch — the whole lifetime is the tail.
+        const lastEnd = never ? L.launch : L.merged[L.merged.length - 1][1];
+        // Where does billing stop? Only three answers are honest:
+        //   - we watched it vanish from the inventory  -> L.gone
+        //   - the run is still going                   -> now
+        //   - otherwise                                -> WE DO NOT KNOW
+        //
+        // The third case has to be unknown, not `now`. /api/aws/inventory is
+        // cached, so a box can read as "running" for minutes after EC2 has
+        // terminated it — extrapolating to now billed six phantom minutes
+        // against seven boxes and reported 59% waste on a run whose real figure
+        // was 41%. EC2 confirmed 377s lifetimes the chart was drawing as 723s.
+        // Undercounting with the gap marked unknown is recoverable; doubling
+        // the bill is not.
+        // On the farm every machine exists for the WHOLE run — it is not
+        // launched or terminated — so its window is the run's window, not its
+        // own first-to-last-chunk. Without this, a finished job shrinks each
+        // lane to the period it happened to be working and every machine reads
+        // 100%: the box that idled through the tail becomes indistinguishable
+        // from the one that carried it, which is the comparison this chart is
+        // for. Cloud keeps per-instance bounds, because there a box really does
+        // stop existing.
+        const tailTo = local ? runEnd : (L.gone || (jobLive ? now : null));
+        if (tailTo && tailTo > lastEnd) {
+            const d = tailTo - lastEnd;
+            tailMs += d * v;
+            if (d > 1500) segs.push({ a: lastEnd, b: tailTo, s: 'idle' });
+        }
+        if (L.gone) freed.push(L.gone - lastEnd);
+
+        // Billed = launch (or first work, if we never saw it boot) -> freed.
+        // Not "how long it worked", and never past what we actually observed.
+        const billFrom = L.launch || (never ? lastEnd : L.merged[0][0]);
+        const busyMs = L.merged.reduce((n, [a, b]) => n + (b - a), 0);
+        // Never let billed fall below busy. A termination timestamp that lands
+        // before the last recorded work — clock skew between EC2 and the stage
+        // stream, or a stage still open when the box went away — would otherwise
+        // produce negative waste and a negative idle%, and the three buckets
+        // below would stop summing to the total.
+        const billMs = Math.max(busyMs, Math.max(0, (tailTo || lastEnd) - billFrom));
+        billedMs += billMs * v; workMs += busyMs * v;
+        const wastePct = billMs ? Math.round((1 - busyMs / billMs) * 100) : 0;
+
+        const bars = segs.map(g => {
+            const w = (g.b - g.a) / span * 100;
+            if (w <= 0) return '';
+            const bg = g.s === 'busy' ? host : g.s === 'boot' ? BOOT : IDLE;
+            const what = g.s === 'busy' ? 'encoding' : g.s === 'boot' ? 'booting / pulling image' : 'RENTED, NO JOB';
+            return `<div style="position:absolute;left:${pos(g.a)}%;width:${w}%;top:0;bottom:0;`
+                + `background:${bg};${g.s === 'boot' ? stripes : ''}" `
+                + `title="${escapeHtml(`${what} · ${fmt(g.b - g.a)} · ${(((g.b - g.a) * v) / 3600000).toFixed(3)} vCPU-h`)}"></div>`;
+        }).join('');
+        // Where the meter stops. Without this the eye cannot tell a box that was
+        // released from one that is still running off the right-hand edge.
+        const cap = L.gone
+            ? `<div style="position:absolute;left:${pos(L.gone)}%;top:-2px;bottom:-2px;width:2px;background:#e6e9ef" title="terminated — billing stops"></div>`
+            : '';
+        // On the farm the useful per-lane number is how much of the run this
+        // machine spent working — the thing you would act on is a box that sat
+        // idle while another was the tail.
+        const localTail = `<span style="color:${busyMs / Math.max(1, billMs) < 0.6 ? IDLE : '#8a94a2'}">`
+            + `${fmt(busyMs)} working · <b>${Math.round(busyMs / Math.max(1, billMs) * 100)}%</b> of its window</span>`;
+        const tail = local ? localTail : never
+            ? `<span style="color:${IDLE}"><b>${fmt(billMs)} billed, never ran a job</b></span>`
+            : L.gone
+            ? `<span style="color:#7f8899">${fmt(billMs)} billed · <b style="color:${wastePct >= 40 ? IDLE : '#8a94a2'}">${wastePct}%</b> idle</span>`
+            : jobLive
+                ? `<span style="color:#c58b82">${fmt(billMs)} billed · <b>${wastePct}%</b> idle · still on</span>`
+                : `<span style="color:#6f7887">&ge;${fmt(billMs)} billed · freed time unknown</span>`;
+        return `<div style="display:flex;align-items:center;gap:8px">
+            <div style="width:184px;flex:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:#9aa3b0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(L.id + ' ' + L.type)}">${escapeHtml(L.id)}</div>
+            <div style="width:62px;flex:none;font-size:10.5px;color:#6f7887;font-variant-numeric:tabular-nums">${local ? '' : (v || '?') + ' vCPU'}</div>
+            <div style="position:relative;flex:1;height:15px;background:${TRACK};border-radius:3px;overflow:visible">${bars}${cap}</div>
+            <div style="width:196px;flex:none;font-size:10.5px;text-align:right;font-variant-numeric:tabular-nums">${tail}</div>
+        </div>`;
+    }).join('');
+
+    const ticks = [0, .25, .5, .75, 1].map(f =>
+        `<div style="position:absolute;left:${f * 100}%;transform:translateX(${f === 0 ? '0' : f === 1 ? '-100%' : '-50%'});color:#6f7887;font-size:10px;font-variant-numeric:tabular-nums">${fmt(span * f)}</div>`).join('');
+    const key = (c, t, extra) =>
+        `<span style="display:inline-flex;align-items:center;gap:5px"><i style="width:11px;height:11px;border-radius:2px;background:${c};${extra || ''}"></i>${t}</span>`;
+    const freedTxt = freed.length
+        ? `${fmt(freed.reduce((a, b) => a + b, 0) / freed.length)} avg (${freed.length})`
+        : 'none freed yet';
+
+    // Efficiency: CPU actually BURNED against vCPU-seconds RENTED. Distinct from
+    // the idle figure beside it, and stricter — idle asks "did a job exist on
+    // this box", this asks "did the box do arithmetic".
+    //
+    // Measured 51-56% across six runs, and the gap is NOT slack inside the
+    // containers: per-rung utilisation of reserved vCPU runs at 99% overall,
+    // with six of twelve rungs exceeding their reservation (the cgroup is CPU
+    // shares, not a hard quota, so a job bursts into idle capacity on its box).
+    // So every point of the loss is fleet-level: boot, image pull, the fan-in
+    // wait, the scale-down tail, and scheduling gaps. There is nothing to win
+    // inside a container, which is worth knowing before anyone tries.
+    const cpuS = stages.reduce((n, st) => n + (Number(st.cpu_seconds) || 0), 0);
+    const rentedS = billedMs / 1000;
+    const effPct = rentedS > 0 ? cpuS / rentedS * 100 : 0;
+
+    const wasteMs = Math.max(0, billedMs - workMs);
+    const wastePctAll = billedMs ? Math.round(wasteMs / billedMs * 100) : 0;
+
+    return `<div style="margin-top:16px;border-top:1px solid #2a303c;padding-top:12px">
+      <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px">
+        <div style="font-size:12px;color:#ccc;font-weight:600">Machine timeline</div>
+        <div style="font-size:11px;color:#7f8899">${local ? "when each machine was working, and where the run waited on one of them" : "you pay from launch to termination — colour is billed, track is not. Idle here means NO job on the box; the rental table\u0027s figure is stricter (it counts partly-allocated boxes too)."}</div>
+      </div>
+      <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:10px;font-variant-numeric:tabular-nums">
+        ${local
+          ? `<div style="font-size:19px;color:#e6e9ef;font-weight:600">${Math.round(workMs / Math.max(1, billedMs) * 100)}% <span style="font-size:12px;font-weight:400;color:#8a94a2">of the run each machine was working</span></div>`
+          : `<div style="font-size:19px;color:#e6e9ef;font-weight:600">${(billedMs / 3600000).toFixed(2)} <span style="font-size:12px;font-weight:400;color:#8a94a2">vCPU-h billed</span></div>`}
+        ${(!local && cpuS > 0) ? `<div style="font-size:13px;color:#e6e9ef" title="CPU seconds actually burned by ffmpeg, over vCPU-seconds rented. Containers run at ~99% of their reserved vCPU, so the shortfall is fleet idle — boot, image pull, the fan-in wait and the scale-down tail — not slack inside a job.">${effPct.toFixed(0)}% <span style="color:#8a94a2">efficient</span> <span style="color:#6f7887">(${(cpuS / 3600).toFixed(2)} vCPU-h of real CPU)</span></div>` : ''}
+        <div style="font-size:13px;color:${IDLE}">${local
+          ? `${fmt(wasteMs)} of machine-time idle between jobs`
+          : `${(wasteMs / 3600000).toFixed(2)} vCPU-h (${wastePctAll}%) with no job at all`}</div>
+      </div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;font-size:10.5px;color:#8a94a2;margin-bottom:10px;align-items:center">
+        <span style="color:#6f7887">${local ? 'machine:' : 'paying:'}</span>
+        ${key('#4a90d9', 'encoding (host colour)')}
+        ${key(BOOT, 'booting / pulling image', stripes)}
+        ${key(IDLE, local ? '<b style="color:#c58b82">idle</b>' : '<b style="color:#c58b82">rented, no job</b>')}
+        ${local ? '' : `<span style="color:#6f7887;margin-left:6px">not paying:</span>
+        ${key(TRACK, 'not launched / terminated', 'border:1px solid #2a303c')}
+        <span style="display:inline-flex;align-items:center;gap:5px"><i style="width:2px;height:12px;background:#e6e9ef"></i>billing stops</span>`}
+      </div>
+      <div style="display:flex;flex-direction:column;gap:5px">${rows}</div>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
+        <div style="width:184px;flex:none"></div><div style="width:62px;flex:none"></div>
+        <div style="position:relative;flex:1;height:14px">${ticks}</div>
+        <div style="width:196px;flex:none"></div>
+      </div>
+      <div style="margin-top:9px;font-size:11px;color:#8a94a2;display:flex;gap:18px;flex-wrap:wrap;font-variant-numeric:tabular-nums">
+        <span>of which — cold start <b style="color:${BOOT}">${(coldMs / 3600000).toFixed(2)}</b></span>
+        <span>mid-run gaps <b style="color:#c58b82">${(gapMs / 3600000).toFixed(2)}</b> across ${gapN}</span>
+        <span>after last job <b style="color:${IDLE}">${(tailMs / 3600000).toFixed(2)}</b></span>
+        <span>idle&nbsp;&rarr;&nbsp;freed ${freedTxt}</span>
+      </div>
+    </div>`;
+}
+
+// The timeline is drawn from job STAGES, which arrive on the SSE stream, but it
+// used to be rendered only by renderFleet — which runs on the AWS inventory
+// poll, every 10s. So a chart whose data was already current visibly trailed the
+// chunk grid beside it by up to a poll. Redraw it on the job stream instead, and
+// let the inventory keep its own slower cadence for the rows above.
+function refreshFleetLanes() {
+    // Two framings share this class — the cloud panel bills, the local panel
+    // reports utilisation — so each container is rebuilt for the fleet it sits
+    // in rather than handed one shared string.
+    const byLocal = { false: null, true: null };
+    document.querySelectorAll('.fleet-lanes').forEach(el => {
+        const isLocal = !!el.closest('#jobs-local-fleet-panel');
+        const k = String(isLocal);
+        if (byLocal[k] === null) byLocal[k] = _fleetLanesHtml({ local: isLocal });
+        if (el.innerHTML !== byLocal[k]) el.innerHTML = byLocal[k];
+    });
+}
+
 function renderFleet(fleet, instances) {
     _lastFleet = { fleet, instances };
+    _recordFleetLanes(instances);
     // Oldest box first, by launch time. The inventory returns instances in
     // whatever order EC2 hands them back, which is arbitrary and free to change
     // between polls — so a box you were watching jumped position for no reason.
@@ -3690,7 +4120,12 @@ function renderFleet(fleet, instances) {
     // Build the full panel once, then render it into both the AWS tab and the
     // Jobs-page Fleet panel.
     let panelHtml;
+    const lanesHtml = _fleetLanesHtml();
     if (!running.length && !total) {
+        // Keep the timeline when the fleet is gone. The instant every box is
+        // released is exactly when "how long did they sit idle before being
+        // freed" becomes answerable, and blanking the panel would throw the
+        // answer away at the moment it arrives.
         panelHtml = '<div class="aws-empty">No active fleet.</div>';
     } else {
         const bar = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
@@ -3709,6 +4144,15 @@ function renderFleet(fleet, instances) {
         const rows = running.map(i => _fleetInstanceRow(i, maxV)).join('');
         panelHtml = bar + _fleetSparks(fleet) + note + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
     }
+    // Appended in BOTH branches, including "No active fleet": the timeline is
+    // most useful once the boxes are gone, because that is when idle -> freed
+    // becomes measurable at all.
+    //
+    // Wrapped in a class, not an id — this same HTML is injected into two
+    // containers (the AWS tab and the Jobs panel), so an id would be duplicated.
+    // The wrapper lets refreshFleetLanes() redraw just the timeline without
+    // rebuilding the instance rows above it.
+    panelHtml += `<div class="fleet-lanes">${lanesHtml}</div>`;
 
     const el = document.getElementById('aws-fleet');
     if (el) el.innerHTML = panelHtml;
@@ -3980,7 +4424,19 @@ function renderLocalFleet() {
     // (authoritative, from Temporal's pending activities). Show machines reporting
     // fresh CPU (i.e. actively encoding).
     const fresh = (_distMachines.fleet || []).filter(f => (f.age_s != null ? f.age_s : 1e9) < 30);
-    if (!fresh.length) { panel.style.display = 'none'; return; }
+    if (!fresh.length) {
+        // No machine reporting fresh CPU — but a just-finished run still has a
+        // timeline worth reading, and that is exactly when you want it. Keep the
+        // panel up for the lanes alone; hide it only when there is nothing.
+        const lanes = _fleetLanesHtml({ local: true });
+        if (lanes) {
+            panel.style.display = '';
+            el.innerHTML = `<div class="fleet-lanes">${lanes}</div>`;
+        } else {
+            panel.style.display = 'none';
+        }
+        return;
+    }
     const insts = fresh.slice().sort((a, b) => a.machine.localeCompare(b.machine)).map(f => ({
         machine: f.machine, cores: f.perf || 0, latest: f.latest || 0,
         cw: f.history || [], age: f.age_s || 0, chunks: f.chunks || [],
@@ -4002,7 +4458,12 @@ function renderLocalFleet() {
       </div>`;
     const rows = insts.map(i => _localFleetRow(i, maxCores)).join('');
     panel.style.display = '';
-    el.innerHTML = bar + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`;
+    // Machine timeline for the farm (same lanes, owned-machine framing). Three
+    // boxes make it MORE readable than the cloud's nine, and it answers the
+    // question the live rows above cannot: not "who is busy now" but "who sat
+    // idle while another machine was the tail".
+    el.innerHTML = bar + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`
+        + `<div class="fleet-lanes">${_fleetLanesHtml({ local: true })}</div>`;
     const ls = document.getElementById('local-fleet-summary');
     if (ls) ls.textContent = `${usedCores}/${totalCores} cores · ${totalChunks} chunk${totalChunks !== 1 ? 's' : ''} · ${insts.length} machine${insts.length > 1 ? 's' : ''}`;
     // Local metrics tiles live in THIS panel (not the cloud one). Their own

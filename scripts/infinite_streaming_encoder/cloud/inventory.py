@@ -172,7 +172,36 @@ def _instance_view(ec2, instance: dict) -> dict[str, Any]:
         "availability_zone": instance.get("Placement", {}).get("AvailabilityZone"),
         "subnet": instance.get("SubnetId"),
         "estimated_hourly_usd": round(hourly, 4),
+        # When billing stopped. This call already returns terminated instances
+        # (see _describe_app_instances) but reported no end time, so the only
+        # way a client could tell a box had been released was to notice it stop
+        # appearing — which it never does here, and which is inference by
+        # absence in any case. The UI's machine timeline needs it live, not at
+        # end-of-run when the orchestrator's rental summary finally lands.
+        "terminated_at": _terminated_at(instance),
     }
+
+
+def _terminated_at(instance: dict) -> str | None:
+    """Termination time, ISO, or None while the instance is alive.
+
+    EC2 has no structured field for this — it is embedded in the human-readable
+    StateTransitionReason, e.g. "User initiated (2026-08-03 13:16:10 GMT)". The
+    orchestrator's rental table parses the same string; this is the live half of
+    the same fact.
+    """
+    if instance.get("State", {}).get("Name") not in ("terminated", "shutting-down"):
+        return None
+    reason = instance.get("StateTransitionReason", "") or ""
+    if "(" not in reason or ")" not in reason:
+        return None
+    try:
+        return datetime.strptime(
+            reason[reason.index("(") + 1:reason.index(")")],
+            "%Y-%m-%d %H:%M:%S %Z",
+        ).replace(tzinfo=timezone.utc).isoformat()
+    except ValueError:
+        return None
 
 
 def _volume_view(volume: dict) -> dict[str, Any]:
