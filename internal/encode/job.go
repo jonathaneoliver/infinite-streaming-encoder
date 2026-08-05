@@ -905,9 +905,10 @@ type JobConfig struct {
 	ForceReencode bool   `json:"force_reencode"`
 	// SkipMediaDownload leaves a cloud run's segments in S3 and brings back only
 	// manifests and metadata — ~4 MB instead of ~2.6 GB (#214). Egress is billed
-	// per GB past a 100 GB/month allowance and was 3x the compute on the 1-3 Aug
-	// bill; during iteration almost every downloaded ladder is superseded within
-	// hours. Fetch the media later from the Outputs tab.
+	// per GB and was 3x the compute on the 1-3 Aug bill; during iteration almost
+	// every downloaded ladder is superseded within hours. Fetch the media later
+	// from the Outputs tab. Costed at EgressUSDPerGB with no free-tier discount,
+	// so the saving is the same figure on any day of the month.
 	//
 	// A pointer so nil means "use the server default" (SKIP_OUTPUT_MEDIA), and an
 	// explicit true/false from the client wins. Cloud-batch only — the local and

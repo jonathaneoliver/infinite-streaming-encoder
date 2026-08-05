@@ -2083,10 +2083,13 @@ function _outputActions(d) {
         return `<span class="btn-fetch disabled" title="S3 staging expired ${escapeAttr(d.remote.expires_at)}; the media is gone and cannot be fetched">&#10007;</span>`;
     }
     if (d.remote) {
-        // Show the cost before the click: egress is ~$0.09/GB past the monthly
-        // 100 GB allowance, so a full ladder is real money, not a free button.
+        // Show the cost before the click — a full ladder is real money, not a
+        // free button. Priced at the flat marginal rate from the server; the
+        // monthly free allowance is deliberately not modelled, so the same
+        // ladder quotes the same number on any day of the month.
         const gb = (d.remote.pending_bytes || 0) / 1e9;
-        const cost = gb > 0.01 ? ` (~$${(gb * 0.09).toFixed(2)} egress)` : '';
+        const usd = gb * _egressUsdPerGb;
+        const cost = usd >= 0.005 ? ` (~$${usd.toFixed(2)} egress)` : '';
         return `<span class="btn-fetch" onclick="event.stopPropagation(); fetchOutput('${n}', this)"
                       title="Download ${formatSize(d.remote.pending_bytes)} from S3${cost}. Expires ${escapeAttr(d.remote.expires_at)}">&#11015;</span>`;
     }
@@ -4721,11 +4724,18 @@ function _renderWatcher(enabled) {
         st.style.color = enabled ? '#6ab04c' : '#666';
     }
 }
+// S3 egress rate, $/GB, from the server (encode.EgressUSDPerGB). Held here so
+// the Download button can price a fetch before it happens. 0 until settings
+// load, which reads as "no estimate" rather than "free".
+let _egressUsdPerGb = 0;
+
 async function loadSettings() {
     try {
         const res = await fetch('/api/settings');
         if (!res.ok) return;
-        _renderWatcher((await res.json()).watcher_enabled);
+        const s = await res.json();
+        _renderWatcher(s.watcher_enabled);
+        if (typeof s.egress_usd_per_gb === 'number') _egressUsdPerGb = s.egress_usd_per_gb;
     } catch (e) { /* leave unchecked */ }
 }
 async function setWatcher(enabled) {

@@ -2221,8 +2221,10 @@ def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "",
 
     include_media=False fetches METADATA ONLY — everything except _MEDIA_SUFFIXES.
     Measured at 3.99 MB of a 2.63 GB output dir (0.151%), which is the point: S3
-    egress is billed per GB past a 100 GB/month allowance and was 3x the compute
-    on the 1-3 Aug bill. The directory LAYOUT is preserved either way, so
+    egress is billed per GB and was 3x the compute on the 1-3 Aug bill. (Costing
+    treats every GB as billable — the monthly free allowance is not modelled, so
+    a run's cost does not depend on the date.) The directory LAYOUT is preserved
+    either way, so
     parseOutputMeta still infers resolutions from subdirectory existence and the
     run lists normally in the Outputs tab. Fetch the media later with
     `cli_batch.py fetch`."""

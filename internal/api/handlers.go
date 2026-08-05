@@ -347,8 +347,28 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 
 // getSettings returns the persisted global settings (currently just the
 // watcher on/off toggle).
+// settingsResponse is the persisted Settings plus read-only server facts the UI
+// needs but must not own a copy of. Rates live here rather than in Settings
+// because they are constants, not preferences — persisting them would let a
+// stale settings.json outlive a price change.
+type settingsResponse struct {
+	encode.Settings
+	// EgressUSDPerGB prices the Outputs tab's Download button. Sent rather than
+	// hardcoded in the page: #217 exists because three copies of a rate drifted
+	// apart, and the UI must not become a fourth. Free tier is deliberately not
+	// modelled — see encode.EgressUSDPerGB.
+	EgressUSDPerGB float64 `json:"egress_usd_per_gb"`
+}
+
+func (s *Server) settingsPayload() settingsResponse {
+	return settingsResponse{
+		Settings:       s.Manager.Settings(),
+		EgressUSDPerGB: encode.EgressUSDPerGB,
+	}
+}
+
 func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, s.Manager.Settings())
+	writeJSON(w, s.settingsPayload())
 }
 
 // putSettings applies a partial settings update. Only fields present in the
@@ -365,7 +385,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	if body.WatcherEnabled != nil {
 		s.Manager.SetWatcherEnabled(*body.WatcherEnabled)
 	}
-	writeJSON(w, s.Manager.Settings())
+	writeJSON(w, s.settingsPayload())
 }
 
 func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
