@@ -358,12 +358,18 @@ type settingsResponse struct {
 	// apart, and the UI must not become a fourth. Free tier is deliberately not
 	// modelled — see encode.EgressUSDPerGB.
 	EgressUSDPerGB float64 `json:"egress_usd_per_gb"`
+	// SkipMediaDownloadDefault seeds the encode form's checkbox from
+	// SKIP_OUTPUT_MEDIA, so the box shows what would actually happen rather than
+	// a guess. Without this the server default is unreachable from the UI and
+	// the two can disagree silently.
+	SkipMediaDownloadDefault bool `json:"skip_media_download_default"`
 }
 
 func (s *Server) settingsPayload() settingsResponse {
 	return settingsResponse{
-		Settings:       s.Manager.Settings(),
-		EgressUSDPerGB: encode.EgressUSDPerGB,
+		Settings:                 s.Manager.Settings(),
+		EgressUSDPerGB:           encode.EgressUSDPerGB,
+		SkipMediaDownloadDefault: encode.SkipMediaDownloadDefault,
 	}
 }
 

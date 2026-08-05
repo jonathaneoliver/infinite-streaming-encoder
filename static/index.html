@@ -443,6 +443,11 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group" id="spot-group" style="display:none;align-self:center;padding-top:16px">
                 <label title="Spot is ~2.6× cheaper but AWS can reclaim with 2 min notice. Uncheck to use on-demand (guaranteed, no interruption)."><input type="checkbox" id="use-spot" checked style="width:auto;min-width:auto"> Use spot (cheaper)</label>
             </div>
+            <!-- #214. Cloud only: local and local-dist write straight to disk, so
+                 there is no egress to avoid and the box would be a no-op. -->
+            <div class="control-group" id="skip-media-group" style="display:none;align-self:center;padding-top:16px">
+                <label title="Bring back manifests and metadata only (~4 MB instead of ~2.6 GB), leaving the segments in S3. Egress is billed per GB and is roughly 3× the compute for a run. Download any output you want to keep from the Outputs tab — but within 7 days, after which S3 staging expires and the media is gone."><input type="checkbox" id="skip-media" style="width:auto;min-width:auto"> Leave media in S3 (fetch on demand)</label>
+            </div>
             <div class="control-group">
                 <label>Codec</label>
                 <div id="codec" class="codec-checks">
@@ -1784,8 +1789,7 @@ function renderSources() {
 
 function onTargetChange() {
     const target = document.getElementById('target').value;
-    // "cloud-batch" is accepted as an alias for "cloud" (old links/state).
-    const isAnyCloud = target === 'cloud' || target === 'cloud-batch';
+    const isAnyCloud = isAnyCloudTarget(target);
     document.getElementById('cloud-warning').style.display =
         isAnyCloud ? 'block' : 'none';
     // Chunk granularity applies to BOTH local (Temporal) and cloud (AWS Batch).
@@ -1796,6 +1800,10 @@ function onTargetChange() {
         const el = document.getElementById(id);
         if (el) el.style.display = 'none';
     }
+    // #214 — cloud only. Local targets write to disk directly; there is no
+    // egress to skip, so offering the choice there would be misleading.
+    const skipGroup = document.getElementById('skip-media-group');
+    if (skipGroup) skipGroup.style.display = isAnyCloud ? 'flex' : 'none';
 }
 
 // Before submitting a cloud encode, peek at the AWS inventory. If
@@ -1884,6 +1892,13 @@ async function startEncode(force = false) {
         burnin: document.getElementById('burnin').checked,
         promote: document.getElementById('promote-after').checked
     };
+    // #214 — send only for cloud targets. The server field is a *bool, so
+    // OMITTING it means "use the SKIP_OUTPUT_MEDIA default"; sending false on a
+    // local run would look like a deliberate opt-out of something that does not
+    // apply there.
+    if (isAnyCloudTarget(target)) {
+        body.skip_media_download = document.getElementById('skip-media').checked;
+    }
 
     try {
         const res = await fetch('/api/encode', {
@@ -2302,6 +2317,10 @@ function _jobConfigHtml(c) {
     if (c.hevc_single_pass) chips.push(chip('hevc', '1-pass'));
     if (c.chunk_duration) chips.push(chip('chunk', /^\d+$/.test(c.chunk_duration) ? c.chunk_duration + 's' : c.chunk_duration));
     if (c.cpu_arch && (c.target === 'cloud' || c.target === 'cloud-batch')) chips.push(chip('cpu', c.cpu_arch));
+    // #214 — worth surfacing on the RUNNING job, not just afterwards on the
+    // output: this is the difference between a finished encode you can play and
+    // one whose media is still in S3 on a 7-day clock.
+    if (c.skip_media_download) chips.push(chip('media', 'stays in S3', '#e9c46a'));
     if (c.padding) chips.push(chip('padding', c.padding));
     if (c.time) chips.push(chip('time', c.time));
     if (c.force_reencode) chips.push(chip('force', 're-encode', '#d0883a'));
@@ -5185,6 +5204,11 @@ function _renderWatcher(enabled) {
         st.style.color = enabled ? '#6ab04c' : '#666';
     }
 }
+// "cloud-batch" is accepted as an alias for "cloud" (old links/state). Shared so
+// the form's cloud-only controls and the submit payload cannot disagree about
+// what counts as a cloud target.
+function isAnyCloudTarget(t) { return t === 'cloud' || t === 'cloud-batch'; }
+
 // S3 egress rate, $/GB, from the server (encode.EgressUSDPerGB). Held here so
 // the Download button can price a fetch before it happens. 0 until settings
 // load, which reads as "no estimate" rather than "free".
@@ -5197,6 +5221,11 @@ async function loadSettings() {
         const s = await res.json();
         _renderWatcher(s.watcher_enabled);
         if (typeof s.egress_usd_per_gb === 'number') _egressUsdPerGb = s.egress_usd_per_gb;
+        // Seed from SKIP_OUTPUT_MEDIA so the box shows what would actually
+        // happen. Leaving it always-unchecked while the server default was on
+        // would make the form lie about the run it is about to start.
+        const skip = document.getElementById('skip-media');
+        if (skip) skip.checked = !!s.skip_media_download_default;
     } catch (e) { /* leave unchecked */ }
 }
 async function setWatcher(enabled) {
