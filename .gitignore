@@ -22,3 +22,8 @@ __pycache__/
 .claude/worktrees/
 # untracked comparison doc — never commit
 ENCODER_COMPARISON.md
+
+# Screenshots taken while debugging the UI — the browser tool writes these
+# into the repo root when no output dir is given.
+fleet-lanes.png
+*.playwright.png

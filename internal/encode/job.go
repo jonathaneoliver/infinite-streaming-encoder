@@ -201,6 +201,17 @@ var (
 	// the boot, image pull and scale-down tail that a job-derived cost figure
 	// cannot see (#195). Captured so the per-output stats can show it.
 	machinesMarkerRe = regexp.MustCompile(`^\[\[ENCODER-MACHINES exec=(\S+) instances=(\d+) machine_vcpu_h=([0-9.]+) allocated_vcpu_h=([0-9.]+) unallocated_pct=([0-9.]+)\]\]$`)
+	// ENCODER-RENTAL is the per-instance detail behind ENCODER-MACHINES: exact
+	// launch and termination for one box. The aggregate says 41% of the fleet was
+	// rented-and-unallocated; this says which box and when, which is what the UI
+	// needs to place lanes on a shared time axis.
+	//
+	// `end` is the load-bearing field. It is the one fact the browser cannot get
+	// for itself — /api/aws/inventory drops terminated instances and is cached,
+	// so a client can only infer "freed" from a box ceasing to appear, and that
+	// inference billed six phantom minutes against machines EC2 had already
+	// reclaimed. alive=1 means end is "as of now" and will grow.
+	rentalMarkerRe = regexp.MustCompile(`^\[\[ENCODER-RENTAL exec=(\S+) id=(\S+) type=(\S+) vcpu=(\d+) launch=(\d+) end=(\d+) first_job=(\d+) last_job=(\d+) alive=([01]) chunks=(\d+)\]\]$`)
 	// ENCODER-FLEET reports one distributed-local worker box's live CPU: busy =
 	// logical cores currently busy (from /proc/stat), perf = its perf-core target
 	// (4/4/8). Emitted by cli_local_dist from the workers' Temporal heartbeats,
@@ -660,6 +671,37 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Unlock()
 		return true
 	}
+	if m := rentalMarkerRe.FindStringSubmatch(line); m != nil {
+		vcpu, _ := strconv.Atoi(m[4])
+		launch, _ := strconv.ParseInt(m[5], 10, 64)
+		end, _ := strconv.ParseInt(m[6], 10, 64)
+		firstJob, _ := strconv.ParseInt(m[7], 10, 64)
+		lastJob, _ := strconv.ParseInt(m[8], 10, 64)
+		chunks, _ := strconv.Atoi(m[10])
+		row := MachineRental{
+			ID: m[2], Type: m[3], VCPUs: vcpu,
+			LaunchedAt: launch, EndedAt: end,
+			FirstJobAt: firstJob, LastJobAt: lastJob,
+			Alive: m[9] == "1", Chunks: chunks,
+		}
+		j.mu.Lock()
+		// Re-emitted on every rental summary as a run progresses, so replace the
+		// row for this instance rather than appending a duplicate with a stale
+		// end time.
+		replaced := false
+		for i := range j.Rentals {
+			if j.Rentals[i].ID == row.ID {
+				j.Rentals[i] = row
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			j.Rentals = append(j.Rentals, row)
+		}
+		j.mu.Unlock()
+		return true
+	}
 	if m := statsMarkerRe.FindStringSubmatch(line); m != nil {
 		wall, _ := strconv.ParseFloat(m[2], 64)
 		vcpuH, _ := strconv.ParseFloat(m[3], 64)
@@ -945,6 +987,30 @@ type JobConfig struct {
 	UseSpot *bool `json:"use_spot,omitempty"`
 }
 
+// MachineRental is one instance's slice of a cloud run: which box, how big, and
+// the two instants that bound what you were charged for. Times are unix seconds,
+// matching the marker; the UI converts.
+//
+// Alive means EndedAt is "as of the last rental summary" rather than a real
+// termination, so it will grow. That distinction has to survive to the client:
+// treating an un-terminated box as billing up to the present is how a timeline
+// ends up charging for machines EC2 has already reclaimed.
+type MachineRental struct {
+	ID         string `json:"id"`
+	Type       string `json:"type"`
+	VCPUs      int    `json:"vcpus"`
+	LaunchedAt int64  `json:"launched_at"`
+	EndedAt    int64  `json:"ended_at"`
+	// When Batch work began and ended on this box — NOT the first/last stage.
+	// A job outlives its stage: pkgall's stages total 73s against a 177s job,
+	// the remainder being the parallel fetch and the packaged-output upload.
+	// A timeline drawn from stages alone paints that as idle.
+	FirstJobAt int64 `json:"first_job_at,omitempty"`
+	LastJobAt  int64 `json:"last_job_at,omitempty"`
+	Alive      bool  `json:"alive,omitempty"`
+	Chunks     int   `json:"chunks,omitempty"`
+}
+
 type StageProgress struct {
 	Key     string  `json:"key"`
 	Label   string  `json:"label"`
@@ -1055,9 +1121,16 @@ type Job struct {
 	AllocatedVCPUHours float64 `json:"allocated_vcpu_hours,omitempty"`
 	IdlePct            float64 `json:"idle_pct,omitempty"`
 	Instances          int     `json:"instances,omitempty"`
-	SpotUSD            float64 `json:"spot_usd,omitempty"`
-	OnDemandUSD        float64 `json:"ondemand_usd,omitempty"`
-	SavedUSD           float64 `json:"saved_usd,omitempty"`
+	// Rentals is the per-instance detail behind those aggregates (ENCODER-RENTAL):
+	// which box, and exactly when it appeared and went away. The UI's machine
+	// timeline needs absolute launch/end to place lanes on a shared axis — a
+	// lifetime alone cannot say when a box appeared relative to the others, and
+	// the browser cannot source termination for itself (the inventory endpoint
+	// drops terminated instances and is cached).
+	Rentals     []MachineRental `json:"rentals,omitempty"`
+	SpotUSD     float64         `json:"spot_usd,omitempty"`
+	OnDemandUSD float64         `json:"ondemand_usd,omitempty"`
+	SavedUSD    float64         `json:"saved_usd,omitempty"`
 	// CommercialUSD / MediaConvertUSD are what this job's output ladder would have
 	// cost on hosted transcoders (a generic commercial cloud encoder, and AWS
 	// MediaConvert) — comparison baselines against our own spot/local cost. Both
@@ -3639,7 +3712,10 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	}
 	sort.SliceStable(order, func(a, b int) bool { return scores[order[a]] > scores[order[b]] })
 	for rank, vi := range order {
-		within := 999 - rank
+		// 998, not 999: the top of the band is reserved for audio (see
+		// prio_audio). Ranks stay strictly decreasing and a ladder has <= ~40
+		// variants, so nothing collides.
+		within := 998 - rank
 		if within < 1 {
 			within = 1
 		}
@@ -3686,8 +3762,21 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		// Banded priorities for the fixed phases (chunks carry their own banded
 		// priority per variant). Keeps a job's whole pipeline in one band so an
 		// earlier job's package isn't starved by a later job's chunks.
-		"prio_mezz":  clampPrio(priorityBase + 99),
-		"prio_audio": clampPrio(priorityBase + 55),
+		"prio_mezz": clampPrio(priorityBase + 99),
+		// Audio outranks every variant, and has to.
+		//
+		// It runs in the same FanOut Parallel as the Variants map, so packaging
+		// cannot start until BOTH finish — but at base+55 it sat below all 336
+		// chunk jobs and was placed near the end. Measured on run
+		// 1785781612611: the last chunk container stopped at 18:34:26.969 and
+		// audio, an ~11s job with no dependency on any chunk, stopped at
+		// 18:34:33.224. Six seconds of a 42.9s fan-in gap spent waiting for a
+		// job that could have run at the very start.
+		//
+		// It is one small job per run, so promoting it above the ladder costs
+		// the heaviest variant a few seconds of queue position at most, and buys
+		// that back many times over by removing audio from the critical path.
+		"prio_audio": clampPrio(priorityBase + 999),
 		"prio_pkg":   clampPrio(priorityBase + 45),
 		// NOTE: two_pass + chunk_* are per-variant now (see the variant struct),
 		// not top-level — variants differ in codec/pass AND chunk length.

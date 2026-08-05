@@ -143,6 +143,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build, to
 	printf '  py machinerent '; \
 	if out=$$(python3 scripts/test_machine_rental.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py diststate   '; \
+	if out=$$(python3 scripts/test_dist_stage_state.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py mezzcache   '; \
 	if out=$$(python3 scripts/test_mezz_cache.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
@@ -705,6 +708,27 @@ cloud-check:          ## live cloud readiness: AWS creds + state machine + S3 bu
 	  && echo "  ok: state machine live" || { echo "  FAIL: STATE_MACHINE_ARN not reachable — run cloud-up"; exit 1; }
 	@aws s3api head-bucket --bucket "$(S3_BUCKET)" 2>/dev/null \
 	  && echo "  ok: S3 bucket $(S3_BUCKET) reachable" || { echo "  FAIL: S3_BUCKET '$(S3_BUCKET)' not reachable"; exit 1; }
+	@# minScaleDownDelayMinutes is how long Batch holds an idle instance before it
+	@# is eligible for scale-in. At 0 the fleet is released as soon as Batch's own
+	@# evaluation loop notices — measured at 70-77s after the queue drains, with
+	@# ~88 vCPU idle across that window. At the alternative extreme it would be
+	@# ~10 minutes of FULL-FLEET rental per run, several times the run's entire
+	@# encode cost, and completely invisible: every job would still succeed.
+	@#
+	@# It is asserted rather than pinned because aws_batch_compute_environment in
+	@# provider 6.56 has no scaling_policy block — compute_resources accepts only
+	@# ec2_configuration and launch_template. So Terraform cannot express it, and
+	@# a console edit or a future provider default could move it with nothing to
+	@# catch it. Drop this check once the provider gains the block and pin it.
+	@d=$$(aws batch describe-compute-environments --region $(AWS_REGION) \
+	    --query 'computeEnvironments[0].computeResources.scalingPolicy.minScaleDownDelayMinutes' \
+	    --output text 2>/dev/null); \
+	  if [ "$$d" = "0" ] || [ "$$d" = "None" ] || [ -z "$$d" ]; then \
+	    echo "  ok: Batch scale-down delay 0 (no artificial hold on idle instances)"; \
+	  else \
+	    echo "  WARN: Batch minScaleDownDelayMinutes=$$d — every run pays $$d min of"; \
+	    echo "        full-fleet idle rental. Expected 0; set it back on the compute env."; \
+	  fi
 
 # Deploy stops at the plan on purpose — review it, then run `make infra-apply`.
 # (Keeping preview and apply as separate, deliberate steps for live IaC.)
