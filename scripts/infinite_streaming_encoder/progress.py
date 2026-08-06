@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -176,6 +177,100 @@ def emit_fleet_cpu() -> None:
     _FLEET_PREV["emitted"] = now
     emit(f"[[ENCODER-FLEET machine={machine} busy={busy:.2f} "
          f"perf={os.cpu_count() or 0}]]")
+
+
+_FFMPEG_EMITTED = False
+
+
+def emit_ffmpeg_version() -> None:
+    """Report the ffmpeg this process will actually encode with.
+
+    The image tracks BtbN's rolling `latest` rather than a dated autobuild —
+    dated pins get pruned upstream and break every build (see the Dockerfile).
+    The reproducibility that a pin was buying is bought back here instead: the
+    version is recorded per encode, so "which ffmpeg made this?" is answered by
+    the artifact rather than inferred from a Dockerfile line that has since
+    moved.
+
+    Asks the BINARY, not /app/ffmpeg-version.txt: the file records what the
+    image was built with, this records what is actually on PATH and running. A
+    bind-mount, a PATH change or a hand-patched container makes those differ,
+    and the one that produced the pixels is the true answer.
+
+    Emitted from the worker that runs the encode, not the orchestrator — on
+    cloud-batch those can be different images if tags have drifted. Once per
+    process; the phase entry points call it on every chunk.
+    """
+    global _FFMPEG_EMITTED
+    if _FFMPEG_EMITTED:
+        return
+    _FFMPEG_EMITTED = True
+    import subprocess
+    try:
+        out = subprocess.run(["ffmpeg", "-version"], capture_output=True,
+                             text=True, timeout=10)
+        line = (out.stdout or "").splitlines()[0].strip()
+    except Exception:  # noqa: BLE001 — no ffmpeg on PATH, or it hung
+        return
+    if not line:
+        return
+    # "ffmpeg version N-125978-g95c43d7df7-20260806 Copyright (c) ..." — keep the
+    # build id, drop the copyright tail. It is the same on every build, so it is
+    # pure noise in a field that lands in every output's encode.json.
+    m = re.match(r"ffmpeg version (\S+)", line)
+    emit(f"[[ENCODER-FFMPEG version={m.group(1) if m else line}]]")
+
+
+# Our codec name -> (ffmpeg encoder, regex capturing the library version from
+# the encoder's own init banner).
+#
+# x264 is ABSENT ON PURPOSE and the gap is real: unlike x265 and SVT-AV1 it
+# prints no version at init. Its core number is written only into the bitstream
+# SEI, so reading it back needs a produced file and a parse — machinery out of
+# proportion to the answer. For h264 the ffmpeg build (ENCODER-FFMPEG) is the
+# proxy: a given BtbN build bundles a fixed x264, so the build ID pins it even
+# though it does not name it. Recorded as such rather than left to look like an
+# oversight; see encode.json's codec_libs.
+_CODEC_LIBS = {
+    "hevc": ("libx265", re.compile(r"HEVC encoder version (\S+)")),
+    "av1": ("libsvtav1", re.compile(r"SVT-AV1 Encoder Lib v(\S+)")),
+}
+_CODEC_LIB_EMITTED: set[str] = set()
+
+
+def emit_codec_lib(codec: str) -> None:
+    """Report the ENCODER LIBRARY version for this codec, not just ffmpeg's.
+
+    `ffmpeg -version` names libx264/libx265/libsvtav1 but carries no version for
+    any of them, and the library is what actually determines the bitstream. An
+    x265 bump under a static ffmpeg build changes HEVC output while every
+    recorded version stays identical — precisely the confound the VMAF curve and
+    ladder work cannot absorb.
+
+    Probes with a one-frame nullsrc encode (~50ms, once per codec per process)
+    rather than scraping the real encode's stderr, because that stderr is
+    deliberately inherited so live `-stats` keeps flowing to the log viewer;
+    capturing it to parse a banner would change that behaviour.
+    """
+    if codec in _CODEC_LIB_EMITTED:
+        return
+    _CODEC_LIB_EMITTED.add(codec)
+    spec = _CODEC_LIBS.get(codec)
+    if spec is None:
+        return   # h264 — see _CODEC_LIBS
+    encoder, pat = spec
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "info",
+             "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.04",
+             "-c:v", encoder, "-frames:v", "1", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=30)
+    except Exception:  # noqa: BLE001 — encoder missing, or the probe hung
+        return
+    m = pat.search((out.stderr or "") + (out.stdout or ""))
+    if m:
+        emit(f"[[ENCODER-CODECLIB codec={codec} lib={encoder} version={m.group(1)}]]")
 
 
 def emit_boot_ami() -> None:

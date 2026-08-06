@@ -37,10 +37,22 @@ type encodeMeta struct {
 	// Burnin records the text-overlay toggle only when it DEVIATES from the
 	// default (on): a pointer left nil when burn-in was on, so existing outputs'
 	// encode.json is byte-unchanged; set to &false when the overlay was disabled.
-	Burnin    *bool      `json:"burnin,omitempty"`
-	Source    string     `json:"source,omitempty"`
-	EncodedAt string     `json:"encoded_at"`
-	Rungs     []metaRung `json:"rungs,omitempty"`
+	Burnin    *bool  `json:"burnin,omitempty"`
+	Source    string `json:"source,omitempty"`
+	EncodedAt string `json:"encoded_at"`
+	// What encoded this. FfmpegVersion is the build id; CodecLibs maps codec ->
+	// encoder library ("hevc" -> "libx265 4.2+37-b81f650e"). Recorded because
+	// the image tracks ffmpeg's rolling `latest`, so the Dockerfile no longer
+	// names a version — and because the LIBRARY, not ffmpeg, determines the
+	// bitstream: an x265 bump under a static ffmpeg changes HEVC output while
+	// every other version string stays put.
+	//
+	// h264 is absent from CodecLibs by design — libx264 prints no version at
+	// init and its core lives only in the bitstream SEI. FfmpegVersion is the
+	// proxy for it. Absent != unrecorded.
+	FfmpegVersion string            `json:"ffmpeg_version,omitempty"`
+	CodecLibs     map[string]string `json:"codec_libs,omitempty"`
+	Rungs         []metaRung        `json:"rungs,omitempty"`
 }
 
 type metaRung struct {
@@ -57,7 +69,7 @@ func (m *Manager) writeEncodeMetaForDirs(job *Job, dirs []string) {
 		if IsDatedBackup(name) || strings.HasPrefix(name, ".") {
 			continue
 		}
-		m.writeEncodeMeta(name, job.Config, job.Vmaf)
+		m.writeEncodeMeta(name, job.Config, job.Vmaf, job)
 	}
 }
 
@@ -81,7 +93,8 @@ func vmafForRung(vmaf map[string]*VmafScore, codec string, height int) float64 {
 	return 0
 }
 
-func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string]*VmafScore) {
+func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string]*VmafScore,
+	job *Job) {
 	dir := filepath.Join(m.OutputDir, dirName)
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 		return
@@ -163,6 +176,17 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 		EncodedAt:         time.Now().UTC().Format(time.RFC3339),
 		Rungs:             rungs,
 	}
+	if job != nil {
+		job.mu.Lock()
+		meta.FfmpegVersion = job.FfmpegVersion
+		// Record only THIS output's codec. A job encoding h264+hevc writes two
+		// dirs, and copying the whole map into both would claim each was made
+		// with a library that never touched it.
+		if v := job.CodecLibs[codec]; v != "" {
+			meta.CodecLibs = map[string]string{codec: v}
+		}
+		job.mu.Unlock()
+	}
 	if b, err := json.MarshalIndent(meta, "", "  "); err == nil {
 		_ = os.WriteFile(filepath.Join(dir, "encode.json"), b, 0644)
 	}
@@ -179,6 +203,14 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 	}
 	if !cfg.BurninEnabled() {
 		line += " burnin=off"
+	}
+	// Provenance in the manifest itself, so a bare output dir handed to someone
+	// else still answers "what encoded this?" without encode.json.
+	if meta.FfmpegVersion != "" {
+		line += " ffmpeg=" + meta.FfmpegVersion
+	}
+	if v := meta.CodecLibs[codec]; v != "" {
+		line += " lib=[" + v + "]"
 	}
 	injectM3U8Comment(filepath.Join(dir, "master.m3u8"), line)
 	injectMPDComment(filepath.Join(dir, "manifest.mpd"), line)

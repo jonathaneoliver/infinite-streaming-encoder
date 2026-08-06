@@ -23,7 +23,9 @@ from infinite_streaming_encoder.ladder import (
     DEFAULT_MAXRATE_PERCENT,
     Rung,
 )
-from infinite_streaming_encoder.progress import emit_stage, run_ffmpeg_with_progress
+from infinite_streaming_encoder.progress import (
+    emit_codec_lib, emit_ffmpeg_version, emit_stage,
+    run_ffmpeg_with_progress)
 
 
 def variant_stage_key(codec: str, label: str, chunk_index: int | None = None) -> str:
@@ -363,6 +365,11 @@ def encode_variant(
     encoding); the concat phase later joins the chunks into the whole
     `_variant_path`. Without it, encodes the whole clip as before.
     """
+    # The single choke point every path reaches — local, local-dist and each
+    # cloud worker — so recording the ffmpeg here covers all three without any
+    # orchestrator needing to remember. Self-throttling to once per process.
+    emit_ffmpeg_version()
+    emit_codec_lib(codec)
     target_kbps = rung.bitrate
 
     if chunk is None:

@@ -42,9 +42,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ffmpeg + ffprobe: PINNED static GPL build (BtbN), which ships a much newer
 # libx265 than Debian's apt package — measurably faster HEVC (see
 # infra/local-cluster/PERFORMANCE.md). Multi-arch; self-contained binaries.
-# Pinned (tag + build) for reproducible images; bump both to update.
-ARG FFMPEG_TAG=autobuild-2026-07-22-13-36
-ARG FFMPEG_BUILD=ffmpeg-N-125716-g1b1f602699
+# Deliberately the ROLLING `latest` release, not a dated autobuild.
+#
+# A dated pin rots: BtbN keeps only a rolling window and prunes older releases,
+# so the URL 404s after a few weeks. Worse, it does not fail when the asset
+# disappears — it fails at the next build that MISSES the docker layer cache,
+# which can be long after, and then blocks EVERY build including `make publish`
+# to :latest. autobuild-2026-07-22-13-36 broke exactly that way on 2026-08-06.
+#
+# The trade a pin was buying was reproducibility, and that is bought back a
+# better way: the version is RECORDED PER ENCODE rather than declared here.
+# `ffmpeg -version` is captured into /app/ffmpeg-version.txt at build time, the
+# encoder emits the version it actually ran with, and it lands in each output's
+# encode.json. So "which ffmpeg made this?" is answered by the artifact instead
+# of inferred from a Dockerfile line that may have moved since.
+#
+# Vendoring the tarball would remove the upstream dependency entirely; filed.
+ARG FFMPEG_TAG=latest
+ARG FFMPEG_BUILD=ffmpeg-master-latest
 RUN set -eux; \
     case "${TARGETARCH}" in \
         amd64) farch="linux64" ;; \
@@ -56,7 +71,13 @@ RUN set -eux; \
     mv /tmp/${FFMPEG_BUILD}-${farch}-gpl/bin/ffmpeg \
        /tmp/${FFMPEG_BUILD}-${farch}-gpl/bin/ffprobe /usr/local/bin/; \
     rm -rf /tmp/ffmpeg*; \
-    ffmpeg -version | head -1
+    ffmpeg -version | head -1; \
+    mkdir -p /app; \
+    ffmpeg -version | head -1 > /app/ffmpeg-version.txt
+# ^ Pin the ROLLING build's identity at the moment it was fetched. With
+# FFMPEG_TAG=latest the Dockerfile no longer names a version, so this file is
+# the only record of which ffmpeg is actually in this image. Read at run time
+# and copied into every output's encode.json.
 
 # AWS CLI v2 (multi-arch; official installer).
 RUN set -eux; \

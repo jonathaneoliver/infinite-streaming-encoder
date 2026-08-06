@@ -171,6 +171,17 @@ var (
 	// AMI) to flag whether the image was already resident — a definitive
 	// "AMI cache hit" signal for the UI, independent of timing.
 	bootMarkerRe = regexp.MustCompile(`^\[\[ENCODER-BOOT ami=(\S+)\]\]$`)
+	// ENCODER-FFMPEG / ENCODER-CODECLIB record WHAT ENCODED THIS, reported by the
+	// worker that actually ran ffmpeg. The image tracks BtbN's rolling `latest`
+	// (a dated pin gets pruned upstream and breaks every build), so the version is
+	// no longer knowable from the Dockerfile — it has to come from the run.
+	//
+	// CODECLIB is the one that matters for output: `ffmpeg -version` names
+	// libx264/libx265/libsvtav1 but versions none of them, and an x265 bump under
+	// a static ffmpeg build changes HEVC bitstreams while every other recorded
+	// version stays identical.
+	ffmpegMarkerRe   = regexp.MustCompile(`^\[\[ENCODER-FFMPEG version=(.+)\]\]$`)
+	codecLibMarkerRe = regexp.MustCompile(`^\[\[ENCODER-CODECLIB codec=(\S+) lib=(\S+) version=(\S+)\]\]$`)
 	// ENCODER-SPEED reports a completed encode's content-seconds vs wall-seconds
 	// so the control plane can learn each variant's speed for the dynamic chunk
 	// selector, cost, and ETA. Keyed by every dimension that moves encode time:
@@ -633,6 +644,23 @@ func (j *Job) parseMarker(line string) bool {
 		idx, _ := strconv.Atoi(m[1])
 		total, _ := strconv.Atoi(m[2])
 		j.startFile(strings.TrimSpace(m[3]), idx, total)
+		return true
+	}
+	if m := ffmpegMarkerRe.FindStringSubmatch(line); m != nil {
+		j.mu.Lock()
+		j.FfmpegVersion = strings.TrimSpace(m[1])
+		j.mu.Unlock()
+		return true
+	}
+	if m := codecLibMarkerRe.FindStringSubmatch(line); m != nil {
+		j.mu.Lock()
+		if j.CodecLibs == nil {
+			j.CodecLibs = map[string]string{}
+		}
+		// "libx265 4.2+37-b81f650e" — lib name kept with the version so the
+		// record stays readable without knowing the codec->library mapping.
+		j.CodecLibs[m[1]] = m[2] + " " + m[3]
+		j.mu.Unlock()
 		return true
 	}
 	if m := bootMarkerRe.FindStringSubmatch(line); m != nil {
@@ -1112,6 +1140,18 @@ type Job struct {
 	// and the ECR pull was skipped. Drives the "pre-baked AMI" UI badge.
 	BootAMI     string `json:"boot_ami,omitempty"`
 	PrebakedAMI bool   `json:"prebaked_ami,omitempty"`
+
+	// What actually encoded this, reported by the worker that ran ffmpeg.
+	// FfmpegVersion is the build id; CodecLibs maps our codec name to the
+	// encoder library that produced its bitstream ("hevc" -> "libx265 4.2+37-…").
+	//
+	// h264 is ABSENT FROM CodecLibs BY DESIGN: libx264 prints no version at
+	// init, unlike libx265 and SVT-AV1, and its core number lives only in the
+	// bitstream SEI. FfmpegVersion is the proxy — a given BtbN build bundles a
+	// fixed x264 — so the gap is bounded, not unbounded. Do not read an absent
+	// h264 entry as "not recorded".
+	FfmpegVersion string            `json:"ffmpeg_version,omitempty"`
+	CodecLibs     map[string]string `json:"codec_libs,omitempty"`
 
 	// Spot-reclaim accounting for this file's encode (from ENCODER-RECLAIM).
 	// ReclaimCount = chunks reclaimed; ReclaimLostS = encode wall-seconds thrown
