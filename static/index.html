@@ -864,7 +864,59 @@ function showToast(message, type = '') {
     setTimeout(() => { toast.style.opacity = '0'; toast.style.transition = 'opacity 0.3s'; setTimeout(() => toast.remove(), 300); }, 4000);
 }
 
-function showDialog(title, body, actions) {
+// --- interaction latency instrumentation ------------------------------------
+//
+// The "Re-encode (replace existing)" dialog was reported as slow to appear, and
+// its code path does not explain it: no fetch, no await, and no CSS transition
+// on .modal-overlay/.dialog, so it should paint on the next frame. That points
+// at main-thread contention from something ELSE on the page — invisible unless
+// it is measured at the moment it happens, which is why this instruments rather
+// than guesses.
+//
+// Prime suspect to confirm or kill: /api/aws/inventory measures 5.15s and polls
+// every 10s. The request is async, but whatever renders its result is not, and a
+// click landing in that window waits. If that is it, the long-task list below
+// will show a multi-hundred-ms task overlapping the slow interaction.
+
+const _LONGTASK_WINDOW_MS = 20000;   // keep enough history to cover a 10s poll
+let _longTasks = [];
+try {
+    new PerformanceObserver(list => {
+        const now = performance.now();
+        for (const e of list.getEntries()) {
+            _longTasks.push({ at: Math.round(e.startTime), ms: Math.round(e.duration) });
+        }
+        _longTasks = _longTasks.filter(t => now - t.at < _LONGTASK_WINDOW_MS);
+    }).observe({ entryTypes: ['longtask'] });
+} catch (e) { /* no longtask support — the timing marks below still work */ }
+
+// Only report interactions a person would actually notice. Below this it is
+// noise, and logging every dialog would bury the one that matters.
+const _SLOW_INTERACTION_MS = 150;
+
+function _traceInteraction(name, t0, marks) {
+    const total = Math.round(performance.now() - t0);
+    if (total < _SLOW_INTERACTION_MS) return;
+    // Long tasks still running when the interaction began, or starting during
+    // it — these are what actually stole the frame.
+    const overlapping = _longTasks
+        .filter(t => t.at + t.ms >= t0)
+        .map(t => ({ ms: t.ms, before_ms: Math.round(t0 - t.at) }));
+    // Requests in flight across the interaction, from Resource Timing — no
+    // fetch monkey-patching needed, so this cannot alter the behaviour it is
+    // measuring.
+    const requests = performance.getEntriesByType('resource')
+        .filter(r => r.responseEnd >= t0 && r.startTime <= t0 + total && r.duration > 50)
+        .map(r => ({ url: r.name.replace(location.origin, ''), ms: Math.round(r.duration) }));
+    uiLog('slow-interaction', { name, total_ms: total, ...marks,
+                                longtasks: overlapping, requests });
+}
+
+// _t0 lets a caller time from the real user event (the click) rather than from
+// here — the gap between the two is exactly where a blocked main thread hides.
+function showDialog(title, body, actions, _t0) {
+    const t0 = typeof _t0 === 'number' ? _t0 : performance.now();
+    const tEnter = performance.now();
     return new Promise(resolve => {
         const overlay = document.createElement('div');
         overlay.className = 'modal-overlay';
@@ -893,6 +945,18 @@ function showDialog(title, body, actions) {
         document.addEventListener('keydown', function esc(e) {
             if (e.key === 'Escape') { overlay.remove(); resolve(null); document.removeEventListener('keydown', esc); }
         });
+
+        // Two frames: the first is scheduled before paint, the second runs after
+        // it, so this measures when the dialog was actually on screen.
+        const tAppend = performance.now();
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            _traceInteraction('dialog', t0, {
+                title,
+                to_handler_ms: Math.round(tEnter - t0),   // click -> showDialog
+                build_ms: Math.round(tAppend - tEnter),   // DOM construction
+                paint_ms: Math.round(performance.now() - tAppend),
+            });
+        }));
     });
 }
 let outputsView = 'list'; // 'list' or 'detail'
@@ -2225,7 +2289,11 @@ function renderLadderTable(ladder) {
     const rows = ladder.tiers.map(t => {
         // Budget compares the TRUE average (actual) to target; fall back to peak
         // if we couldn't measure the average.
-        const measured = t.actual_kbps > 0 ? t.actual_kbps : t.peak_kbps;
+        // #214: with the media in S3 nothing byte-derived is measurable, and a
+        // peak-based fallback would render a real-looking ratio from a different
+        // quantity. Show nothing rather than something wrong.
+        const measured = ladder.remote ? 0
+                       : (t.actual_kbps > 0 ? t.actual_kbps : t.peak_kbps);
         const ratio = t.target_kbps > 0 ? (measured / t.target_kbps) : 0;
         const pct = Math.min(150, Math.round(ratio * 100));
         const cls = ratio === 0 ? 'ladder-bar-empty'
@@ -2248,11 +2316,14 @@ function renderLadderTable(ladder) {
                     </div>
                     <span class="ladder-bar-label">${ratio === 0 ? '—' : (ratio * 100).toFixed(0) + '%'}</span>
                 </td>
-                <td class="ladder-num">${formatSize(t.size_bytes)}</td>
+                <td class="ladder-num">${ladder.remote ? '—' : formatSize(t.size_bytes)}</td>
             </tr>
         `;
     }).join('');
     const p = ladder.profile;
+    const remoteNote = ladder.remote
+        ? `<div style="font-size:12px;color:#e9c46a;margin:2px 0 8px">media is in S3 — Actual, Size and Budget need the segments on disk. Download to measure them. Target / Peak / Avg come from the manifests and are accurate.</div>`
+        : '';
     const chip = (label, on) => on ? `<span style="color:#8cf"> · ${label}</span>` : '';
     const profileLine = p
         ? `<div style="font-size:12px;color:#aab;margin:2px 0 8px">
@@ -2276,6 +2347,7 @@ function renderLadderTable(ladder) {
         <div class="ladder-panel">
             <div class="ladder-title">ABR ladder — ${ladder.codec.toUpperCase()}</div>
             ${profileLine}
+            ${remoteNote}
             <div style="overflow-x:auto">
             <table class="ladder-table">
                 <thead>
@@ -3290,9 +3362,20 @@ function connectSSE() {
     es.onmessage = (e) => {
         try {
             const job = JSON.parse(e.data);
+            const was = jobs[job.id] && jobs[job.id].status;
             jobs[job.id] = job;
             renderJobs();
             renderLocalFleet();
+            // A finished job has just written to OUTPUT_DIR, but the outputs
+            // list polls on a 60s timer — so a completed encode could sit
+            // invisible for the best part of a minute, which reads as "it did
+            // not work". Refresh on the TRANSITION only, so the repeated
+            // terminal-state frames the stream sends do not each trigger a
+            // scan (/api/outputs walks every output dir: ~0.8s).
+            const TERMINAL = ['done', 'failed', 'cancelled', 'move-failed'];
+            if (was && was !== job.status && TERMINAL.includes(job.status)) {
+                loadOutputs();
+            }
         } catch (err) {}
     };
     es.onerror = () => {
@@ -4950,7 +5033,7 @@ function showSourceContextMenu(e, fileName) {
     ctxMenu.innerHTML = `
         <div class="ctx-menu-item" onclick="hideContextMenu(); playSource('${escapeAttr(fileName)}')">&#9654; Play source</div>
         <div class="ctx-menu-separator"></div>
-        <div class="ctx-menu-item" onclick="hideContextMenu(); forceReencode('${escapeAttr(fileName)}')">&#128260; Re-encode (replace existing)</div>
+        <div class="ctx-menu-item" onclick="hideContextMenu(); forceReencode('${escapeAttr(fileName)}', performance.now())">&#128260; Re-encode (replace existing)</div>
     `;
     ctxMenu.style.left = e.clientX + 'px';
     ctxMenu.style.top = e.clientY + 'px';
@@ -4964,7 +5047,7 @@ function showSourceContextMenu(e, fileName) {
     });
 }
 
-async function forceReencode(fileName) {
+async function forceReencode(fileName, _clickAt) {
     const bandErr = resBandError();
     if (bandErr) { showToast(bandErr, 'error'); return; }
 
@@ -4995,7 +5078,8 @@ async function forceReencode(fileName) {
         [
             { label: 'Cancel', value: false, class: 'btn-secondary' },
             { label: 'Re-encode', value: true, class: 'btn-danger' }
-        ]
+        ],
+        _clickAt
     );
     if (!result) return;
 
