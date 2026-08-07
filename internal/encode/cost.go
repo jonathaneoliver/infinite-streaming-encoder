@@ -22,6 +22,21 @@ const (
 	awsOndemandVCPUHourUSD = 0.036
 )
 
+// EgressUSDPerGB prices S3 -> internet transfer, us-west-2.
+//
+// **The 100 GB/month free tier is deliberately ignored.** Applying it would make
+// the same run cost $0.00 on the 1st and $0.24 on the 20th, so no two runs would
+// be comparable and the cheapest-looking run would be whichever happened to go
+// first. This is the long-run marginal rate: past the allowance — which heavy
+// iteration now clears within days of each month starting — it is what every GB
+// actually costs. Under the allowance it over-states, which is the safe
+// direction for a number meant to discourage needless transfer.
+//
+// The single definition. The UI reads it from /api/settings rather than
+// hardcoding a copy — #217 exists because three spot-rate constants drifted
+// apart in three files, and this must not become the fourth.
+const EgressUSDPerGB = 0.09
+
 // projectCloudCost estimates what a job's full output ladder would cost to
 // encode on our AWS Batch Graviton fleet, and is authoritative for the UI's
 // "AWS spot / on-demand" numbers (the Python marker only supplies the SaaS

@@ -81,8 +81,21 @@ COMPOSE_PROMOTE :=
 ifneq ($(strip $(PROMOTE_LOCAL_DIR)),)
 COMPOSE_PROMOTE += -f docker-compose.promote-local.yml
 endif
-ifneq ($(strip $(PROMOTE_SSH_HOST)),)
+# Gate on the RESOLVED IP, not on PROMOTE_SSH_HOST. The overlay interpolates
+# "$$(PROMOTE_SSH_HOST):$$(PROMOTE_SSH_IP)" into extra_hosts, and PROMOTE_SSH_IP
+# comes from an mDNS lookup that returns nothing when the promote box is asleep
+# or off. Gating on the host name then layers an overlay that renders
+# "somebox.local:" — which docker rejects with `invalid IP address in add-host`,
+# taking down the WHOLE farm because an optional rsync destination is offline.
+# The failure only appears when a container is actually recreated (a changed
+# image tag), so it hides for weeks and then blocks a deploy.
+#
+# If the box is unreachable, promote-over-SSH cannot work anyway; bringing the
+# farm up without it is strictly better than not bringing it up at all.
+ifneq ($(strip $(PROMOTE_SSH_IP)),)
 COMPOSE_PROMOTE += -f docker-compose.promote-ssh.yml
+else ifneq ($(strip $(PROMOTE_SSH_HOST)),)
+$(warning PROMOTE_SSH_HOST=$(PROMOTE_SSH_HOST) did not resolve via mDNS — SSH promote is DISABLED for this run. Wake the box, or set PROMOTE_SSH_IP in .env.)
 endif
 COMPOSE_BASE := $(COMPOSE) -p $(COMPOSE_PROJECT) -f docker-compose.yml $(COMPOSE_PROMOTE)
 COMPOSE_DEV  := $(COMPOSE_BASE) -f docker-compose.dev.yml
@@ -151,6 +164,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build, to
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py pkgfetch    '; \
 	if out=$$(python3 scripts/test_package_fetch.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py outfetch    '; \
+	if out=$$(python3 scripts/test_output_fetch.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  python compile '; \
 	if out=$$(cd scripts && python3 -m compileall -q infinite_streaming_encoder 2>&1); then echo "ok"; \
@@ -310,7 +326,19 @@ publish: require-ghcr   ## build once (multi-arch) → GHCR always, ECR when clo
 	echo "Published GHCR ($(GHCR_IMAGE)) :latest :$(VERSION) :$(GIT_SHA) :$(IMAGE_TAG)$$ecr_note [$(PLATFORMS)]"
 
 publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :latest alone (TAG=<name>, SKIP_ECR=1, ALSO_TAG=<alias> GHCR-only)
-	@: $${TAG:?TAG is not set — e.g. TAG=test-145. Use a name that cannot be mistaken for a release}
+	@# Checks the MAKE-level $(TAG) — the value the rest of this recipe actually
+	@# uses — not the shell's $$TAG. They are not the same variable here, and the
+	@# difference is not theoretical: `farm-test-up: TAG ?= $$(DEV_TAG)` is a
+	@# target-specific assignment, and GNU make 3.81 (what Xcode ships, and so
+	@# what `make` is on a stock Mac) stops exporting a variable to EVERY recipe
+	@# shell once any target-specific assignment for it exists — even one on an
+	@# unrelated target, even when TAG came from the command line. The blanket
+	@# `export` at the top of this file does not save it. So the old
+	@# `$$(TAG:?...)` guard rejected a TAG that was correctly set, and
+	@# `make farm-test-up` could not run at all. Do not "simplify" this back.
+	@[ -n '$(TAG)' ] || { \
+	  echo "!!! TAG is not set — e.g. TAG=test-145. Use a name that cannot be mistaken for a release" >&2; \
+	  exit 1; }
 	@: $${GHCR_PAT:?GHCR_PAT is not set — create a classic PAT with write:packages scope}
 	@# Validate here rather than at each caller: this is the single choke point
 	@# for every tagged push (GHCR + ECR), so it also catches a hand-passed TAG.
@@ -340,6 +368,12 @@ publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :lates
 	  aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(ECR_REGISTRY); \
 	  ecr_tags="--tag $(ECR_REPO):$(TAG)"; \
 	  ecr_note=" + ECR ($(ECR_REPO)):$(TAG)"; \
+	else \
+	  echo "!!! ECR_REPO did not resolve — pushing GHCR ONLY, ECR is NOT updated."; \
+	  echo "    ECR_REPO comes from \`tofu output ecr_repo_url\`, which fails when"; \
+	  echo "    terraform is not initialised in THIS checkout. Fix:  make infra-init"; \
+	  echo "    Cloud workers keep running whatever tag the Batch job defs pin."; \
+	  ecr_note=" (ECR NOT UPDATED — ECR_REPO unresolved)"; \
 	fi; \
 	docker buildx build --builder encoder-builder --platform $(PLATFORMS) \
 		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(GIT_SHA) --build-arg IMAGE_TAG=$(TAG) \
@@ -1008,7 +1042,10 @@ farm-up: require-paths require-ghcr ## bring the whole master farm up from GHCR 
 # target exists to catch.
 farm-test-up: TAG ?= $(DEV_TAG)
 farm-test-up: require-paths require-ghcr ## build+publish your WORKING TREE under one tag and run the farm on it (:latest untouched) (TAG=<name>, defaults to $(DEV_TAG))
-	@: $${TAG:?TAG resolved empty — pass TAG=<name> explicitly}
+	@# Make-level, not shell — see the note on publish-tag's guard. The
+	@# `TAG ?= $$(DEV_TAG)` line above is the very thing that unexports it.
+	@[ -n '$(TAG)' ] || { \
+	  echo "!!! TAG resolved empty — pass TAG=<name> explicitly" >&2; exit 1; }
 	@# SKIP_ECR: the farm pulls GHCR exclusively. Pushing ECR here would spend
 	@# slots in its `keep last 10` lifecycle rule — enough farm iterations would
 	@# expire images cloud still has history in, for an image cloud never runs.

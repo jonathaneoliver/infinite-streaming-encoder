@@ -26,6 +26,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import NamedTuple
 
 # Taxonomy only — cli_batch is the queue's CONSUMER and must never emit through
 # telemetry, or it would republish what it just drained.
@@ -2103,8 +2104,110 @@ def _translate_events(events: list[dict], seen: set[int]) -> None:
             _report_task_failure(ev.get("taskFailedEventDetails", {}))
 
 
+def _parallel_get(s3, bucket: str, items: list, stage_key: str) -> tuple[int, int]:
+    """Download (key, size, dst) triples concurrently, emitting stage progress.
+
+    Shared by the end-of-run sync-back and the on-demand `fetch`, so both report
+    progress the same way and there is one place where the thread count lives.
+
+    PARALLEL, because this transfer is round-trip bound rather than bandwidth
+    bound. Packaged HLS output is thousands of tiny files — 1,486 objects at a
+    28 KB median on a measured 12-rung run — and fetching them one at a time
+    spends almost all of its time waiting.
+
+    Measured in the orchestrator container, 114 objects / 246.7 MB:
+
+      sequential download_file        29.9s    8.3 MB/s   <- what this was
+      ThreadPoolExecutor(16)           4.8s   51.2 MB/s
+      ThreadPoolExecutor(32)           4.1s   59.9 MB/s
+      TransferManager(16)              4.4s   56.3 MB/s
+      TransferManager(32)              4.8s   50.9 MB/s
+
+    A plain thread pool matches or beats s3transfer's TransferManager here, so
+    the simpler tool wins: TransferManager exists to orchestrate MULTIPART
+    transfers, and at a 28 KB median nothing crosses the 8 MB multipart
+    threshold — all that machinery does nothing but coordinate.
+
+    64. This default has moved twice, and BOTH earlier values were measuring
+    the destination disk rather than this code:
+
+      32 — benchmarked against container-local /tmp, which is not where this
+           writes. Wrong destination.
+      16 — benchmarked against the real destination (TMP_DIR), which was then
+           an NVMe enclosure negotiating USB 2.0 at 480 Mbps. It capped every
+           thread count at ~36 MB/s and collapsed to 8.4 MB/s at 32 threads,
+           so 16 looked like a plateau with a cliff just past it.
+
+    With that enclosure on Thunderbolt (3.2 GB/s, ~90x) the disk contributes
+    nothing and the transfer is round-trip bound as originally described.
+    Re-measured through this path, real prefix, real destination, 1486
+    objects / 2512 MB, repeated runs:
+
+        1 thread    9.1 MB/s        32 threads  71.8 / 77.6 / 77.7 MB/s
+        4 threads  27.1 MB/s        64 threads  90.3 / 90.3 / 91.9 MB/s
+        8 threads  41.4 MB/s       128 threads  95.6 / 96.8 / 98.4 MB/s
+       16 threads  58.3 / 55.5 / 32.0 MB/s     192 threads  40.9 MB/s  <- cliff
+
+    64 rather than 128: 128 is ~7% faster but sits close to a collapse that is
+    worse than doing nothing, and the knee is a property of the local network
+    path (~730 Mbps here), so it will not sit in the same place everywhere.
+    64 keeps 3x headroom below the cliff for most of the gain.
+
+    Note 16 is not merely slower but ERRATIC (32.0-58.3 across repeats), which
+    is why live runs on it landed anywhere from 44 to 64 MB/s."""
+    if not items:
+        return 0, 0
+    total_bytes = sum(s for _, s, _ in items) or 1
+    workers = max(1, int(os.environ.get("DOWNLOAD_CONCURRENCY", "64")))
+    done = {"bytes": 0, "pct": -1.0}
+    lock = threading.Lock()
+
+    def _one(item) -> None:
+        key, size, dst = item
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        # boto3 clients are thread-safe for this; the per-thread cost is a
+        # connection from the shared pool, which is why the pool size and
+        # the worker count are kept in step.
+        s3.download_file(bucket, key, str(dst))
+        with lock:
+            done["bytes"] += size
+            pct = done["bytes"] / total_bytes * 100.0
+            if pct - done["pct"] >= 1.0:   # throttle: at most ~100 markers
+                done["pct"] = pct
+                _emit_stage(stage_key, "running", pct)
+
+    t0 = time.monotonic()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for fut in as_completed([pool.submit(_one, it) for it in items]):
+            fut.result()   # surface the first failure rather than silently
+    dt = time.monotonic() - t0
+    _emit_stage(stage_key, "done", 100.0)
+    _narrate(f"    downloaded {len(items)} objects, {total_bytes / 1e6:.0f} MB in "
+             f"{dt:.0f}s ({total_bytes / 1e6 / max(dt, 0.001):.1f} MB/s, "
+             f"{workers} threads)")
+    return len(items), total_bytes
+
+
+# Suffixes that make up ~99.85% of a packaged output's bytes. Excluding these
+# leaves manifests, init segments and encode metadata — enough for the Outputs
+# tab to describe the run without the media (#214).
+#
+# Stated as an EXCLUSION rather than an allow-list on purpose: a new metadata
+# file added to the packager should ship by default, not be silently dropped.
+_MEDIA_SUFFIXES = (".m4s", ".byteranges")
+
+
+class DownloadResult(NamedTuple):
+    """What a sync-back moved, and what it deliberately left in S3."""
+    files: int
+    bytes: int
+    skipped_files: int
+    skipped_bytes: int
+
+
 def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "",
-                      output_tag: str = "") -> int:
+                      output_tag: str = "", include_media: bool = True,
+                      ) -> DownloadResult:
     """Mirror s3://.../<prefix>/output_<codec>/ into local_dir.
 
     The state machine writes each codec's packaged dir as output_<codec>/. When
@@ -2114,10 +2217,20 @@ def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "",
     tag appended LAST so the _p200_<codec> shape smashing keys off stays intact).
     That lets moveTmpToOutput move each codec independently, so codecs of the same
     clip COEXIST in OUTPUT_DIR instead of one replacing the other's <stem> wrapper.
-    Without output_stem (legacy), the raw output_<codec>/ layout is preserved."""
+    Without output_stem (legacy), the raw output_<codec>/ layout is preserved.
+
+    include_media=False fetches METADATA ONLY — everything except _MEDIA_SUFFIXES.
+    Measured at 3.99 MB of a 2.63 GB output dir (0.151%), which is the point: S3
+    egress is billed per GB and was 3x the compute on the 1-3 Aug bill. (Costing
+    treats every GB as billable — the monthly free allowance is not modelled, so
+    a run's cost does not depend on the date.) The directory LAYOUT is preserved
+    either way, so
+    parseOutputMeta still infers resolutions from subdirectory existence and the
+    run lists normally in the Outputs tab. Fetch the media later with
+    `cli_batch.py fetch`."""
     tag_suffix = f"_{output_tag}" if output_tag else ""
     if not s3_prefix.startswith("s3://"):
-        return 0
+        return DownloadResult(0, 0, 0, 0)
     rest = s3_prefix[len("s3://"):].rstrip("/")
     bucket, _, base_key = rest.partition("/")
     s3 = _s3()
@@ -2138,92 +2251,172 @@ def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "",
     # driver, whose stdout is forwarded straight to the app, so the marker needs
     # no CloudWatch round-trip.
     objs: list[tuple[str, int]] = []
+    skipped_files = skipped_bytes = 0
+    # Per output_<codec> tally of what was left behind, so each destination dir
+    # gets its own sidecar naming the exact prefix a later fetch must pull.
+    pending: dict[str, list[int]] = {}
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=f"{base_key}/output_"):
         for obj in page.get("Contents", []):
-            objs.append((obj["Key"], obj.get("Size", 0)))
+            key, size = obj["Key"], obj.get("Size", 0)
+            if not include_media and key.endswith(_MEDIA_SUFFIXES):
+                skipped_files += 1
+                skipped_bytes += size
+                head = key[len(base_key) + 1:].partition("/")[0]
+                tally = pending.setdefault(head, [0, 0])
+                tally[0] += 1
+                tally[1] += size
+                continue
+            objs.append((key, size))
 
     total_bytes = sum(s for _, s in objs) or 1
     if not objs:
-        return 0
+        return DownloadResult(0, 0, skipped_files, skipped_bytes)
     _emit_stage("download:outputs", "running", 0.0)
 
-    # PARALLEL, because this transfer is round-trip bound rather than bandwidth
-    # bound. Packaged HLS output is thousands of tiny files — 1,486 objects at a
-    # 28 KB median on a measured 12-rung run — and fetching them one at a time
-    # spends almost all of its time waiting.
-    #
-    # Measured in the orchestrator container, 114 objects / 246.7 MB:
-    #
-    #   sequential download_file        29.9s    8.3 MB/s   <- what this was
-    #   ThreadPoolExecutor(16)           4.8s   51.2 MB/s
-    #   ThreadPoolExecutor(32)           4.1s   59.9 MB/s
-    #   TransferManager(16)              4.4s   56.3 MB/s
-    #   TransferManager(32)              4.8s   50.9 MB/s
-    #
-    # A plain thread pool matches or beats s3transfer's TransferManager here, so
-    # the simpler tool wins: TransferManager exists to orchestrate MULTIPART
-    # transfers, and at a 28 KB median nothing crosses the 8 MB multipart
-    # threshold — all that machinery does nothing but coordinate.
-    #
-    # 64. This default has moved twice, and BOTH earlier values were measuring
-    # the destination disk rather than this code:
-    #
-    #   32 — benchmarked against container-local /tmp, which is not where this
-    #        writes. Wrong destination.
-    #   16 — benchmarked against the real destination (TMP_DIR), which was then
-    #        an NVMe enclosure negotiating USB 2.0 at 480 Mbps. It capped every
-    #        thread count at ~36 MB/s and collapsed to 8.4 MB/s at 32 threads,
-    #        so 16 looked like a plateau with a cliff just past it.
-    #
-    # With that enclosure on Thunderbolt (3.2 GB/s, ~90x) the disk contributes
-    # nothing and the transfer is round-trip bound as originally described.
-    # Re-measured through THIS function, real prefix, real destination, 1486
-    # objects / 2512 MB, repeated runs:
-    #
-    #     1 thread    9.1 MB/s        32 threads  71.8 / 77.6 / 77.7 MB/s
-    #     4 threads  27.1 MB/s        64 threads  90.3 / 90.3 / 91.9 MB/s
-    #     8 threads  41.4 MB/s       128 threads  95.6 / 96.8 / 98.4 MB/s
-    #    16 threads  58.3 / 55.5 / 32.0 MB/s     192 threads  40.9 MB/s  <- cliff
-    #
-    # 64 rather than 128: 128 is ~7% faster but sits close to a collapse that is
-    # worse than doing nothing, and the knee is a property of the local network
-    # path (~730 Mbps here), so it will not sit in the same place everywhere.
-    # 64 keeps 3x headroom below the cliff for most of the gain.
-    #
-    # Note 16 is not merely slower but ERRATIC (32.0-58.3 across repeats), which
-    # is why live runs on it landed anywhere from 44 to 64 MB/s.
-    workers = max(1, int(os.environ.get("DOWNLOAD_CONCURRENCY", "64")))
-    done = {"bytes": 0, "pct": -1.0}
-    lock = threading.Lock()
-
-    def _fetch(item) -> None:
-        key, size = item
-        rel = key[len(base_key) + 1:]
-        dst = _dst_for(rel)
+    items = []
+    for key, size in objs:
+        dst = _dst_for(key[len(base_key) + 1:])
         if dst is not None:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            # boto3 clients are thread-safe for this; the per-thread cost is a
-            # connection from the shared pool, which is why the pool size and
-            # the worker count are kept in step below.
-            s3.download_file(bucket, key, str(dst))
-        with lock:
-            done["bytes"] += size
-            pct = done["bytes"] / total_bytes * 100.0
-            if pct - done["pct"] >= 1.0:   # throttle: at most ~100 markers
-                done["pct"] = pct
-                _emit_stage("download:outputs", "running", pct)
+            items.append((key, size, dst))
 
-    t0 = time.monotonic()
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for fut in as_completed([pool.submit(_fetch, o) for o in objs]):
-            fut.result()   # surface the first failure rather than silently
-    dt = time.monotonic() - t0
-    _emit_stage("download:outputs", "done", 100.0)
-    _narrate(f"    downloaded {len(objs)} objects, {total_bytes / 1e6:.0f} MB in "
-             f"{dt:.0f}s ({total_bytes / 1e6 / max(dt, 0.001):.1f} MB/s, "
-             f"{workers} threads)")
-    return len(objs)
+    _parallel_get(s3, bucket, items, "download:outputs")
+    if skipped_files:
+        for head, (n_pend, b_pend) in sorted(pending.items()):
+            dst = _dst_for(f"{head}/x")
+            if dst is None:
+                continue
+            _write_remote_sidecar(dst.parent, f"s3://{bucket}/{base_key}/{head}",
+                                  n_pend, b_pend, bucket, base_key)
+        _narrate(f"    left {skipped_files} media objects "
+                 f"({skipped_bytes / 1e6:.0f} MB) in S3 — fetch on demand")
+    return DownloadResult(len(objs), total_bytes, skipped_files, skipped_bytes)
+
+
+# Matches the `expire-job-staging` lifecycle rule in infra/terraform. Read from
+# the bucket when permitted (below) so the two cannot silently drift; this is
+# only the fallback when the IAM principal lacks GetLifecycleConfiguration.
+_STAGING_EXPIRY_DAYS = 7
+
+REMOTE_SIDECAR = ".remote.json"
+
+
+def _staging_expiry_days(s3, bucket: str) -> int:
+    """Days until `jobs/` objects expire, read from the bucket's own lifecycle."""
+    try:
+        cfg = s3.get_bucket_lifecycle_configuration(Bucket=bucket)
+    except Exception:  # noqa: BLE001 — permission or no config; use the default
+        return _STAGING_EXPIRY_DAYS
+    for rule in cfg.get("Rules", []):
+        if rule.get("Status") != "Enabled":
+            continue
+        prefix = (rule.get("Filter") or {}).get("Prefix", "")
+        days = (rule.get("Expiration") or {}).get("Days")
+        if days and prefix and prefix.rstrip("/") == "jobs":
+            return int(days)
+    return _STAGING_EXPIRY_DAYS
+
+
+def _write_remote_sidecar(dst_dir: Path, s3_prefix: str, files: int, size: int,
+                          bucket: str, base_key: str) -> None:
+    """Record that this output's media is still in S3, and when it evaporates.
+
+    A file rather than a stdout marker: it moves with the directory through
+    moveTmpToOutput, survives a server restart, and needs no ordering contract
+    between the orchestrator's output and the control plane's log scanner."""
+    days = _staging_expiry_days(_s3(), bucket)
+    now = time.time()
+    payload = {
+        "s3_prefix": s3_prefix,
+        "pending_files": files,
+        "pending_bytes": size,
+        "recorded_at": _iso(now),
+        # Advisory: the lifecycle clock runs from each object's own creation, so
+        # this is the floor, not a guarantee. Shown in the UI so a run is fetched
+        # before it lapses rather than found missing afterwards.
+        "expires_at": _iso(now + days * 86400),
+        "expiry_days": days,
+    }
+    try:
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        (dst_dir / REMOTE_SIDECAR).write_text(json.dumps(payload, indent=2))
+    except OSError as e:
+        print(f"    warn: could not write {REMOTE_SIDECAR} in {dst_dir}: {e}",
+              flush=True)
+
+
+def _iso(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def cmd_fetch(args) -> int:
+    """Pull the media a --no-media poll left in S3, into an existing output dir.
+
+    Idempotent and re-entrant, which the Outputs tab's Download button relies on:
+
+      * no sidecar -> nothing pending, exit 0. A second click is a no-op, and a
+        fully-fetched dir stays fetched.
+      * objects already on disk at the right size are skipped, so an interrupted
+        fetch resumes instead of re-paying for what already landed. Size comes
+        from the listing, so this costs no extra request.
+
+    A size check is the right tool HERE and the wrong one for de-duplicating
+    re-encodes (#214): these are the same S3 objects, not a fresh encode of the
+    same source."""
+    out_dir = Path(args.dir)
+    sidecar = out_dir / REMOTE_SIDECAR
+    if not sidecar.exists():
+        print(f"    nothing pending: no {REMOTE_SIDECAR} in {out_dir}", flush=True)
+        return 0
+    try:
+        meta = json.loads(sidecar.read_text())
+    except (OSError, ValueError) as e:
+        print(f"!!! unreadable {sidecar}: {e}", file=sys.stderr)
+        return 1
+
+    s3_prefix = meta.get("s3_prefix", "")
+    if not s3_prefix.startswith("s3://"):
+        print(f"!!! {sidecar} has no usable s3_prefix", file=sys.stderr)
+        return 1
+    bucket, _, base_key = s3_prefix[len("s3://"):].rstrip("/").partition("/")
+
+    s3 = _s3()
+    items, have = [], 0
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{base_key}/"):
+        for obj in page.get("Contents", []):
+            key, size = obj["Key"], obj.get("Size", 0)
+            dst = out_dir / key[len(base_key) + 1:]
+            if dst.exists() and dst.stat().st_size == size:
+                have += 1
+                continue
+            items.append((key, size, dst))
+
+    pend_bytes = sum(s for _, s, _ in items)
+    if args.dry_run:
+        print(json.dumps({"files": len(items), "bytes": pend_bytes,
+                          "already_present": have, "s3_prefix": s3_prefix,
+                          "expires_at": meta.get("expires_at", "")}))
+        return 0
+    if not items:
+        # Everything is already here — the sidecar is stale (a previous fetch
+        # died after the last object but before this line). Clear it so the UI
+        # stops offering a download that would do nothing.
+        sidecar.unlink(missing_ok=True)
+        print(f"    already complete: {have} objects present", flush=True)
+        return 0
+
+    print(f"    fetching {len(items)} objects ({pend_bytes / 1e6:.0f} MB) "
+          f"from {s3_prefix}" + (f", {have} already present" if have else ""),
+          flush=True)
+    _parallel_get(s3, bucket, items, "fetch:media")
+    # Only now is the output complete, so only now does it stop being remote.
+    sidecar.unlink(missing_ok=True)
+    return 0
 
 
 # Blended Graviton per-vCPU-hour rates, us-west-2 (c7g/c8g .2xlarge/.4xlarge).
@@ -2672,11 +2865,14 @@ def cmd_poll(args: argparse.Namespace) -> int:
                     if on:
                         for k in ("package", "fragments", "hls"):
                             _emit_stage(f"{k}:{codec}", "done", 100.0)
-                print(f"    downloading outputs from {args.s3_prefix}", flush=True)
-                n = _download_outputs(args.s3_prefix, Path(args.local_dir),
-                                      getattr(args, "output_stem", ""),
-                                      getattr(args, "output_tag", ""))
-                print(f"    downloaded {n} files", flush=True)
+                media = not getattr(args, "no_media", False)
+                what = "outputs" if media else "manifests only"
+                print(f"    downloading {what} from {args.s3_prefix}", flush=True)
+                res = _download_outputs(args.s3_prefix, Path(args.local_dir),
+                                        getattr(args, "output_stem", ""),
+                                        getattr(args, "output_tag", ""),
+                                        include_media=media)
+                print(f"    downloaded {res.files} files", flush=True)
                 try:
                     _emit_cost_summary(exec_name, log_state)  # cost + host sweep
                 except Exception:  # noqa: BLE001 — cost summary is best-effort
@@ -2705,6 +2901,17 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="infinite_streaming_encoder.cli_batch")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    # fetch — pull the media a --no-media poll deliberately left in S3, for one
+    # already-downloaded output dir. Driven by the Outputs tab's Download button
+    # (#214); the control plane shells out to this rather than carrying an AWS
+    # SDK for Go, matching how it already calls cloud.batch_admin.
+    pf = sub.add_parser("fetch")
+    pf.add_argument("--dir", required=True, dest="dir",
+                    help="output directory holding a " + REMOTE_SIDECAR)
+    pf.add_argument("--dry-run", action="store_true", dest="dry_run",
+                    help="report what would be fetched, then exit")
+    pf.set_defaults(fn=cmd_fetch)
+
     ps = sub.add_parser("submit")
     ps.add_argument("--state-machine-arn", required=True, dest="state_machine_arn")
     ps.add_argument("--input-json", required=True, dest="input_json")
@@ -2719,6 +2926,10 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--output-stem", dest="output_stem", default="")
     pp.add_argument("--output-tag", dest="output_tag", default="",
                     help="profile suffix appended AFTER the codec (e.g. 'xs')")
+    pp.add_argument("--no-media", action="store_true", dest="no_media",
+                    default=_env_flag("SKIP_OUTPUT_MEDIA"),
+                    help="fetch manifests and metadata only, leaving segments "
+                         "in S3 for an on-demand `fetch` (#214)")
     pp.set_defaults(fn=cmd_poll)
 
     args = p.parse_args(argv)

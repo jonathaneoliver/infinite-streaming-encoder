@@ -26,6 +26,16 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .btn-play:hover { background: #1a2a4a; color: #4cc9f0; }
 .btn-promote { color: #2a9d8f; cursor: pointer; font-size: 0.95rem; padding: 4px 7px; border-radius: 4px; margin-left: 2px; }
 .btn-promote:hover { background: #14332c; color: #4ecdc4; }
+/* #214 — Download replaces Play while an output's media is still in S3. */
+.btn-fetch { color: #e9c46a; cursor: pointer; font-size: 0.95rem; padding: 4px 7px; border-radius: 4px; }
+.btn-fetch:hover { background: #3a3320; color: #f4d787; }
+.btn-fetch.busy, .btn-fetch.disabled { cursor: default; opacity: 0.55; }
+.btn-fetch.busy:hover, .btn-fetch.disabled:hover { background: none; color: #e9c46a; }
+.badge-remote { display: inline-block; margin-left: 8px; padding: 1px 6px; border-radius: 3px;
+                font-size: 0.72rem; background: #3a3320; color: #e9c46a; vertical-align: middle; }
+.badge-remote.busy { background: #1e3348; color: #7db8e8; }
+.badge-remote.failed { background: #4a2020; color: #e88; }
+.badge-remote.expired { background: #333; color: #999; text-decoration: line-through; }
 .src-badge-slot { flex: 0 0 96px; display: inline-flex; align-items: center; }
 .file-size { color: #888; font-size: 0.85rem; width: 80px; text-align: right; }
 .file-count { color: #666; font-size: 0.8rem; margin-left: 12px; }
@@ -432,6 +442,11 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             </div>
             <div class="control-group" id="spot-group" style="display:none;align-self:center;padding-top:16px">
                 <label title="Spot is ~2.6× cheaper but AWS can reclaim with 2 min notice. Uncheck to use on-demand (guaranteed, no interruption)."><input type="checkbox" id="use-spot" checked style="width:auto;min-width:auto"> Use spot (cheaper)</label>
+            </div>
+            <!-- #214. Cloud only: local and local-dist write straight to disk, so
+                 there is no egress to avoid and the box would be a no-op. -->
+            <div class="control-group" id="skip-media-group" style="display:none;align-self:center;padding-top:16px">
+                <label title="Bring back manifests and metadata only (~4 MB instead of ~2.6 GB), leaving the segments in S3. Egress is billed per GB and is roughly 3× the compute for a run. Download any output you want to keep from the Outputs tab — but within 7 days, after which S3 staging expires and the media is gone."><input type="checkbox" id="skip-media" style="width:auto;min-width:auto"> Leave media in S3 (fetch on demand)</label>
             </div>
             <div class="control-group">
                 <label>Codec</label>
@@ -849,7 +864,59 @@ function showToast(message, type = '') {
     setTimeout(() => { toast.style.opacity = '0'; toast.style.transition = 'opacity 0.3s'; setTimeout(() => toast.remove(), 300); }, 4000);
 }
 
-function showDialog(title, body, actions) {
+// --- interaction latency instrumentation ------------------------------------
+//
+// The "Re-encode (replace existing)" dialog was reported as slow to appear, and
+// its code path does not explain it: no fetch, no await, and no CSS transition
+// on .modal-overlay/.dialog, so it should paint on the next frame. That points
+// at main-thread contention from something ELSE on the page — invisible unless
+// it is measured at the moment it happens, which is why this instruments rather
+// than guesses.
+//
+// Prime suspect to confirm or kill: /api/aws/inventory measures 5.15s and polls
+// every 10s. The request is async, but whatever renders its result is not, and a
+// click landing in that window waits. If that is it, the long-task list below
+// will show a multi-hundred-ms task overlapping the slow interaction.
+
+const _LONGTASK_WINDOW_MS = 20000;   // keep enough history to cover a 10s poll
+let _longTasks = [];
+try {
+    new PerformanceObserver(list => {
+        const now = performance.now();
+        for (const e of list.getEntries()) {
+            _longTasks.push({ at: Math.round(e.startTime), ms: Math.round(e.duration) });
+        }
+        _longTasks = _longTasks.filter(t => now - t.at < _LONGTASK_WINDOW_MS);
+    }).observe({ entryTypes: ['longtask'] });
+} catch (e) { /* no longtask support — the timing marks below still work */ }
+
+// Only report interactions a person would actually notice. Below this it is
+// noise, and logging every dialog would bury the one that matters.
+const _SLOW_INTERACTION_MS = 150;
+
+function _traceInteraction(name, t0, marks) {
+    const total = Math.round(performance.now() - t0);
+    if (total < _SLOW_INTERACTION_MS) return;
+    // Long tasks still running when the interaction began, or starting during
+    // it — these are what actually stole the frame.
+    const overlapping = _longTasks
+        .filter(t => t.at + t.ms >= t0)
+        .map(t => ({ ms: t.ms, before_ms: Math.round(t0 - t.at) }));
+    // Requests in flight across the interaction, from Resource Timing — no
+    // fetch monkey-patching needed, so this cannot alter the behaviour it is
+    // measuring.
+    const requests = performance.getEntriesByType('resource')
+        .filter(r => r.responseEnd >= t0 && r.startTime <= t0 + total && r.duration > 50)
+        .map(r => ({ url: r.name.replace(location.origin, ''), ms: Math.round(r.duration) }));
+    uiLog('slow-interaction', { name, total_ms: total, ...marks,
+                                longtasks: overlapping, requests });
+}
+
+// _t0 lets a caller time from the real user event (the click) rather than from
+// here — the gap between the two is exactly where a blocked main thread hides.
+function showDialog(title, body, actions, _t0) {
+    const t0 = typeof _t0 === 'number' ? _t0 : performance.now();
+    const tEnter = performance.now();
     return new Promise(resolve => {
         const overlay = document.createElement('div');
         overlay.className = 'modal-overlay';
@@ -878,6 +945,18 @@ function showDialog(title, body, actions) {
         document.addEventListener('keydown', function esc(e) {
             if (e.key === 'Escape') { overlay.remove(); resolve(null); document.removeEventListener('keydown', esc); }
         });
+
+        // Two frames: the first is scheduled before paint, the second runs after
+        // it, so this measures when the dialog was actually on screen.
+        const tAppend = performance.now();
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            _traceInteraction('dialog', t0, {
+                title,
+                to_handler_ms: Math.round(tEnter - t0),   // click -> showDialog
+                build_ms: Math.round(tAppend - tEnter),   // DOM construction
+                paint_ms: Math.round(performance.now() - tAppend),
+            });
+        }));
     });
 }
 let outputsView = 'list'; // 'list' or 'detail'
@@ -1774,8 +1853,7 @@ function renderSources() {
 
 function onTargetChange() {
     const target = document.getElementById('target').value;
-    // "cloud-batch" is accepted as an alias for "cloud" (old links/state).
-    const isAnyCloud = target === 'cloud' || target === 'cloud-batch';
+    const isAnyCloud = isAnyCloudTarget(target);
     document.getElementById('cloud-warning').style.display =
         isAnyCloud ? 'block' : 'none';
     // Chunk granularity applies to BOTH local (Temporal) and cloud (AWS Batch).
@@ -1786,6 +1864,10 @@ function onTargetChange() {
         const el = document.getElementById(id);
         if (el) el.style.display = 'none';
     }
+    // #214 — cloud only. Local targets write to disk directly; there is no
+    // egress to skip, so offering the choice there would be misleading.
+    const skipGroup = document.getElementById('skip-media-group');
+    if (skipGroup) skipGroup.style.display = isAnyCloud ? 'flex' : 'none';
 }
 
 // Before submitting a cloud encode, peek at the AWS inventory. If
@@ -1874,6 +1956,13 @@ async function startEncode(force = false) {
         burnin: document.getElementById('burnin').checked,
         promote: document.getElementById('promote-after').checked
     };
+    // #214 — send only for cloud targets. The server field is a *bool, so
+    // OMITTING it means "use the SKIP_OUTPUT_MEDIA default"; sending false on a
+    // local run would look like a deliberate opt-out of something that does not
+    // apply there.
+    if (isAnyCloudTarget(target)) {
+        body.skip_media_download = document.getElementById('skip-media').checked;
+    }
 
     try {
         const res = await fetch('/api/encode', {
@@ -1911,9 +2000,34 @@ async function loadOutputs() {
         // Outputs feed the per-source picker badges (issue #114) — refresh them
         // once the list lands, whichever tab is showing.
         refreshSourceBadges();
+        _scheduleFetchPoll();
     } catch (e) {
         document.getElementById('outputs-list').innerHTML = '<div class="no-files">Failed to load outputs</div>';
     }
+}
+
+// #214: while any output's media is downloading from S3, re-poll so the percent
+// advances and the row flips to Play on its own. Self-cancelling — the timer
+// only re-arms while something is in flight, so an idle Outputs tab is silent.
+let _fetchPollTimer = null;
+function _scheduleFetchPoll() {
+    const busy = outputDirs.some(d => d.fetch && d.fetch.state === 'fetching');
+    if (_fetchPollTimer) { clearTimeout(_fetchPollTimer); _fetchPollTimer = null; }
+    if (busy) _fetchPollTimer = setTimeout(loadOutputs, 2000);
+}
+
+// Start an on-demand media download. Safe to click twice: the server treats a
+// second request as a no-op and returns the running state.
+async function fetchOutput(name, el) {
+    if (el) { el.classList.add('busy'); el.innerHTML = '&#8987;'; }
+    try {
+        const r = await fetch(`/api/outputs/${encodeURIComponent(name)}/fetch`,
+                              { method: 'POST' });
+        if (!r.ok) { alert(`Download failed: ${await r.text()}`); }
+    } catch (e) {
+        alert(`Download failed: ${e}`);
+    }
+    loadOutputs();
 }
 
 // Promote destinations (from /api/promote). Empty => promote not configured, so
@@ -2004,19 +2118,64 @@ function renderOutputs() {
     ` + sorted.map((d, i) => `
         <div class="output-grid output-dir" onclick="toggleOutputDetail(${i}, '${escapeAttr(d.name)}')" oncontextmenu="showContextMenu(event, '${escapeAttr(d.name)}')">
             <span class="out-chev" id="outchev-${i}" title="Expand ladder">&#9656;</span>
-            <span class="output-dir-name">${escapeHtml(d.name)}</span>
+            <span class="output-dir-name">${escapeHtml(d.name)}${_remoteBadge(d)}</span>
             <span>${renderCodecBadge(d)}</span>
             <span>${renderResBadges(d)}</span>
             <span>${renderFormatBadge(d)}</span>
             <span class="output-dir-stats">${formatSize(d.size)}</span>
             <span class="file-date">${formatDate(d.mod_time)}</span>
-            <span>
-                <span class="btn-play" onclick="event.stopPropagation(); playOutputMaster('${escapeAttr(d.name)}')" title="Play">&#9654;</span>
-                ${_promoteDests.length ? `<span class="btn-promote" onclick="event.stopPropagation(); promoteOutput('${escapeAttr(d.name)}', this)" title="Promote to ${_promoteDests.length} live location(s)">&#8681;</span>` : ''}
-            </span>
+            <span>${_outputActions(d)}</span>
         </div>
         <div class="output-details" id="outdet-${i}" style="display:none"></div>
     `).join('');
+}
+
+// #214 — an output whose media is still in S3. The badge says so next to the
+// name; the action cell offers Download in place of Play.
+//
+// Play MUST NOT be offered: it points hls.js at /content/<dir>/<playlist>.m3u8,
+// which the Go file server reads off local disk. With manifests present but no
+// segments the playlist loads and every part 404s, which is worse than not
+// offering it at all.
+function _remoteBadge(d) {
+    const f = d.fetch;
+    if (f && f.state === 'fetching') {
+        return `<span class="badge-remote busy">downloading ${(f.percent || 0).toFixed(0)}%</span>`;
+    }
+    if (f && f.state === 'failed') {
+        return `<span class="badge-remote failed" title="${escapeAttr(f.error || '')}">download failed</span>`;
+    }
+    if (!d.remote) return '';
+    if (d.remote_expired) {
+        return `<span class="badge-remote expired" title="S3 staging expired ${escapeAttr(d.remote.expires_at)} — the media is gone">expired</span>`;
+    }
+    return `<span class="badge-remote" title="${d.remote.pending_files} media objects still in S3. Expires ${escapeAttr(d.remote.expires_at)}">in S3 &middot; ${formatSize(d.remote.pending_bytes)}</span>`;
+}
+
+function _outputActions(d) {
+    const n = escapeAttr(d.name);
+    const f = d.fetch;
+    if (f && f.state === 'fetching') {
+        return `<span class="btn-fetch busy" title="Downloading ${(f.percent || 0).toFixed(0)}% — this row updates itself">&#8987;</span>`;
+    }
+    if (d.remote && d.remote_expired) {
+        return `<span class="btn-fetch disabled" title="S3 staging expired ${escapeAttr(d.remote.expires_at)}; the media is gone and cannot be fetched">&#10007;</span>`;
+    }
+    if (d.remote) {
+        // Show the cost before the click — a full ladder is real money, not a
+        // free button. Priced at the flat marginal rate from the server; the
+        // monthly free allowance is deliberately not modelled, so the same
+        // ladder quotes the same number on any day of the month.
+        const gb = (d.remote.pending_bytes || 0) / 1e9;
+        const usd = gb * _egressUsdPerGb;
+        const cost = usd >= 0.005 ? ` (~$${usd.toFixed(2)} egress)` : '';
+        return `<span class="btn-fetch" onclick="event.stopPropagation(); fetchOutput('${n}', this)"
+                      title="Download ${formatSize(d.remote.pending_bytes)} from S3${cost}. Expires ${escapeAttr(d.remote.expires_at)}">&#11015;</span>`;
+    }
+    // Local: Play, and Promote — which rsyncs the tree, so it is equally
+    // meaningless without the media.
+    return `<span class="btn-play" onclick="event.stopPropagation(); playOutputMaster('${n}')" title="Play">&#9654;</span>`
+        + (_promoteDests.length ? `<span class="btn-promote" onclick="event.stopPropagation(); promoteOutput('${n}', this)" title="Promote to ${_promoteDests.length} live location(s)">&#8681;</span>` : '');
 }
 
 // #60: fold a package open in place (inline ladder table) instead of drilling
@@ -2130,7 +2289,11 @@ function renderLadderTable(ladder) {
     const rows = ladder.tiers.map(t => {
         // Budget compares the TRUE average (actual) to target; fall back to peak
         // if we couldn't measure the average.
-        const measured = t.actual_kbps > 0 ? t.actual_kbps : t.peak_kbps;
+        // #214: with the media in S3 nothing byte-derived is measurable, and a
+        // peak-based fallback would render a real-looking ratio from a different
+        // quantity. Show nothing rather than something wrong.
+        const measured = ladder.remote ? 0
+                       : (t.actual_kbps > 0 ? t.actual_kbps : t.peak_kbps);
         const ratio = t.target_kbps > 0 ? (measured / t.target_kbps) : 0;
         const pct = Math.min(150, Math.round(ratio * 100));
         const cls = ratio === 0 ? 'ladder-bar-empty'
@@ -2153,11 +2316,14 @@ function renderLadderTable(ladder) {
                     </div>
                     <span class="ladder-bar-label">${ratio === 0 ? '—' : (ratio * 100).toFixed(0) + '%'}</span>
                 </td>
-                <td class="ladder-num">${formatSize(t.size_bytes)}</td>
+                <td class="ladder-num">${ladder.remote ? '—' : formatSize(t.size_bytes)}</td>
             </tr>
         `;
     }).join('');
     const p = ladder.profile;
+    const remoteNote = ladder.remote
+        ? `<div style="font-size:12px;color:#e9c46a;margin:2px 0 8px">media is in S3 — Actual, Size and Budget need the segments on disk. Download to measure them. Target / Peak / Avg come from the manifests and are accurate.</div>`
+        : '';
     const chip = (label, on) => on ? `<span style="color:#8cf"> · ${label}</span>` : '';
     const profileLine = p
         ? `<div style="font-size:12px;color:#aab;margin:2px 0 8px">
@@ -2174,12 +2340,14 @@ function renderLadderTable(ladder) {
              ${p.burnin === false ? ` · overlay off` : ''}
              ${chip('force re-encode', p.force_reencode)}
              ${p.encoded_at ? `<span style="color:#889"> · ${new Date(p.encoded_at).toLocaleString()}</span>` : ''}
+             ${_encoderProvenance(p)}
            </div>`
         : `<div style="font-size:12px;color:#889;margin:2px 0 8px">no encode.json (encoded before profile metadata) — targets/config best-effort</div>`;
     return `
         <div class="ladder-panel">
             <div class="ladder-title">ABR ladder — ${ladder.codec.toUpperCase()}</div>
             ${profileLine}
+            ${remoteNote}
             <div style="overflow-x:auto">
             <table class="ladder-table">
                 <thead>
@@ -2208,6 +2376,30 @@ function renderLadderTable(ladder) {
 // updates so a new log line doesn't collapse an open viewer.
 const openLogs = new Set();
 
+// Which ffmpeg + encoder library produced this output (from encode.json).
+//
+// Shown because the image tracks ffmpeg's rolling `latest` — a dated pin gets
+// pruned upstream and breaks every build — so the Dockerfile no longer names a
+// version and the artifact is the only record. The LIBRARY line matters more
+// than ffmpeg's: `ffmpeg -version` versions none of libx264/libx265/libsvtav1,
+// and an x265 bump under a static ffmpeg changes HEVC output while every other
+// version string stays put. That is the confound VMAF comparisons cannot absorb.
+function _encoderProvenance(p) {
+    if (!p || (!p.ffmpeg_version && !p.codec_libs)) return '';
+    const bits = [];
+    if (p.ffmpeg_version) bits.push(`ffmpeg ${escapeHtml(p.ffmpeg_version)}`);
+    for (const [codec, lib] of Object.entries(p.codec_libs || {})) {
+        bits.push(`${escapeHtml(codec)} via ${escapeHtml(lib)}`);
+    }
+    // h264 has no library entry and never will — libx264 prints no version at
+    // init, its core lives only in the bitstream SEI. Say so, so an absent entry
+    // does not read as "we forgot to record it".
+    const gap = p.codec === 'h264' && !(p.codec_libs || {}).h264
+        ? ` <span style="color:#776" title="libx264 reports no version at encoder init; its core number is only in the bitstream SEI. The ffmpeg build pins it — a given build bundles a fixed x264.">(x264 version not reported — ffmpeg build is the proxy)</span>`
+        : '';
+    return `<div style="color:#889;margin-top:2px">${bits.join(' · ')}${gap}</div>`;
+}
+
 function _jobConfigHtml(c) {
     const chip = (label, val, hl) =>
         `<span style="background:#232a36;border-radius:3px;padding:1px 7px;font-size:11px;color:#bbb">`
@@ -2222,6 +2414,10 @@ function _jobConfigHtml(c) {
     if (c.hevc_single_pass) chips.push(chip('hevc', '1-pass'));
     if (c.chunk_duration) chips.push(chip('chunk', /^\d+$/.test(c.chunk_duration) ? c.chunk_duration + 's' : c.chunk_duration));
     if (c.cpu_arch && (c.target === 'cloud' || c.target === 'cloud-batch')) chips.push(chip('cpu', c.cpu_arch));
+    // #214 — worth surfacing on the RUNNING job, not just afterwards on the
+    // output: this is the difference between a finished encode you can play and
+    // one whose media is still in S3 on a 7-day clock.
+    if (c.skip_media_download) chips.push(chip('media', 'stays in S3', '#e9c46a'));
     if (c.padding) chips.push(chip('padding', c.padding));
     if (c.time) chips.push(chip('time', c.time));
     if (c.force_reencode) chips.push(chip('force', 're-encode', '#d0883a'));
@@ -3166,9 +3362,20 @@ function connectSSE() {
     es.onmessage = (e) => {
         try {
             const job = JSON.parse(e.data);
+            const was = jobs[job.id] && jobs[job.id].status;
             jobs[job.id] = job;
             renderJobs();
             renderLocalFleet();
+            // A finished job has just written to OUTPUT_DIR, but the outputs
+            // list polls on a 60s timer — so a completed encode could sit
+            // invisible for the best part of a minute, which reads as "it did
+            // not work". Refresh on the TRANSITION only, so the repeated
+            // terminal-state frames the stream sends do not each trigger a
+            // scan (/api/outputs walks every output dir: ~0.8s).
+            const TERMINAL = ['done', 'failed', 'cancelled', 'move-failed'];
+            if (was && was !== job.status && TERMINAL.includes(job.status)) {
+                loadOutputs();
+            }
         } catch (err) {}
     };
     es.onerror = () => {
@@ -4826,7 +5033,7 @@ function showSourceContextMenu(e, fileName) {
     ctxMenu.innerHTML = `
         <div class="ctx-menu-item" onclick="hideContextMenu(); playSource('${escapeAttr(fileName)}')">&#9654; Play source</div>
         <div class="ctx-menu-separator"></div>
-        <div class="ctx-menu-item" onclick="hideContextMenu(); forceReencode('${escapeAttr(fileName)}')">&#128260; Re-encode (replace existing)</div>
+        <div class="ctx-menu-item" onclick="hideContextMenu(); forceReencode('${escapeAttr(fileName)}', performance.now())">&#128260; Re-encode (replace existing)</div>
     `;
     ctxMenu.style.left = e.clientX + 'px';
     ctxMenu.style.top = e.clientY + 'px';
@@ -4840,7 +5047,7 @@ function showSourceContextMenu(e, fileName) {
     });
 }
 
-async function forceReencode(fileName) {
+async function forceReencode(fileName, _clickAt) {
     const bandErr = resBandError();
     if (bandErr) { showToast(bandErr, 'error'); return; }
 
@@ -4871,7 +5078,8 @@ async function forceReencode(fileName) {
         [
             { label: 'Cancel', value: false, class: 'btn-secondary' },
             { label: 'Re-encode', value: true, class: 'btn-danger' }
-        ]
+        ],
+        _clickAt
     );
     if (!result) return;
 
@@ -5105,11 +5313,51 @@ function _renderWatcher(enabled) {
         st.style.color = enabled ? '#6ab04c' : '#666';
     }
 }
+// "cloud-batch" is accepted as an alias for "cloud" (old links/state). Shared so
+// the form's cloud-only controls and the submit payload cannot disagree about
+// what counts as a cloud target.
+function isAnyCloudTarget(t) { return t === 'cloud' || t === 'cloud-batch'; }
+
+// ?developer=1 — the app-wide "I am iterating, not producing" switch proposed in
+// #211 (which also wants it to skip confirmations). Nothing else reads it yet;
+// this is the first consumer, kept as ONE helper so #211 can extend it
+// (localStorage, a visible toggle) without hunting for copies of the parse.
+function isDeveloperMode() {
+    try { return new URLSearchParams(location.search).get('developer') === '1'; }
+    catch (e) { return false; }   // very old browser / opaque origin
+}
+
+// S3 egress rate, $/GB, from the server (encode.EgressUSDPerGB). Held here so
+// the Download button can price a fetch before it happens. 0 until settings
+// load, which reads as "no estimate" rather than "free".
+let _egressUsdPerGb = 0;
+
 async function loadSettings() {
     try {
         const res = await fetch('/api/settings');
         if (!res.ok) return;
-        _renderWatcher((await res.json()).watcher_enabled);
+        const s = await res.json();
+        _renderWatcher(s.watcher_enabled);
+        if (typeof s.egress_usd_per_gb === 'number') _egressUsdPerGb = s.egress_usd_per_gb;
+        // Seed from SKIP_OUTPUT_MEDIA so the box shows what would actually
+        // happen. Leaving it always-unchecked while the server default was on
+        // would make the form lie about the run it is about to start.
+        //
+        // ?developer=1 forces it ON: developer mode means iterating, and
+        // iteration is exactly when a 2.6 GB sync-back per run is pure waste —
+        // that traffic is what put egress at 3x the compute on the 1-3 Aug bill.
+        // OR rather than override, so SKIP_OUTPUT_MEDIA=1 still wins on its own.
+        // It only sets the DEFAULT; unticking it for a keeper run still works.
+        const skip = document.getElementById('skip-media');
+        if (skip) {
+            skip.checked = !!s.skip_media_download_default || isDeveloperMode();
+            if (isDeveloperMode() && !s.skip_media_download_default) {
+                // Say why it is pre-ticked, so a surprising "where is my media?"
+                // has an answer visible at the point of the decision.
+                skip.closest('label').title =
+                    'Pre-ticked by ?developer=1. ' + skip.closest('label').title;
+            }
+        }
     } catch (e) { /* leave unchecked */ }
 }
 async function setWatcher(enabled) {

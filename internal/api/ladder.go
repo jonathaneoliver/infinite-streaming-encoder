@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/encode"
 )
 
 // Mirror of scripts/infinite_streaming_encoder/ladder.py's LADDER. Changing the kbps
@@ -64,7 +66,13 @@ type ladderTier struct {
 }
 
 type ladderDoc struct {
-	Codec   string       `json:"codec"`
+	Codec string `json:"codec"`
+	// Remote: the media is still in S3 (#214), so the byte-derived columns
+	// (ActualKbps, SizeBytes) are NOT measurable and are left at 0 rather than
+	// computed from the manifests that are all that is on disk. Doing that
+	// reported "Actual 3 k / Budget 0%" for an encode that really produced
+	// ~565 kbps — a confident wrong number, worse than an absent one.
+	Remote  bool         `json:"remote,omitempty"`
 	Profile *profileInfo `json:"profile,omitempty"` // from encode.json (nil for older outputs)
 	Tiers   []ladderTier `json:"tiers"`
 }
@@ -192,6 +200,9 @@ func (s *Server) ladder(w http.ResponseWriter, r *http.Request) {
 		return v
 	}
 
+	// Media still in S3 (#214)? Then nothing byte-derived is measurable here.
+	isRemote := encode.ReadRemote(dirPath) != nil
+
 	// Enumerate the ACTUAL resolution dirs (<N>p) rather than a fixed standard
 	// list, so unique-resolution ladders (432p/468p/504p/594p …) show every rung.
 	resDirRe := regexp.MustCompile(`^(\d+)p$`)
@@ -216,11 +227,17 @@ func (s *Server) ladder(w http.ResponseWriter, r *http.Request) {
 			width = h * 16 / 9 // 16:9 derive (apple-uniq rungs are 16:9)
 		}
 		resDir := filepath.Join(dirPath, res)
-		size, _ := dirStats(resDir)
-		// True average bitrate = size × 8 ÷ duration.
+		// Byte-derived columns only when the bytes are actually here. For a
+		// metadata-only output the segments are in S3, so dirStats sees just the
+		// manifest and init and both numbers would be wrong by ~200x.
+		var size int64
 		actual := 0
-		if dur := rungDurationS(resDir); dur > 0 {
-			actual = int(float64(size) * 8 / dur / 1000)
+		if !isRemote {
+			size, _ = dirStats(resDir)
+			// True average bitrate = size × 8 ÷ duration.
+			if dur := rungDurationS(resDir); dur > 0 {
+				actual = int(float64(size) * 8 / dur / 1000)
+			}
 		}
 		tiers = append(tiers, ladderTier{
 			Res: res, Width: width, Height: h, TargetKbps: target,
@@ -230,7 +247,7 @@ func (s *Server) ladder(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(tiers, func(i, j int) bool { return tiers[i].Height < tiers[j].Height })
 
-	writeJSON(w, ladderDoc{Codec: meta.codec, Profile: profile, Tiers: tiers})
+	writeJSON(w, ladderDoc{Codec: meta.codec, Remote: isRemote, Profile: profile, Tiers: tiers})
 }
 
 // readEncodeJSON reads the full encode.json profile record (nil for older

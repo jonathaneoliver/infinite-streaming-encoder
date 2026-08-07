@@ -89,6 +89,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/outputs/{name}/ladder", s.ladder)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/logs", s.outputLogs)
 	s.Mux.HandleFunc("POST /api/outputs/{name}/promote", s.promoteOutput)
+	s.Mux.HandleFunc("POST /api/outputs/{name}/fetch", s.fetchOutput)
 	s.Mux.HandleFunc("GET /api/promote", s.getPromote)
 	s.Mux.HandleFunc("POST /api/encode", s.startEncode)
 	s.Mux.HandleFunc("GET /api/jobs", s.listJobs)
@@ -346,8 +347,34 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 
 // getSettings returns the persisted global settings (currently just the
 // watcher on/off toggle).
+// settingsResponse is the persisted Settings plus read-only server facts the UI
+// needs but must not own a copy of. Rates live here rather than in Settings
+// because they are constants, not preferences — persisting them would let a
+// stale settings.json outlive a price change.
+type settingsResponse struct {
+	encode.Settings
+	// EgressUSDPerGB prices the Outputs tab's Download button. Sent rather than
+	// hardcoded in the page: #217 exists because three copies of a rate drifted
+	// apart, and the UI must not become a fourth. Free tier is deliberately not
+	// modelled — see encode.EgressUSDPerGB.
+	EgressUSDPerGB float64 `json:"egress_usd_per_gb"`
+	// SkipMediaDownloadDefault seeds the encode form's checkbox from
+	// SKIP_OUTPUT_MEDIA, so the box shows what would actually happen rather than
+	// a guess. Without this the server default is unreachable from the UI and
+	// the two can disagree silently.
+	SkipMediaDownloadDefault bool `json:"skip_media_download_default"`
+}
+
+func (s *Server) settingsPayload() settingsResponse {
+	return settingsResponse{
+		Settings:                 s.Manager.Settings(),
+		EgressUSDPerGB:           encode.EgressUSDPerGB,
+		SkipMediaDownloadDefault: encode.SkipMediaDownloadDefault,
+	}
+}
+
 func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, s.Manager.Settings())
+	writeJSON(w, s.settingsPayload())
 }
 
 // putSettings applies a partial settings update. Only fields present in the
@@ -364,7 +391,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	if body.WatcherEnabled != nil {
 		s.Manager.SetWatcherEnabled(*body.WatcherEnabled)
 	}
-	writeJSON(w, s.Manager.Settings())
+	writeJSON(w, s.settingsPayload())
 }
 
 func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
@@ -563,6 +590,17 @@ type outputDir struct {
 	HlsFormat   string   `json:"hls_format"`
 	Partial     string   `json:"partial"`
 	Padding     string   `json:"padding"`
+	// Remote is set when this output's media is still in S3 (#214) — the
+	// manifests are local, the segments are not. The UI shows Download instead
+	// of Play, because /content/ serves from disk and every segment would 404.
+	Remote *encode.RemoteInfo `json:"remote,omitempty"`
+	// RemoteExpired distinguishes "fetch it" from "too late" without making the
+	// UI parse timestamps.
+	RemoteExpired bool `json:"remote_expired,omitempty"`
+	// Fetch is the in-flight (or last failed) on-demand download. An output
+	// mid-fetch is neither remote nor complete; Play stays disabled until it
+	// clears.
+	Fetch *encode.FetchState `json:"fetch,omitempty"`
 }
 
 // getLadders returns all ladder definitions (built-in + user-defined) keyed by
@@ -661,6 +699,23 @@ func (s *Server) promoteOutput(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, results)
 }
 
+// fetchOutput starts an on-demand download of an output whose media was left in
+// S3 by a metadata-only run (#214). Returns immediately: the transfer runs in
+// the background and its progress rides the outputs listing.
+//
+// A second click while one is running is deliberately NOT an error — the button
+// must be safe to press twice — so ErrFetchInFlight returns 200 with the
+// existing state rather than a 4xx the UI would have to special-case.
+func (s *Server) fetchOutput(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	err := s.Manager.FetchOutput(name)
+	if err != nil && err != encode.ErrFetchInFlight {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, s.Manager.FetchStateFor(name))
+}
+
 func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {
 	entries, err := os.ReadDir(s.Manager.OutputDir)
 	if err != nil {
@@ -683,10 +738,13 @@ func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {
 		dirPath := filepath.Join(s.Manager.OutputDir, e.Name())
 		size, count := dirStats(dirPath)
 		meta := parseOutputMeta(e.Name(), dirPath)
+		remote := encode.ReadRemote(dirPath)
 		dirs = append(dirs, outputDir{
 			Name: e.Name(), Size: size, NumFiles: count, ModTime: info.ModTime().UnixMilli(),
 			Codec: meta.codec, Resolutions: meta.resolutions, HlsFormat: meta.hlsFormat,
 			Partial: meta.partial, Padding: meta.padding,
+			Remote: remote, RemoteExpired: remote.Expired(),
+			Fetch: s.Manager.FetchStateFor(e.Name()),
 		})
 	}
 	writeJSON(w, dirs)
@@ -783,39 +841,9 @@ func parseOutputMeta(name, dirPath string) outputMeta {
 		}
 	}
 
-	// HLS format: check for .ts vs .m4s segments
-	hasM4S := false
-	hasTS := false
-	entries, _ := os.ReadDir(dirPath)
-	for _, e := range entries {
-		if e.IsDir() {
-			subEntries, _ := os.ReadDir(filepath.Join(dirPath, e.Name()))
-			for _, se := range subEntries {
-				switch filepath.Ext(se.Name()) {
-				case ".m4s":
-					hasM4S = true
-				case ".ts":
-					if se.Name() != "playlist.m3u8" {
-						hasTS = true
-					}
-				}
-				if hasM4S && hasTS {
-					break
-				}
-			}
-		}
-		if hasM4S && hasTS {
-			break
-		}
-	}
-	switch {
-	case hasM4S && hasTS:
-		m.hlsFormat = "both"
-	case hasTS:
-		m.hlsFormat = "ts"
-	case hasM4S:
-		m.hlsFormat = "fmp4"
-	}
+	// HLS format detection lives in internal/encode so the WRITER of
+	// encode.json and this READER cannot drift apart.
+	m.hlsFormat = encode.DetectHLSFormat(dirPath)
 
 	return m
 }
