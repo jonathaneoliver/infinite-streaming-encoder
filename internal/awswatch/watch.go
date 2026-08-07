@@ -286,7 +286,13 @@ func gcFailedStaging(maxAge time.Duration) error {
 }
 
 func fetchInventory() (*inventoryDoc, error) {
-	cmd := exec.Command("python3", "-m", "infinite_streaming_encoder.cloud.inventory", "--json")
+	// --no-s3-prefixes: the watchdog reads instances, executions and Batch jobs;
+	// nothing here touches the per-prefix staging sizes, which are a display on
+	// the AWS tab. Enumerating every staged object once a minute cost ~$2.90/month
+	// of LIST requests on an idle account and grew with whatever was staged (#227).
+	// The HTTP handler computes them on demand instead, cached.
+	cmd := exec.Command("python3", "-m", "infinite_streaming_encoder.cloud.inventory",
+		"--json", "--no-s3-prefixes")
 	cmd.Env = os.Environ()
 	out, err := cmd.Output()
 	if err != nil {

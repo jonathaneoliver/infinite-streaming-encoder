@@ -636,7 +636,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="aws-header-actions">
                 <span id="aws-last-refresh" class="aws-refresh-time"></span>
                 <label class="aws-auto-toggle">
-                    <input type="checkbox" id="aws-auto-refresh" checked>
+                    <input type="checkbox" id="aws-auto-refresh" checked onchange="onAwsAutoRefreshToggled()">
                     auto-refresh 10s
                 </label>
                 <button class="btn btn-small" onclick="refreshAws()">Refresh</button>
@@ -1022,6 +1022,179 @@ function showMessage(title, body) {
 
 let outputsView = 'list'; // 'list' or 'detail'
 
+// ---------------------------------------------------------------------------
+// Background pollers — tab-scoped and visibility-aware (#227, #228)
+//
+// Every periodic fetch on this page goes through here, because the rule is the
+// same for all of them: a timer runs only while something on screen needs it.
+// They used to be top-level setIntervals, so they ran on every tab forever —
+// `/api/outputs` walks 133 dirs / 108,606 files on an external volume every 60s
+// (0.77s cold), and `/api/aws/inventory` LISTed every staged S3 object every
+// 10s, which is a bill. A page left open on Originals overnight did all of it
+// and displayed none of it.
+//
+// Three gates, all required:
+//   - the browser tab is not hidden — the commonest idle case by far, and it
+//     needs no timeout logic at all
+//   - the user has not walked away (see pollingIdle below)
+//   - the poller's own when() says its view is on screen
+//
+// Resuming fetches IMMEDIATELY, because idling must not make the page feel
+// stale when you come back to it. _POLL_FRESH_MS suppresses that fetch when
+// something else (a tab-switch handler, a button) has just done it.
+// ---------------------------------------------------------------------------
+
+const _POLL_FRESH_MS = 2000;
+const _pollers = [];
+
+function registerPoller(name, fn, intervalMs, when) {
+    _pollers.push({ name, fn, intervalMs, when, timer: null, lastRun: 0 });
+}
+
+function _pollerWanted(p) {
+    return document.visibilityState !== 'hidden' && !pollingIdle() && p.when();
+}
+
+function _runPoller(p) {
+    p.lastRun = Date.now();
+    try { p.fn(); } catch (e) { /* one bad poll must not stop the others */ }
+}
+
+// Start/stop every timer to match the current view + visibility. Call this
+// whenever either could have changed: tab switch, visibilitychange, the
+// auto-refresh checkbox, the idle timeout.
+function syncPollers() {
+    for (const p of _pollers) {
+        const want = _pollerWanted(p);
+        if (want && !p.timer) {
+            p.timer = setInterval(() => _runPoller(p), p.intervalMs);
+            if (Date.now() - p.lastRun > _POLL_FRESH_MS) _runPoller(p);
+        } else if (!want && p.timer) {
+            clearInterval(p.timer);
+            p.timer = null;
+        }
+    }
+}
+
+// Fetch now, on the tab you just opened, and record it as that poller's latest
+// run — otherwise syncPollers' resume-fetch fires the same request a moment
+// later, which for /api/outputs means walking 108k files twice per tab switch.
+function pollNow(name) {
+    const p = _pollers.find(x => x.name === name);
+    if (p) _runPoller(p);
+}
+
+function activeTab() {
+    const el = document.querySelector('.tab-content.active');
+    return el ? el.id.replace(/^tab-/, '') : '';
+}
+
+// Registered here, not at boot, so a tab switch can never run before the
+// pollers exist. All four are hoisted function declarations.
+registerPoller('sources', loadSources, 60000, () => activeTab() === 'originals');
+// Outputs also feed the Originals tab's per-source badges (#114) — but those
+// only change when an encode finishes, and the SSE terminal-transition hook
+// already reloads them, so the timer has no reason to run off the Outputs tab.
+registerPoller('outputs', loadOutputs, 60000, () => activeTab() === 'outputs');
+// The CPU sparkline + machine pills this feeds live on Jobs and AWS only.
+registerPoller('dist-workers', pollDistWorkers, 5000,
+    () => activeTab() === 'jobs' || activeTab() === 'aws');
+// The cloud inventory: the AWS tab's tables, and the compact fleet line on Jobs.
+registerPoller('aws-inventory', refreshAws, 10000, () => {
+    const chk = document.getElementById('aws-auto-refresh');
+    return !!(chk && chk.checked) && (activeTab() === 'aws' || activeTab() === 'jobs');
+});
+
+// ---------------------------------------------------------------------------
+// Idle: stop polling, and hand the page back to Originals (#227, #228)
+//
+// A tab nobody has touched since yesterday is not a view. Left alone it kept
+// every timer above running — the AWS one at 10s against a paid API, where a
+// single forgotten tab costs several times the entire background load #227 was
+// opened about.
+//
+// TWO different decisions, on two different clocks, because they cost
+// different things to get wrong:
+//
+//   pollingIdle() — stop fetching. Cheap and instantly reversible: the next
+//   click restarts the timers and refetches, so five minutes away is enough to
+//   act on (an hour while an encode is running — see below). This is the one
+//   that actually saves the requests.
+//
+//   viewExpired() — give up the Jobs/AWS view and go back to Originals. Moving
+//   someone's tab is disruptive, so it waits much longer, and it is anchored on
+//   the WORK rather than on the user: 30 minutes after the last encode
+//   finished, since a just-finished run is exactly what you come back to look
+//   at. While one is still running the view has live content, so it gets the
+//   full hour before the page concludes you have gone.
+//
+// Idle means NO INTERACTION, not no data. Reset it on poll completions and it
+// never expires — so only real user events count.
+// ---------------------------------------------------------------------------
+
+const _IDLE_POLL_MS = 5 * 60 * 1000;         // stop fetching: you left the desk
+const _IDLE_SETTLED_MS = 30 * 60 * 1000;     // ...and the last encode is 30min done
+const _IDLE_RETURN_MS = 60 * 60 * 1000;      // 1h on the tab regardless
+const _IDLE_TICK_MS = 30 * 1000;
+let _lastInteraction = Date.now();
+// When an encode last went terminal, per the SSE stream. 0 = none this session
+// (a reload does not resurrect one: the snapshot lists old terminal jobs, and
+// treating those as "just finished" would hold the view open for nothing).
+let _lastJobFinished = 0;
+
+function anyEncodeRunning() {
+    return Object.values(jobs).some(j => j.status === 'running' || j.status === 'queued');
+}
+
+// While an encode IS running the live panels have something to say every few
+// seconds, and watching a progress bar is not an activity that generates
+// pointer events — so polling gets the same hour the view does, and stops at
+// the same moment. It is the idle tail AFTER a run that this is really about.
+function pollingIdle() {
+    const limit = anyEncodeRunning() ? _IDLE_RETURN_MS : _IDLE_POLL_MS;
+    return Date.now() - _lastInteraction >= limit;
+}
+
+function viewExpired() {
+    const limit = anyEncodeRunning() ? _IDLE_RETURN_MS : _IDLE_SETTLED_MS;
+    return Date.now() - Math.max(_lastInteraction, _lastJobFinished) >= limit;
+}
+
+function _noteInteraction() {
+    const now = Date.now();
+    // Cheap path first — mousemove fires a lot, and a stamp from a second ago
+    // cannot have been idle, so there is nothing to check or restart.
+    if (now - _lastInteraction < 1000) { _lastInteraction = now; return; }
+    const wasIdle = pollingIdle();
+    _lastInteraction = now;
+    // Back at the desk: restart the timers now and refresh at once, rather than
+    // showing however-old data until the next tick.
+    if (wasIdle) syncPollers();
+}
+
+function _idleTick() {
+    const tab = activeTab();
+    // The live views give way to Originals, which is static and cheap. switchTab
+    // syncs the pollers itself; anywhere else, stop them here.
+    if (viewExpired() && (tab === 'jobs' || tab === 'aws')) switchTab('originals');
+    else syncPollers();
+}
+
+function startIdleWatch() {
+    ['pointerdown', 'keydown', 'wheel', 'touchstart', 'mousemove'].forEach(ev =>
+        document.addEventListener(ev, _noteInteraction, { passive: true, capture: true }));
+    document.addEventListener('visibilitychange', () => {
+        // Coming back to the tab IS interaction — otherwise a page hidden for an
+        // hour bounces to Originals the moment you look at it.
+        if (document.visibilityState !== 'hidden') _noteInteraction();
+        syncPollers();
+    });
+    setInterval(_idleTick, _IDLE_TICK_MS);
+}
+
+// Deliberately does NOT stamp an interaction: the idle timeout switches tabs
+// itself, and a stamp here would reset the very idleness that triggered it.
+// A user's own tab click stamps through the pointerdown listener instead.
 function switchTab(name) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
@@ -1037,10 +1210,14 @@ function switchTab(name) {
             break;
         }
     }
-    if (name === 'outputs') loadOutputs();
-    if (name === 'aws') refreshAws();
+    if (name === 'outputs') pollNow('outputs');
+    if (name === 'aws') pollNow('aws-inventory');
     if (name === 'about') loadVersion();
     if (name === 'ladders') renderLaddersTab();
+    // Start the timers this view needs and stop the ones it doesn't. The
+    // one-shot loads above cover the immediate refresh; syncPollers' own
+    // resume-fetch is suppressed for _POLL_FRESH_MS so it doesn't double up.
+    syncPollers();
 }
 
 // ---- Ladders ----
@@ -3564,6 +3741,10 @@ function connectSSE() {
             const TERMINAL = ['done', 'failed', 'cancelled', 'move-failed'];
             if (was && was !== job.status && TERMINAL.includes(job.status)) {
                 loadOutputs();
+                // A just-finished encode is what you come back to look at, so
+                // the Jobs view stays put for _IDLE_SETTLED_MS from here rather
+                // than from whenever you last touched the page.
+                _lastJobFinished = Date.now();
             }
         } catch (err) {}
     };
@@ -3574,8 +3755,8 @@ function connectSSE() {
 }
 
 // --- AWS Resources tab ---
-
-let awsTimer = null;
+// (its 10s poll is the 'aws-inventory' poller — no module-level timer here, so
+// there is no handle that can survive a tab switch)
 
 function formatBytes(n) {
     if (!n) return '0 B';
@@ -3659,7 +3840,9 @@ function renderAws(data) {
     renderAwsInstances(data.instances || []);
     renderAwsSpotRequests(data.spot_requests || []);
     renderAwsVolumes(data.volumes || []);
-    renderAwsS3(data.s3_prefixes || []);
+    // s3_prefixes_at is present only when the server served a CACHED staging
+    // walk (#227). Absent means it was measured on this very call.
+    renderAwsS3(data.s3_prefixes || [], data.s3_prefixes_at);
 }
 
 function renderAwsExecutions(execs) {
@@ -4577,10 +4760,18 @@ function renderAwsVolumes(volumes) {
     `;
 }
 
-function renderAwsS3(prefixes) {
+// measuredAt: when the enumeration behind these rows was taken, when that was
+// not this call. Listing every staged object is the one O(objects-held) call in
+// the inventory, so the server reuses one walk for a few minutes (#227) — say so
+// rather than presenting a ten-minute-old size as this second's.
+function renderAwsS3(prefixes, measuredAt) {
     const el = document.getElementById('aws-s3');
+    const stamp = measuredAt
+        ? `<div class="aws-refresh-time" style="margin-bottom:6px">sizes measured `
+          + `${new Date(measuredAt).toLocaleTimeString()}</div>`
+        : '';
     if (prefixes.length === 0) {
-        el.innerHTML = '<div class="aws-empty">No S3 staging.</div>';
+        el.innerHTML = stamp + '<div class="aws-empty">No S3 staging.</div>';
         return;
     }
     const rows = prefixes.map(p => {
@@ -4604,7 +4795,7 @@ function renderAwsS3(prefixes) {
             <td>${del}</td>
         </tr>`;
     }).join('');
-    el.innerHTML = `
+    el.innerHTML = stamp + `
         <table class="aws-table">
             <thead><tr>
                 <th>Prefix</th><th>Size</th><th>Objects</th><th>Job</th><th></th>
@@ -4825,8 +5016,8 @@ async function pollDistWorkers() {
         renderLocalFleet();
     } catch (e) { /* cluster not up */ }
 }
-setInterval(pollDistWorkers, 5000);   // 5s: keeps the live CPU sparkline current
-pollDistWorkers();
+// Polled every 5s to keep the live CPU sparkline current — but only while a
+// view that draws it (Jobs, AWS) is on screen. See registerPoller above.
 
 // Single overall completion % for an encode, WEIGHTED BY EXPECTED ENCODE COST —
 // a 4K HEVC 2-pass rendition is ~200× the compute of an h264 360p one, so it must
@@ -5132,17 +5323,10 @@ async function executeClear() {
     }
 }
 
-function startAwsAutoRefresh() {
-    const chk = document.getElementById('aws-auto-refresh');
-    const tick = () => {
-        // Refresh on the AWS tab, and also on the Jobs tab to keep the compact
-        // fleet-utilization line live there.
-        const onAws = document.querySelector('#tab-aws').classList.contains('active');
-        const onJobs = document.querySelector('#tab-jobs').classList.contains('active');
-        if (chk.checked && (onAws || onJobs)) refreshAws();
-    };
-    awsTimer = setInterval(tick, 10000);
-}
+// The auto-refresh checkbox is part of the AWS poller's when() (see
+// registerPoller above), so it has to re-evaluate the gates when toggled —
+// unticking it must actually stop the timer, not just skip a tick.
+function onAwsAutoRefreshToggled() { syncPollers(); }
 
 // --- Context Menu ---
 
@@ -5502,15 +5686,16 @@ function closePlayer(modal) {
     if (modal) modal.remove();
 }
 
-loadSources();
-// Outputs power the encode tab's per-source status badges (#114), not just the
-// Outputs tab — load them at boot and keep them fresh alongside the source poll.
+// Outputs power the Originals tab's per-source status badges (#114), not just
+// the Outputs tab — load them once at boot; after that the SSE terminal-job
+// hook and the Outputs tab's own poller keep them current.
 loadOutputs();
 initDropUpload();
 connectSSE();
-setInterval(loadSources, 60000);
-setInterval(loadOutputs, 60000);
-startAwsAutoRefresh();
+// Starts whatever the opening view needs (sources, on Originals) and fetches
+// straight away; everything else stays stopped until you go and look at it.
+syncPollers();
+startIdleWatch();
 loadVersion();
 loadLadders();
 loadSettings();

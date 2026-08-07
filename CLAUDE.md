@@ -243,6 +243,33 @@ The EC2 user-data itself is still bash (it runs on the remote instance) — `clo
 
 **`static/index.html`** — a single self-contained HTML file (vanilla JS, no build step). Served directly by the Go file server. It polls `/api/jobs/stream` for live updates and plays HLS via hls.js pointed at `/content/<dir>/<playlist>.m3u8`.
 
+### Background polling (page + server)
+
+Every periodic fetch the page makes goes through `registerPoller` /
+`syncPollers`, and a timer runs only when all three gates agree: the browser tab
+is not hidden, the user has not gone idle (`pollingIdle()`, 5min), and the
+poller's own `when()` says its view is on screen. Add a bare `setInterval` and
+you have re-created #228: `/api/outputs` walks 133 dirs / 108,606 files on an
+external volume, and it was doing that every 60s on every tab including ones
+nobody had looked at since yesterday.
+
+Returning the Jobs/AWS tabs to Originals is a **separate, slower** clock
+(`viewExpired()`) on purpose — stopping a fetch is free and the next click
+undoes it, but moving someone's tab is disruptive. It is anchored on the work
+rather than the user: 30min after the last encode went terminal, or an hour
+while one is still running. Keep both, and keep them apart; collapsing them
+means either paying for polls nobody wants or yanking the view out from under
+someone who came back to read a finished run (#227, #228).
+
+Server-side, the corresponding rule is that the AWS inventory's S3 staging walk
+(`_s3_prefix_inventory`) is the only part whose cost is O(objects held) rather
+than O(resources running), and it feeds exactly one display. So `awswatch`
+passes `--no-s3-prefixes` (it reads instances/executions/Batch jobs and nothing
+else), and the HTTP handler computes it on demand and reuses it for
+`s3PrefixTTL`. `null` s3_prefixes means "not measured" — never cache it as
+"nothing staged", and every user-facing path that deletes staging must call
+`invalidateS3Prefixes`.
+
 ## Things to know when editing
 
 - Output dir naming is a contract shared by `OutputStem`, the encode script (appends `_<codec>`), `parseOutputMeta`, `resolveCodec`, and the watcher's `alreadyEncoded`. Changing the format means touching all of them.

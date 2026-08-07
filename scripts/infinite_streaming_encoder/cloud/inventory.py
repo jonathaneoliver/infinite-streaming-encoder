@@ -17,10 +17,14 @@ Output shape (JSON):
       "spot_requests": [{id, state, instance_id, job_id, launched_at}],
       "volumes":  [{id, state, size_gib, job_id, attached_to,
                     is_orphan, created_at}],
-      "s3_prefixes": [{prefix, object_count, size_bytes, job_id}],
+      "s3_prefixes": [{prefix, object_count, size_bytes, job_id}] | null,
       "summary": {running_instances, orphan_volumes, total_s3_bytes,
                   estimated_hourly_usd}
     }
+
+`s3_prefixes` (and `summary.total_s3_bytes` with it) is **null** when called
+with `--no-s3-prefixes` — see collect(). Null means "not measured"; an empty
+list means "measured, nothing staged".
 
 Costs are approximate. Spot pricing is noisy per-AZ; we use the most
 recent spot price when available and fall back to a hardcoded
@@ -719,7 +723,7 @@ def _spot_and_reclaim_stats() -> dict:
 # Public entry
 # ---------------------------------------------------------------------------
 
-def collect() -> dict[str, Any]:
+def collect(include_s3_prefixes: bool = True) -> dict[str, Any]:
     ec2 = ec2_client()
 
     instances_raw = _describe_app_instances(ec2)
@@ -729,14 +733,23 @@ def collect() -> dict[str, Any]:
     spot_requests = [_spot_view(r) for r in _describe_app_spot_requests(ec2)]
 
     bucket = os.environ.get("S3_BUCKET") or None
-    s3_prefixes = _s3_prefix_inventory(bucket)
+    # The staging walk is the only O(objects-held) part of this call, and it
+    # feeds exactly one display — the AWS tab's S3 Staging table. Riding the
+    # 60s watchdog poll it cost ~$2.90/month of LIST requests on an idle
+    # account, growing with whatever happened to be staged (#227), so the
+    # caller now says whether anything is going to read it.
+    #
+    # null, NOT [] — "nobody asked" has to be distinguishable from "measured,
+    # nothing staged", or a skipped walk renders as an emptied bucket.
+    s3_prefixes = _s3_prefix_inventory(bucket) if include_s3_prefixes else None
 
     executions = _executions()
     batch_jobs = _batch_jobs()
 
     running_instances = [i for i in instances if i["state"] == "running"]
     orphan_volumes = [v for v in volumes if v["is_orphan"]]
-    total_s3_bytes = sum(p.get("size_bytes", 0) for p in s3_prefixes)
+    total_s3_bytes = (None if s3_prefixes is None
+                      else sum(p.get("size_bytes", 0) for p in s3_prefixes))
     hourly_total = sum(i["estimated_hourly_usd"] for i in running_instances)
     running_executions = [e for e in executions if e.get("status") == "RUNNING"]
     active_batch_jobs = [j for j in batch_jobs if not j.get("error")]
@@ -795,10 +808,14 @@ def _main() -> int:
     p = argparse.ArgumentParser(prog="infinite_streaming_encoder.cloud.inventory")
     p.add_argument("--json", action="store_true",
                    help="emit machine-readable JSON (default: text summary)")
+    p.add_argument("--no-s3-prefixes", action="store_true",
+                   help="skip the per-prefix S3 staging walk (the only part "
+                        "whose cost scales with objects held); s3_prefixes and "
+                        "summary.total_s3_bytes come back null")
     args = p.parse_args()
 
     try:
-        data = collect()
+        data = collect(include_s3_prefixes=not args.no_s3_prefixes)
     except ClientError as e:
         print(json.dumps({"error": str(e)}) if args.json else f"[inventory] error: {e}",
               file=sys.stderr)
@@ -813,8 +830,11 @@ def _main() -> int:
     print(f"[inventory] region={data['region']} fetched_at={data['fetched_at']}")
     print(f"  running instances:  {s['running_instances']}")
     print(f"  orphan volumes:     {s['orphan_volumes']}")
-    print(f"  S3 staged:          {s['total_s3_bytes'] / (1024**3):.2f} GiB "
-          f"({sum(p.get('object_count', 0) for p in data['s3_prefixes'])} objects)")
+    if data["s3_prefixes"] is None:
+        print("  S3 staged:          (not measured — --no-s3-prefixes)")
+    else:
+        print(f"  S3 staged:          {s['total_s3_bytes'] / (1024**3):.2f} GiB "
+              f"({sum(p.get('object_count', 0) for p in data['s3_prefixes'])} objects)")
     print(f"  est hourly spend:   ${s['estimated_hourly_usd']:.2f}")
     for i in data["instances"]:
         if i["state"] != "running":
