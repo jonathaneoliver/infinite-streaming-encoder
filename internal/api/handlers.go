@@ -42,6 +42,20 @@ type Server struct {
 	invMu   sync.Mutex
 	invLast []byte
 	invAt   time.Time
+	// s3Mu/s3Prefixes/s3Bytes/s3At cache the S3 staging enumeration — the one
+	// part of the inventory whose cost is O(objects held) rather than O(running
+	// resources), and the only part no background caller wants (#227). It is
+	// recomputed at most once per s3PrefixTTL and spliced into every inventory
+	// served in between, so an open AWS tab polling every 10s pays for one walk
+	// per TTL and a closed one pays for none.
+	s3Mu       sync.Mutex
+	s3Prefixes json.RawMessage
+	s3Bytes    int64
+	s3At       time.Time
+	// s3Gen advances on every invalidation, so a walk that was already in
+	// flight when staging was deleted cannot land its now-wrong result in the
+	// cache after the invalidation that was meant to clear it.
+	s3Gen uint64
 	// GHCRImage is the GHCR image (no tag) whose OCI labels stand in for the
 	// cloud worker image's — the worker image is an ECR ref imageinfo can't
 	// query, but publish keeps ECR + GHCR in sync by tag.
@@ -1147,8 +1161,30 @@ func runPythonCloud(module string, args ...any) ([]byte, error) {
 // being papered over indefinitely.
 const invStaleWindow = 2 * time.Minute
 
+// s3PrefixTTL is how long one S3 staging enumeration is reused.
+//
+// Staging changes on the timescale of an encode, not of a poll: the page asks
+// for the inventory every 10s while the AWS or Jobs tab is open, and a walk per
+// poll is ~9 LIST pages of a bill for a number that has not moved. Deletions do
+// not wait for it — every path a user can press invalidates the cache — so the
+// only staleness this can show is staging that GREW, which the next TTL picks
+// up. (The one deleter that does not invalidate is awswatch's failed-staging
+// GC: it runs on its own schedule in another package, so its rows age out on
+// the TTL like any other change.)
+const s3PrefixTTL = 10 * time.Minute
+
 func (s *Server) awsInventory(w http.ResponseWriter, r *http.Request) {
-	out, err := runPythonCloud("inventory")
+	prefixes, sizeBytes, at, cached := s.cachedS3Prefixes()
+	gen := s.s3Generation()
+	var (
+		out []byte
+		err error
+	)
+	if cached {
+		out, err = runPythonCloud("inventory", "--no-s3-prefixes")
+	} else {
+		out, err = runPythonCloud("inventory")
+	}
 	if err != nil {
 		// Log it: this path was previously silent, so the fleet blanking left no
 		// trace at all and could not be told apart from the fleet being empty.
@@ -1167,12 +1203,102 @@ func (s *Server) awsInventory(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 502)
 		return
 	}
+	if cached {
+		out = mergeS3Prefixes(out, prefixes, sizeBytes, at)
+	} else {
+		s.storeS3Prefixes(out, gen)
+	}
 	s.invMu.Lock()
 	s.invLast, s.invAt = out, time.Now()
 	s.invMu.Unlock()
 	out = s.attachFleetCPU(out)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(out)
+}
+
+// cachedS3Prefixes returns the cached staging enumeration when it is still
+// within s3PrefixTTL. ok=false means the caller must ask Python to walk again.
+func (s *Server) cachedS3Prefixes() (prefixes json.RawMessage, sizeBytes int64, at time.Time, ok bool) {
+	s.s3Mu.Lock()
+	defer s.s3Mu.Unlock()
+	if s.s3Prefixes == nil || time.Since(s.s3At) >= s3PrefixTTL {
+		return nil, 0, time.Time{}, false
+	}
+	return s.s3Prefixes, s.s3Bytes, s.s3At, true
+}
+
+func (s *Server) s3Generation() uint64 {
+	s.s3Mu.Lock()
+	defer s.s3Mu.Unlock()
+	return s.s3Gen
+}
+
+// storeS3Prefixes caches the staging enumeration out of a full inventory,
+// unless staging was deleted while this walk was running (gen moved).
+// A null s3_prefixes (the --no-s3-prefixes shape) is not cached either — it
+// says "not measured", which must never be mistaken for "nothing staged".
+func (s *Server) storeS3Prefixes(out []byte, gen uint64) {
+	var doc struct {
+		S3Prefixes json.RawMessage `json:"s3_prefixes"`
+		Summary    struct {
+			TotalS3Bytes int64 `json:"total_s3_bytes"`
+		} `json:"summary"`
+	}
+	if json.Unmarshal(out, &doc) != nil || len(doc.S3Prefixes) == 0 ||
+		string(doc.S3Prefixes) == "null" {
+		return
+	}
+	s.s3Mu.Lock()
+	defer s.s3Mu.Unlock()
+	if s.s3Gen != gen {
+		return
+	}
+	s.s3Prefixes, s.s3Bytes, s.s3At = doc.S3Prefixes, doc.Summary.TotalS3Bytes, time.Now()
+}
+
+// invalidateS3Prefixes drops the cache so the next inventory walks for real.
+// Called by every path that deletes staging: a delete whose row survives the
+// next refresh reads as a failed delete, so the ONE thing this cache must not
+// do is outlive the objects it describes.
+func (s *Server) invalidateS3Prefixes() {
+	s.s3Mu.Lock()
+	s.s3Prefixes, s.s3Bytes, s.s3At = nil, 0, time.Time{}
+	s.s3Gen++
+	s.s3Mu.Unlock()
+}
+
+// mergeS3Prefixes splices the cached enumeration into an inventory fetched with
+// --no-s3-prefixes, so the payload shape is identical either way and the UI has
+// no idea which path it got. Decoding to json.RawMessage rather than `any`
+// keeps every other number in the document byte-for-byte as Python wrote it.
+func mergeS3Prefixes(out []byte, prefixes json.RawMessage, sizeBytes int64, at time.Time) []byte {
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(out, &doc) != nil {
+		return out
+	}
+	var summary map[string]json.RawMessage
+	if json.Unmarshal(doc["summary"], &summary) != nil {
+		return out
+	}
+	doc["s3_prefixes"] = prefixes
+	summary["total_s3_bytes"] = json.RawMessage(strconv.FormatInt(sizeBytes, 10))
+	// When these numbers were measured, so the tab can say so rather than
+	// presenting a ten-minute-old size as current.
+	stamp, err := json.Marshal(at.UTC().Format(time.RFC3339))
+	if err != nil {
+		return out
+	}
+	doc["s3_prefixes_at"] = stamp
+	merged, err := json.Marshal(summary)
+	if err != nil {
+		return out
+	}
+	doc["summary"] = merged
+	merged, err = json.Marshal(doc)
+	if err != nil {
+		return out
+	}
+	return merged
 }
 
 // attachFleetCPU adds the per-machine CPU history from ENCODER-FLEET markers to
@@ -1327,6 +1453,9 @@ func (s *Server) awsClearAll(w http.ResponseWriter, r *http.Request) {
 			400)
 		return
 	}
+	// Deferred, not conditional on success: a partial sweep still deleted
+	// something, so the cached staging table is wrong either way (#227).
+	defer s.invalidateS3Prefixes()
 	out, err := runPythonCloud("cleanup", "--sweep-all")
 	if err != nil {
 		// Non-zero exit from cleanup means at least one action failed —
@@ -1353,6 +1482,7 @@ func (s *Server) awsCleanupJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid job id", 400)
 		return
 	}
+	defer s.invalidateS3Prefixes() // this drops the job's staging prefix
 	out, err := runPythonCloud("cleanup", "--job-id", cloudVal(id))
 	if err != nil {
 		http.Error(w, err.Error(), 502)
@@ -1374,6 +1504,7 @@ func (s *Server) awsDeleteS3Prefix(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `bad request: {"prefix": "..."} required`, 400)
 		return
 	}
+	defer s.invalidateS3Prefixes() // the row the user just deleted must not come back
 	out, err := runPythonCloud("cleanup", "--delete-prefix", cloudVal(body.Prefix))
 	if err != nil {
 		http.Error(w, err.Error(), 502)
