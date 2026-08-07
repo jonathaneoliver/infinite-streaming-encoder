@@ -697,7 +697,7 @@ func (j *Job) parseMarker(line string) bool {
 			EgressGB: num("egress_gb"), EgressUSD: num("egress_usd"),
 			EgressAvoidedGB: num("egress_avoided_gb"),
 			SfnUSD:          num("sfn_usd"), RequestUSD: num("s3_request_usd"),
-			StorageUSD: num("storage_usd"),
+			StorageUSD: num("storage_usd"), PutEstUSD: num("s3_put_est_usd"),
 		}, kv["unmodelled"])
 		return true
 	}
@@ -862,7 +862,7 @@ func (j *Job) recordCost(exec string, c execCost, unmodelled string) {
 		j.costByExec = map[string]execCost{}
 	}
 	j.costByExec[exec] = c
-	var s, o, sv, eg, eu, ea, sf, rq, st float64
+	var s, o, sv, eg, eu, ea, sf, rq, st, pe float64
 	for _, v := range j.costByExec {
 		s += v.Spot
 		o += v.OnDemand
@@ -873,12 +873,13 @@ func (j *Job) recordCost(exec string, c execCost, unmodelled string) {
 		sf += v.SfnUSD
 		rq += v.RequestUSD
 		st += v.StorageUSD
+		pe += v.PutEstUSD
 	}
 	j.SpotUSD, j.OnDemandUSD, j.SavedUSD = s, o, sv
 	j.EgressGB, j.EgressUSD, j.EgressAvoidedGB = eg, eu, ea
-	j.SfnUSD, j.RequestUSD, j.StorageUSD = sf, rq, st
+	j.SfnUSD, j.RequestUSD, j.StorageUSD, j.PutEstUSD = sf, rq, st, pe
 	// The headline: what the run cost at full rate, not what one component did.
-	j.TotalUSD = s + eu + sf + rq + st
+	j.TotalUSD = s + eu + sf + rq + st + pe
 	// Carried so the UI can say what the total EXCLUDES. A partial number that
 	// looks complete is the whole reason #217 was filed.
 	if unmodelled != "" {
@@ -896,6 +897,11 @@ type execCost struct {
 	// did AWS happen to charge this month". Step Functions is why that matters:
 	// the account is already at 4,000/4,000 free transitions.
 	SfnUSD, RequestUSD, StorageUSD float64
+	// PutEstUSD is FITTED from staged bytes, not counted — Tier1 requests
+	// happen across workers and the packager, which keep no counters. Kept in a
+	// distinct field so the UI can label it an estimate rather than pass it off
+	// as measured.
+	PutEstUSD float64
 }
 
 // parseMarkerFields splits "a=1 b=2" into a map. Values cannot contain spaces,
@@ -1249,7 +1255,9 @@ type Job struct {
 	SfnUSD     float64 `json:"sfn_usd,omitempty"`
 	RequestUSD float64 `json:"request_usd,omitempty"`
 	StorageUSD float64 `json:"storage_usd,omitempty"`
-	TotalUSD   float64 `json:"total_usd,omitempty"`
+	// Fitted, not measured — labelled as such in the UI.
+	PutEstUSD float64 `json:"put_est_usd,omitempty"`
+	TotalUSD  float64 `json:"total_usd,omitempty"`
 	// Comma-separated list of cost lines the total does NOT include, so the UI
 	// can show the gap rather than implying there isn't one.
 	CostUnmodelled string  `json:"cost_unmodelled,omitempty"`

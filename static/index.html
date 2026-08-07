@@ -2424,6 +2424,12 @@ function _runCostHtml(j) {
     // hiding them would put us back to reporting a fraction as if it were all.
     const small = (j.sfn_usd || 0) + (j.request_usd || 0) + (j.storage_usd || 0);
     if (small > 0) parts.push(`$${small.toFixed(2)} sfn+requests+storage`);
+    // Marked "est" because it is FITTED from staged bytes, not counted — Tier1
+    // requests happen across workers and the packager, which keep no counters.
+    // Presenting a fitted number as measured is the failure this issue is about.
+    if (j.put_est_usd > 0) {
+        parts.push(`<span title="Estimated, not measured: ~1,897 Tier1 requests per GB staged (fitted, R²=0.991). Excludes the ~$0.10/day background inventory sweep, which no run causes — see #227.">$${j.put_est_usd.toFixed(2)} S3 PUT (est)</span>`);
+    }
     if (parts.length) html += ` <span class="u">${parts.join(' · ')}</span>`;
     if (j.saved_usd > 0) html += ` <span class="u">· saved $${j.saved_usd.toFixed(2)} on spot</span>`;
     // Only meaningful when the run left media in S3; silent otherwise.

@@ -2721,7 +2721,13 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None,
     store_usd = pricing.s3_storage_usd(
         (staged_bytes or 0) / 1e9, max(wall_s, 0.0) / 3600.0)
 
-    total = spot + eg_usd + sfn_cost + req_usd + store_usd
+    # Tier1 is ESTIMATED from staged bytes, not counted — see
+    # pricing.s3_put_estimate_usd. It is the largest line we cannot attribute
+    # directly (8.5% of the full-rate total), so a fitted figure beats omitting
+    # it, but it is labelled est so nobody mistakes it for a measurement.
+    put_est = pricing.s3_put_estimate_usd(staged_bytes)
+
+    total = spot + eg_usd + sfn_cost + req_usd + store_usd + put_est
 
     # Name what is NOT in the total. #217 existed because a partial number looked
     # complete; repeating that with a longer list of terms would be worse, not
@@ -2729,7 +2735,7 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None,
     # Tier1 requests cost $2.96 over 1-3 Aug, but they happen across the workers
     # and the packager, not here, so attributing them per-run needs counters
     # those paths do not yet keep.
-    unmodelled = ",".join(("s3-put",) + pricing.UNMODELLED)
+    unmodelled = ",".join(pricing.UNMODELLED)
 
     print(f"[[ENCODER-COST exec={exec_name} spot_usd={spot:.4f} "
           f"ondemand_usd={ondemand:.4f} saved_usd={saved:.4f} "
@@ -2738,6 +2744,7 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None,
           f"egress_avoided_gb={avoided_gb:.3f} "
           f"sfn_transitions={sfn_txns} sfn_usd={sfn_cost:.4f} "
           f"s3_get={get_n} s3_request_usd={req_usd:.4f} "
+          f"s3_put_est_usd={put_est:.4f} "
           f"storage_usd={store_usd:.4f} "
           f"total_usd={total:.4f} unmodelled={unmodelled}]]", flush=True)
     print(f"[[ENCODER-STATS exec={exec_name} wall_s={wall_s:.1f} vcpu_h={vh:.3f} "

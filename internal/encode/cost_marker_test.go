@@ -106,6 +106,9 @@ func TestFullRateLinesAreIncludedInTheTotal(t *testing.T) {
 		"unmodelled=s3-put,cloudwatch-logs,sqs]]") {
 		t.Fatal("marker not consumed")
 	}
+	if !closeTo(j.PutEstUSD, 0) {
+		t.Fatalf("absent put estimate should be zero, got %v", j.PutEstUSD)
+	}
 	if !closeTo(j.SfnUSD, 0.0203) || !closeTo(j.RequestUSD, 0.0006) ||
 		!closeTo(j.StorageUSD, 0.0004) {
 		t.Fatalf("full-rate lines lost: sfn=%v req=%v store=%v",
@@ -120,6 +123,25 @@ func TestFullRateLinesAreIncludedInTheTotal(t *testing.T) {
 	// complete is exactly what #217 was filed about.
 	if j.CostUnmodelled == "" {
 		t.Fatal("unmodelled list dropped — the UI could not disclose the gap")
+	}
+}
+
+// The fitted PUT estimate must reach the total AND stay distinguishable from
+// measured lines — presenting a fit as a measurement is the failure mode #217 is
+// about, one level up.
+func TestPutEstimateIsSummedButKeptSeparate(t *testing.T) {
+	j := &Job{}
+	if !j.parseMarker("[[ENCODER-COST exec=e1 spot_usd=0.15 egress_usd=0.7067 " +
+		"sfn_usd=0.0111 s3_request_usd=0.0072 storage_usd=0.0033 " +
+		"s3_put_est_usd=0.0745 total_usd=0.9528]]") {
+		t.Fatal("marker not consumed")
+	}
+	if !closeTo(j.PutEstUSD, 0.0745) {
+		t.Fatalf("put estimate lost: %v", j.PutEstUSD)
+	}
+	want := 0.15 + 0.7067 + 0.0111 + 0.0072 + 0.0033 + 0.0745
+	if !closeTo(j.TotalUSD, want) {
+		t.Fatalf("total = %v, want %v — the estimate was not summed", j.TotalUSD, want)
 	}
 }
 

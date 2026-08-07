@@ -88,9 +88,11 @@ S3_STORAGE_USD_PER_GB_MONTH = 0.023
 # currently charged would give an answer with a shelf life.
 SFN_USD_PER_1K_TRANSITIONS = 0.025
 
-# SQS standard queue (the telemetry channel). 289k/1M free used at time of
-# writing, so currently invisible.
-SQS_USD_PER_MILLION = 0.40
+# SQS. FIFO and standard are priced DIFFERENTLY and this workload uses both —
+# measured 1-3 Aug: 145,099 FIFO against 124,102 standard, i.e. 54% FIFO. A
+# single rate would be wrong for the majority of the traffic.
+SQS_STANDARD_USD_PER_MILLION = 0.40
+SQS_FIFO_USD_PER_MILLION = 0.50
 
 # CloudWatch Logs. Ingestion dominates; storage is rounding.
 CW_LOGS_INGEST_USD_PER_GB = 0.50
@@ -113,12 +115,61 @@ def sfn_usd(transitions: int) -> float:
     return transitions / 1000 * SFN_USD_PER_1K_TRANSITIONS
 
 
+def sqs_usd(standard: int = 0, fifo: int = 0) -> float:
+    return (standard / 1e6 * SQS_STANDARD_USD_PER_MILLION
+            + fifo / 1e6 * SQS_FIFO_USD_PER_MILLION)
+
+
+# ---------------------------------------------------------------------------
+# S3 Tier1 (PUT/LIST) — ESTIMATED, not counted.
+# ---------------------------------------------------------------------------
+#
+# Tier1 requests happen across the workers, the packager and the orchestrator,
+# so counting them properly needs counters in paths that do not keep any. They
+# are also the largest single unmodelled line — $2.96 over 1-3 Aug, 8.5% of the
+# full-rate total — so omitting them is worse than estimating them.
+#
+# Counting resident objects instead would understate by ~77x (7,673 resident vs
+# 591,572 charged): multipart parts, chunks deleted after concat, and LISTs
+# never appear in a listing. That is the plausible-but-wrong answer.
+#
+# So: fitted. Ten days of daily Tier1 against daily bytes, 2026-07-28..08-06:
+#
+#     Tier1 ≈ 1,897 x GB + 19,236        R² = 0.991
+#
+# ONLY THE SLOPE IS USED HERE. The ~19,236/day intercept is background traffic —
+# the inventory poll enumerating staging once a minute (#227) — which no encode
+# causes. Confirmed directly: 2026-08-05 logged 62,865 Tier1 with ZERO
+# executions. Attributing that to whichever run happened to be nearby would be
+# worse than leaving it out, so it is left out.
+#
+# Applied to STAGED bytes, not egress bytes, even though the fit used egress.
+# During the calibration window every run downloaded its whole output, so the
+# two were the same quantity. Staged is the correct causal one — a --no-media
+# run (#214) writes just as many objects while egressing almost nothing — and
+# using egress would have quietly dropped this line to ~zero for exactly the
+# runs the feature was built for.
+#
+# Re-derive after anything that changes object counts per byte: chunk duration,
+# the multipart threshold, or #215 (which removes ~half of all output objects).
+S3_TIER1_PER_GB_STAGED = 1897
+
+
+def s3_put_estimate_usd(staged_bytes: int | float) -> float:
+    """Estimated Tier1 cost for a run, from bytes staged. See the note above —
+    this is a fitted figure, not a count, and excludes background traffic."""
+    gb = (staged_bytes or 0) / 1e9
+    return gb * S3_TIER1_PER_GB_STAGED / 1000 * S3_TIER1_USD_PER_1K
+
+
 # Named so a reader knows the total is INCOMPLETE and by roughly how much,
 # rather than assuming silence means zero. Reported alongside the total; see
 # #217 — the whole issue existed because a partial number looked total.
 UNMODELLED = (
     "cloudwatch-logs",   # per-run ingest bytes are not tracked; ~$0.16/3 days
-    "sqs",               # telemetry message count not threaded through; ~$0.12/3 days
+    "sqs",               # message counts not threaded through; ~$0.12/3 days
+    "s3-list-background",  # the once-a-minute inventory sweep (#227), ~$0.10/day,
+                           # deliberately not per-run: no encode causes it
     "ecr-storage",       # image storage, shared across all runs, not per-run
     "data-transfer-in",  # always free
 )
