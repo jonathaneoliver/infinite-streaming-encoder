@@ -99,6 +99,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("DELETE /api/ladders/{name}", s.deleteLadder)
 	s.Mux.HandleFunc("GET /api/outputs", s.listOutputs)
 	s.Mux.HandleFunc("GET /api/outputs/{name}", s.listOutputContents)
+	s.Mux.HandleFunc("GET /api/outputs/{name}/files", s.listOutputFiles)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/playlists", s.listPlaylists)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/ladder", s.ladder)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/logs", s.outputLogs)
@@ -828,6 +829,61 @@ func (s *Server) listOutputContents(w http.ResponseWriter, r *http.Request) {
 		files = append(files, f)
 	}
 	writeJSON(w, files)
+}
+
+// listOutputFiles walks one output dir and returns every FILE in it, as paths
+// relative to the dir, with sizes. listOutputContents is deliberately not this:
+// it lists only the top level (with aggregate sizes) because that is what the
+// Outputs table draws.
+//
+// A client that wants the media needs the whole tree, and the alternative was
+// to reconstruct it — parse the playlists for segment names, then guess at the
+// files no playlist mentions (.byteranges sidecars, encode.json, the master
+// manifest). Every one of those omissions would be silent.
+//
+// Sizes are here so a download can skip what it already has at the right size
+// without a request per file, the same way cli_batch's fetch does against S3.
+func (s *Server) listOutputFiles(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		http.Error(w, "invalid name", http.StatusBadRequest)
+		return
+	}
+	root := filepath.Join(s.Manager.OutputDir, name)
+	fi, err := os.Stat(root)
+	if err != nil || !fi.IsDir() {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	type entry struct {
+		Path string `json:"path"`
+		Size int64  `json:"size"`
+	}
+	files := []entry{}
+	var total int64
+	err = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil // an unreadable subtree skips itself, not the whole listing
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, p)
+		if rerr != nil {
+			return nil
+		}
+		// Always forward slashes: these are used to build /content/ URLs, and
+		// a Windows client joining them back is not this server's business.
+		files = append(files, entry{Path: filepath.ToSlash(rel), Size: info.Size()})
+		total += info.Size()
+		return nil
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"name": name, "files": files, "total_bytes": total})
 }
 
 type outputMeta struct {

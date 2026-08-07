@@ -190,13 +190,214 @@ def test_a_vanished_job_counts_as_failure() -> None:
     orig = encoder_cli._call
     encoder_cli._call = fake_call
     try:
-        args = types.SimpleNamespace(timeout=1, poll_interval=0, json=False)
+        args = types.SimpleNamespace(timeout=1, poll_interval=0, json=False,
+                                     quiet=True)
         with contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            rc = encoder_cli._wait("http://x", ["job-1"], args)
+            rc, _ = encoder_cli._wait("http://x", ["job-1"], args)
         assert rc == 1, "a missing job was treated as done"
     finally:
         encoder_cli._call = orig
+
+
+def test_a_local_path_uploads_and_a_bare_name_does_not() -> None:
+    """The positional argument means two things and the filesystem decides
+    which. `encoder_cli ./clip.mp4` from a laptop and `encoder_cli clip.mp4` on
+    the master box are both natural, and getting it backwards either uploads a
+    file that is already there or submits a name the server has never seen."""
+    import tempfile
+    import types
+    uploaded = []
+
+    def fake_upload(server, path, quiet):
+        uploaded.append(path)
+        return "uploaded-" + Path(path).name, None
+
+    orig = encoder_cli._upload
+    encoder_cli._upload = fake_upload
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            local = Path(td) / "clip.mp4"
+            local.write_bytes(b"\0" * 10)
+            args = types.SimpleNamespace(no_upload=False, quiet=True)
+
+            names, err = encoder_cli._resolve_inputs(
+                "http://x", [str(local), "already-there.mp4"], args)
+            assert err is None, err
+            assert names == ["uploaded-clip.mp4", "already-there.mp4"], names
+            assert uploaded == [str(local)], uploaded
+
+            # --no-upload forces the server-side reading even for a real file.
+            uploaded.clear()
+            args.no_upload = True
+            names, err = encoder_cli._resolve_inputs("http://x", [str(local)], args)
+            assert err is None and uploaded == [], (names, uploaded)
+    finally:
+        encoder_cli._upload = orig
+
+
+def test_a_path_that_does_not_exist_locally_is_an_error_not_a_source_name() -> None:
+    # Otherwise a typo'd path is sent as a source name and comes back as a
+    # confusing 400 about SOURCE_DIR.
+    import types
+    args = types.SimpleNamespace(no_upload=False, quiet=True)
+    _, err = encoder_cli._resolve_inputs("http://x", ["./nope/clip.mp4"], args)
+    assert err and "no such local file" in err, err
+
+
+def test_dry_run_does_not_upload() -> None:
+    # A dry run must have no side effects, and pushing a multi-GB source is the
+    # largest side effect this tool has.
+    import contextlib
+    import io
+    import tempfile
+    called = []
+    orig = encoder_cli._upload
+    encoder_cli._upload = lambda *a, **k: (called.append(a), ("x", None))[1]
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            local = Path(td) / "clip.mp4"
+            local.write_bytes(b"\0")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = encoder_cli.main([str(local), "--dry-run",
+                                       "--server", "http://127.0.0.1:1"])
+            assert rc == 0 and called == [], called
+    finally:
+        encoder_cli._upload = orig
+
+
+def test_progress_line_shows_percent_stage_and_worker_output() -> None:
+    d = encoder_cli._describe({
+        "status": "running", "overall_progress": 42.4, "progress": "frame= 1200",
+        "stages": [{"key": "encode:h264:1080p", "label": "h264 1080p",
+                    "status": "running"},
+                   {"key": "mezz", "label": "mezzanine", "status": "done"}]})
+    assert "42%" in d and "h264 1080p" in d and "frame= 1200" in d, d
+    # Whatever is missing is simply absent — a local job has no stages until the
+    # worker reports any, and an empty line must not print as " · · ".
+    assert encoder_cli._describe({"status": "pending"}) == "pending"
+    assert encoder_cli._describe(
+        {"status": "running", "progress": "starting"}) == "starting"
+
+
+def test_download_skips_files_already_present_at_the_right_size() -> None:
+    """rsync's useful property. An interrupted download must resume rather than
+    re-pay, and the size comes from the listing so the skip costs no request."""
+    import tempfile
+    calls = []
+
+    def fake_call(url, body=None):
+        return {"files": [{"path": "master.m3u8", "size": 3},
+                          {"path": "1080p/seg_0.m4s", "size": 5}]}, None
+
+    fetched = []
+
+    class FakeResp:
+        def __init__(self, data):
+            self._d = data
+
+        def read(self, n=-1):
+            d, self._d = self._d, b""
+            return d
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_open(url, timeout=0):
+        fetched.append(url)
+        return FakeResp(b"\0" * (3 if url.endswith(".m3u8") else 5))
+
+    orig_call, orig_open = encoder_cli._call, encoder_cli.urllib.request.urlopen
+    encoder_cli._call = fake_call
+    encoder_cli.urllib.request.urlopen = fake_open
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            # Pre-place one at the RIGHT size and one SHORT.
+            good = Path(td) / "clip_h264" / "master.m3u8"
+            good.parent.mkdir(parents=True)
+            good.write_bytes(b"\0" * 3)
+            short = Path(td) / "clip_h264" / "1080p" / "seg_0.m4s"
+            short.parent.mkdir(parents=True)
+            short.write_bytes(b"\0")            # truncated -> must re-fetch
+
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = encoder_cli._download("http://x", ["clip_h264"], td, True)
+            assert rc == 0, rc
+            assert len(fetched) == 1 and fetched[0].endswith("seg_0.m4s"), fetched
+            assert short.stat().st_size == 5, "truncated file not repaired"
+            # Nested layout preserved — parseOutputMeta infers resolutions from
+            # subdirectory existence, so a flattened download is unusable.
+            assert (Path(td) / "clip_h264" / "1080p" / "seg_0.m4s").exists()
+    finally:
+        encoder_cli._call, encoder_cli.urllib.request.urlopen = orig_call, orig_open
+        _ = calls
+
+
+def test_download_implies_wait_and_fetches_what_the_job_reported() -> None:
+    """There is nothing to fetch until the job finishes, so --download without
+    --wait can only mean the user expected one. And the dirs come from the
+    JOB's `outputs` — a client cannot derive them, because resolveCodec may
+    narrow the codec list and the ladder may add an output_tag."""
+    import contextlib
+    import io
+    seen = {}
+
+    def fake_call(url, body=None):
+        if url.endswith("/api/encode"):
+            return [{"id": "job-1"}], None
+        if url.endswith("/api/jobs"):
+            return [{"id": "job-1", "status": "done",
+                     "outputs": ["clip_p200_h264", "clip_p200_hevc"]}], None
+        raise AssertionError(url)
+
+    def fake_download(server, names, dest, quiet):
+        seen["names"], seen["dest"] = names, dest
+        return 0
+
+    orig_call, orig_dl = encoder_cli._call, encoder_cli._download
+    encoder_cli._call, encoder_cli._download = fake_call, fake_download
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = encoder_cli.main(["clip.mp4", "--no-upload",
+                                   "--download", "/tmp/out", "--quiet"])
+        assert rc == 0, rc
+        assert seen.get("names") == ["clip_p200_h264", "clip_p200_hevc"], seen
+        assert seen.get("dest") == "/tmp/out", seen
+    finally:
+        encoder_cli._call, encoder_cli._download = orig_call, orig_dl
+
+
+def test_nothing_produced_is_not_a_download_failure() -> None:
+    # resolveCodec skipped every codec because the output already existed. The
+    # job is legitimately done; there is simply nothing new to fetch, and
+    # erroring here would break any script that re-runs idempotently.
+    import contextlib
+    import io
+
+    def fake_call(url, body=None):
+        if url.endswith("/api/encode"):
+            return [{"id": "job-1"}], None
+        return [{"id": "job-1", "status": "done", "outputs": []}], None
+
+    called = []
+    orig_call, orig_dl = encoder_cli._call, encoder_cli._download
+    encoder_cli._call = fake_call
+    encoder_cli._download = lambda *a: called.append(a) or 0
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = encoder_cli.main(["clip.mp4", "--no-upload",
+                                   "--download", "/tmp/out", "--quiet"])
+        assert rc == 0, rc
+        assert called == [], "downloaded when nothing was produced"
+        assert "already encoded" in buf.getvalue(), buf.getvalue()
+    finally:
+        encoder_cli._call, encoder_cli._download = orig_call, orig_dl
 
 
 def main() -> int:

@@ -39,6 +39,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DEFAULT_SERVER = os.environ.get("ENCODER_SERVER", "http://localhost:8080")
@@ -134,10 +135,19 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     p.add_argument("files", nargs="*", metavar="FILE",
-                   help="source file name(s) in the server's SOURCE_DIR. Each "
-                        "becomes its own job, so they run concurrently.")
+                   help="a path to a local file (uploaded first), or the name "
+                        "of one already in the server's SOURCE_DIR. Each becomes "
+                        "its own job, so they run concurrently.")
     p.add_argument("--server", default=DEFAULT_SERVER,
                    help="encoder server base URL (env: ENCODER_SERVER)")
+    p.add_argument("--no-upload", action="store_true",
+                   help="never upload: treat every FILE as a name already on "
+                        "the server, even if a local file shares that name")
+    p.add_argument("--download", metavar="DIR",
+                   help="after a successful encode, copy the produced output "
+                        "directories into DIR. Implies --wait. Files already "
+                        "present at the right size are skipped, so an "
+                        "interrupted download resumes.")
 
     g = p.add_argument_group("what to encode")
     g.add_argument("--codec", choices=["h264", "hevc", "av1", "both", "all"],
@@ -199,6 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--wait", action="store_true",
                    help="poll until every job reaches a terminal state; exit "
                         "non-zero if any did not finish 'done'")
+    g.add_argument("--quiet", action="store_true",
+                   help="with --wait, print only terminal transitions")
     g.add_argument("--poll-interval", type=float, default=5.0, metavar="S")
     g.add_argument("--timeout", type=float, default=3600.0, metavar="S",
                    help="give up waiting after this long (the encode keeps going)")
@@ -262,35 +274,221 @@ def _call(url: str, body: dict | None = None) -> tuple[object, str | None]:
         return None, f"{url}: {e}"
 
 
-def _wait(server: str, ids: list[str], args) -> int:
-    """Poll until every job is terminal. A job that DISAPPEARS counts as bad —
-    silence is not success."""
+# --- upload -----------------------------------------------------------------
+
+def _upload(server: str, path: str, quiet: bool) -> tuple[str | None, str | None]:
+    """POST one local file to /api/sources/upload; returns (server name, error).
+
+    Streams from disk in chunks rather than reading the file into a bytes
+    object: sources are multi-GB, and the server takes the same care on its
+    side (MultipartReader, never ParseMultipartForm). Building the body as one
+    string here would undo that.
+    """
+    import mimetypes
+    import uuid
+    name = os.path.basename(path)
+    size = os.path.getsize(path)
+    boundary = "----encoder-cli-" + uuid.uuid4().hex
+    ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    head = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{name}"\r\n'
+            f"Content-Type: {ctype}\r\n\r\n").encode()
+    tail = f"\r\n--{boundary}--\r\n".encode()
+
+    def body():
+        yield head
+        with open(path, "rb") as f:
+            while chunk := f.read(1 << 20):
+                yield chunk
+        yield tail
+
+    req = urllib.request.Request(
+        f"{server}/api/sources/upload", data=body(), method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                 # Without an explicit length urllib would use chunked transfer
+                 # encoding, which Go's multipart reader handles but which makes
+                 # the upload unresumable and hides its size from any proxy.
+                 "Content-Length": str(len(head) + size + len(tail))})
+    if not quiet:
+        print(f"    uploading {name} ({_human(size)})...", flush=True)
+    try:
+        with urllib.request.urlopen(req, timeout=3600) as r:
+            saved = (json.loads(r.read() or b"{}") or {}).get("saved") or []
+    except urllib.error.HTTPError as e:
+        detail = (e.read() or b"").decode(errors="replace").strip()
+        return None, f"upload {name}: server said {e.code}: {detail or e.reason}"
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return None, f"upload {name}: {e}"
+    if not saved:
+        return None, f"upload {name}: server saved nothing"
+    return saved[0], None
+
+
+def _resolve_inputs(server: str, files: list[str], args) -> tuple[list[str], str | None]:
+    """Turn the positional arguments into names the server knows.
+
+    A FILE that exists on this machine is uploaded and replaced by its
+    basename; anything else is passed through as an existing source name. That
+    ambiguity is resolved by the filesystem rather than by a flag because both
+    forms are natural — `encoder_cli ./clip.mp4` from a laptop and
+    `encoder_cli clip.mp4` on the master box — and --no-upload forces the
+    second reading when a local file happens to share a name with a server one.
+    """
+    out = []
+    for f in files:
+        if not args.no_upload and os.path.isfile(f):
+            name, err = _upload(server, f, args.quiet)
+            if err:
+                return [], err
+            out.append(name)
+        else:
+            # A path-looking argument that does not exist locally is almost
+            # certainly a typo, not a source name — say so here rather than
+            # letting the server reject "../foo.mp4" for a different reason.
+            if os.sep in f and not args.no_upload:
+                return [], (f"{f}: no such local file (a name with a path "
+                            "separator is treated as a local path)")
+            out.append(f)
+    return out, None
+
+
+def _human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+# --- wait -------------------------------------------------------------------
+
+def _describe(job: dict) -> str:
+    """One line of live state: percent, the running stage, and the worker's
+    latest output. Which of the three exist depends on the target and how far
+    the run has got, so this shows whatever is there."""
+    bits = []
+    pct = job.get("overall_progress") or 0
+    if pct:
+        bits.append(f"{pct:.0f}%")
+    running = [s.get("label") or s.get("key")
+               for s in (job.get("stages") or []) if s.get("status") == "running"]
+    if running:
+        bits.append(", ".join(running[:3]))
+    line = (job.get("progress") or "").strip()
+    if line and line not in bits:
+        bits.append(line)
+    return " · ".join(bits) or job.get("status", "")
+
+
+def _wait(server: str, ids: list[str], args) -> tuple[int, dict[str, list[str]]]:
+    """Poll until every job is terminal, narrating as it goes.
+
+    A job that DISAPPEARS counts as bad — silence is not success. That is
+    exactly how `make oobe` could reach its PASS branch for a run that never
+    happened.
+
+    Returns (exit code, {job id: produced output dir names}).
+    """
     pending, deadline = set(ids), time.time() + args.timeout
     bad: dict[str, str] = {}
+    outputs: dict[str, list[str]] = {}
+    last: dict[str, str] = {}
     while pending and time.time() < deadline:
         jobs, err = _call(f"{server}/api/jobs")
         if err:
-            return _fail(err)
+            return _fail(err), outputs
         by_id = {j["id"]: j for j in (jobs or [])}
         for jid in sorted(pending):
-            st = (by_id.get(jid) or {}).get("status", "gone")
+            job = by_id.get(jid) or {}
+            st = job.get("status", "gone")
             if st in _TERMINAL_OK:
                 pending.discard(jid)
+                outputs[jid] = job.get("outputs") or []
                 if not args.json:
-                    print(f"    {jid} {st}", flush=True)
+                    got = f" -> {', '.join(outputs[jid])}" if outputs[jid] else ""
+                    print(f"    {jid} {st}{got}", flush=True)
             elif st in _TERMINAL_BAD:
                 pending.discard(jid)
-                bad[jid] = st
+                bad[jid] = f"{st}: {job.get('error')}" if job.get("error") else st
                 if not args.json:
-                    print(f"    {jid} {st}", flush=True)
+                    print(f"    {jid} {bad[jid]}", flush=True)
+            elif not args.quiet and not args.json:
+                # Only on CHANGE. A 13-minute encode polled every 5s would
+                # otherwise print 156 identical lines.
+                desc = _describe(job)
+                if desc and desc != last.get(jid):
+                    last[jid] = desc
+                    print(f"    {jid} {desc}", flush=True)
         if pending:
             time.sleep(args.poll_interval)
     if pending:
         return _fail(f"timed out after {args.timeout:.0f}s with "
                      f"{len(pending)} job(s) still running: {', '.join(sorted(pending))}"
-                     " — the encode itself keeps going")
+                     " — the encode itself keeps going"), outputs
     if bad:
-        return _fail("; ".join(f"{k} {v}" for k, v in sorted(bad.items())))
+        return _fail("; ".join(f"{k} {v}" for k, v in sorted(bad.items()))), outputs
+    return 0, outputs
+
+
+# --- download ---------------------------------------------------------------
+
+def _download(server: str, names: list[str], dest: str, quiet: bool) -> int:
+    """Copy finished output directories to a local directory over HTTP.
+
+    Not rsync — but rsync's useful property, which is skipping what is already
+    there. Size is taken from the listing, so the skip costs no extra request,
+    and an interrupted download resumes instead of re-paying. Same idiom as
+    cli_batch's S3 fetch.
+
+    HTTP rather than ssh+rsync deliberately: it works identically whether the
+    server is this machine or another one, and needs no key, no account, and no
+    knowledge of the server's filesystem layout.
+    """
+    from pathlib import Path
+    total_got = total_skipped = 0
+    for name in names:
+        listing, err = _call(f"{server}/api/outputs/{urllib.parse.quote(name)}/files")
+        if err:
+            return _fail(f"{name}: {err}")
+        files = (listing or {}).get("files") or []
+        if not files:
+            print(f"    {name}: nothing to download", flush=True)
+            continue
+        root = Path(dest) / name
+        got = skipped = 0
+        for f in files:
+            rel, size = f["path"], f.get("size", 0)
+            dst = root / rel
+            if dst.exists() and dst.stat().st_size == size:
+                skipped += 1
+                total_skipped += size
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            url = (f"{server}/content/{urllib.parse.quote(name)}/"
+                   + urllib.parse.quote(rel))
+            # Straight to a temp file then rename, so an interrupted transfer
+            # cannot leave a short file that the size check would later accept
+            # as complete.
+            tmp = dst.with_name(dst.name + ".part")
+            try:
+                with urllib.request.urlopen(url, timeout=300) as r, \
+                        open(tmp, "wb") as out:
+                    while chunk := r.read(1 << 20):
+                        out.write(chunk)
+                tmp.replace(dst)
+            except (urllib.error.URLError, OSError) as e:
+                tmp.unlink(missing_ok=True)
+                return _fail(f"{name}/{rel}: {e}")
+            got += 1
+            total_got += size
+            if not quiet and got % 25 == 0:
+                print(f"    {name}: {got}/{len(files)} files...", flush=True)
+        print(f"    {name}: {got} file(s) -> {root}"
+              + (f", {skipped} already present" if skipped else ""), flush=True)
+    if not quiet:
+        print(f"    downloaded {_human(total_got)}"
+              + (f", skipped {_human(total_skipped)} already on disk"
+                 if total_skipped else ""), flush=True)
     return 0
 
 
@@ -316,10 +514,22 @@ def main(argv: list[str] | None = None) -> int:
     if not args.files:
         return _fail("no source files given (see --list-sources)")
 
-    body = build_body(args)
+    # --download needs a finished job to fetch from, so it cannot mean anything
+    # without waiting. Implying it beats rejecting the combination.
+    if args.download:
+        args.wait = True
+
     if args.dry_run:
-        print(json.dumps(body, indent=2))
+        # Before any upload: a dry run must not have side effects, and pushing a
+        # multi-GB source is the largest side effect this tool has.
+        print(json.dumps(build_body(args), indent=2))
         return 0
+
+    names, err = _resolve_inputs(server, args.files, args)
+    if err:
+        return _fail(err)
+    args.files = names
+    body = build_body(args)
 
     if args.estimate:
         est, err = _call(f"{server}/api/encode/estimate", body)
@@ -340,7 +550,20 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"jobs": ids}))
     else:
         print(f"submitted {len(ids)} job(s): {', '.join(ids)}", flush=True)
-    return _wait(server, ids, args) if args.wait else 0
+    if not args.wait:
+        return 0
+
+    rc, outputs = _wait(server, ids, args)
+    if rc != 0 or not args.download:
+        return rc
+    produced = [n for ns in outputs.values() for n in ns]
+    if not produced:
+        # Done, but nothing moved — resolveCodec skipped every codec because the
+        # output already existed. Not a failure, and not something to download.
+        print("    nothing produced (already encoded — use --force-reencode "
+              "to replace)", flush=True)
+        return 0
+    return _download(server, produced, args.download, args.quiet)
 
 
 def _format_estimate(est) -> str:

@@ -1214,6 +1214,13 @@ type Job struct {
 	Progress string     `json:"progress"`
 	Error    string     `json:"error,omitempty"`
 
+	// Outputs are the directory names this job moved into OutputDir, recorded
+	// at the move rather than inferred. Set only on success, so its presence
+	// also answers "is there anything to fetch". A client that needs the files
+	// (encoder_cli --download) cannot derive these: resolveCodec may narrow the
+	// codec list and the ladder may contribute an output_tag.
+	Outputs []string `json:"outputs,omitempty"`
+
 	// BootAMI is the AMI a cloud worker's instance actually booted from
 	// (from the [[ENCODER-BOOT]] marker); PrebakedAMI is true when that
 	// matches the pre-baked worker AMI, i.e. the image was already resident
@@ -2075,6 +2082,13 @@ func (m *Manager) run(job *Job, startIdx int) {
 		} else {
 			job.Status = StatusDone
 			job.Progress = "complete"
+			// What this job actually produced. moveTmpToOutput already knows —
+			// it just moved these — and every consumer that wanted the answer
+			// was reconstructing it by globbing OutputDir for "<stem>_p*"
+			// (make smoke did exactly that). A guess, because resolveCodec may
+			// have narrowed the codec list and the ladder may have added an
+			// output_tag, so the name is not derivable from the request.
+			job.Outputs = moved
 			// Write the profile metadata (encode.json + a one-line manifest
 			// comment) into each output dir BEFORE promote, so a promoted copy
 			// carries it too.
