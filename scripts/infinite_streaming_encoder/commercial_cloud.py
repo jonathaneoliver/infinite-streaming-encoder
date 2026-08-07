@@ -23,6 +23,28 @@ exactly; AV1 did not (corrected below).
 
 Everything is a pure function of the plan (ladder) + source probe, so any
 orchestrator can call estimate_usd() once and print an ENCODER-COMMERCIAL marker.
+
+MUX IS DELIBERATELY NOT MODELLED (considered 2026-08-07, rejected).
+
+Mux bills per minute of INPUT video, once, regardless of how many renditions come
+out — so a 21-rendition ladder costs the same there as a 3-rendition one, and on
+paper it lands 2.4-3.6x below our own cost. That makes it the most eye-catching
+row anyone could add here, which is exactly why it is not one:
+
+  * The published input rate is "starting at $0.025/min FOR 720p". No multiplier
+    is given for higher resolutions, and our ladders top out at 2160p. Delivery
+    and storage explicitly scale (4x at 4K), so input plausibly does too — by an
+    unknown factor. Any figure we printed would be a guess wearing a price tag.
+  * It is not the same product. Mux returns a hosted stream, not rendition
+    files. This project exists to produce, measure and compare those files;
+    `make ladder-audit` cannot run against a playback URL. Cheaper at a
+    different job is not cheaper.
+  * Delivery-inclusive pricing is not comparable to a per-output-minute
+    transcode rate without also modelling delivery on both sides.
+
+Revisit only if the goal changes from "produce and analyse encodes" to "publish
+to viewers", at which point delivery dominates and this whole table is the wrong
+comparison anyway.
 """
 from __future__ import annotations
 
