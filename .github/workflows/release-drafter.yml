@@ -24,11 +24,11 @@ jobs:
       # and the autolabeler is now a SEPARATE action (was built into the main
       # action in v6). The draft step runs on every trigger; the autolabeler
       # only has a PR to label on pull_request events.
-      - uses: release-drafter/release-drafter@v7.6.0
+      - uses: release-drafter/release-drafter@v7.7.0
         with:
           config-name: release-drafter.yml
           token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: release-drafter/release-drafter/autolabeler@v7.6.0
+      - uses: release-drafter/release-drafter/autolabeler@v7.7.0
         if: github.event_name == 'pull_request'
         with:
           config-name: release-drafter.yml
