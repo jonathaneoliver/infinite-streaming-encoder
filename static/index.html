@@ -1284,8 +1284,15 @@ function syncResTiers() {
     const minSel = document.getElementById('min-res');
     if (!maxSel || !minSel) return;
 
+    // Offer only heights the SOURCE can actually produce: the encoder never
+    // upscales, so a rung wider than the source is a dead option (picking it as a
+    // Max/Min cap does nothing). _srcWidthForTiers is the last probed source width
+    // (from the cost estimate); 0 = unknown, so show every tier as before.
+    const srcW = _srcWidthForTiers;
     const heights = [...new Set(
-        selectedCodecs().flatMap(c => (d && d.codecs && d.codecs[c] || []).map(r => r[1]))
+        selectedCodecs().flatMap(c => (d && d.codecs && d.codecs[c] || [])
+            .filter(r => !(srcW > 0 && r[0] > srcW))
+            .map(r => r[1]))
     )].sort((a, b) => b - a);
 
     // Preserve each selection across a ladder switch when the new ladder still
@@ -2717,6 +2724,9 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 let _estTimer = null;
+// Last probed source width (from the cost estimate), so the Min/Max-Res tiers can
+// drop resolutions the source can't produce. 0 until the first estimate lands.
+let _srcWidthForTiers = 0;
 function scheduleCostEstimate() {
     clearTimeout(_estTimer);
     _estTimer = setTimeout(refreshCostEstimate, 400);
@@ -2749,6 +2759,11 @@ async function refreshCostEstimate() {
         if (!d.ok) { el.style.display = 'none'; return; }
         el.innerHTML = _estimateHtml(d.estimate, files.length);
         el.style.display = '';
+        // Now that we know the source width, prune the Min/Max-Res tiers to what
+        // this source can produce (no upscale). Only re-sync on a real change to
+        // avoid clobbering the user's selection on every keystroke-debounced call.
+        const w = d.estimate.width || 0;
+        if (w !== _srcWidthForTiers) { _srcWidthForTiers = w; syncResTiers(); }
     } catch (e) { el.style.display = 'none'; }
 }
 
@@ -2763,32 +2778,34 @@ function _saasCompare(e, prefix) {
     return ` · ${prefix || 'vs '}` + all.map(([n, v]) => `$${v.toFixed(2)} ${n}`).join(', ');
 }
 
-// A ladder can define rungs the current Max-Res cap or the source resolution
-// won't produce, so the estimate silently ignores them. That is exactly why
-// switching apple-uniq-live → -full at a stuck 1080p cap showed no change: the
-// only difference between those ladders is h264 1440p/1800p/2160p, all above the
-// cap. Name the excluded rungs so the no-op is visible and actionable rather than
-// mysterious. Computed client-side from the ladder def + the estimate's probed
-// width; empty when nothing is excluded.
+// The encoder never upscales: select_rungs / resolveRungs drop every ladder rung
+// wider than the source, for all codecs. So on a sub-ladder-height source the
+// ladder's taller rungs are INERT — switching apple-uniq-live → -full, or nudging
+// Max/Min-Res above the source, does nothing for them, and the cost doesn't move.
+// THAT silent no-op is the surprise to state; a Max-Res cap the user set is not
+// (that's a deliberate reduction). Name the rungs the SOURCE caps away and the
+// ceiling it tops out at, so "why did nothing change?" answers itself. Computed
+// from the ladder def + the estimate's probed width; empty when the source can
+// produce the whole ladder (or the width is unknown).
 function _excludedRungsNote(e) {
     const d = laddersCache[document.getElementById('ladder')?.value];
     if (!d || !d.codecs) return '';
-    const maxH = parseInt(document.getElementById('max-res').value, 10); // NaN = no cap
     const srcW = e.width || 0;
-    const byCap = new Set(), bySrc = new Set();
+    if (srcW <= 0) return ''; // probe failed — no honest statement to make
+    const above = new Set();
+    let ceiling = 0;
     for (const c of selectedCodecs()) {
         for (const r of (d.codecs[c] || [])) {
             const [w, h] = r;
-            if (!isNaN(maxH) && h > maxH) byCap.add(h);
-            else if (srcW > 0 && w > srcW) bySrc.add(h);
+            if (w > srcW) above.add(h);
+            else if (h > ceiling) ceiling = h;
         }
     }
-    const fmt = (s) => [...s].sort((a, b) => a - b).map(h => `${h}p`).join(', ');
-    const notes = [];
-    if (byCap.size) notes.push(`Max Res ${document.getElementById('max-res').value} hides ${byCap.size} taller rung${byCap.size > 1 ? 's' : ''} this ladder adds (${fmt(byCap)}) — set Max Res to “No limit” to include ${byCap.size > 1 ? 'them' : 'it'}`);
-    if (bySrc.size) notes.push(`source is ${srcW}px wide, so ${bySrc.size} rung${bySrc.size > 1 ? 's' : ''} (${fmt(bySrc)}) can't be produced`);
-    if (!notes.length) return '';
-    return `<div style="color:#e9c46a;font-size:11px;margin-top:3px">⚠ ${notes.join('; ')}.</div>`;
+    if (!above.size) return '';
+    const list = [...above].sort((a, b) => a - b).map(h => `${h}p`).join(', ');
+    const cap = ceiling ? `${ceiling}p` : `${srcW}px wide`;
+    return `<div style="color:#e9c46a;font-size:11px;margin-top:3px">`
+         + `⚠ Source tops out at ${cap} — this ladder's taller rungs (${list}) can't be produced (no upscale), so switching to a ladder that adds them won't change the output.</div>`;
 }
 
 function _estimateHtml(e, nFiles) {
