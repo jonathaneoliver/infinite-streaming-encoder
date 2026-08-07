@@ -190,12 +190,21 @@ def _parse_vmaf_log(log_path: Path) -> dict:
 
 
 def vmaf_marker(codec: str, label: str, height: int, chunk_index: int,
-                r: dict) -> str:
+                r: dict, model: str = "", common_h: int = 0) -> str:
     """The [[ENCODER-VMAF ...]] marker the control plane scans and aggregates
     per (codec, label). One per chunk (chunk=-1 for a whole-variant encode).
     inv_sum + frames let the control plane recombine mean/harmonic/min correctly.
-    """
+
+    `model` (vmaf_v0.6.1 | vmaf_4k_v0.6.1) and `common_h` (the resolution both
+    streams were scaled to for the comparison) are the score's PROVENANCE (#117):
+    a VMAF number is only interpretable against the model + comparison height that
+    produced it, and scores from different sources sit on different scales and must
+    never be pooled. They trail the record so an older control plane (regex without
+    them) still matches — its optional-group parser reads them as unknown."""
+    tail = ""
+    if model or common_h:
+        tail = f" model={model} common_h={common_h}"
     return (f"[[ENCODER-VMAF codec={codec} label={label} height={height} "
             f"chunk={chunk_index} mean={r['mean']:.4f} "
             f"harmonic={r['harmonic_mean']:.4f} min={r['min']:.4f} "
-            f"frames={r['frames']} inv_sum={r['inv_sum']:.6f}]]")
+            f"frames={r['frames']} inv_sum={r['inv_sum']:.6f}{tail}]]")

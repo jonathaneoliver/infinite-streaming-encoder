@@ -946,7 +946,8 @@ def phase_variant(args: argparse.Namespace) -> int:
                 n_frames=n_frames,
             )
             emit(vmaf_marker(args.codec, args.label, rung.height,
-                             chunk.index if chunk is not None else -1, r))
+                             chunk.index if chunk is not None else -1, r,
+                             model=pick_model(cmn_h), common_h=cmn_h))
         except Exception as e:  # noqa: BLE001 — audit must never fail the encode
             # Prefix with [[ENCODER so the temporal worker relays it (it only
             # forwards [[ENCODER… lines) — otherwise a VMAF failure is invisible.

@@ -94,6 +94,100 @@ func TestEncodeMetaRecordsOnlyItsOwnCodecsLibrary(t *testing.T) {
 	}
 }
 
+func TestVmafMarkerProvenanceIsCapturedAndBackwardCompatible(t *testing.T) {
+	// The score's scale (model + comparison height) rides the ENCODER-VMAF marker
+	// (#117). A marker from an OLDER worker image omits them — the optional regex
+	// group must still match so the score aggregates, just without provenance.
+	j := &Job{}
+	newM := "[[ENCODER-VMAF codec=hevc label=1080p height=1080 chunk=0 mean=95.0000 harmonic=94.0000 min=80.0000 frames=300 inv_sum=3.150000 model=vmaf_v0.6.1 common_h=1080]]"
+	oldM := "[[ENCODER-VMAF codec=av1 label=2160p height=2160 chunk=0 mean=90.0000 harmonic=89.0000 min=70.0000 frames=300 inv_sum=3.300000]]"
+	if !j.parseMarker(newM) {
+		t.Fatalf("new marker not consumed: %s", newM)
+	}
+	if !j.parseMarker(oldM) {
+		t.Fatalf("old (no-provenance) marker not consumed: %s", oldM)
+	}
+	if v := j.Vmaf["hevc/1080p"]; v == nil || v.Model != "vmaf_v0.6.1" || v.CommonHeight != 1080 {
+		t.Fatalf("hevc provenance not captured: %+v", j.Vmaf["hevc/1080p"])
+	}
+	if v := j.Vmaf["av1/2160p"]; v == nil || v.Mean == 0 {
+		t.Fatalf("old marker must still aggregate: %+v", j.Vmaf["av1/2160p"])
+	}
+	if v := j.Vmaf["av1/2160p"]; v.Model != "" || v.CommonHeight != 0 {
+		t.Fatalf("old marker must record NO provenance, got model=%q h=%d", v.Model, v.CommonHeight)
+	}
+}
+
+func TestEncodeMetaRecordsVmafReproducibility(t *testing.T) {
+	// #117: encode.json must carry what a post-hoc audit needs to reproduce the
+	// reference (time_limit_s) and interpret a score (model, comparison height,
+	// state). Absent must read as unknown for the 42 pre-existing outputs, so the
+	// no-audit case records state=pending/ineligible but no fabricated numbers.
+	out := t.TempDir()
+	m := &Manager{OutputDir: out}
+	read := func(dir string) encodeMeta {
+		b, err := os.ReadFile(filepath.Join(out, dir, "encode.json"))
+		if err != nil {
+			t.Fatalf("%s: %v", dir, err)
+		}
+		var em encodeMeta
+		if err := json.Unmarshal(b, &em); err != nil {
+			t.Fatal(err)
+		}
+		return em
+	}
+
+	// Measured: state=done, provenance recorded, time limit carried through.
+	mkdir(t, out, "clip_p200_hevc")
+	vmaf := map[string]*VmafScore{
+		"hevc/1080p": {Mean: 95, Model: "vmaf_v0.6.1", CommonHeight: 1080},
+	}
+	m.writeEncodeMeta("clip_p200_hevc", JobConfig{Time: "30", MeasureVmaf: true}, vmaf, nil)
+	done := read("clip_p200_hevc")
+	if done.VmafState != "done" {
+		t.Fatalf("measured output state = %q, want done", done.VmafState)
+	}
+	if done.VmafModel != "vmaf_v0.6.1" || done.VmafComparisonHeight != 1080 {
+		t.Fatalf("provenance not recorded: model=%q h=%d", done.VmafModel, done.VmafComparisonHeight)
+	}
+	if done.TimeLimitS != "30" {
+		t.Fatalf("time_limit_s not recorded: %q", done.TimeLimitS)
+	}
+
+	// Audit requested but no score for this codec → failed.
+	mkdir(t, out, "clip_p200_h264")
+	m.writeEncodeMeta("clip_p200_h264", JobConfig{MeasureVmaf: true}, vmaf, nil)
+	if s := read("clip_p200_h264").VmafState; s != "failed" {
+		t.Fatalf("requested-but-unscored state = %q, want failed", s)
+	}
+
+	// Not requested, burn-in ON (default) → ineligible, and NO provenance numbers.
+	mkdir(t, out, "clip_p200_av1")
+	m.writeEncodeMeta("clip_p200_av1", JobConfig{}, nil, nil)
+	inel := read("clip_p200_av1")
+	if inel.VmafState != "ineligible" {
+		t.Fatalf("burn-in output state = %q, want ineligible", inel.VmafState)
+	}
+	if inel.VmafModel != "" || inel.VmafComparisonHeight != 0 {
+		t.Fatalf("unaudited output must fabricate no provenance: %+v", inel)
+	}
+
+	// Not requested, burn-in OFF → pending (eligible for a future audit).
+	mkdir(t, out, "clip_p200_h264_nb")
+	off := false
+	m.writeEncodeMeta("clip_p200_h264_nb", JobConfig{Burnin: &off}, nil, nil)
+	if s := read("clip_p200_h264_nb").VmafState; s != "pending" {
+		t.Fatalf("eligible-unaudited state = %q, want pending", s)
+	}
+}
+
+func mkdir(t *testing.T, base, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(base, dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEncodeMetaSurvivesAJoblessCall(t *testing.T) {
 	// writeEncodeMeta is best-effort and must never panic the job; a nil job
 	// (reconciled state, older persisted job) simply records no provenance.

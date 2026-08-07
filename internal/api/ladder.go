@@ -95,9 +95,18 @@ type profileInfo struct {
 	ForceReencode     bool    `json:"force_reencode,omitempty"`
 	// Burnin is nil when the overlay was on (default) and &false when disabled,
 	// mirroring encode.json — so the UI flags only the exception.
-	Burnin    *bool  `json:"burnin,omitempty"`
-	Source    string `json:"source,omitempty"`
-	EncodedAt string `json:"encoded_at,omitempty"`
+	Burnin *bool  `json:"burnin,omitempty"`
+	Source string `json:"source,omitempty"`
+	// #117: mezzanine re-derivation input + VMAF score provenance/lifecycle, so
+	// the ladder view can show the score's scale and tell "never audited"
+	// (pending) from "ineligible" (burn-in) from done/failed.
+	TimeLimitS           string `json:"time_limit_s,omitempty"`
+	SourceSize           int64  `json:"source_size,omitempty"`
+	SourceModified       string `json:"source_modified,omitempty"`
+	VmafModel            string `json:"vmaf_model,omitempty"`
+	VmafComparisonHeight int    `json:"vmaf_comparison_height,omitempty"`
+	VmafState            string `json:"vmaf_state,omitempty"`
+	EncodedAt            string `json:"encoded_at,omitempty"`
 }
 
 // encodeJSON mirrors the encode.json written by the encoder (internal/encode/meta.go).
@@ -117,8 +126,15 @@ type encodeJSON struct {
 	ForceReencode     bool    `json:"force_reencode"`
 	Burnin            *bool   `json:"burnin"`
 	Source            string  `json:"source"`
-	EncodedAt         string  `json:"encoded_at"`
-	Rungs             []struct {
+	// #117 provenance: mezzanine re-derivation input + VMAF score scale/state.
+	TimeLimitS           string `json:"time_limit_s"`
+	SourceSize           int64  `json:"source_size"`
+	SourceModified       string `json:"source_modified"`
+	VmafModel            string `json:"vmaf_model"`
+	VmafComparisonHeight int    `json:"vmaf_comparison_height"`
+	VmafState            string `json:"vmaf_state"`
+	EncodedAt            string `json:"encoded_at"`
+	Rungs                []struct {
 		Height      int     `json:"height"`
 		BitrateKbps int     `json:"bitrate_kbps"`
 		Vmaf        float64 `json:"vmaf"`
@@ -174,6 +190,11 @@ func (s *Server) ladder(w http.ResponseWriter, r *http.Request) {
 			ChunkDuration: ej.ChunkDuration, ForceReencode: ej.ForceReencode,
 			Burnin: ej.Burnin,
 			Source: ej.Source, EncodedAt: ej.EncodedAt,
+			TimeLimitS: ej.TimeLimitS, SourceSize: ej.SourceSize,
+			SourceModified:       ej.SourceModified,
+			VmafModel:            ej.VmafModel,
+			VmafComparisonHeight: ej.VmafComparisonHeight,
+			VmafState:            ej.VmafState,
 		}
 	}
 
