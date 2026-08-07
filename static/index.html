@@ -401,7 +401,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="no-files">Loading...</div>
         </div>
 
-        <fieldset class="encode-options">
+        <fieldset class="encode-options" id="encode-options">
             <legend>Encoding Options</legend>
             <div id="cloud-warning" class="cloud-warning" style="display:none">
                 ⚠ Cloud encodes launch billable AWS resources. Check the
@@ -520,6 +520,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 </div>
             </div>
             </div>
+            <div class="encode-hint" id="encode-estimate" style="display:none"></div>
             <div class="encode-hint"><b>Encode</b> fills in whatever's missing and resumes an interrupted run — a brand-new source encodes fully, an already-complete one is skipped. Use <b>Re-encode</b> (the ▾ menu) to archive existing output and produce every variant fresh.</div>
         </fieldset>
     </div>
@@ -1868,6 +1869,7 @@ function onTargetChange() {
     // egress to skip, so offering the choice there would be misleading.
     const skipGroup = document.getElementById('skip-media-group');
     if (skipGroup) skipGroup.style.display = isAnyCloud ? 'flex' : 'none';
+    scheduleCostEstimate();
 }
 
 // Before submitting a cloud encode, peek at the AWS inventory. If
@@ -2438,6 +2440,81 @@ function _runCostHtml(j) {
         html += ` <span style="color:#8c8">· avoided $${avoided.toFixed(2)} (${j.egress_avoided_gb.toFixed(2)} GB left in S3)</span>`;
     }
     return html;
+}
+
+// Pre-flight cost estimate for the current form, shown before you press Encode.
+//
+// Server-side on purpose: it runs the SAME projectCloudCost / projectSaaSCosts
+// the finished job reports, so the estimate and the outcome cannot disagree. An
+// estimate that contradicts the result reads as a bug in the encode rather than
+// in the estimator, which is worse than showing nothing.
+//
+// Debounced because each call ffprobes every selected file.
+// Delegated rather than hooked onto each control: the options block already has
+// a dozen inputs and gains more, and a new one silently not updating the
+// estimate is the kind of staleness nobody notices until the number is wrong.
+document.addEventListener('DOMContentLoaded', () => {
+    for (const sel of ['#encode-options', '#file-list']) {
+        const root = document.querySelector(sel);
+        if (root) root.addEventListener('change', scheduleCostEstimate);
+    }
+    scheduleCostEstimate();
+});
+
+let _estTimer = null;
+function scheduleCostEstimate() {
+    clearTimeout(_estTimer);
+    _estTimer = setTimeout(refreshCostEstimate, 400);
+}
+
+async function refreshCostEstimate() {
+    const el = document.getElementById('encode-estimate');
+    if (!el) return;
+    const files = [...document.querySelectorAll('#file-list input:checked')].map(cb => cb.value);
+    if (!files.length) { el.style.display = 'none'; return; }
+    const target = document.getElementById('target').value;
+    const body = {
+        files, target, codec: codecValue(),
+        max_res: document.getElementById('max-res').value,
+        min_res: document.getElementById('min-res').value,
+        time: document.getElementById('time-limit').value,
+        ladder: document.getElementById('ladder').value,
+        hevc_single_pass: false,
+    };
+    if (isAnyCloudTarget(target)) {
+        body.skip_media_download = document.getElementById('skip-media').checked;
+    }
+    try {
+        const r = await fetch('/api/encode/estimate', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        if (!r.ok) { el.style.display = 'none'; return; }
+        const d = await r.json();
+        if (!d.ok) { el.style.display = 'none'; return; }
+        el.innerHTML = _estimateHtml(d.estimate, files.length);
+        el.style.display = '';
+    } catch (e) { el.style.display = 'none'; }
+}
+
+function _estimateHtml(e, nFiles) {
+    const mins = (e.duration_s || 0) / 60;
+    const src = `${nFiles} file${nFiles > 1 ? 's' : ''} · ${mins.toFixed(1)} min`;
+    if (e.local) {
+        // Say $0 explicitly rather than hiding the line — the contrast with the
+        // cloud figure is the useful part of showing this at all.
+        return `<b>Estimated cost</b> ${src} → <b style="color:#6ab04c">$0.00</b> `
+             + `<span style="color:#889">local encode, nothing billed`
+             + (e.commercial_usd > 0 ? ` · would be $${e.commercial_usd.toFixed(2)} on Qencode, $${e.mediaconvert_usd.toFixed(2)} on MediaConvert` : '')
+             + `</span>`;
+    }
+    const parts = [`$${(e.spot_usd || 0).toFixed(2)} compute`];
+    if (e.egress_usd > 0) parts.push(`$${e.egress_usd.toFixed(2)} egress (${e.egress_gb.toFixed(2)} GB)`);
+    else parts.push(`<span style="color:#6ab04c">no egress — media stays in S3</span>`);
+    return `<b>Estimated cost</b> ${src} → <b>$${(e.total_usd || 0).toFixed(2)}</b> `
+         + `<span style="color:#889">${parts.join(' · ')}`
+         + (e.commercial_usd > 0 ? ` · vs $${e.commercial_usd.toFixed(2)} Qencode, $${e.mediaconvert_usd.toFixed(2)} MediaConvert` : '')
+         + `</span>`;
 }
 
 function _jobConfigHtml(c) {

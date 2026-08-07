@@ -1,6 +1,7 @@
 package encode
 
 import (
+	"fmt"
 	"math"
 	"path/filepath"
 	"strconv"
@@ -322,4 +323,110 @@ func (m *Manager) projectAndSetCosts(job *Job) {
 	}
 	job.mu.Unlock()
 	m.notify(job)
+}
+
+// EstimateResult is a pre-flight cost projection for a config that has not been
+// submitted. Same machinery projectAndSetCosts uses after a job starts — the
+// only difference is that it probes a filename instead of reading a Job.
+type EstimateResult struct {
+	DurationS   float64 `json:"duration_s"`
+	Width       int     `json:"width"`
+	Fps         int     `json:"fps"`
+	SpotUSD     float64 `json:"spot_usd"`
+	OnDemandUSD float64 `json:"ondemand_usd"`
+	// Egress the run would pay to bring output home. Zero when the config
+	// leaves media in S3 (#214) — which is most of the point of showing this
+	// before you press the button rather than after.
+	EgressGB  float64 `json:"egress_gb"`
+	EgressUSD float64 `json:"egress_usd"`
+	TotalUSD  float64 `json:"total_usd"`
+	// SaaS baselines for the same ladder, so the comparison is visible at the
+	// moment of choosing rather than only in the finished job.
+	CommercialUSD   float64 `json:"commercial_usd"`
+	MediaConvertUSD float64 `json:"mediaconvert_usd"`
+	// Local targets write straight to disk: no egress, no AWS spend at all.
+	Local bool `json:"local"`
+}
+
+// EstimateCost projects what a config WOULD cost, before it is submitted.
+//
+// Deliberately reuses projectCloudCost / projectSaaSCosts rather than
+// approximating in JavaScript: an estimate that disagrees with the figure the
+// finished job reports is worse than no estimate, because the difference reads
+// as a bug in the encode rather than in the estimator.
+//
+// Probes the source with ffprobe, so it costs one subprocess per distinct file.
+// Callers should debounce.
+func (m *Manager) EstimateCost(cfg JobConfig) (EstimateResult, error) {
+	var out EstimateResult
+	if len(cfg.Files) == 0 {
+		return out, fmt.Errorf("no files selected")
+	}
+	// Sum durations across every selected file — the form can select several,
+	// and quoting only the first would understate a batch.
+	var totalDur float64
+	for _, f := range cfg.Files {
+		src := filepath.Join(m.SourceDir, f)
+		d, err := probeDurationSeconds(src)
+		if err != nil || d <= 0 {
+			continue
+		}
+		totalDur += d
+		if out.Width == 0 {
+			out.Width, out.Fps = probeSourceWidth(src), probeSourceFps(src)
+		}
+	}
+	if totalDur <= 0 {
+		return out, fmt.Errorf("could not probe duration")
+	}
+	// A --time limit caps what actually gets encoded, per file.
+	if lim, err := strconv.ParseFloat(cfg.Time, 64); err == nil && lim > 0 {
+		capped := lim * float64(len(cfg.Files))
+		if capped < totalDur {
+			totalDur = capped
+		}
+	}
+	out.DurationS = totalDur
+
+	src0 := filepath.Join(m.SourceDir, cfg.Files[0])
+	hasAudio, srcMbps := probeHasAudio(src0), probeSourceMbps(src0)
+	out.CommercialUSD, out.MediaConvertUSD = m.projectSaaSCosts(
+		cfg, out.Width, out.Fps, totalDur, hasAudio, srcMbps)
+
+	out.Local = cfg.Target != "cloud" && cfg.Target != "cloud-batch"
+	if out.Local {
+		// Nothing is billed: local and local-dist write to disk. Say $0 rather
+		// than omitting the line, so the contrast with cloud is visible.
+		return out, nil
+	}
+
+	out.SpotUSD, out.OnDemandUSD = m.projectCloudCost(cfg, out.Width, out.Fps, totalDur)
+	// Output size = the ladder's total bitrate x duration. The same bytes drive
+	// egress and (via the fitted per-GB rate) the Tier1 estimate, so a run that
+	// leaves media in S3 correctly shows near-zero here.
+	if !m.skipMediaDownload(cfg) {
+		out.EgressGB = m.ladderOutputGB(cfg, out.Width, totalDur)
+		out.EgressUSD = out.EgressGB * EgressUSDPerGB
+	}
+	out.TotalUSD = out.SpotUSD + out.EgressUSD
+	return out, nil
+}
+
+// ladderOutputGB is the ladder's summed bitrate over the duration — what the
+// encode will actually produce, and therefore what would be transferred.
+func (m *Manager) ladderOutputGB(cfg JobConfig, sourceWidth int, durationS float64) float64 {
+	var kbps int
+	ladderName := cfg.Ladder
+	if ladderName == "" {
+		ladderName = DefaultLadderName
+	}
+	if m.Ladders == nil {
+		return 0
+	}
+	for _, codec := range parseCodecSel(cfg.Codec) {
+		for _, r := range m.Ladders.resolveRungs(ladderName, codec, cfg.MaxRes, cfg.MinRes, sourceWidth) {
+			kbps += r.Bitrate
+		}
+	}
+	return float64(kbps) * 1000 * durationS / 8 / 1e9
 }
