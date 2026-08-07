@@ -171,9 +171,8 @@ check:                ## run the same static checks CI runs (gofmt/vet/build, to
 	printf '  python compile '; \
 	if out=$$(cd scripts && python3 -m compileall -q infinite_streaming_encoder 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
-	printf '  page JS syntax '; \
-	if ! command -v node >/dev/null 2>&1; then echo "skipped (node not installed)"; \
-	elif out=$$(python3 scripts/check_page_js.py 2>&1); then echo "ok"; \
+	printf '  page JS       '; \
+	if out=$$(python3 scripts/check_page_js.py 2>&1); then echo "$$out"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	if [ $$fail -ne 0 ]; then echo; echo "make check: FAILED"; exit 1; fi; \
 	echo "make check: all passed"
