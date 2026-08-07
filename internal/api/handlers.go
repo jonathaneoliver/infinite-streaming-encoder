@@ -598,6 +598,11 @@ type outputDir struct {
 	// RemoteExpired distinguishes "fetch it" from "too late" without making the
 	// UI parse timestamps.
 	RemoteExpired bool `json:"remote_expired,omitempty"`
+	// RemoteGone is the third state (#225): the prefix was observed empty, so
+	// the media is gone for a reason other than the clock. Separate from
+	// RemoteExpired because the two have different explanations and only one
+	// of them is anybody's fault.
+	RemoteGone bool `json:"remote_gone,omitempty"`
 	// Fetch is the in-flight (or last failed) on-demand download. An output
 	// mid-fetch is neither remote nor complete; Play stays disabled until it
 	// clears.
@@ -770,7 +775,8 @@ func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {
 			Codec: meta.codec, Resolutions: meta.resolutions, HlsFormat: meta.hlsFormat,
 			Partial: meta.partial, Padding: meta.padding,
 			Remote: remote, RemoteExpired: remote.Expired(),
-			Fetch: s.Manager.FetchStateFor(e.Name()),
+			RemoteGone: remote != nil && remote.Gone,
+			Fetch:      s.Manager.FetchStateFor(e.Name()),
 		})
 	}
 	writeJSON(w, dirs)
@@ -1341,6 +1347,7 @@ func (s *Server) awsClearAll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 502)
 		return
 	}
+	s.invalidateRemoteOutputs(out, "emergency clear removed all AWS staging")
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(out)
 }
@@ -1358,8 +1365,41 @@ func (s *Server) awsCleanupJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 502)
 		return
 	}
+	s.invalidateRemoteOutputs(out, "job cleanup deleted the staging prefix")
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(out)
+}
+
+// invalidateRemoteOutputs marks every #214 output whose media lived under a
+// prefix this cleanup just deleted (#225).
+//
+// Reads the prefixes out of cleanup.py's own report rather than re-listing S3:
+// the report already says exactly what was removed, so this is free and exact.
+// Anything the server did NOT delete itself — a console delete, an early
+// lifecycle firing — is still caught at fetch time, which is the backstop.
+//
+// Best-effort by design. A cleanup that worked must not report failure because
+// the bookkeeping afterwards did not, so problems are logged and swallowed.
+func (s *Server) invalidateRemoteOutputs(report []byte, reason string) {
+	var doc struct {
+		Actions []struct {
+			Kind   string `json:"kind"`
+			ID     string `json:"id"`
+			Action string `json:"action"`
+		} `json:"actions"`
+	}
+	if err := json.Unmarshal(report, &doc); err != nil {
+		log.Printf("[remote] could not read cleanup report to invalidate sidecars: %v", err)
+		return
+	}
+	for _, a := range doc.Actions {
+		if a.Kind != "s3_prefix" || a.Action != "deleted" {
+			continue
+		}
+		if n := s.Manager.MarkGoneUnderPrefix(a.ID, reason); n > 0 {
+			log.Printf("[remote] %s deleted: marked %d output(s) as no longer fetchable", a.ID, n)
+		}
+	}
 }
 
 // awsStopExecution stops one Step Functions execution (aborts its Batch jobs).
@@ -1379,6 +1419,7 @@ func (s *Server) awsDeleteS3Prefix(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 502)
 		return
 	}
+	s.invalidateRemoteOutputs(out, "staging prefix was deleted from the AWS tab")
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(out)
 }

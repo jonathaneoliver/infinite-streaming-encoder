@@ -209,6 +209,113 @@ def test_fetch_resumes_and_only_clears_the_sidecar_when_complete() -> None:
         _unpatch(monkey)
 
 
+def test_empty_prefix_is_reported_gone_and_keeps_the_sidecar() -> None:
+    """#225: an EMPTY listing used to share the 'already complete' branch, so a
+    deleted prefix silently cleared its own sidecar and the output was
+    reclassified as complete. Every other signal agrees with that lie — right
+    name, right rung subdirs, manifests present — so nothing else catches it."""
+    fake = FakeS3({})            # the prefix exists in the sidecar, not in S3
+    monkey: dict = {}
+    _patch(monkey, fake)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "clip_p200_h264_xs"
+            out.mkdir(parents=True)
+            (out / cli_batch.REMOTE_SIDECAR).write_text(json.dumps({
+                "s3_prefix": "s3://buck/jobs/j1-clip/output_h264",
+                "pending_files": 80, "pending_bytes": 144_104_000,
+                "expires_at": "2099-01-01T00:00:00Z"}))
+
+            rc = cli_batch.cmd_fetch(types.SimpleNamespace(dir=str(out),
+                                                           dry_run=False))
+            assert rc == cli_batch.EXIT_STAGING_GONE, rc
+
+            sc = out / cli_batch.REMOTE_SIDECAR
+            assert sc.exists(), "sidecar deleted — output now reads as complete"
+            meta = json.loads(sc.read_text())
+            assert meta["gone"] is True, meta
+            assert meta["gone_detected_at"], meta
+            assert meta["gone_reason"], meta
+            # The record of what was lost has to survive with it.
+            assert meta["pending_files"] == 80, meta
+            assert meta["s3_prefix"] == "s3://buck/jobs/j1-clip/output_h264"
+            assert meta["expires_at"] == "2099-01-01T00:00:00Z"
+    finally:
+        _unpatch(monkey)
+
+
+def test_a_sidecar_already_marked_gone_short_circuits() -> None:
+    # Second click: say so without paying for a listing that comes back empty
+    # again. FakeS3 raising on list proves no request was made.
+    class NoListS3(FakeS3):
+        def get_paginator(self, _op):
+            raise AssertionError("listed S3 for a prefix already known gone")
+
+    monkey: dict = {}
+    _patch(monkey, NoListS3({}))
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            (out / cli_batch.REMOTE_SIDECAR).write_text(json.dumps({
+                "s3_prefix": "s3://buck/jobs/j1-clip/output_h264",
+                "gone": True, "gone_reason": "staging cleared",
+                "gone_detected_at": "2026-08-07T12:00:00Z"}))
+            rc = cli_batch.cmd_fetch(types.SimpleNamespace(dir=str(out),
+                                                           dry_run=False))
+            assert rc == cli_batch.EXIT_STAGING_GONE, rc
+            assert (out / cli_batch.REMOTE_SIDECAR).exists()
+    finally:
+        _unpatch(monkey)
+
+
+def test_empty_prefix_after_a_complete_fetch_is_not_a_loss() -> None:
+    """The benign reading of an empty listing: the media already landed and the
+    prefix was cleared afterwards. Nothing was lost, so the output becomes
+    plain-complete rather than being flagged — check the disk before crying."""
+    fake = FakeS3({})
+    monkey: dict = {}
+    _patch(monkey, fake)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "clip_p200_h264_xs"
+            (out / "1080p").mkdir(parents=True)
+            for i in range(3):
+                (out / "1080p" / f"segment_{i:05d}.m4s").write_bytes(b"\0")
+            (out / cli_batch.REMOTE_SIDECAR).write_text(json.dumps({
+                "s3_prefix": "s3://buck/jobs/j1-clip/output_h264",
+                "pending_files": 3, "pending_bytes": 3,
+                "expires_at": "2099-01-01T00:00:00Z"}))
+
+            rc = cli_batch.cmd_fetch(types.SimpleNamespace(dir=str(out),
+                                                           dry_run=False))
+            assert rc == 0, rc
+            assert not (out / cli_batch.REMOTE_SIDECAR).exists(), \
+                "a complete output should stop being remote, not be flagged gone"
+    finally:
+        _unpatch(monkey)
+
+
+def test_dry_run_reports_gone_without_writing_the_sidecar() -> None:
+    # A dry run is asked what WOULD happen. The sidecar is state, not output.
+    fake = FakeS3({})
+    monkey: dict = {}
+    _patch(monkey, fake)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            (out / cli_batch.REMOTE_SIDECAR).write_text(json.dumps({
+                "s3_prefix": "s3://buck/jobs/j1-clip/output_h264",
+                "pending_files": 80, "pending_bytes": 1,
+                "expires_at": "2099-01-01T00:00:00Z"}))
+            rc = cli_batch.cmd_fetch(types.SimpleNamespace(dir=str(out),
+                                                           dry_run=True))
+            assert rc == cli_batch.EXIT_STAGING_GONE, rc
+            meta = json.loads((out / cli_batch.REMOTE_SIDECAR).read_text())
+            assert "gone" not in meta, "dry run mutated the sidecar"
+    finally:
+        _unpatch(monkey)
+
+
 def test_fetch_dry_run_reports_without_downloading() -> None:
     # The UI shows size before the click, because the click costs ~$0.09/GB.
     base = "jobs/j1-clip"

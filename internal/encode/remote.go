@@ -3,6 +3,7 @@ package encode
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -34,6 +35,21 @@ type RemoteInfo struct {
 	// object's own creation, so this is the floor rather than a guarantee.
 	ExpiresAt  string `json:"expires_at"`
 	ExpiryDays int    `json:"expiry_days"`
+
+	// Gone records that the prefix was OBSERVED empty — a manual staging
+	// clear, a console delete, or the lifecycle firing early (#225). Expiry
+	// alone was being used as a proxy for existence, and the two are different
+	// claims: everything that removes objects other than the clock produced an
+	// output that looked perfectly healthy right up until the click.
+	//
+	// Set rather than deleting the sidecar. Deleting it would reclassify the
+	// output as COMPLETE, which is the one wrong answer available: the UI would
+	// offer Play, hls.js would load the playlist, and every segment would 404.
+	Gone bool `json:"gone,omitempty"`
+	// GoneDetectedAt/GoneReason keep the provenance — which prefix, how much,
+	// when it was expected to expire, and what noticed it had not.
+	GoneDetectedAt string `json:"gone_detected_at,omitempty"`
+	GoneReason     string `json:"gone_reason,omitempty"`
 }
 
 // Expired reports whether the staging prefix is past its advertised expiry, in
@@ -47,6 +63,90 @@ func (r *RemoteInfo) Expired() bool {
 		return false // unparseable: assume still fetchable, let the fetch say
 	}
 	return time.Now().After(t)
+}
+
+// Fetchable reports whether Download can still succeed. The three states —
+// available, expired, deleted — used to render as two, and the missing one
+// degraded the worst, so callers ask this rather than re-deriving it from
+// whichever field they happen to know about.
+func (r *RemoteInfo) Fetchable() bool {
+	return r != nil && !r.Gone && !r.Expired()
+}
+
+// MarkRemoteGone records on an output's sidecar that its staging prefix no
+// longer holds the media. Returns false when there was nothing to mark (no
+// sidecar, or already marked), so a sweep can report only what it changed.
+//
+// Written via a temp file and rename: the sidecar IS the state, and a partial
+// write would leave an output that is neither remote nor local.
+func MarkRemoteGone(dir, reason string) (bool, error) {
+	info := ReadRemote(dir)
+	if info == nil || info.Gone {
+		return false, nil
+	}
+	info.Gone = true
+	info.GoneDetectedAt = time.Now().UTC().Format(time.RFC3339)
+	info.GoneReason = reason
+
+	b, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	final := filepath.Join(dir, RemoteSidecar)
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		os.Remove(tmp)
+		return false, err
+	}
+	return true, nil
+}
+
+// MarkGoneUnderPrefix marks every output whose staging lives under an S3 prefix
+// that was just deleted, and returns how many it changed.
+//
+// This is the "invalidate on purpose" half of #225: whatever cleared the
+// staging already knows which prefixes it removed, so the common case is
+// detected immediately instead of on a user's click days later. Discovery at
+// fetch time stays as the backstop for everything the server did not do
+// itself — a console delete, or the lifecycle firing early.
+//
+// Deliberately NOT on the /api/outputs path: this runs once per clear, over
+// local files only, and costs no S3 call.
+func (m *Manager) MarkGoneUnderPrefix(s3Prefix, reason string) int {
+	s3Prefix = strings.TrimRight(strings.TrimSpace(s3Prefix), "/")
+	if !strings.HasPrefix(s3Prefix, "s3://") {
+		return 0
+	}
+	entries, err := os.ReadDir(m.OutputDir)
+	if err != nil {
+		return 0
+	}
+	marked := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(m.OutputDir, e.Name())
+		info := ReadRemote(dir)
+		if info == nil || info.Gone {
+			continue
+		}
+		// The sidecar points at a codec subdirectory INSIDE the job prefix
+		// (…/jobs/<id>-<base>/output_h264), so an equality test would never
+		// match what the cleanup actually deletes (…/jobs/<id>-<base>/). The
+		// "/" guard keeps jobs/12-clip from matching jobs/12-clip2.
+		p := strings.TrimRight(info.S3Prefix, "/")
+		if p != s3Prefix && !strings.HasPrefix(p, s3Prefix+"/") {
+			continue
+		}
+		if ok, err := MarkRemoteGone(dir, reason); err == nil && ok {
+			marked++
+		}
+	}
+	return marked
 }
 
 // ReadRemote returns the output dir's remote record, or nil when the media is
@@ -94,6 +194,11 @@ func (m *Manager) FetchOutput(name string) error {
 	info := ReadRemote(dir)
 	if info == nil {
 		return fmt.Errorf("%s: nothing pending — media is already local", name)
+	}
+	if info.Gone {
+		return fmt.Errorf("%s: the media is no longer in S3 (%s, detected %s); "+
+			"it cannot be fetched — re-encode to recreate it",
+			name, info.GoneReason, info.GoneDetectedAt)
 	}
 	if info.Expired() {
 		return fmt.Errorf("%s: staging expired %s; the media is gone from S3",
@@ -172,7 +277,25 @@ func (m *Manager) runFetch(name, dir string) {
 			m.fetchMu.Unlock()
 		}
 	}
-	m.finishFetch(name, cmd.Wait())
+	m.finishFetch(name, fetchError(cmd.Wait()))
+}
+
+// exitStagingGone is cli_batch.py's EXIT_STAGING_GONE — the prefix listed
+// empty, so there is nothing to fetch and never will be. A distinct code
+// rather than a message match: the message is for people, and a fetch that
+// dies mid-transfer also prints about S3.
+const exitStagingGone = 4
+
+// fetchError turns cli_batch's exit status into something the UI can show.
+// Without this the badge reads "exit status 4", which tells the user nothing
+// about the one thing that matters — that clicking again will not help.
+func fetchError(err error) error {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == exitStagingGone {
+		return fmt.Errorf("media no longer in S3 — the staging prefix is empty, " +
+			"so it cannot be downloaded; re-encode to recreate it")
+	}
+	return err
 }
 
 func (m *Manager) finishFetch(name string, err error) {
