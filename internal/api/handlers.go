@@ -866,6 +866,17 @@ func parseOutputMeta(name, dirPath string) outputMeta {
 			break
 		}
 	}
+	// Media in S3 (#214)? Then neither extension is on disk and the scan above
+	// finds nothing — but the PLAYLISTS are local, and they say what they
+	// reference. Read the format out of them instead of reporting "unknown"
+	// about an output whose format is knowable.
+	//
+	// The manifest is the better source in general: it records what was actually
+	// produced, where a config field would only record what was asked for.
+	if !hasM4S && !hasTS {
+		hasM4S, hasTS = hlsFormatFromPlaylists(dirPath)
+	}
+
 	switch {
 	case hasM4S && hasTS:
 		m.hlsFormat = "both"
@@ -876,6 +887,46 @@ func parseOutputMeta(name, dirPath string) outputMeta {
 	}
 
 	return m
+}
+
+// hlsFormatFromPlaylists infers the segment format from the .m3u8 files, which
+// stay local even when the segments do not.
+//
+//	EXT-X-MAP:URI=... or a .m4s URI  -> fMP4
+//	a .ts URI                        -> TS
+//
+// Reads at most a few playlists and bails at the first hit of each kind: this
+// runs per output dir on every /api/outputs, which already costs ~0.8s over 30
+// outputs and must not grow into a full manifest parse.
+func hlsFormatFromPlaylists(dirPath string) (m4s, ts bool) {
+	entries, _ := os.ReadDir(dirPath)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		sub := filepath.Join(dirPath, e.Name())
+		subEntries, _ := os.ReadDir(sub)
+		for _, se := range subEntries {
+			if filepath.Ext(se.Name()) != ".m3u8" {
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join(sub, se.Name()))
+			if err != nil {
+				continue
+			}
+			body := string(b)
+			if strings.Contains(body, "EXT-X-MAP:") || strings.Contains(body, ".m4s") {
+				m4s = true
+			}
+			if strings.Contains(body, ".ts\n") || strings.Contains(body, ".ts\r") {
+				ts = true
+			}
+			if m4s && ts {
+				return
+			}
+		}
+	}
+	return
 }
 
 func dirStats(path string) (totalSize int64, fileCount int) {
