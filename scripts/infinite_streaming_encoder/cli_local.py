@@ -37,6 +37,7 @@ from infinite_streaming_encoder.ffprobe import ProbeError, probe
 from infinite_streaming_encoder.hls import (
     TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls, generate_ts_hls,
 )
+from infinite_streaming_encoder import pricing
 from infinite_streaming_encoder.manifests import write_fragmented_mpd
 from infinite_streaming_encoder.ladder import (
     Rung, get_ladder, label_height, ladder_bufsize_multiplier,
@@ -672,7 +673,8 @@ def run_resume(args: argparse.Namespace) -> int:
 # Rough Graviton (c7g/c8g/c6g) spot price per vCPU-hour in us-west-2. We can't
 # read the exact instance type from inside the container, but nproc x this is a
 # solid cost estimate for the encode compute. Override via SPOT_USD_PER_VCPU_HR.
-_SPOT_USD_PER_VCPU_HR = 0.0155
+# One definition, in pricing.py (#217). Was 0.0155 here.
+_SPOT_USD_PER_VCPU_HR = pricing.AWS_SPOT_VCPU_HR
 
 
 def _log_run_summary(wall_s: float, cpu_s: float) -> None:

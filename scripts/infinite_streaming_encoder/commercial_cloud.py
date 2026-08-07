@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import math
 
+from infinite_streaming_encoder import pricing
+
 # Transcoding rate ($/output-minute) by resolution tier x codec column.
 # Codec columns: h264 -> Base, hevc -> HEVC/VP9, av1 -> AV1.
 _TIERS = [  # (max_output_height, {codec: usd_per_min}) — SD is *below* 720p
@@ -97,8 +99,9 @@ def _mc_rate(height: int, codec: str) -> float:
 # codec/resolution/pass (mirrors the control plane's seeded speed model), so all
 # variants + resolutions + codecs are accounted for individually.
 _SPEED_1080P = {"h264": 1.5, "hevc": 0.14, "av1": 0.1}   # content-s per wall-s @1080p, 1-pass
-_AWS_SPOT_VCPU_HR = 0.013      # Graviton (c7g) spot ≈ $/vCPU-hr
-_AWS_ONDEMAND_VCPU_HR = 0.036  # Graviton (c7g) on-demand ≈ $/vCPU-hr (~2.8× spot)
+# One definition, in pricing.py (#217).
+_AWS_SPOT_VCPU_HR = pricing.AWS_SPOT_VCPU_HR
+_AWS_ONDEMAND_VCPU_HR = pricing.AWS_ONDEMAND_VCPU_HR
 _AWS_VCPU_PER_VARIANT = 2      # each encode runs on ~2 vCPU (matches ENCODE_THREADS)
 
 

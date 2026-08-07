@@ -30,6 +30,7 @@ from typing import NamedTuple
 
 # Taxonomy only — cli_batch is the queue's CONSUMER and must never emit through
 # telemetry, or it would republish what it just drained.
+from infinite_streaming_encoder import pricing
 from infinite_streaming_encoder.telemetry import (
     is_gauge, is_marker, queue_name, trim_execution_name)
 
@@ -2428,8 +2429,11 @@ def cmd_fetch(args) -> int:
 # means something for a run of real length.
 _IDLE_WARN_PCT = 35.0
 
-_SPOT_VCPU_HR = 0.011
-_ONDEMAND_VCPU_HR = 0.037
+# Re-exported from pricing.py so this module's call sites keep their short names
+# while there is only ONE definition. Was 0.011 here, 0.013 in commercial_cloud
+# and 0.0155 in cli_local — three answers for one quantity (#217).
+_SPOT_VCPU_HR = pricing.AWS_SPOT_VCPU_HR
+_ONDEMAND_VCPU_HR = pricing.AWS_ONDEMAND_VCPU_HR
 
 
 def _job_vcpu(job: dict) -> float:
@@ -2619,7 +2623,8 @@ def _emit_machine_rental(exec_name: str, jobs: list) -> tuple | None:
     return pct, machine_vcpu_s / 3600.0
 
 
-def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
+def _emit_cost_summary(exec_name: str, log_state: dict | None = None,
+                       egress_bytes: int = 0, egress_avoided_bytes: int = 0) -> None:
     """At job end, sum the execution's Batch compute and emit two markers the
     control plane consumes: ENCODER-COST (spot-vs-on-demand savings, accumulated
     into 'saved by using spot') and ENCODER-STATS (run efficiency: encode wall,
@@ -2676,9 +2681,27 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
         max_vcpus = int(get_vcpus().get("max_vcpus") or 0)
     except Exception:  # noqa: BLE001 — best-effort
         max_vcpus = 0
+    # Egress rides the SAME marker as compute, deliberately. A run's cost is one
+    # number to a person, and the reason #214 was found on a billing page rather
+    # than in the app is that this marker reported 21% of the bill as if it were
+    # all of it — $5.47 of compute against $26.48 actually spent, with $16.75 of
+    # egress modelled nowhere.
+    #
+    # avoided_gb is what --no-media left in S3. Worth reporting because it is the
+    # only place the saving is visible: a cheap run and an expensive one look
+    # identical once the bytes are (or are not) on disk.
+    #
+    # GB, not bytes, and dollars alongside: bytes are the ground truth, dollars
+    # make it actionable. Flat rate, no free tier — see pricing.EGRESS_USD_PER_GB.
+    eg_gb = (egress_bytes or 0) / 1e9
+    eg_usd = pricing.egress_usd(egress_bytes)
+    avoided_gb = (egress_avoided_bytes or 0) / 1e9
     print(f"[[ENCODER-COST exec={exec_name} spot_usd={spot:.4f} "
           f"ondemand_usd={ondemand:.4f} saved_usd={saved:.4f} "
-          f"vcpu_hours={billed_vh:.2f}]]", flush=True)
+          f"vcpu_hours={billed_vh:.2f} "
+          f"egress_gb={eg_gb:.3f} egress_usd={eg_usd:.4f} "
+          f"egress_avoided_gb={avoided_gb:.3f} "
+          f"total_usd={spot + eg_usd:.4f}]]", flush=True)
     print(f"[[ENCODER-STATS exec={exec_name} wall_s={wall_s:.1f} vcpu_h={vh:.3f} "
           f"longest_s={longest_s:.1f} slowest={slowest or '-'} jobs={n} "
           f"max_vcpus={max_vcpus}]]", flush=True)
@@ -2874,7 +2897,11 @@ def cmd_poll(args: argparse.Namespace) -> int:
                                         include_media=media)
                 print(f"    downloaded {res.files} files", flush=True)
                 try:
-                    _emit_cost_summary(exec_name, log_state)  # cost + host sweep
+                    # res is what the sync-back actually moved, so the cost is
+                    # measured rather than assumed.
+                    _emit_cost_summary(exec_name, log_state,
+                                       egress_bytes=res.bytes,
+                                       egress_avoided_bytes=res.skipped_bytes)
                 except Exception:  # noqa: BLE001 — cost summary is best-effort
                     pass
                 return 0
