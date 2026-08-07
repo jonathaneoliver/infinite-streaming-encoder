@@ -191,11 +191,13 @@ func (m *Manager) sourceFingerprint(cfg JobConfig, dirName string) (int64, strin
 			return 0, ""
 		}
 	}
-	p := src
-	if !filepath.IsAbs(p) {
-		p = filepath.Join(m.SourceDir, src)
+	// A source is always a plain name resolved WITHIN SourceDir (the encoder joins
+	// it the same way). Reject an absolute path or any "../" traversal so a crafted
+	// Files entry can't aim the stat at an arbitrary path (go/path-injection, #200).
+	if !filepath.IsLocal(src) {
+		return 0, ""
 	}
-	fi, err := os.Stat(p)
+	fi, err := os.Stat(filepath.Join(m.SourceDir, src))
 	if err != nil || fi.IsDir() {
 		return 0, ""
 	}
