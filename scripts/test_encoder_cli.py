@@ -266,18 +266,33 @@ def test_dry_run_does_not_upload() -> None:
         encoder_cli._upload = orig
 
 
-def test_progress_line_shows_percent_stage_and_worker_output() -> None:
+def test_progress_line_prefers_stages_over_the_stale_worker_line() -> None:
+    """Observed in a real smoke run: on local-dist `progress` freezes at the
+    orchestrator's "[dist] starting workflow …" while the stage list keeps
+    moving, so showing both repeated the same 60 stale characters on every
+    line — text that reads as current and is not."""
     d = encoder_cli._describe({
-        "status": "running", "overall_progress": 42.4, "progress": "frame= 1200",
+        "status": "running", "overall_progress": 42.4,
+        "progress": "[dist] starting workflow encode-jobs-123 on host:7233",
         "stages": [{"key": "encode:h264:1080p", "label": "h264 1080p",
                     "status": "running"},
                    {"key": "mezz", "label": "mezzanine", "status": "done"}]})
-    assert "42%" in d and "h264 1080p" in d and "frame= 1200" in d, d
-    # Whatever is missing is simply absent — a local job has no stages until the
-    # worker reports any, and an empty line must not print as " · · ".
-    assert encoder_cli._describe({"status": "pending"}) == "pending"
+    assert "42%" in d and "h264 1080p" in d, d
+    assert "starting workflow" not in d, f"stale worker line still shown: {d}"
+    # Done stages are not "running" and must not be listed as though they were.
+    assert "mezzanine" not in d, d
+
+    # With no stage running, the worker line IS the only thing there is — the
+    # cloud upload phase and a plain local encode both look like this.
     assert encoder_cli._describe(
-        {"status": "running", "progress": "starting"}) == "starting"
+        {"status": "running", "progress": "frame= 1200"}) == "frame= 1200"
+    assert encoder_cli._describe(
+        {"status": "running", "overall_progress": 5, "progress": "uploading",
+         "stages": [{"key": "mezz", "status": "done"}]}) == "5% · uploading"
+
+    # Nothing to say falls back to the status, and an empty line must never
+    # print as " · · ".
+    assert encoder_cli._describe({"status": "pending"}) == "pending"
 
 
 def test_download_skips_files_already_present_at_the_right_size() -> None:

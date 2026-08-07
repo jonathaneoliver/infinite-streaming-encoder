@@ -363,9 +363,17 @@ def _human(n: float) -> str:
 # --- wait -------------------------------------------------------------------
 
 def _describe(job: dict) -> str:
-    """One line of live state: percent, the running stage, and the worker's
-    latest output. Which of the three exist depends on the target and how far
-    the run has got, so this shows whatever is there."""
+    """One line of live state: percent, plus whichever of stages / progress is
+    actually saying something.
+
+    `progress` is the worker's latest line and `stages` is the structured view,
+    and they are NOT both worth showing. On local-dist, progress stops at the
+    orchestrator's "[dist] starting workflow …" while the stage list keeps
+    moving, so including both repeated the same 60 stale characters on every
+    line of a real smoke run — text that looks current and is not. Stages win
+    when there are any; progress is the fallback for a target or a phase that
+    reports no stages (submission, the cloud upload, a plain local encode).
+    """
     bits = []
     pct = job.get("overall_progress") or 0
     if pct:
@@ -374,9 +382,10 @@ def _describe(job: dict) -> str:
                for s in (job.get("stages") or []) if s.get("status") == "running"]
     if running:
         bits.append(", ".join(running[:3]))
-    line = (job.get("progress") or "").strip()
-    if line and line not in bits:
-        bits.append(line)
+    else:
+        line = (job.get("progress") or "").strip()
+        if line and line not in bits:
+            bits.append(line)
     return " · ".join(bits) or job.get("status", "")
 
 
