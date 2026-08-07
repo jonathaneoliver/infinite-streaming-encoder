@@ -343,7 +343,11 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 2000; display: flex; align-items: center; justify-content: center; }
 .dialog { background: #16213e; border-radius: 8px; padding: 24px; max-width: 480px; width: 90vw; }
 .dialog-title { font-size: 1rem; font-weight: 600; color: #fff; margin-bottom: 12px; }
-.dialog-body { font-size: 0.9rem; color: #ccc; margin-bottom: 20px; line-height: 1.5; }
+/* pre-line so a body can use "\n\n" for a second paragraph — the messages
+   migrated off native confirm() in #211 were written that way, and escapeHtml
+   means a <br> cannot be smuggled in. max-height keeps a long one (the promote
+   failure summary, one block per destination) inside the viewport. */
+.dialog-body { font-size: 0.9rem; color: #ccc; margin-bottom: 20px; line-height: 1.5; white-space: pre-line; max-height: 55vh; overflow-y: auto; }
 .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; }
 .dialog-actions .btn { min-width: 80px; text-align: center; }
 .btn-secondary { background: #333; color: #ccc; }
@@ -356,6 +360,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .toast-error { border-color: #ef476f; color: #ef476f; }
 .toast-success { border-color: #06d6a0; color: #06d6a0; }
 @keyframes toastIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+/* ?developer=1 indicator. Deliberately loud: it means every "are you sure?" is
+   answered yes automatically, and the flag survives a bookmark. */
+.dev-chip { display: none; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; color: #1a1a2e; background: #ffd166; border-radius: 4px; padding: 3px 8px; cursor: help; }
 
 .player-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 2000; display: flex; align-items: center; justify-content: center; }
 .player-container { background: #111; border-radius: 8px; padding: 16px; max-width: 1000px; width: 90vw; }
@@ -370,7 +378,11 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 </head>
 <body>
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
-    <h1 style="margin:0">Infinite Streaming Encoder</h1>
+    <div style="display:flex;align-items:center;gap:10px">
+        <h1 style="margin:0">Infinite Streaming Encoder</h1>
+        <span class="dev-chip" id="dev-chip"
+              title="?developer=1 — confirmation prompts are skipped and cloud media is left in S3 by default. Remove the URL argument to restore them.">DEV</span>
+    </div>
     <label id="watcher-toggle" title="Auto-encode new files dropped into the source folder. Persists across restarts." style="display:flex;align-items:center;gap:7px;font-size:13px;color:#aaa;cursor:pointer;user-select:none">
         <input type="checkbox" id="watcher-enabled" onchange="setWatcher(this.checked)" style="cursor:pointer;width:15px;height:15px">
         <span>Auto-watch source folder</span>
@@ -960,6 +972,43 @@ function showDialog(title, body, actions, _t0) {
         }));
     });
 }
+
+// The one gate every destructive action goes through (#211). Two reasons it is
+// a wrapper rather than 11 hand-rolled showDialog calls:
+//
+//  - Dismissal. showDialog resolves `null` for Escape and for a backdrop click,
+//    and a bare `if (!await showDialog(...))` treating that as "no" is only
+//    correct by accident — coerce it here, once, so no call site has to know.
+//  - developer=1. A skip has to be implemented in exactly one place or it is
+//    not a skip, it is a list of places somebody remembered.
+//
+// `confirmLabel` names the action ("Delete ladder", not "OK") because the button
+// is the last thing read before the thing happens, and a native browser
+// confirmation, whose buttons are always OK/Cancel, could never say it.
+// `cancelLabel` exists for the one case that naming the action breaks: when the
+// action is itself called Cancel, "Cancel / Cancel job" is a coin toss.
+function confirmDialog(title, body, confirmLabel, confirmClass = 'btn-danger',
+                       cancelLabel = 'Cancel', _t0) {
+    if (isDeveloperMode()) {
+        // Announced, not silent. The chip says confirmations are off in general;
+        // this says which one just went unasked, so a destructive action never
+        // happens with no trace — including the cloud-billing check, which is
+        // the one where a forgotten flag actually costs money.
+        showToast('developer=1 — skipped confirmation: ' + title);
+        return Promise.resolve(true);
+    }
+    return showDialog(title, body, [
+        { label: cancelLabel, value: false, class: 'btn-secondary' },
+        { label: confirmLabel, value: true, class: confirmClass },
+    ], _t0).then(v => v === true);
+}
+
+// A message too long or too structured for a toast — the promote summary lists a
+// block per failed destination. Still the app's dialog, with one dismiss action.
+function showMessage(title, body) {
+    return showDialog(title, body, [{ label: 'Close', value: true, class: 'btn-secondary' }]);
+}
+
 let outputsView = 'list'; // 'list' or 'detail'
 
 function switchTab(name) {
@@ -1669,9 +1718,12 @@ async function saveLadder() {
 }
 
 async function deleteLadder(name) {
-    if (!confirm(`Delete ladder "${name}"? This cannot be undone.`)) return;
+    if (!await confirmDialog(
+        `Delete ladder "${name}"`,
+        'The ladder definition is removed permanently. Encodes already produced with it are not affected.',
+        'Delete ladder')) return;
     const res = await fetch('/api/ladders/' + encodeURIComponent(name), { method: 'DELETE' });
-    if (!res.ok) { alert(await res.text()); return; }
+    if (!res.ok) { showToast(`Could not delete "${name}": ${await res.text()}`, 'error'); return; }
     laddersCache = (await res.json()) || {};
     await loadLadders();
     renderLaddersTab();
@@ -1884,15 +1936,20 @@ async function confirmCloudIfBilling() {
         const running = (inv.summary && inv.summary.running_instances) || 0;
         if (running === 0) return true;
         const hourly = (inv.summary && inv.summary.estimated_hourly_usd) || 0;
-        return confirm(
-            `${running} AWS instance${running === 1 ? '' : 's'} already ` +
-            `running (~$${hourly.toFixed(2)}/hr). Start another cloud encode?`
+        return confirmDialog(
+            'AWS resources are already running',
+            `${running} instance${running === 1 ? '' : 's'} are billing right now ` +
+            `(~$${hourly.toFixed(2)}/hr). Starting another cloud encode adds to that.\n\n` +
+            'Check the AWS tab first if you did not expect anything to be running.',
+            'Start anyway', 'btn-primary'
         );
     } catch (e) {
         // Can't reach inventory — let the user decide.
-        return confirm(
-            'Could not verify AWS state (' + e.message + '). ' +
-            'Start cloud encode anyway?'
+        return confirmDialog(
+            'Could not check AWS state',
+            'The inventory request failed (' + e.message + '), so there may be ' +
+            'instances already billing. The encode can still be started.',
+            'Start anyway', 'btn-primary'
         );
     }
 }
@@ -1927,15 +1984,10 @@ async function startEncode(force = false) {
     if ((target === 'cloud' || target === 'cloud-batch') && !await confirmCloudIfBilling()) return;
 
     if (force) {
-        const confirmed = await showDialog(
+        if (!await confirmDialog(
             'Re-encode (replace existing)',
-            `Re-encode ${selected.length} file${selected.length === 1 ? '' : 's'} with current settings? Existing encodes will be moved to the archive directory.`,
-            [
-                { label: 'Cancel', value: false, class: 'btn-secondary' },
-                { label: 'Re-encode All', value: true, class: 'btn-danger' }
-            ]
-        );
-        if (!confirmed) return;
+            `Re-encode ${selected.length} file${selected.length === 1 ? '' : 's'} with the current settings. Existing encodes are moved to the archive directory, not deleted.`,
+            'Re-encode all')) return;
     }
 
     const body = {
@@ -2025,9 +2077,9 @@ async function fetchOutput(name, el) {
     try {
         const r = await fetch(`/api/outputs/${encodeURIComponent(name)}/fetch`,
                               { method: 'POST' });
-        if (!r.ok) { alert(`Download failed: ${await r.text()}`); }
+        if (!r.ok) { showToast(`Download of ${name} failed: ${await r.text()}`, 'error'); }
     } catch (e) {
-        alert(`Download failed: ${e}`);
+        showToast(`Download of ${name} failed: ${e}`, 'error');
     }
     loadOutputs();
 }
@@ -2062,12 +2114,14 @@ async function promoteOutput(name, el) {
         const failed = results.filter(r => !r.ok);
         if (el) el.textContent = failed.length ? '✗' : '✓';
         if (failed.length) {
-            alert(`Promote ${name}: ${failed.length}/${results.length} destination(s) failed:\n\n`
-                + failed.map(r => `${r.dest}\n  ${r.error}`).join('\n\n'));
+            // A dialog rather than a toast: one block per destination, and the
+            // rsync error is the only thing that says which host to look at.
+            showMessage(`Promote ${name} — ${failed.length} of ${results.length} destinations failed`,
+                failed.map(r => `${r.dest}\n  ${r.error}`).join('\n\n'));
         }
     } catch (e) {
         if (el) el.textContent = '✗';
-        alert('Promote failed: ' + e.message);
+        showToast('Promote failed: ' + e.message, 'error');
     } finally {
         if (el) setTimeout(() => { el.textContent = orig; el.style.pointerEvents = ''; }, 2500);
     }
@@ -3378,26 +3432,24 @@ function renderJobs() {
 }
 
 async function cancelJob(id) {
-    if (!confirm('Cancel this job?')) return;
+    if (!await confirmDialog(
+        'Cancel job',
+        'The running encode is stopped and its partial output discarded. Anything already finished and moved to the output directory stays.',
+        'Cancel job', 'btn-danger', 'Keep running')) return;
     try {
         const res = await fetch('/api/jobs/' + id + '/cancel', { method: 'POST' });
-        if (!res.ok) alert('Cancel failed: ' + res.status);
+        if (!res.ok) showToast('Cancel failed: HTTP ' + res.status, 'error');
     } catch (e) {
-        alert('Cancel failed: ' + e);
+        showToast('Cancel failed: ' + e, 'error');
     }
 }
 
 
 async function retryJob(id) {
-    const confirmed = await showDialog(
+    if (!await confirmDialog(
         'Retry job',
-        'Resume from this job\'s S3 staging? Already-completed variants will be skipped; partial files (not marked .done) will be re-encoded.',
-        [
-            { label: 'Cancel', value: false, class: 'btn-secondary' },
-            { label: 'Retry', value: true, class: 'btn-primary' }
-        ]
-    );
-    if (!confirmed) return;
+        'Resume from this job\'s S3 staging. Already-completed variants are skipped; partial files (not marked .done) are re-encoded.',
+        'Retry', 'btn-primary')) return;
     try {
         const res = await fetch('/api/jobs/' + id + '/retry', { method: 'POST' });
         if (!res.ok) {
@@ -3413,15 +3465,10 @@ async function retryJob(id) {
 }
 
 async function redoJob(id) {
-    const confirmed = await showDialog(
+    if (!await confirmDialog(
         'Redo job from scratch',
-        'Re-encode this entire job again, reusing nothing? Every rendition is produced fresh (existing outputs are archived/replaced) — this does the full amount of work again.',
-        [
-            { label: 'Cancel', value: false, class: 'btn-secondary' },
-            { label: 'Redo', value: true, class: 'btn-primary' }
-        ]
-    );
-    if (!confirmed) return;
+        'Re-encode this entire job, reusing nothing. Every rendition is produced fresh and existing outputs are archived — this does the full amount of work, and costs it, again.',
+        'Redo', 'btn-primary')) return;
     try {
         const res = await fetch('/api/jobs/' + id + '/redo', { method: 'POST' });
         if (!res.ok) {
@@ -3656,32 +3703,42 @@ function renderAwsBatchJobs(jobs) {
 }
 
 async function stopExecution(arn) {
-    if (!confirm('Stop this execution? Its Batch jobs will be aborted.')) return;
+    if (!await confirmDialog(
+        'Stop execution',
+        'The Step Functions execution is stopped and every Batch job it started is aborted. Chunks already staged in S3 remain, so a Retry can resume from them.',
+        'Stop execution')) return;
     try {
         const r = await fetch('/api/aws/executions/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({arn})});
         if (!r.ok) throw new Error('HTTP ' + r.status);
         refreshAws();
-    } catch (e) { alert('Stop failed: ' + e.message); }
+    } catch (e) { showToast('Stop failed: ' + e.message, 'error'); }
 }
 
 async function terminateBatchJob(id) {
-    if (!confirm('Terminate this Batch job?')) return;
+    if (!await confirmDialog(
+        'Terminate Batch job',
+        'This kills one job. The state machine treats it as a failure, so it may resubmit a retry — stop the whole execution instead if that is not what you want.',
+        'Terminate')) return;
     try {
         const r = await fetch('/api/aws/batch-jobs/terminate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
         if (!r.ok) throw new Error('HTTP ' + r.status);
         refreshAws();
-    } catch (e) { alert('Terminate failed: ' + e.message); }
+    } catch (e) { showToast('Terminate failed: ' + e.message, 'error'); }
 }
 
 async function batchStopAll() {
-    if (!confirm('Stop ALL cloud-batch executions and terminate ALL their Batch jobs?')) return;
+    if (!await confirmDialog(
+        'Stop all cloud-batch work',
+        'Every running execution is stopped and all of their Batch jobs are terminated. This affects encodes started by anyone, not just this browser.',
+        'Stop everything')) return;
     try {
         const r = await fetch('/api/aws/batch/stop-all', {method:'POST'});
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const rep = await r.json();
-        alert(`Stopped ${(rep.stopped_executions||[]).length} execution(s), terminated ${(rep.terminated_jobs||[]).length} job(s).`);
+        showToast(`Stopped ${(rep.stopped_executions||[]).length} execution(s), `
+            + `terminated ${(rep.terminated_jobs||[]).length} job(s)`, 'success');
         refreshAws();
-    } catch (e) { alert('Stop-all failed: ' + e.message); }
+    } catch (e) { showToast('Stop-all failed: ' + e.message, 'error'); }
 }
 
 // Turn a raw Batch job name into a human label, dropping the execution UUID.
@@ -4864,12 +4921,16 @@ async function setMaxVcpus(v) {
         if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
         await refreshAws();
     } catch (e) {
-        alert('Set max vCPUs failed: ' + e.message);
+        showToast('Set max vCPUs failed: ' + e.message, 'error');
     }
 }
 
 async function deleteS3Prefix(prefix) {
-    if (!confirm('Delete all objects under ' + prefix + '?')) return;
+    if (!await confirmDialog(
+        'Delete S3 staging',
+        'Every object under ' + prefix + ' is deleted from the cloud staging bucket.\n\n'
+        + 'A running encode reading from this prefix will fail. Finished output already synced to the output directory is not affected — but an output still marked "in S3" loses its media.',
+        'Delete objects')) return;
     try {
         const res = await fetch('/api/aws/s3/delete-prefix', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -4878,7 +4939,7 @@ async function deleteS3Prefix(prefix) {
         if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
         await refreshAws();
     } catch (e) {
-        alert('Delete failed: ' + e.message);
+        showToast('Delete failed: ' + e.message, 'error');
     }
 }
 
@@ -4940,9 +5001,11 @@ function renderDistStaging(doc) {
 }
 
 async function deleteDistPrefix(prefix) {
-    if (!confirm('Delete all objects under ' + prefix + '?\n\n' +
-                 'This is encode staging, not output — the finished output already ' +
-                 'lives in the output directory.')) return;
+    if (!await confirmDialog(
+        'Delete local staging',
+        'Every object under ' + prefix + ' is deleted from MinIO.\n\n'
+        + 'This is encode staging, not output — a finished encode already wrote its output to the output directory. A job still running against this prefix will fail.',
+        'Delete objects')) return;
     try {
         const res = await fetch('/api/dist/staging/delete-prefix', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -4951,13 +5014,16 @@ async function deleteDistPrefix(prefix) {
         if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
         await refreshDistStaging();
     } catch (e) {
-        alert('Delete failed: ' + e.message);
+        showToast('Delete failed: ' + e.message, 'error');
     }
 }
 
 async function reclaimDistStaging() {
-    if (!confirm('Delete local staging idle for more than 24h?\n\n' +
-                 'Queued and running jobs are skipped.')) return;
+    if (!await confirmDialog(
+        'Reclaim idle staging',
+        'Deletes local staging prefixes untouched for more than 24 hours.\n\n'
+        + 'Queued and running jobs are skipped, so an encode in flight cannot be reclaimed out from under itself.',
+        'Reclaim')) return;
     try {
         const res = await fetch('/api/dist/staging/gc', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -4970,22 +5036,26 @@ async function reclaimDistStaging() {
                   n ? 'success' : '');
         await refreshDistStaging();
     } catch (e) {
-        alert('Reclaim failed: ' + e.message);
+        showToast('Reclaim failed: ' + e.message, 'error');
     }
 }
 
 async function cleanupJob(jobId, instanceHint) {
     if (!jobId) {
-        alert('No JobId tag on ' + instanceHint + '; use Emergency Clear or tag it manually.');
+        showToast('No JobId tag on ' + instanceHint + ' — nothing to scope a cleanup to. '
+            + 'Use "Clear all AWS resources", or tag the instance and retry.', 'error');
         return;
     }
-    if (!confirm('Terminate all AWS resources for job ' + jobId + '?')) return;
+    if (!await confirmDialog(
+        'Terminate resources for ' + jobId,
+        'Every AWS resource tagged with this job is terminated: instances, Batch jobs, and the execution that owns them. In-progress work is lost.',
+        'Terminate')) return;
     try {
         const res = await fetch('/api/aws/jobs/' + encodeURIComponent(jobId) + '/cleanup', { method: 'POST' });
         if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
         await refreshAws();
     } catch (e) {
-        alert('Cleanup failed: ' + e.message);
+        showToast('Cleanup failed: ' + e.message, 'error');
     }
 }
 
@@ -5434,6 +5504,7 @@ loadVersion();
 loadLadders();
 loadSettings();
 loadPromoteConfig();
+_renderDevChip();
 
 function _renderWatcher(enabled) {
     const cb = document.getElementById('watcher-enabled');
@@ -5449,13 +5520,21 @@ function _renderWatcher(enabled) {
 // what counts as a cloud target.
 function isAnyCloudTarget(t) { return t === 'cloud' || t === 'cloud-batch'; }
 
-// ?developer=1 — the app-wide "I am iterating, not producing" switch proposed in
-// #211 (which also wants it to skip confirmations). Nothing else reads it yet;
-// this is the first consumer, kept as ONE helper so #211 can extend it
-// (localStorage, a visible toggle) without hunting for copies of the parse.
+// ?developer=1 — the app-wide "I am iterating, not producing" switch. Two
+// consumers: the skip-media default below, and confirmDialog, which answers yes
+// to every "are you sure?" (#211). ONE helper so a third consumer cannot end up
+// with its own subtly different parse.
 function isDeveloperMode() {
     try { return new URLSearchParams(location.search).get('developer') === '1'; }
     catch (e) { return false; }   // very old browser / opaque origin
+}
+
+// The flag lives in the URL, so it survives a bookmark and outlives the session
+// somebody set it for. Since its main effect is the ABSENCE of a prompt, there
+// is nothing else on the page to notice — hence a permanent marker.
+function _renderDevChip() {
+    const chip = document.getElementById('dev-chip');
+    if (chip && isDeveloperMode()) chip.style.display = 'inline-block';
 }
 
 // S3 egress rate, $/GB, from the server (encode.EgressUSDPerGB). Held here so
