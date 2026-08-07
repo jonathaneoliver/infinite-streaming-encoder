@@ -974,15 +974,52 @@ DIST_WORKERS ?=
 MASTER_IP ?= 192.168.1.10
 .PHONY: dist-deploy-workers dist-deploy dist-deploy-ghcr
 
-dist-deploy-workers: require-ghcr ## rsync code + rebuild image + (re)start worker on each DIST_WORKERS box
+# Roll over every DIST_WORKERS box, and DO NOT let one box take the others down.
+#
+# Remote workers are optional and disposable by design — the farm runs fine
+# without them — so a box that does not answer is a SKIP, not a failure. The loop
+# used to `|| exit 1` on the first bad box, which cost three things at once: the
+# remaining boxes were never attempted, `farm-up` failed, and `make deploy`
+# therefore never reached `infra-apply`. One asleep laptop stopped an AWS
+# deployment that had nothing to do with it.
+#
+# A box that DOES answer and then fails is a different claim — that is a broken
+# deploy rather than an absent box — so it still fails the target. The two must
+# not collapse into one exit code, or "my worker is off" and "my worker is
+# broken" become indistinguishable.
+#
+# Whatever happens, the summary names every box and its outcome: a deploy that
+# quietly reached none of them must not look like one that reached them all.
+#
+# $(1) = the per-box command; $$label and $$host are in scope.
+WORKER_SSH_OPTS := -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=10 -o ServerAliveCountMax=3
+
+define for_each_worker
 	@if [ -z "$(DIST_WORKERS)" ]; then echo "set DIST_WORKERS=label=ssh_target [..] (in .env)"; exit 1; fi
-	@for w in $(DIST_WORKERS); do \
+	@ok=0; skipped=; failed=; \
+	for w in $(DIST_WORKERS); do \
 	  label=$${w%%=*}; host=$${w#*=}; \
-	  MASTER_IP=$(MASTER_IP) MINIO_ROOT_USER=$(MINIO_ROOT_USER) MINIO_ROOT_PASSWORD=$(MINIO_ROOT_PASSWORD) \
+	  if ! ssh $(WORKER_SSH_OPTS) "$$host" true >/dev/null 2>&1; then \
+	    echo ">>> [$$label] $$host — UNREACHABLE, skipping (box asleep or off the network)"; \
+	    skipped="$$skipped $$label"; \
+	    continue; \
+	  fi; \
+	  if $(1); then \
+	    ok=$$((ok+1)); \
+	  else \
+	    echo ">>> [$$label] $$host — FAILED (the box answered, so this is a real error)"; \
+	    failed="$$failed $$label"; \
+	  fi; \
+	done; \
+	echo ">>> workers: $$ok deployed$${skipped:+, unreachable:$$skipped}$${failed:+, FAILED:$$failed}"; \
+	[ -z "$$failed" ]
+endef
+
+dist-deploy-workers: require-ghcr ## rsync code + rebuild image + (re)start worker on each DIST_WORKERS box
+	$(call for_each_worker, MASTER_IP=$(MASTER_IP) MINIO_ROOT_USER=$(MINIO_ROOT_USER) MINIO_ROOT_PASSWORD=$(MINIO_ROOT_PASSWORD) \
 	  DEV_BUILD=$(DEV_BUILD) FORCE_IMAGE=$(FORCE_IMAGE) \
-	    bash infra/local-cluster/deploy-worker.sh "$$host" "$$label" || exit 1; \
-	done
-	@echo ">>> remote workers deployed (DEV_BUILD=1 native-builds uncommitted deps on cross-arch boxes)."
+	  bash infra/local-cluster/deploy-worker.sh "$$host" "$$label")
+	@echo ">>> (DEV_BUILD=1 native-builds uncommitted deps on cross-arch boxes)."
 
 dist-deploy: build dist-worker dist-deploy-workers  ## deploy distributed-local to the master + all remote boxes
 	@echo ">>> distributed-local deployed: master worker + $(words $(DIST_WORKERS)) remote box(es)."
@@ -999,14 +1036,9 @@ dist-deploy: build dist-worker dist-deploy-workers  ## deploy distributed-local 
 # for a fully no-local-build bring-up. (Forked to a PRIVATE package? Log each
 # worker box into GHCR by hand first — not supported headlessly on macOS.)
 dist-deploy-ghcr: require-ghcr ## GHCR-pull workers on each DIST_WORKERS box (no build/transfer, no auth)
-	@if [ -z "$(DIST_WORKERS)" ]; then echo "set DIST_WORKERS=label=ssh_target [..] (in .env)"; exit 1; fi
-	@for w in $(DIST_WORKERS); do \
-	  label=$${w%%=*}; host=$${w#*=}; \
-	  GHCR_PAT= MASTER_IP=$(MASTER_IP) IMAGE=$(REMOTE_IMAGE) GHCR_USERNAME=$(GHCR_USERNAME) \
-	    MINIO_ROOT_USER=$(MINIO_ACCESS_KEY) MINIO_ROOT_PASSWORD=$(MINIO_SECRET_KEY) \
-	    bash infra/local-cluster/deploy-worker-ghcr.sh "$$host" "$$label" || exit 1; \
-	done
-	@echo ">>> GHCR-pull workers deployed to $(words $(DIST_WORKERS)) box(es)."
+	$(call for_each_worker, GHCR_PAT= MASTER_IP=$(MASTER_IP) IMAGE=$(REMOTE_IMAGE) GHCR_USERNAME=$(GHCR_USERNAME) \
+	  MINIO_ROOT_USER=$(MINIO_ACCESS_KEY) MINIO_ROOT_PASSWORD=$(MINIO_SECRET_KEY) \
+	  bash infra/local-cluster/deploy-worker-ghcr.sh "$$host" "$$label")
 
 # ---- One-command farm --------------------------------------------------------
 # `make farm-up` brings the whole master profile up in ONE compose command (cluster
