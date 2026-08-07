@@ -368,6 +368,12 @@ publish-tag: require-ghcr ## push a build under ONE explicit tag, leaving :lates
 	  aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(ECR_REGISTRY); \
 	  ecr_tags="--tag $(ECR_REPO):$(TAG)"; \
 	  ecr_note=" + ECR ($(ECR_REPO)):$(TAG)"; \
+	else \
+	  echo "!!! ECR_REPO did not resolve — pushing GHCR ONLY, ECR is NOT updated."; \
+	  echo "    ECR_REPO comes from \`tofu output ecr_repo_url\`, which fails when"; \
+	  echo "    terraform is not initialised in THIS checkout. Fix:  make infra-init"; \
+	  echo "    Cloud workers keep running whatever tag the Batch job defs pin."; \
+	  ecr_note=" (ECR NOT UPDATED — ECR_REPO unresolved)"; \
 	fi; \
 	docker buildx build --builder encoder-builder --platform $(PLATFORMS) \
 		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(GIT_SHA) --build-arg IMAGE_TAG=$(TAG) \
