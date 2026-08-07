@@ -30,6 +30,7 @@ from typing import NamedTuple
 
 # Taxonomy only — cli_batch is the queue's CONSUMER and must never emit through
 # telemetry, or it would republish what it just drained.
+from infinite_streaming_encoder import pricing
 from infinite_streaming_encoder.telemetry import (
     is_gauge, is_marker, queue_name, trim_execution_name)
 
@@ -2428,8 +2429,11 @@ def cmd_fetch(args) -> int:
 # means something for a run of real length.
 _IDLE_WARN_PCT = 35.0
 
-_SPOT_VCPU_HR = 0.011
-_ONDEMAND_VCPU_HR = 0.037
+# Re-exported from pricing.py so this module's call sites keep their short names
+# while there is only ONE definition. Was 0.011 here, 0.013 in commercial_cloud
+# and 0.0155 in cli_local — three answers for one quantity (#217).
+_SPOT_VCPU_HR = pricing.AWS_SPOT_VCPU_HR
+_ONDEMAND_VCPU_HR = pricing.AWS_ONDEMAND_VCPU_HR
 
 
 def _job_vcpu(job: dict) -> float:
@@ -2619,7 +2623,9 @@ def _emit_machine_rental(exec_name: str, jobs: list) -> tuple | None:
     return pct, machine_vcpu_s / 3600.0
 
 
-def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
+def _emit_cost_summary(exec_name: str, log_state: dict | None = None,
+                       egress_bytes: int = 0, egress_avoided_bytes: int = 0,
+                       egress_files: int = 0, staged_bytes: int = 0) -> None:
     """At job end, sum the execution's Batch compute and emit two markers the
     control plane consumes: ENCODER-COST (spot-vs-on-demand savings, accumulated
     into 'saved by using spot') and ENCODER-STATS (run efficiency: encode wall,
@@ -2676,9 +2682,71 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None) -> None:
         max_vcpus = int(get_vcpus().get("max_vcpus") or 0)
     except Exception:  # noqa: BLE001 — best-effort
         max_vcpus = 0
+    # Egress rides the SAME marker as compute, deliberately. A run's cost is one
+    # number to a person, and the reason #214 was found on a billing page rather
+    # than in the app is that this marker reported 21% of the bill as if it were
+    # all of it — $5.47 of compute against $26.48 actually spent, with $16.75 of
+    # egress modelled nowhere.
+    #
+    # avoided_gb is what --no-media left in S3. Worth reporting because it is the
+    # only place the saving is visible: a cheap run and an expensive one look
+    # identical once the bytes are (or are not) on disk.
+    #
+    # GB, not bytes, and dollars alongside: bytes are the ground truth, dollars
+    # make it actionable. Flat rate, no free tier — see pricing.EGRESS_USD_PER_GB.
+    eg_gb = (egress_bytes or 0) / 1e9
+    eg_usd = pricing.egress_usd(egress_bytes)
+    avoided_gb = (egress_avoided_bytes or 0) / 1e9
+
+    # Everything below is priced at FULL RATE with no free-tier discount, so the
+    # answer is "what would this run cost if every allowance were already
+    # spent?" — the number that matters when deciding whether to run it a
+    # hundred more times. A line that reads $0.00 today only because an
+    # allowance has not run out yet is not information.
+    #
+    # Step Functions is the case in point: this account is already at 4,000/4,000
+    # free transitions, so it bills TODAY. Modelling only what is currently
+    # charged would have given an answer with a shelf life.
+    sfn_txns = int((log_state or {}).get("_sfn_transitions", 0))
+    sfn_cost = pricing.sfn_usd(sfn_txns)
+
+    # Tier2 GETs we can attribute exactly: one per object the sync-back fetched.
+    # Worker-side GETs and every Tier1 PUT are NOT attributable from here — see
+    # the note on `unmodelled` below.
+    get_n = int(egress_files or 0)
+    req_usd = pricing.s3_request_usd(tier2=get_n)
+
+    # Staging held for the run's duration. GB-HOURS, not GB-months: treating a
+    # day's staging as a month over-states by ~30x.
+    store_usd = pricing.s3_storage_usd(
+        (staged_bytes or 0) / 1e9, max(wall_s, 0.0) / 3600.0)
+
+    # Tier1 is ESTIMATED from staged bytes, not counted — see
+    # pricing.s3_put_estimate_usd. It is the largest line we cannot attribute
+    # directly (8.5% of the full-rate total), so a fitted figure beats omitting
+    # it, but it is labelled est so nobody mistakes it for a measurement.
+    put_est = pricing.s3_put_estimate_usd(staged_bytes)
+
+    total = spot + eg_usd + sfn_cost + req_usd + store_usd + put_est
+
+    # Name what is NOT in the total. #217 existed because a partial number looked
+    # complete; repeating that with a longer list of terms would be worse, not
+    # better. S3 PUTs are the big omission and are called out by name: 591,572
+    # Tier1 requests cost $2.96 over 1-3 Aug, but they happen across the workers
+    # and the packager, not here, so attributing them per-run needs counters
+    # those paths do not yet keep.
+    unmodelled = ",".join(pricing.UNMODELLED)
+
     print(f"[[ENCODER-COST exec={exec_name} spot_usd={spot:.4f} "
           f"ondemand_usd={ondemand:.4f} saved_usd={saved:.4f} "
-          f"vcpu_hours={billed_vh:.2f}]]", flush=True)
+          f"vcpu_hours={billed_vh:.2f} "
+          f"egress_gb={eg_gb:.3f} egress_usd={eg_usd:.4f} "
+          f"egress_avoided_gb={avoided_gb:.3f} "
+          f"sfn_transitions={sfn_txns} sfn_usd={sfn_cost:.4f} "
+          f"s3_get={get_n} s3_request_usd={req_usd:.4f} "
+          f"s3_put_est_usd={put_est:.4f} "
+          f"storage_usd={store_usd:.4f} "
+          f"total_usd={total:.4f} unmodelled={unmodelled}]]", flush=True)
     print(f"[[ENCODER-STATS exec={exec_name} wall_s={wall_s:.1f} vcpu_h={vh:.3f} "
           f"longest_s={longest_s:.1f} slowest={slowest or '-'} jobs={n} "
           f"max_vcpus={max_vcpus}]]", flush=True)
@@ -2761,6 +2829,12 @@ def cmd_poll(args: argparse.Namespace) -> int:
             token = hist.get("nextToken")
             if not token:
                 break
+        # Free: the poll already has every event. Counting here rather than with
+        # a second API call at summary time, and the last poll's count is the
+        # complete one because this refetches from the start each iteration.
+        if log_state is not None:
+            log_state["_sfn_transitions"] = sum(
+                1 for e in events if str(e.get("type", "")).endswith("StateEntered"))
         _translate_events(events, seen)
         # Then refine chunk cells to queued/running from live Batch status
         # (runs after _translate_events so it wins over the enter-event's
@@ -2874,7 +2948,13 @@ def cmd_poll(args: argparse.Namespace) -> int:
                                         include_media=media)
                 print(f"    downloaded {res.files} files", flush=True)
                 try:
-                    _emit_cost_summary(exec_name, log_state)  # cost + host sweep
+                    # res is what the sync-back actually moved, so the cost is
+                    # measured rather than assumed.
+                    _emit_cost_summary(exec_name, log_state,
+                                       egress_bytes=res.bytes,
+                                       egress_avoided_bytes=res.skipped_bytes,
+                                       egress_files=res.files,
+                                       staged_bytes=res.bytes + res.skipped_bytes)
                 except Exception:  # noqa: BLE001 — cost summary is best-effort
                     pass
                 return 0

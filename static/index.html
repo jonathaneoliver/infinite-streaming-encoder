@@ -2400,6 +2400,46 @@ function _encoderProvenance(p) {
     return `<div style="color:#889;margin-top:2px">${bits.join(' · ')}${gap}</div>`;
 }
 
+// #217 — what the run actually cost, compute AND transfer.
+//
+// This used to show spot alone, which on the 1-3 Aug bill was $5.47 of $26.48:
+// 21% quoted as if it were the whole thing, with $16.75 of egress modelled
+// nowhere. That is why the egress problem was found on an AWS billing page
+// rather than in this app.
+//
+// Bytes are shown next to dollars deliberately: bytes are the ground truth and
+// never go stale, dollars make it actionable but depend on a rate that moves.
+function _runCostHtml(j) {
+    const spot = j.spot_usd || 0, eg = j.egress_usd || 0;
+    const total = j.total_usd || (spot + eg);
+    const excl = j.cost_unmodelled
+        ? ` title="Full-rate estimate — free tiers deliberately ignored, so this is what the run would cost once every allowance is spent. NOT included: ${j.cost_unmodelled.split(',').join(', ')}."`
+        : ' title="Full-rate estimate — free tiers deliberately ignored."';
+    let html = `<span${excl}>$${total.toFixed(2)}${j.cost_unmodelled ? '<sup>+</sup>' : ''}</span>`;
+    const parts = [];
+    if (spot > 0) parts.push(`$${spot.toFixed(2)} compute`);
+    if (eg > 0) parts.push(`$${eg.toFixed(2)} egress (${(j.egress_gb || 0).toFixed(2)} GB)`);
+    // Small lines, but shown because they are priced at FULL rate — several are
+    // $0 on the actual bill only because a free allowance has not run out, and
+    // hiding them would put us back to reporting a fraction as if it were all.
+    const small = (j.sfn_usd || 0) + (j.request_usd || 0) + (j.storage_usd || 0);
+    if (small > 0) parts.push(`$${small.toFixed(2)} sfn+requests+storage`);
+    // Marked "est" because it is FITTED from staged bytes, not counted — Tier1
+    // requests happen across workers and the packager, which keep no counters.
+    // Presenting a fitted number as measured is the failure this issue is about.
+    if (j.put_est_usd > 0) {
+        parts.push(`<span title="Estimated, not measured: ~1,897 Tier1 requests per GB staged (fitted, R²=0.991). Excludes the ~$0.10/day background inventory sweep, which no run causes — see #227.">$${j.put_est_usd.toFixed(2)} S3 PUT (est)</span>`);
+    }
+    if (parts.length) html += ` <span class="u">${parts.join(' · ')}</span>`;
+    if (j.saved_usd > 0) html += ` <span class="u">· saved $${j.saved_usd.toFixed(2)} on spot</span>`;
+    // Only meaningful when the run left media in S3; silent otherwise.
+    if (j.egress_avoided_gb > 0) {
+        const avoided = j.egress_avoided_gb * (_egressUsdPerGb || 0);
+        html += ` <span style="color:#8c8">· avoided $${avoided.toFixed(2)} (${j.egress_avoided_gb.toFixed(2)} GB left in S3)</span>`;
+    }
+    return html;
+}
+
 function _jobConfigHtml(c) {
     const chip = (label, val, hl) =>
         `<span style="background:#232a36;border-radius:3px;padding:1px 7px;font-size:11px;color:#bbb">`
@@ -2449,8 +2489,8 @@ function renderJobStats(el, j) {
         + (cloud ? stat('avg busy', (j.avg_concurrency || 0).toFixed(0) + ' <span class="u">of ' + (j.max_vcpus || '?') + ' vCPU</span>') : '')
         + (cloud ? stat('efficiency', (j.efficiency_pct || 0).toFixed(0) + '%') : '')
         + (j.slowest_job ? stat('slowest chunk', escapeHtml(slowest) + ' <span class="u">' + formatDuration(j.slowest_job_s || 0) + '</span>') : '')
-        + (j.saved_usd > 0 ? stat('cost', '$' + (j.spot_usd || 0).toFixed(2) + ' <span class="u">spot · saved $' + j.saved_usd.toFixed(2) + '</span>') : '')
-        + ((j.commercial_usd > 0 || j.mediaconvert_usd > 0 || j.aws_spot_usd > 0 || j.local_wall_s > 0) ? stat('would cost', `MediaConvert $${(j.mediaconvert_usd || 0).toFixed(2)} · commercial $${(j.commercial_usd || 0).toFixed(2)} · AWS on-demand $${(j.aws_ondemand_usd || 0).toFixed(2)} · AWS spot $${(j.aws_spot_usd || 0).toFixed(2)} · <span class="u">local hardware ~${formatDuration(j.local_wall_s || totalS)} of your time</span>`) : '');
+        + (j.saved_usd > 0 || j.egress_usd > 0 ? stat('cost', _runCostHtml(j)) : '')
+        + ((j.commercial_usd > 0 || j.mediaconvert_usd > 0 || j.aws_spot_usd > 0 || j.local_wall_s > 0) ? stat('would cost', `<span title="Commercial rates are TRANSCODE ONLY — those services bill delivery separately. Our figure now includes egress, so this comparison understates them by roughly whatever delivery would cost.">MediaConvert</span> $${(j.mediaconvert_usd || 0).toFixed(2)} · commercial $${(j.commercial_usd || 0).toFixed(2)} · AWS on-demand $${(j.aws_ondemand_usd || 0).toFixed(2)} · AWS spot $${(j.aws_spot_usd || 0).toFixed(2)} · <span class="u">local hardware ~${formatDuration(j.local_wall_s || totalS)} of your time</span>`) : '');
     el.title = 'efficiency = avg vCPUs busy ÷ max vCPUs (how full the fleet ran). '
         + 'slowest chunk = the makespan floor — nothing finishes faster than this one chunk.';
     el.style.display = '';

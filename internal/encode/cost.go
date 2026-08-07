@@ -15,10 +15,15 @@ const defaultLocalPerfCores = 16.0
 
 // AWS Batch per-vCPU-hour pricing for the Graviton (c/m-7g) fleet. Spot is the
 // steady-state rate we actually pay; on-demand is the reclaim-proof upper bound
-// we quote alongside it. These mirror commercial_cloud.py's _AWS_*_VCPU_HR so
-// the Go-side projection and the Python SaaS baselines agree on units.
+// we quote alongside it.
+//
+// These mirror scripts/infinite_streaming_encoder/pricing.py, which holds the
+// single Python-side definition and documents how the spot figure was measured
+// (7-day blended mean over the instance types the compute env launches, 479
+// price points on 2026-08-07). Two languages cannot share a constant, so these
+// MUST be changed together — #217 exists because three copies drifted apart.
 const (
-	awsSpotVCPUHourUSD     = 0.013
+	awsSpotVCPUHourUSD     = 0.014
 	awsOndemandVCPUHourUSD = 0.036
 )
 

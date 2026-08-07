@@ -202,7 +202,12 @@ var (
 	// ENCODER-COST reports one execution's spot-vs-on-demand cost + savings at
 	// job end. Keyed by exec so a reattach that re-emits is idempotent (the Job
 	// sums per-exec, last value wins). Drives "saved by using spot".
-	costMarkerRe = regexp.MustCompile(`^\[\[ENCODER-COST exec=(\S+) spot_usd=([0-9.]+) ondemand_usd=([0-9.]+) saved_usd=([0-9.]+) vcpu_hours=([0-9.]+)\]\]$`)
+	// Matched as a PREFIX and then parsed key=value, not as one rigid pattern.
+	// The rigid version listed every field in order, so adding egress_gb (#217)
+	// would have stopped it matching AT ALL — and the failure mode of a
+	// non-matching cost marker is silent: no error, just a run that reports $0.
+	// Key=value also means old workers emitting the shorter form still parse.
+	costMarkerRe = regexp.MustCompile(`^\[\[ENCODER-COST (.+)\]\]$`)
 	// ENCODER-STATS reports one execution's run-efficiency stats at job end
 	// (encode wall span, total vCPU-hours, the slowest single chunk = makespan
 	// floor, job count, and the compute-env max vCPUs). The Job derives avg
@@ -681,11 +686,19 @@ func (j *Job) parseMarker(line string) bool {
 		return true
 	}
 	if m := costMarkerRe.FindStringSubmatch(line); m != nil {
-		spot, _ := strconv.ParseFloat(m[2], 64)
-		ondemand, _ := strconv.ParseFloat(m[3], 64)
-		saved, _ := strconv.ParseFloat(m[4], 64)
-		vh, _ := strconv.ParseFloat(m[5], 64)
-		j.recordCost(m[1], spot, ondemand, saved, vh)
+		kv := parseMarkerFields(m[1])
+		if kv["exec"] == "" {
+			return true // malformed; consumed, but nothing to record
+		}
+		num := func(k string) float64 { v, _ := strconv.ParseFloat(kv[k], 64); return v }
+		j.recordCost(kv["exec"], execCost{
+			Spot: num("spot_usd"), OnDemand: num("ondemand_usd"),
+			Saved: num("saved_usd"), VCPUHours: num("vcpu_hours"),
+			EgressGB: num("egress_gb"), EgressUSD: num("egress_usd"),
+			EgressAvoidedGB: num("egress_avoided_gb"),
+			SfnUSD:          num("sfn_usd"), RequestUSD: num("s3_request_usd"),
+			StorageUSD: num("storage_usd"), PutEstUSD: num("s3_put_est_usd"),
+		}, kv["unmodelled"])
 		return true
 	}
 	if m := machinesMarkerRe.FindStringSubmatch(line); m != nil {
@@ -836,20 +849,71 @@ func (j *Job) recordRunStats(exec string, s runStat) {
 	}
 }
 
-func (j *Job) recordCost(exec string, spot, ondemand, saved, vcpuH float64) {
+// recordCost folds one execution's ENCODER-COST into the job. Keyed by exec so a
+// re-emitted marker replaces rather than double-counts.
+//
+// Egress is summed here with compute because a run's cost is ONE number to a
+// person. Reporting compute alone is how this shipped for months quoting 21% of
+// the bill as though it were all of it (#217).
+func (j *Job) recordCost(exec string, c execCost, unmodelled string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.costByExec == nil {
-		j.costByExec = map[string][4]float64{}
+		j.costByExec = map[string]execCost{}
 	}
-	j.costByExec[exec] = [4]float64{spot, ondemand, saved, vcpuH}
-	var s, o, sv float64
+	j.costByExec[exec] = c
+	var s, o, sv, eg, eu, ea, sf, rq, st, pe float64
 	for _, v := range j.costByExec {
-		s += v[0]
-		o += v[1]
-		sv += v[2]
+		s += v.Spot
+		o += v.OnDemand
+		sv += v.Saved
+		eg += v.EgressGB
+		eu += v.EgressUSD
+		ea += v.EgressAvoidedGB
+		sf += v.SfnUSD
+		rq += v.RequestUSD
+		st += v.StorageUSD
+		pe += v.PutEstUSD
 	}
 	j.SpotUSD, j.OnDemandUSD, j.SavedUSD = s, o, sv
+	j.EgressGB, j.EgressUSD, j.EgressAvoidedGB = eg, eu, ea
+	j.SfnUSD, j.RequestUSD, j.StorageUSD, j.PutEstUSD = sf, rq, st, pe
+	// The headline: what the run cost at full rate, not what one component did.
+	j.TotalUSD = s + eu + sf + rq + st + pe
+	// Carried so the UI can say what the total EXCLUDES. A partial number that
+	// looks complete is the whole reason #217 was filed.
+	if unmodelled != "" {
+		j.CostUnmodelled = unmodelled
+	}
+}
+
+// execCost is one execution's contribution. A named struct rather than the old
+// [4]float64 so adding a term cannot silently shift the meaning of an index.
+type execCost struct {
+	Spot, OnDemand, Saved, VCPUHours     float64
+	EgressGB, EgressUSD, EgressAvoidedGB float64
+	// Priced at FULL RATE with no free-tier discount, so the total answers
+	// "what would this cost if every allowance were spent?" rather than "what
+	// did AWS happen to charge this month". Step Functions is why that matters:
+	// the account is already at 4,000/4,000 free transitions.
+	SfnUSD, RequestUSD, StorageUSD float64
+	// PutEstUSD is FITTED from staged bytes, not counted — Tier1 requests
+	// happen across workers and the packager, which keep no counters. Kept in a
+	// distinct field so the UI can label it an estimate rather than pass it off
+	// as measured.
+	PutEstUSD float64
+}
+
+// parseMarkerFields splits "a=1 b=2" into a map. Values cannot contain spaces,
+// which every field here satisfies.
+func parseMarkerFields(s string) map[string]string {
+	out := map[string]string{}
+	for _, tok := range strings.Fields(s) {
+		if k, v, ok := strings.Cut(tok, "="); ok {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // startFile archives the current Stages (so end-of-job timing can still
@@ -1178,10 +1242,27 @@ type Job struct {
 	// lifetime alone cannot say when a box appeared relative to the others, and
 	// the browser cannot source termination for itself (the inventory endpoint
 	// drops terminated instances and is cached).
-	Rentals     []MachineRental `json:"rentals,omitempty"`
-	SpotUSD     float64         `json:"spot_usd,omitempty"`
-	OnDemandUSD float64         `json:"ondemand_usd,omitempty"`
-	SavedUSD    float64         `json:"saved_usd,omitempty"`
+	Rentals []MachineRental `json:"rentals,omitempty"`
+	SpotUSD float64         `json:"spot_usd,omitempty"`
+	// Egress this run paid for, and what --no-media left in S3 (#217). Priced
+	// flat at EgressUSDPerGB with no free-tier discount, so two runs of the same
+	// ladder quote the same figure whatever the date. TotalUSD = spot + egress:
+	// the headline, because reporting compute alone quoted 21% of a real bill.
+	EgressGB        float64 `json:"egress_gb,omitempty"`
+	EgressUSD       float64 `json:"egress_usd,omitempty"`
+	EgressAvoidedGB float64 `json:"egress_avoided_gb,omitempty"`
+	// Step Functions, S3 requests and S3 storage, all at full rate.
+	SfnUSD     float64 `json:"sfn_usd,omitempty"`
+	RequestUSD float64 `json:"request_usd,omitempty"`
+	StorageUSD float64 `json:"storage_usd,omitempty"`
+	// Fitted, not measured — labelled as such in the UI.
+	PutEstUSD float64 `json:"put_est_usd,omitempty"`
+	TotalUSD  float64 `json:"total_usd,omitempty"`
+	// Comma-separated list of cost lines the total does NOT include, so the UI
+	// can show the gap rather than implying there isn't one.
+	CostUnmodelled string  `json:"cost_unmodelled,omitempty"`
+	OnDemandUSD    float64 `json:"ondemand_usd,omitempty"`
+	SavedUSD       float64 `json:"saved_usd,omitempty"`
 	// CommercialUSD / MediaConvertUSD are what this job's output ladder would have
 	// cost on hosted transcoders (a generic commercial cloud encoder, and AWS
 	// MediaConvert) — comparison baselines against our own spot/local cost. Both
@@ -1204,7 +1285,7 @@ type Job struct {
 	// running local encode's estimate converges on its own actual runtime.
 	LocalWallSeconds float64 `json:"local_wall_s,omitempty"`
 	// per-execution [spot, ondemand, saved, vcpu_h], summed across files; not serialized.
-	costByExec map[string][4]float64
+	costByExec map[string]execCost
 
 	// Cached first-source probe (duration/width/fps) for live cost + local-wall
 	// re-prediction, so the per-sample refresh needn't re-invoke ffprobe. Set once
