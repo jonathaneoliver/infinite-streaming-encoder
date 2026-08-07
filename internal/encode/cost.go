@@ -1,6 +1,7 @@
 package encode
 
 import (
+	"fmt"
 	"math"
 	"path/filepath"
 	"strconv"
@@ -168,6 +169,74 @@ func _commercialRate(height int, codec string) float64 {
 	return _commercialTiers[len(_commercialTiers)-1].rate["h264"]
 }
 
+// --- Coconut (https://www.coconut.co/pricing, verified 2026-08-07) -----------
+//
+// Flat per output-minute by resolution, with NO codec multiplier — AV1 costs the
+// same as H.264 there, which is unusual and is why it undercuts Qencode on wide
+// multi-codec ladders despite a higher H.264 rate.
+const (
+	_coconutSD    = 0.00750 // < 720p
+	_coconutHD    = 0.01500 // 720p-1080p
+	_coconutUHD   = 0.03000 // > 1080p
+	_coconutAudio = 0.00325 // per output-minute, one track
+)
+
+func _coconutRate(height int) float64 {
+	switch {
+	case height <= 719:
+		return _coconutSD
+	case height <= 1080:
+		return _coconutHD
+	}
+	return _coconutUHD
+}
+
+// --- Bitmovin (https://bitmovin.com/pricing/, verified 2026-08-07) -----------
+//
+// A low base rate multiplied three ways, which is what makes it the most
+// expensive of the four despite the smallest headline number: $0.02/output-min
+// x resolution x codec x passes. A 21-rendition 5-minute clip bills as 360
+// output-minutes.
+//
+// The 2,000 free minutes/month are DELIBERATELY NOT MODELLED, consistent with
+// how AWS free tiers are treated everywhere else here (see pricing.py): a figure
+// that is zero only because an allowance has not run out tells you nothing about
+// what the work costs, and makes two runs incomparable.
+const _bitmovinBasePerMin = 0.02
+
+// Resolution factors, from their published table.
+func _bitmovinResFactor(height int) float64 {
+	switch {
+	case height <= 719:
+		return 1
+	case height <= 1080:
+		return 2
+	case height <= 2160:
+		return 4
+	}
+	return 120 // 8K
+}
+
+// Codec factor. HEVC is published as 2x. AV1's factor is NOT on the pricing
+// page — it points at a separate methodology document — so 2x is assumed by
+// analogy with HEVC and the result is a FLOOR, not a quote. Given HEVC is 2x,
+// AV1 is very unlikely to be cheaper.
+func _bitmovinCodecFactor(codec string) float64 {
+	switch codec {
+	case "hevc", "av1":
+		return 2
+	}
+	return 1
+}
+
+// 2-pass is 1.25x (3-pass 2.0x, unused here).
+func _bitmovinPassFactor(twoPass bool) float64 {
+	if twoPass {
+		return 1.25
+	}
+	return 1
+}
+
 // _fpsMult = ceil(fps/30): +100% per additional 30fps (30→1, 60→2).
 func _fpsMult(fps int) int {
 	if fps <= 0 {
@@ -216,9 +285,9 @@ func _mcRate(height int, codec string) float64 {
 // projectSaaSCosts returns what this ladder would cost on a hosted transcoder —
 // commercial cloud (per-output-minute tiers + repack + audio, × fps × bitrate)
 // and AWS MediaConvert (Basic/Pro tiers × 2 over 30fps). Target-independent.
-func (m *Manager) projectSaaSCosts(cfg JobConfig, sourceWidth, fps int, durationS float64, hasAudio bool, srcMbps float64) (commercial, mediaconvert float64) {
+func (m *Manager) projectSaaSCosts(cfg JobConfig, sourceWidth, fps int, durationS float64, hasAudio bool, srcMbps float64) (commercial, mediaconvert, coconut, bitmovin float64) {
 	if m.Ladders == nil || durationS <= 0 {
-		return 0, 0
+		return 0, 0, 0, 0
 	}
 	ladderName := cfg.Ladder
 	if ladderName == "" {
@@ -234,12 +303,17 @@ func (m *Manager) projectSaaSCosts(cfg JobConfig, sourceWidth, fps int, duration
 		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
 			commercial += minutes*_commercialRate(r.Height, c)*cMult + minutes*_commercialRepackPerMin
 			mediaconvert += minutes * _mcRate(r.Height, c) * mcMult
+			coconut += minutes * _coconutRate(r.Height)
+			bitmovin += minutes * _bitmovinBasePerMin *
+				_bitmovinResFactor(r.Height) * _bitmovinCodecFactor(c) *
+				_bitmovinPassFactor(c == "hevc" && !cfg.HevcSinglePass)
 		}
 	}
 	if hasAudio {
 		commercial += minutes * _commercialAudioPerMin
+		coconut += minutes * _coconutAudio
 	}
-	return commercial, mediaconvert
+	return commercial, mediaconvert, coconut, bitmovin
 }
 
 // ensureSourceProbe probes the job's first source file once (duration/width/fps
@@ -299,7 +373,7 @@ func (m *Manager) projectAndSetCosts(job *Job) {
 
 	spot, ondemand := m.projectCloudCost(job.Config, width, fps, dur)
 	localWall := m.projectLocalWallSeconds(job.Config, width, fps, dur)
-	commercial, mediaconvert := m.projectSaaSCosts(job.Config, width, fps, dur, hasAudio, srcMbps)
+	commercial, mediaconvert, coconut, bitmovin := m.projectSaaSCosts(job.Config, width, fps, dur, hasAudio, srcMbps)
 
 	job.mu.Lock()
 	if commercial > 0 {
@@ -307,6 +381,12 @@ func (m *Manager) projectAndSetCosts(job *Job) {
 	}
 	if mediaconvert > 0 {
 		job.MediaConvertUSD = mediaconvert
+	}
+	if coconut > 0 {
+		job.CoconutUSD = coconut
+	}
+	if bitmovin > 0 {
+		job.BitmovinUSD = bitmovin
 	}
 	if spot > 0 {
 		job.AwsSpotUSD, job.AwsOndemandUSD = spot, ondemand
@@ -322,4 +402,112 @@ func (m *Manager) projectAndSetCosts(job *Job) {
 	}
 	job.mu.Unlock()
 	m.notify(job)
+}
+
+// EstimateResult is a pre-flight cost projection for a config that has not been
+// submitted. Same machinery projectAndSetCosts uses after a job starts — the
+// only difference is that it probes a filename instead of reading a Job.
+type EstimateResult struct {
+	DurationS   float64 `json:"duration_s"`
+	Width       int     `json:"width"`
+	Fps         int     `json:"fps"`
+	SpotUSD     float64 `json:"spot_usd"`
+	OnDemandUSD float64 `json:"ondemand_usd"`
+	// Egress the run would pay to bring output home. Zero when the config
+	// leaves media in S3 (#214) — which is most of the point of showing this
+	// before you press the button rather than after.
+	EgressGB  float64 `json:"egress_gb"`
+	EgressUSD float64 `json:"egress_usd"`
+	TotalUSD  float64 `json:"total_usd"`
+	// SaaS baselines for the same ladder, so the comparison is visible at the
+	// moment of choosing rather than only in the finished job.
+	CommercialUSD   float64 `json:"commercial_usd"`
+	MediaConvertUSD float64 `json:"mediaconvert_usd"`
+	CoconutUSD      float64 `json:"coconut_usd"`
+	BitmovinUSD     float64 `json:"bitmovin_usd"`
+	// Local targets write straight to disk: no egress, no AWS spend at all.
+	Local bool `json:"local"`
+}
+
+// EstimateCost projects what a config WOULD cost, before it is submitted.
+//
+// Deliberately reuses projectCloudCost / projectSaaSCosts rather than
+// approximating in JavaScript: an estimate that disagrees with the figure the
+// finished job reports is worse than no estimate, because the difference reads
+// as a bug in the encode rather than in the estimator.
+//
+// Probes the source with ffprobe, so it costs one subprocess per distinct file.
+// Callers should debounce.
+func (m *Manager) EstimateCost(cfg JobConfig) (EstimateResult, error) {
+	var out EstimateResult
+	if len(cfg.Files) == 0 {
+		return out, fmt.Errorf("no files selected")
+	}
+	// Sum durations across every selected file — the form can select several,
+	// and quoting only the first would understate a batch.
+	var totalDur float64
+	for _, f := range cfg.Files {
+		src := filepath.Join(m.SourceDir, f)
+		d, err := probeDurationSeconds(src)
+		if err != nil || d <= 0 {
+			continue
+		}
+		totalDur += d
+		if out.Width == 0 {
+			out.Width, out.Fps = probeSourceWidth(src), probeSourceFps(src)
+		}
+	}
+	if totalDur <= 0 {
+		return out, fmt.Errorf("could not probe duration")
+	}
+	// A --time limit caps what actually gets encoded, per file.
+	if lim, err := strconv.ParseFloat(cfg.Time, 64); err == nil && lim > 0 {
+		capped := lim * float64(len(cfg.Files))
+		if capped < totalDur {
+			totalDur = capped
+		}
+	}
+	out.DurationS = totalDur
+
+	src0 := filepath.Join(m.SourceDir, cfg.Files[0])
+	hasAudio, srcMbps := probeHasAudio(src0), probeSourceMbps(src0)
+	out.CommercialUSD, out.MediaConvertUSD, out.CoconutUSD, out.BitmovinUSD =
+		m.projectSaaSCosts(cfg, out.Width, out.Fps, totalDur, hasAudio, srcMbps)
+
+	out.Local = cfg.Target != "cloud" && cfg.Target != "cloud-batch"
+	if out.Local {
+		// Nothing is billed: local and local-dist write to disk. Say $0 rather
+		// than omitting the line, so the contrast with cloud is visible.
+		return out, nil
+	}
+
+	out.SpotUSD, out.OnDemandUSD = m.projectCloudCost(cfg, out.Width, out.Fps, totalDur)
+	// Output size = the ladder's total bitrate x duration. The same bytes drive
+	// egress and (via the fitted per-GB rate) the Tier1 estimate, so a run that
+	// leaves media in S3 correctly shows near-zero here.
+	if !m.skipMediaDownload(cfg) {
+		out.EgressGB = m.ladderOutputGB(cfg, out.Width, totalDur)
+		out.EgressUSD = out.EgressGB * EgressUSDPerGB
+	}
+	out.TotalUSD = out.SpotUSD + out.EgressUSD
+	return out, nil
+}
+
+// ladderOutputGB is the ladder's summed bitrate over the duration — what the
+// encode will actually produce, and therefore what would be transferred.
+func (m *Manager) ladderOutputGB(cfg JobConfig, sourceWidth int, durationS float64) float64 {
+	var kbps int
+	ladderName := cfg.Ladder
+	if ladderName == "" {
+		ladderName = DefaultLadderName
+	}
+	if m.Ladders == nil {
+		return 0
+	}
+	for _, codec := range parseCodecSel(cfg.Codec) {
+		for _, r := range m.Ladders.resolveRungs(ladderName, codec, cfg.MaxRes, cfg.MinRes, sourceWidth) {
+			kbps += r.Bitrate
+		}
+	}
+	return float64(kbps) * 1000 * durationS / 8 / 1e9
 }

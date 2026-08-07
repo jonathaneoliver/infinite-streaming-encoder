@@ -401,7 +401,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="no-files">Loading...</div>
         </div>
 
-        <fieldset class="encode-options">
+        <fieldset class="encode-options" id="encode-options">
             <legend>Encoding Options</legend>
             <div id="cloud-warning" class="cloud-warning" style="display:none">
                 ⚠ Cloud encodes launch billable AWS resources. Check the
@@ -520,6 +520,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 </div>
             </div>
             </div>
+            <div class="encode-hint" id="encode-estimate" style="display:none"></div>
             <div class="encode-hint"><b>Encode</b> fills in whatever's missing and resumes an interrupted run — a brand-new source encodes fully, an already-complete one is skipped. Use <b>Re-encode</b> (the ▾ menu) to archive existing output and produce every variant fresh.</div>
         </fieldset>
     </div>
@@ -1868,6 +1869,7 @@ function onTargetChange() {
     // egress to skip, so offering the choice there would be misleading.
     const skipGroup = document.getElementById('skip-media-group');
     if (skipGroup) skipGroup.style.display = isAnyCloud ? 'flex' : 'none';
+    scheduleCostEstimate();
 }
 
 // Before submitting a cloud encode, peek at the AWS inventory. If
@@ -2440,6 +2442,92 @@ function _runCostHtml(j) {
     return html;
 }
 
+// Pre-flight cost estimate for the current form, shown before you press Encode.
+//
+// Server-side on purpose: it runs the SAME projectCloudCost / projectSaaSCosts
+// the finished job reports, so the estimate and the outcome cannot disagree. An
+// estimate that contradicts the result reads as a bug in the encode rather than
+// in the estimator, which is worse than showing nothing.
+//
+// Debounced because each call ffprobes every selected file.
+// Delegated rather than hooked onto each control: the options block already has
+// a dozen inputs and gains more, and a new one silently not updating the
+// estimate is the kind of staleness nobody notices until the number is wrong.
+document.addEventListener('DOMContentLoaded', () => {
+    for (const sel of ['#encode-options', '#file-list']) {
+        const root = document.querySelector(sel);
+        if (root) root.addEventListener('change', scheduleCostEstimate);
+    }
+    scheduleCostEstimate();
+});
+
+let _estTimer = null;
+function scheduleCostEstimate() {
+    clearTimeout(_estTimer);
+    _estTimer = setTimeout(refreshCostEstimate, 400);
+}
+
+async function refreshCostEstimate() {
+    const el = document.getElementById('encode-estimate');
+    if (!el) return;
+    const files = [...document.querySelectorAll('#file-list input:checked')].map(cb => cb.value);
+    if (!files.length) { el.style.display = 'none'; return; }
+    const target = document.getElementById('target').value;
+    const body = {
+        files, target, codec: codecValue(),
+        max_res: document.getElementById('max-res').value,
+        min_res: document.getElementById('min-res').value,
+        time: document.getElementById('time-limit').value,
+        ladder: document.getElementById('ladder').value,
+        hevc_single_pass: false,
+    };
+    if (isAnyCloudTarget(target)) {
+        body.skip_media_download = document.getElementById('skip-media').checked;
+    }
+    try {
+        const r = await fetch('/api/encode/estimate', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        if (!r.ok) { el.style.display = 'none'; return; }
+        const d = await r.json();
+        if (!d.ok) { el.style.display = 'none'; return; }
+        el.innerHTML = _estimateHtml(d.estimate, files.length);
+        el.style.display = '';
+    } catch (e) { el.style.display = 'none'; }
+}
+
+// Cheapest-first, so the line answers "who would be cheaper?" at a glance
+// rather than making you compare four numbers.
+function _saasCompare(e, prefix) {
+    const all = [
+        ['Coconut', e.coconut_usd], ['Qencode', e.commercial_usd],
+        ['MediaConvert', e.mediaconvert_usd], ['Bitmovin', e.bitmovin_usd],
+    ].filter(([, v]) => v > 0).sort((a, b) => a[1] - b[1]);
+    if (!all.length) return '';
+    return ` · ${prefix || 'vs '}` + all.map(([n, v]) => `$${v.toFixed(2)} ${n}`).join(', ');
+}
+
+function _estimateHtml(e, nFiles) {
+    const mins = (e.duration_s || 0) / 60;
+    const src = `${nFiles} file${nFiles > 1 ? 's' : ''} · ${mins.toFixed(1)} min`;
+    if (e.local) {
+        // Say $0 explicitly rather than hiding the line — the contrast with the
+        // cloud figure is the useful part of showing this at all.
+        return `<b>Estimated cost</b> ${src} → <b style="color:#6ab04c">$0.00</b> `
+             + `<span style="color:#889">local encode, nothing billed`
+             + _saasCompare(e, 'would be ')
+             + `</span>`;
+    }
+    const parts = [`$${(e.spot_usd || 0).toFixed(2)} compute`];
+    if (e.egress_usd > 0) parts.push(`$${e.egress_usd.toFixed(2)} egress (${e.egress_gb.toFixed(2)} GB)`);
+    else parts.push(`<span style="color:#6ab04c">no egress — media stays in S3</span>`);
+    return `<b>Estimated cost</b> ${src} → <b>$${(e.total_usd || 0).toFixed(2)}</b> `
+         + `<span style="color:#889">${parts.join(' · ')}`
+         + _saasCompare(e)
+         + `</span>`;
+}
+
 function _jobConfigHtml(c) {
     const chip = (label, val, hl) =>
         `<span style="background:#232a36;border-radius:3px;padding:1px 7px;font-size:11px;color:#bbb">`
@@ -2490,7 +2578,10 @@ function renderJobStats(el, j) {
         + (cloud ? stat('efficiency', (j.efficiency_pct || 0).toFixed(0) + '%') : '')
         + (j.slowest_job ? stat('slowest chunk', escapeHtml(slowest) + ' <span class="u">' + formatDuration(j.slowest_job_s || 0) + '</span>') : '')
         + (j.saved_usd > 0 || j.egress_usd > 0 ? stat('cost', _runCostHtml(j)) : '')
-        + ((j.commercial_usd > 0 || j.mediaconvert_usd > 0 || j.aws_spot_usd > 0 || j.local_wall_s > 0) ? stat('would cost', `<span title="Commercial rates are TRANSCODE ONLY — those services bill delivery separately. Our figure now includes egress, so this comparison understates them by roughly whatever delivery would cost.">MediaConvert</span> $${(j.mediaconvert_usd || 0).toFixed(2)} · commercial $${(j.commercial_usd || 0).toFixed(2)} · AWS on-demand $${(j.aws_ondemand_usd || 0).toFixed(2)} · AWS spot $${(j.aws_spot_usd || 0).toFixed(2)} · <span class="u">local hardware ~${formatDuration(j.local_wall_s || totalS)} of your time</span>`) : '');
+        + ((j.commercial_usd > 0 || j.mediaconvert_usd > 0 || j.aws_spot_usd > 0 || j.local_wall_s > 0) ? stat('would cost', `<span title="Commercial rates are TRANSCODE ONLY — those services bill delivery separately. Our figure now includes egress, so this comparison understates them by roughly whatever delivery would cost.">MediaConvert</span> $${(j.mediaconvert_usd || 0).toFixed(2)} · <span title="Qencode, per output-minute per rendition. Compared against their cheapest preset — their published multipliers (1.25-2x H.264/HEVC, up to 8x AV1) are not modelled, so the real figure is higher.">Qencode</span> $${(j.commercial_usd || 0).toFixed(2)}`
+            + (j.coconut_usd ? ` · <span title="Coconut — flat per output-minute by resolution, no codec multiplier, so AV1 costs the same as H.264 there.">Coconut</span> $${j.coconut_usd.toFixed(2)}` : '')
+            + (j.bitmovin_usd ? ` · <span title="Bitmovin — $0.02/output-min x resolution (2x HD, 4x UHD) x codec (2x HEVC) x passes (1.25x two-pass). Their 2,000 free min/month are deliberately not modelled, same as AWS free tiers. AV1 factor is unpublished; 2x assumed, so this is a floor.">Bitmovin</span> $${j.bitmovin_usd.toFixed(2)}` : '')
+            + ` · AWS on-demand $${(j.aws_ondemand_usd || 0).toFixed(2)} · AWS spot $${(j.aws_spot_usd || 0).toFixed(2)} · <span class="u">local hardware ~${formatDuration(j.local_wall_s || totalS)} of your time</span>`) : '');
     el.title = 'efficiency = avg vCPUs busy ÷ max vCPUs (how full the fleet ran). '
         + 'slowest chunk = the makespan floor — nothing finishes faster than this one chunk.';
     el.style.display = '';

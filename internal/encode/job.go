@@ -1271,6 +1271,11 @@ type Job struct {
 	// "what you'd have paid a hosted transcoder for the same work".
 	CommercialUSD   float64 `json:"commercial_usd,omitempty"`
 	MediaConvertUSD float64 `json:"mediaconvert_usd,omitempty"`
+	// Two more transcode-only baselines (#229). Coconut applies no codec
+	// multiplier at all; Bitmovin multiplies base x resolution x codec x passes,
+	// which makes it the dearest despite the smallest headline rate.
+	CoconutUSD  float64 `json:"coconut_usd,omitempty"`
+	BitmovinUSD float64 `json:"bitmovin_usd,omitempty"`
 	// AwsSpotUSD is what this ladder would cost on OUR AWS Batch spot fleet —
 	// compute-based (encode vCPU-hours × spot rate), summed over every variant, so
 	// unlike the per-output-minute SaaS baselines above it reflects each variant's

@@ -92,6 +92,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("POST /api/outputs/{name}/fetch", s.fetchOutput)
 	s.Mux.HandleFunc("GET /api/promote", s.getPromote)
 	s.Mux.HandleFunc("POST /api/encode", s.startEncode)
+	s.Mux.HandleFunc("POST /api/encode/estimate", s.estimateEncode)
 	s.Mux.HandleFunc("GET /api/jobs", s.listJobs)
 	s.Mux.HandleFunc("GET /api/jobs/{id}/logs", s.jobLogs)
 	s.Mux.HandleFunc("GET /api/jobs/stream", s.streamJobs)
@@ -714,6 +715,31 @@ func (s *Server) fetchOutput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, s.Manager.FetchStateFor(name))
+}
+
+// estimateEncode projects what a config would cost BEFORE it is submitted, so
+// the encode form can show it while options are being chosen rather than only
+// in the finished job.
+//
+// Takes the same JobConfig the real submit takes and runs the same projection
+// functions, deliberately: an estimate that disagrees with the number the
+// finished job reports reads as a bug in the encode, not in the estimator.
+//
+// Costs an ffprobe per selected file, so the caller must debounce. A failure
+// (nothing selected, unprobeable source) is a 200 with ok:false — the form
+// should quietly show nothing, not surface an error for a half-filled form.
+func (s *Server) estimateEncode(w http.ResponseWriter, r *http.Request) {
+	var cfg encode.JobConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		http.Error(w, "bad request: "+err.Error(), 400)
+		return
+	}
+	est, err := s.Manager.EstimateCost(cfg)
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "reason": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "estimate": est})
 }
 
 func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {

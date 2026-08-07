@@ -5,14 +5,46 @@ transcoder, as a comparison baseline against our own spot / local cost — the
 control plane surfaces it per job as "would've been $X on a commercial cloud
 encoder".
 
-Pricing is modeled on a commercial cloud encoder's public per-output-minute
-rates (captured 2026-07). The service bills per OUTPUT MINUTE, per rendition,
-with multipliers + small add-ons. Only the components our pipeline exercises are
-charged; unused features (gif, smart thumbnails, extra destinations, per-GB
-repack container) default to 0 and are listed so the model is easy to complete.
+Pricing is modeled on **Qencode**'s public per-output-minute rates
+(https://cloud.qencode.com/pricing). The service bills per OUTPUT MINUTE, per
+rendition, with multipliers + small add-ons. Only the components our pipeline
+exercises are charged; unused features (gif, smart thumbnails, extra
+destinations, per-GB repack container) default to 0 and are listed so the model
+is easy to complete.
+
+NAME THE VENDOR. This said only "a commercial cloud encoder" for months, and the
+cost of that was paid on 2026-08-07: nobody could tell which service the rates
+came from, so nobody could re-verify them. They had to be re-identified from the
+shape of the add-on list, and by then the AV1 column was 33% stale in every tier
+(see below). An unattributable rate table cannot be maintained — only replaced.
+
+Rates verified against the published table 2026-08-07. H.264 and HEVC matched
+exactly; AV1 did not (corrected below).
 
 Everything is a pure function of the plan (ladder) + source probe, so any
 orchestrator can call estimate_usd() once and print an ENCODER-COMMERCIAL marker.
+
+MUX IS DELIBERATELY NOT MODELLED (considered 2026-08-07, rejected).
+
+Mux bills per minute of INPUT video, once, regardless of how many renditions come
+out — so a 21-rendition ladder costs the same there as a 3-rendition one, and on
+paper it lands 2.4-3.6x below our own cost. That makes it the most eye-catching
+row anyone could add here, which is exactly why it is not one:
+
+  * The published input rate is "starting at $0.025/min FOR 720p". No multiplier
+    is given for higher resolutions, and our ladders top out at 2160p. Delivery
+    and storage explicitly scale (4x at 4K), so input plausibly does too — by an
+    unknown factor. Any figure we printed would be a guess wearing a price tag.
+  * It is not the same product. Mux returns a hosted stream, not rendition
+    files. This project exists to produce, measure and compare those files;
+    `make ladder-audit` cannot run against a playback URL. Cheaper at a
+    different job is not cheaper.
+  * Delivery-inclusive pricing is not comparable to a per-output-minute
+    transcode rate without also modelling delivery on both sides.
+
+Revisit only if the goal changes from "produce and analyse encodes" to "publish
+to viewers", at which point delivery dominates and this whole table is the wrong
+comparison anyway.
 """
 from __future__ import annotations
 
@@ -23,11 +55,22 @@ from infinite_streaming_encoder import pricing
 # Transcoding rate ($/output-minute) by resolution tier x codec column.
 # Codec columns: h264 -> Base, hevc -> HEVC/VP9, av1 -> AV1.
 _TIERS = [  # (max_output_height, {codec: usd_per_min}) — SD is *below* 720p
-    (719,        {"h264": 0.005, "hevc": 0.008, "av1": 0.010}),  # SD (<720p)
-    (1080,       {"h264": 0.010, "hevc": 0.015, "av1": 0.020}),  # HD (720–1080)
-    (1440,       {"h264": 0.025, "hevc": 0.038, "av1": 0.050}),  # 1440p
-    (10 ** 9,    {"h264": 0.045, "hevc": 0.068, "av1": 0.090}),  # 4K+
+    (719,        {"h264": 0.005, "hevc": 0.008, "av1": 0.015}),  # SD (<720p)
+    (1080,       {"h264": 0.010, "hevc": 0.015, "av1": 0.030}),  # HD (720–1080)
+    (1440,       {"h264": 0.025, "hevc": 0.038, "av1": 0.075}),  # 1440p
+    (10 ** 9,    {"h264": 0.045, "hevc": 0.068, "av1": 0.135}),  # 4K+
 ]
+# AV1 corrected 2026-08-07: was 0.010/0.020/0.050/0.090, i.e. 33% LOW in EVERY
+# tier. H.264 and HEVC were exact, which is how it went unnoticed — a partly
+# right table looks right. The error understated what Qencode would charge, so
+# it flattered our own comparison; wrong in the safe direction is still wrong.
+#
+# NOT MODELLED, and both push the same way (Qencode costs MORE than we quote):
+#   - Preset multipliers: 1.25x-2x for H.264/H.265, up to 8x for AV1. We compare
+#     against their cheapest preset.
+#   - Repack is billed PER GB ($0.001/GB) on the published table, but this module
+#     charges _REPACK_PER_MIN below. Unverified — left as-is rather than changed
+#     on a guess, but it should be checked against a real invoice.
 
 # Add-ons ($/minute).
 _REPACK_PER_MIN = 0.003   # packaging each rendition to HLS/DASH ("repack")
