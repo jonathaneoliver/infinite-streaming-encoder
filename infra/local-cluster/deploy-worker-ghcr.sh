@@ -19,6 +19,16 @@
 #   MINIO_ROOT_USER / MINIO_ROOT_PASSWORD   MinIO creds (default encoder / encoder-secret)
 set -euo pipefail
 
+# Fail fast when a box goes away MID-DEPLOY. `docker pull` of a ~900MB image is
+# the longest step and the likeliest moment for a laptop-class worker to sleep;
+# with no keepalive, ssh then blocks on a dead TCP connection until the OS gives
+# up (~2h by default). Observed: a sleeping box held a whole deploy for 22
+# minutes with zero output before anyone noticed, and it would have kept going.
+# ConnectTimeout covers "never answered", ServerAlive* covers "answered, then
+# vanished" — the second is the one that actually bit.
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8
+          -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
+
 SSH_TARGET="${1:?usage: deploy-worker-ghcr.sh <ssh_target> <label>}"
 LABEL="${2:?label (e.g. ubuntu) required}"
 MASTER_IP="${MASTER_IP:-192.168.1.10}"
@@ -31,14 +41,14 @@ echo ">>> [$LABEL] $SSH_TARGET — pull $IMAGE from GHCR"
 # Log in only when a PAT is provided (private package); public needs none. Pipe
 # the PAT over ssh stdin so it never appears in the remote process arg list.
 if [ -n "${GHCR_PAT:-}" ]; then
-    printf '%s' "$GHCR_PAT" | ssh -o BatchMode=yes "$SSH_TARGET" \
+    printf '%s' "$GHCR_PAT" | ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
         "docker login ghcr.io -u '$GHCR_USERNAME' --password-stdin"
 fi
-ssh -o BatchMode=yes "$SSH_TARGET" "docker pull -q '$IMAGE'"
+ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "docker pull -q '$IMAGE'"
 
 echo ">>> [$LABEL] $SSH_TARGET — (re)starting worker"
-scp -q infra/local-cluster/run-worker.sh "$SSH_TARGET:/tmp/run-worker.sh"
-ssh -o BatchMode=yes "$SSH_TARGET" "cat > /tmp/worker.env" <<EOF
+scp -q "${SSH_OPTS[@]}" infra/local-cluster/run-worker.sh "$SSH_TARGET:/tmp/run-worker.sh"
+ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "cat > /tmp/worker.env" <<EOF
 TEMPORAL_ADDRESS=$MASTER_IP:7233
 S3_ENDPOINT_URL=http://$MASTER_IP:9000
 AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER:-encoder}
@@ -47,4 +57,4 @@ ENCODER_IMAGE=$IMAGE
 WORKER_LABEL=$LABEL
 WORKER_NAME=encode-worker
 EOF
-ssh -o BatchMode=yes "$SSH_TARGET" "bash /tmp/run-worker.sh /tmp/worker.env"
+ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "bash /tmp/run-worker.sh /tmp/worker.env"
