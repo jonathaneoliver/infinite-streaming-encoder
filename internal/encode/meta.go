@@ -42,9 +42,30 @@ type encodeMeta struct {
 	// Burnin records the text-overlay toggle only when it DEVIATES from the
 	// default (on): a pointer left nil when burn-in was on, so existing outputs'
 	// encode.json is byte-unchanged; set to &false when the overlay was disabled.
-	Burnin    *bool  `json:"burnin,omitempty"`
-	Source    string `json:"source,omitempty"`
-	EncodedAt string `json:"encoded_at"`
+	Burnin *bool  `json:"burnin,omitempty"`
+	Source string `json:"source,omitempty"`
+	// TimeLimitS is JobConfig.Time — the ffmpeg `-t` cap. Recorded because it's
+	// the ONE mezzanine-re-derivation input encode.json otherwise lacked (#117):
+	// the mezzanine is a stream copy, byte-identical given source + time limit, so
+	// a post-hoc VMAF audit can rebuild the exact reference only if this is known.
+	// Absent = no limit (whole source).
+	TimeLimitS string `json:"time_limit_s,omitempty"`
+	// SourceSize/SourceModified fingerprint the input at encode time (#117): a
+	// source edited or replaced afterward silently yields a wrong audit reference.
+	// Size+mtime (not a content hash — sources run to multi-GB and this is written
+	// on every encode) makes that mismatch detectable rather than invisible.
+	// Recorded only when THIS output maps to a single unambiguous source file.
+	SourceSize     int64  `json:"source_size,omitempty"`
+	SourceModified string `json:"source_modified,omitempty"`
+	// VMAF score provenance + lifecycle (#117). VmafModel/VmafComparisonHeight are
+	// the scale a recorded score sits on (see VmafScore); uniform per output since
+	// one encode.json is one source. VmafState lets the UI tell "never audited"
+	// (pending) from "can't be" (ineligible: a burn-in overlay biases VMAF) from
+	// done/failed. Never "running" — encode.json is written post-encode.
+	VmafModel            string `json:"vmaf_model,omitempty"`
+	VmafComparisonHeight int    `json:"vmaf_comparison_height,omitempty"`
+	VmafState            string `json:"vmaf_state,omitempty"`
+	EncodedAt            string `json:"encoded_at"`
 	// What encoded this. FfmpegVersion is the build id; CodecLibs maps codec ->
 	// encoder library ("hevc" -> "libx265 4.2+37-b81f650e"). Recorded because
 	// the image tracks ffmpeg's rolling `latest`, so the Dockerfile no longer
@@ -96,6 +117,89 @@ func vmafForRung(vmaf map[string]*VmafScore, codec string, height int) float64 {
 		}
 	}
 	return 0
+}
+
+// vmafProvenance returns the model + comparison height any measured rung of this
+// codec was scored at (#117). Uniform per source, so the first non-empty score
+// answers for the whole output. ("", 0) when nothing measured or an older worker
+// emitted no provenance.
+func vmafProvenance(vmaf map[string]*VmafScore, codec string) (string, int) {
+	prefix := codec + "/"
+	for k, v := range vmaf {
+		if v != nil && v.Model != "" && strings.HasPrefix(k, prefix) {
+			return v.Model, v.CommonHeight
+		}
+	}
+	return "", 0
+}
+
+// hasVmafForCodec reports whether the aggregated map holds a measured score for
+// any rung of this codec (#117) — the "done" signal, independent of whether the
+// ladder could be resolved to build metaRungs.
+func hasVmafForCodec(vmaf map[string]*VmafScore, codec string) bool {
+	prefix := codec + "/"
+	for k, v := range vmaf {
+		if v != nil && v.Mean > 0 && strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// vmafStateFor derives the audit lifecycle state written to encode.json (#117):
+//
+//	done       — a measured score is present for this codec
+//	failed     — the audit was requested (MeasureVmaf) but produced no score
+//	ineligible — not requested and a burn-in overlay is on (it biases VMAF)
+//	pending    — not requested, eligible, awaiting a future audit
+//
+// Never "running": encode.json is written only after the encode completes.
+func vmafStateFor(cfg JobConfig, hasScores bool) string {
+	switch {
+	case hasScores:
+		return "done"
+	case cfg.MeasureVmaf:
+		return "failed"
+	case cfg.BurninEnabled():
+		return "ineligible"
+	default:
+		return "pending"
+	}
+}
+
+// sourceFingerprint stats the single source file that produced dirName and
+// returns its size + mtime (RFC3339) for #117. Returns (0, "") when the job has
+// no single unambiguous source for this dir (a multi-file job with no stem match,
+// or an unstatable file) — an absent fingerprint reads as unknown, never as a
+// default. Size+mtime, not a content hash: this runs on every encode and sources
+// reach multi-GB, but a swapped/edited source still changes one of the two.
+func (m *Manager) sourceFingerprint(cfg JobConfig, dirName string) (int64, string) {
+	var src string
+	switch len(cfg.Files) {
+	case 0:
+		return 0, ""
+	case 1:
+		src = cfg.Files[0]
+	default:
+		for _, f := range cfg.Files {
+			if strings.HasPrefix(dirName, cfg.OutputStem(filepath.Base(f))) {
+				src = f
+				break
+			}
+		}
+		if src == "" {
+			return 0, ""
+		}
+	}
+	p := src
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(m.SourceDir, src)
+	}
+	fi, err := os.Stat(p)
+	if err != nil || fi.IsDir() {
+		return 0, ""
+	}
+	return fi.Size(), fi.ModTime().UTC().Format(time.RFC3339)
 }
 
 func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string]*VmafScore,
@@ -159,28 +263,43 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 		off := false
 		burnin = &off
 	}
+	// VMAF provenance + state (#117). A score is present iff the aggregated VMAF
+	// map holds a measured mean for this codec — read from the map, not the built
+	// metaRungs, since those depend on the ladder being resolvable.
+	vmafModel, vmafCommonH := vmafProvenance(vmaf, codec)
+	hasScores := hasVmafForCodec(vmaf, codec)
+	vmafState := vmafStateFor(cfg, hasScores)
+	// Fingerprint the single source that produced this dir, when unambiguous, so a
+	// later audit can detect a source swapped out from under it (#117).
+	srcSize, srcMod := m.sourceFingerprint(cfg, dirName)
 	meta := encodeMeta{
-		Profile:           ladderName,
-		Codec:             codec,
-		MaxratePercent:    maxrate,
-		BufsizeMultiplier: buf,
-		SegmentS:          defaultVal(cfg.SegmentDuration, "6"),
-		PartialS:          defaultVal(cfg.PartialDuration, "0.2"),
-		GopS:              defaultVal(cfg.GopDuration, "1.0"),
-		OutputTag:         cfg.OutputTag,
-		MaxRes:            cfg.MaxRes,
-		MinRes:            cfg.MinRes,
-		HevcSinglePass:    cfg.HevcSinglePass,
-		ExtraArgs:         def.extraArgsFor(codec),
-		Passes:            metaPasses,
-		Padding:           cfg.Padding,
-		HlsFormat:         DetectHLSFormat(dir),
-		ChunkDuration:     cfg.ChunkDuration,
-		ForceReencode:     cfg.ForceReencode,
-		Burnin:            burnin,
-		Source:            strings.Join(cfg.Files, ", "),
-		EncodedAt:         time.Now().UTC().Format(time.RFC3339),
-		Rungs:             rungs,
+		Profile:              ladderName,
+		Codec:                codec,
+		MaxratePercent:       maxrate,
+		BufsizeMultiplier:    buf,
+		SegmentS:             defaultVal(cfg.SegmentDuration, "6"),
+		PartialS:             defaultVal(cfg.PartialDuration, "0.2"),
+		GopS:                 defaultVal(cfg.GopDuration, "1.0"),
+		OutputTag:            cfg.OutputTag,
+		MaxRes:               cfg.MaxRes,
+		MinRes:               cfg.MinRes,
+		HevcSinglePass:       cfg.HevcSinglePass,
+		ExtraArgs:            def.extraArgsFor(codec),
+		Passes:               metaPasses,
+		Padding:              cfg.Padding,
+		HlsFormat:            DetectHLSFormat(dir),
+		ChunkDuration:        cfg.ChunkDuration,
+		ForceReencode:        cfg.ForceReencode,
+		Burnin:               burnin,
+		Source:               strings.Join(cfg.Files, ", "),
+		TimeLimitS:           cfg.Time,
+		SourceSize:           srcSize,
+		SourceModified:       srcMod,
+		VmafModel:            vmafModel,
+		VmafComparisonHeight: vmafCommonH,
+		VmafState:            vmafState,
+		EncodedAt:            time.Now().UTC().Format(time.RFC3339),
+		Rungs:                rungs,
 	}
 	if job != nil {
 		job.mu.Lock()

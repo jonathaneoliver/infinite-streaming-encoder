@@ -192,7 +192,10 @@ var (
 	// chunk=-1 for a whole-variant encode). frames + inv_sum let the control
 	// plane recombine the frame-weighted mean and the harmonic mean correctly
 	// across chunks (chunk means/harmonics can't just be averaged).
-	vmafMarkerRe = regexp.MustCompile(`^\[\[ENCODER-VMAF codec=(\S+) label=(\S+) height=(\d+) chunk=(-?\d+) mean=([0-9.]+) harmonic=([0-9.]+) min=([0-9.]+) frames=(\d+) inv_sum=([0-9.]+)\]\]$`)
+	// The trailing ` model=… common_h=…` is score provenance (#117), added later:
+	// an OPTIONAL group so markers from an older worker image (no provenance) still
+	// match and aggregate — their model/common_h simply read as unknown.
+	vmafMarkerRe = regexp.MustCompile(`^\[\[ENCODER-VMAF codec=(\S+) label=(\S+) height=(\d+) chunk=(-?\d+) mean=([0-9.]+) harmonic=([0-9.]+) min=([0-9.]+) frames=(\d+) inv_sum=([0-9.]+)( model=(\S+) common_h=(\d+))?\]\]$`)
 	// ENCODER-RECLAIM reports one encode chunk's spot-reclaim accounting:
 	// count (# reclaimed attempts), lost_s (encode wall-time thrown away), and
 	// total_s (all attempts' wall-time = the "total encoded" denominator).
@@ -459,6 +462,12 @@ func (j *Job) parseMarker(line string) bool {
 		if acc == nil {
 			acc = &VmafScore{Min: mn}
 			j.Vmaf[key] = acc
+		}
+		// Score provenance (#117), when the worker stamped it (optional group).
+		// Uniform across a rung's chunks, so last-writer-wins is a no-op overwrite.
+		if m[11] != "" {
+			acc.Model = m[11]
+			acc.CommonHeight, _ = strconv.Atoi(m[12])
 		}
 		acc.sumMeanW += mean * float64(w)
 		acc.Frames += w
@@ -1157,8 +1166,15 @@ type VmafScore struct {
 	Harmonic float64 `json:"harmonic"`
 	Min      float64 `json:"min"`
 	Frames   int     `json:"frames"`
-	sumMeanW float64 // Σ(chunk_mean × chunk_frames)
-	invSum   float64 // Σ(chunk inv_sum)
+	// Provenance (#117): the model and comparison height this score was measured
+	// at. A VMAF number is only interpretable against these, and scores from
+	// different sources (different comparison heights) must never be pooled.
+	// Uniform across a rung's chunks (same source) — the worker stamps them onto
+	// every ENCODER-VMAF marker; empty/0 when an older worker omitted them.
+	Model        string  `json:"model,omitempty"`
+	CommonHeight int     `json:"common_height,omitempty"`
+	sumMeanW     float64 // Σ(chunk_mean × chunk_frames)
+	invSum       float64 // Σ(chunk inv_sum)
 }
 
 // MarshalJSON serialises a Job under its own lock.
