@@ -2350,6 +2350,44 @@ def _iso(epoch: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
 
+# cmd_fetch's "the prefix is empty, there is nothing to download and there never
+# will be" exit. A distinct code because the caller has to tell it apart from a
+# transfer that died halfway — one is worth retrying and the other is not, and
+# both print about S3. Mirrored by exitStagingGone in internal/encode/remote.go.
+EXIT_STAGING_GONE = 4
+
+
+def _mark_sidecar_gone(sidecar: Path, meta: dict, reason: str) -> None:
+    """Record on the sidecar that the staging prefix no longer holds the media.
+
+    Set rather than delete. Deleting it would reclassify the output as COMPLETE
+    — right name, right rung subdirs, manifests present — so the UI would offer
+    Play and every segment would 404 (#225). Keeping it preserves the record of
+    what was lost: which prefix, how much, and when it was expected to expire.
+    """
+    meta = dict(meta)
+    meta["gone"] = True
+    meta["gone_detected_at"] = _iso(time.time())
+    meta["gone_reason"] = reason
+    try:
+        tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+        tmp.write_text(json.dumps(meta, indent=2))
+        tmp.replace(sidecar)   # atomic: the sidecar IS the state
+    except OSError as e:
+        print(f"    warn: could not mark {sidecar} gone: {e}",
+              file=sys.stderr, flush=True)
+
+
+def _local_media_count(out_dir: Path) -> int:
+    """How many media objects are already on disk under an output dir.
+
+    Used only to tell "the prefix was cleared before we fetched" from "the fetch
+    finished and then the prefix was cleared". Both list zero objects, but only
+    the first has actually lost anything."""
+    return sum(1 for p in out_dir.rglob("*")
+               if p.is_file() and p.name.endswith(_MEDIA_SUFFIXES))
+
+
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -2385,17 +2423,57 @@ def cmd_fetch(args) -> int:
         return 1
     bucket, _, base_key = s3_prefix[len("s3://"):].rstrip("/").partition("/")
 
+    # Already known gone — a clear-time invalidation (#225) got here first. Say
+    # so without paying for a listing that will come back empty again.
+    if meta.get("gone"):
+        print(f"!!! media no longer in S3: {s3_prefix} was emptied "
+              f"({meta.get('gone_reason', 'reason not recorded')}, detected "
+              f"{meta.get('gone_detected_at', '?')}). Re-encode to recreate it.",
+              file=sys.stderr, flush=True)
+        return EXIT_STAGING_GONE
+
     s3 = _s3()
-    items, have = [], 0
+    items, have, listed = [], 0, 0
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=f"{base_key}/"):
         for obj in page.get("Contents", []):
+            listed += 1
             key, size = obj["Key"], obj.get("Size", 0)
             dst = out_dir / key[len(base_key) + 1:]
             if dst.exists() and dst.stat().st_size == size:
                 have += 1
                 continue
             items.append((key, size, dst))
+
+    # An EMPTY listing is not "nothing left to do" — it is the prefix having
+    # ceased to exist, which "not yet expired" was being used as a proxy for
+    # (#225). The two used to share the branch below, so a deleted prefix
+    # silently cleared its own sidecar and the output was reclassified as
+    # complete. Everything else on disk agrees with that lie.
+    #
+    # The one benign reading is that the media already landed and the prefix was
+    # cleared afterwards, so check the disk before crying loss.
+    if listed == 0:
+        want = meta.get("pending_files") or 0
+        if want and _local_media_count(out_dir) >= want:
+            if not args.dry_run:
+                sidecar.unlink(missing_ok=True)
+            print("    already complete: staging is empty but all "
+                  f"{want} media objects are on disk", flush=True)
+            return 0
+        if args.dry_run:
+            # Report, don't record: a dry run is asked what WOULD happen, and
+            # the sidecar is state, not output.
+            print(json.dumps({"files": 0, "bytes": 0, "already_present": 0,
+                              "s3_prefix": s3_prefix, "gone": True,
+                              "expires_at": meta.get("expires_at", "")}))
+            return EXIT_STAGING_GONE
+        _mark_sidecar_gone(sidecar, meta, "staging prefix listed empty at fetch")
+        print(f"!!! media no longer in S3: {s3_prefix} is empty. It was deleted "
+              f"before its {meta.get('expires_at', 'recorded')} expiry — by a "
+              "staging clear, a console delete, or the lifecycle firing early. "
+              "Re-encode to recreate it.", file=sys.stderr, flush=True)
+        return EXIT_STAGING_GONE
 
     pend_bytes = sum(s for _, s, _ in items)
     if args.dry_run:

@@ -36,6 +36,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .badge-remote.busy { background: #1e3348; color: #7db8e8; }
 .badge-remote.failed { background: #4a2020; color: #e88; }
 .badge-remote.expired { background: #333; color: #999; text-decoration: line-through; }
+/* Deleted, not lapsed (#225). Struck through like expired — both mean the media
+   is unreachable — but red, because expiry is the clock doing its job and this
+   is something having removed it early. */
+.badge-remote.gone { background: #3a2028; color: #d98a9c; text-decoration: line-through; }
 .src-badge-slot { flex: 0 0 96px; display: inline-flex; align-items: center; }
 .file-size { color: #888; font-size: 0.85rem; width: 80px; text-align: right; }
 .file-count { color: #666; font-size: 0.8rem; margin-left: 12px; }
@@ -2390,6 +2394,12 @@ function _remoteBadge(d) {
         return `<span class="badge-remote failed" title="${escapeAttr(f.error || '')}">download failed</span>`;
     }
     if (!d.remote) return '';
+    // Gone before expired: an output can be both, and "deleted" is the more
+    // specific and more actionable of the two. Expiry is the clock running out;
+    // this is something having removed it, and the reason says what (#225).
+    if (d.remote_gone) {
+        return `<span class="badge-remote gone" title="The media is no longer in S3 — ${escapeAttr(d.remote.gone_reason || 'the staging prefix was found empty')}${d.remote.gone_detected_at ? ' (detected ' + escapeAttr(d.remote.gone_detected_at) + ')' : ''}. It cannot be downloaded; re-encode to recreate it.">media deleted</span>`;
+    }
     if (d.remote_expired) {
         return `<span class="badge-remote expired" title="S3 staging expired ${escapeAttr(d.remote.expires_at)} — the media is gone">expired</span>`;
     }
@@ -2401,6 +2411,9 @@ function _outputActions(d) {
     const f = d.fetch;
     if (f && f.state === 'fetching') {
         return `<span class="btn-fetch busy" title="Downloading ${(f.percent || 0).toFixed(0)}% — this row updates itself">&#8987;</span>`;
+    }
+    if (d.remote && d.remote_gone) {
+        return `<span class="btn-fetch disabled" title="The media is no longer in S3 — ${escapeAttr(d.remote.gone_reason || 'the staging prefix was found empty')}. Nothing to download; re-encode to recreate it.">&#10007;</span>`;
     }
     if (d.remote && d.remote_expired) {
         return `<span class="btn-fetch disabled" title="S3 staging expired ${escapeAttr(d.remote.expires_at)}; the media is gone and cannot be fetched">&#10007;</span>`;
