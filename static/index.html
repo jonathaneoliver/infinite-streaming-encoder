@@ -2763,6 +2763,34 @@ function _saasCompare(e, prefix) {
     return ` · ${prefix || 'vs '}` + all.map(([n, v]) => `$${v.toFixed(2)} ${n}`).join(', ');
 }
 
+// A ladder can define rungs the current Max-Res cap or the source resolution
+// won't produce, so the estimate silently ignores them. That is exactly why
+// switching apple-uniq-live → -full at a stuck 1080p cap showed no change: the
+// only difference between those ladders is h264 1440p/1800p/2160p, all above the
+// cap. Name the excluded rungs so the no-op is visible and actionable rather than
+// mysterious. Computed client-side from the ladder def + the estimate's probed
+// width; empty when nothing is excluded.
+function _excludedRungsNote(e) {
+    const d = laddersCache[document.getElementById('ladder')?.value];
+    if (!d || !d.codecs) return '';
+    const maxH = parseInt(document.getElementById('max-res').value, 10); // NaN = no cap
+    const srcW = e.width || 0;
+    const byCap = new Set(), bySrc = new Set();
+    for (const c of selectedCodecs()) {
+        for (const r of (d.codecs[c] || [])) {
+            const [w, h] = r;
+            if (!isNaN(maxH) && h > maxH) byCap.add(h);
+            else if (srcW > 0 && w > srcW) bySrc.add(h);
+        }
+    }
+    const fmt = (s) => [...s].sort((a, b) => a - b).map(h => `${h}p`).join(', ');
+    const notes = [];
+    if (byCap.size) notes.push(`Max Res ${document.getElementById('max-res').value} hides ${byCap.size} taller rung${byCap.size > 1 ? 's' : ''} this ladder adds (${fmt(byCap)}) — set Max Res to “No limit” to include ${byCap.size > 1 ? 'them' : 'it'}`);
+    if (bySrc.size) notes.push(`source is ${srcW}px wide, so ${bySrc.size} rung${bySrc.size > 1 ? 's' : ''} (${fmt(bySrc)}) can't be produced`);
+    if (!notes.length) return '';
+    return `<div style="color:#e9c46a;font-size:11px;margin-top:3px">⚠ ${notes.join('; ')}.</div>`;
+}
+
 function _estimateHtml(e, nFiles) {
     const mins = (e.duration_s || 0) / 60;
     const src = `${nFiles} file${nFiles > 1 ? 's' : ''} · ${mins.toFixed(1)} min`;
@@ -2772,7 +2800,8 @@ function _estimateHtml(e, nFiles) {
         return `<b>Estimated cost</b> ${src} → <b style="color:#6ab04c">$0.00</b> `
              + `<span style="color:#889">local encode, nothing billed`
              + _saasCompare(e, 'would be ')
-             + `</span>`;
+             + `</span>`
+             + _excludedRungsNote(e);
     }
     const parts = [`$${(e.spot_usd || 0).toFixed(2)} compute`];
     if (e.egress_usd > 0) parts.push(`$${e.egress_usd.toFixed(2)} egress (${e.egress_gb.toFixed(2)} GB)`);
@@ -2780,7 +2809,8 @@ function _estimateHtml(e, nFiles) {
     return `<b>Estimated cost</b> ${src} → <b>$${(e.total_usd || 0).toFixed(2)}</b> `
          + `<span style="color:#889">${parts.join(' · ')}`
          + _saasCompare(e)
-         + `</span>`;
+         + `</span>`
+         + _excludedRungsNote(e);
 }
 
 function _jobConfigHtml(c) {
