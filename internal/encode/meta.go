@@ -29,9 +29,14 @@ type encodeMeta struct {
 	// ExtraArgs are the raw ffmpeg tokens appended after rate control; Passes is
 	// the effective pass count (with the HevcSinglePass override applied). Both
 	// omitted when at defaults, so existing outputs' encode.json is unchanged.
-	ExtraArgs     string `json:"extra_args,omitempty"`
-	Passes        int    `json:"passes,omitempty"`
-	Padding       string `json:"padding,omitempty"`
+	ExtraArgs string `json:"extra_args,omitempty"`
+	Passes    int    `json:"passes,omitempty"`
+	Padding   string `json:"padding,omitempty"`
+	// HlsFormat is OBSERVED from the packaged output ("fmp4" | "ts" | "both"),
+	// not copied from the request — what was produced can differ from what was
+	// asked for. Same DetectHLSFormat the Outputs badge uses, so the badge and
+	// this field cannot contradict each other.
+	HlsFormat     string `json:"hls_format,omitempty"`
 	ChunkDuration string `json:"chunk_duration,omitempty"`
 	ForceReencode bool   `json:"force_reencode,omitempty"`
 	// Burnin records the text-overlay toggle only when it DEVIATES from the
@@ -169,6 +174,7 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 		ExtraArgs:         def.extraArgsFor(codec),
 		Passes:            metaPasses,
 		Padding:           cfg.Padding,
+		HlsFormat:         DetectHLSFormat(dir),
 		ChunkDuration:     cfg.ChunkDuration,
 		ForceReencode:     cfg.ForceReencode,
 		Burnin:            burnin,

@@ -1,4 +1,4 @@
-package api
+package encode
 
 import (
 	"os"
@@ -32,8 +32,8 @@ func TestHlsFormatFromPlaylistsDetectsFmp4WithNoSegments(t *testing.T) {
 	if !m4s || ts {
 		t.Fatalf("want fmp4, got m4s=%v ts=%v", m4s, ts)
 	}
-	if got := parseOutputMeta("clip_p200_h264", dir).hlsFormat; got != "fmp4" {
-		t.Fatalf("parseOutputMeta hlsFormat = %q, want fmp4", got)
+	if got := DetectHLSFormat(dir); got != "fmp4" {
+		t.Fatalf("DetectHLSFormat = %q, want fmp4", got)
 	}
 }
 
@@ -53,8 +53,8 @@ func TestHlsFormatFromPlaylistsDetectsBoth(t *testing.T) {
 		"#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\nsegment_00000.m4s\n")
 	writePlaylist(t, dir, "1080p_ts", "playlist.m3u8",
 		"#EXTM3U\n#EXTINF:6.0,\nsegment_00000.ts\n")
-	if got := parseOutputMeta("clip_p200_h264", dir).hlsFormat; got != "both" {
-		t.Fatalf("hlsFormat = %q, want both", got)
+	if got := DetectHLSFormat(dir); got != "both" {
+		t.Fatalf("DetectHLSFormat = %q, want both", got)
 	}
 }
 
@@ -67,8 +67,8 @@ func TestRealSegmentsStillWinOverPlaylists(t *testing.T) {
 		[]byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := parseOutputMeta("clip_p200_h264", dir).hlsFormat; got != "ts" {
-		t.Fatalf("hlsFormat = %q, want ts", got)
+	if got := DetectHLSFormat(dir); got != "ts" {
+		t.Fatalf("DetectHLSFormat = %q, want ts", got)
 	}
 }
 
@@ -78,7 +78,7 @@ func TestHlsFormatUnknownWhenThereIsNothingToGoOn(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "1080p"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if got := parseOutputMeta("clip_p200_h264", dir).hlsFormat; got != "" {
-		t.Fatalf("hlsFormat = %q, want empty", got)
+	if got := DetectHLSFormat(dir); got != "" {
+		t.Fatalf("DetectHLSFormat = %q, want empty", got)
 	}
 }

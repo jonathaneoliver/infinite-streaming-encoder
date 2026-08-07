@@ -216,3 +216,87 @@ func (m *Manager) outputDirFor(name string) (string, error) {
 	}
 	return dir, nil
 }
+
+// DetectHLSFormat reports "fmp4", "ts", "both", or "" for a packaged output dir.
+//
+// One definition, in encode, because BOTH the writer of encode.json
+// (writeEncodeMeta) and the reader that renders the Outputs badge
+// (api.parseOutputMeta) need it. Two copies would be free to disagree, and the
+// disagreement would show up as a badge that contradicts the JSON beside it.
+//
+// Prefers real segment files; falls back to the PLAYLISTS when there are none.
+// That fallback is what makes a metadata-only output (#214) still report its
+// format: the .m4s are in S3, but the .m3u8 that references them is on disk.
+func DetectHLSFormat(dirPath string) string {
+	hasM4S, hasTS := false, false
+	entries, _ := os.ReadDir(dirPath)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		subEntries, _ := os.ReadDir(filepath.Join(dirPath, e.Name()))
+		for _, se := range subEntries {
+			switch filepath.Ext(se.Name()) {
+			case ".m4s":
+				hasM4S = true
+			case ".ts":
+				hasTS = true
+			}
+		}
+		if hasM4S && hasTS {
+			break
+		}
+	}
+	if !hasM4S && !hasTS {
+		hasM4S, hasTS = hlsFormatFromPlaylists(dirPath)
+	}
+	switch {
+	case hasM4S && hasTS:
+		return "both"
+	case hasTS:
+		return "ts"
+	case hasM4S:
+		return "fmp4"
+	}
+	return ""
+}
+
+// hlsFormatFromPlaylists infers the format from the .m3u8 files, which stay
+// local even when the segments do not.
+//
+//	EXT-X-MAP:URI=... or a .m4s URI  -> fMP4
+//	a .ts URI                        -> TS
+//
+// Bails at the first hit of each kind: this runs per output dir on every
+// /api/outputs call, which already costs ~0.8s over 30 outputs and must not
+// grow into a full manifest parse.
+func hlsFormatFromPlaylists(dirPath string) (m4s, ts bool) {
+	entries, _ := os.ReadDir(dirPath)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		sub := filepath.Join(dirPath, e.Name())
+		subEntries, _ := os.ReadDir(sub)
+		for _, se := range subEntries {
+			if filepath.Ext(se.Name()) != ".m3u8" {
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join(sub, se.Name()))
+			if err != nil {
+				continue
+			}
+			body := string(b)
+			if strings.Contains(body, "EXT-X-MAP:") || strings.Contains(body, ".m4s") {
+				m4s = true
+			}
+			if strings.Contains(body, ".ts\n") || strings.Contains(body, ".ts\r") {
+				ts = true
+			}
+			if m4s && ts {
+				return
+			}
+		}
+	}
+	return
+}
