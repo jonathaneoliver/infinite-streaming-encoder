@@ -2497,6 +2497,17 @@ async function refreshCostEstimate() {
     } catch (e) { el.style.display = 'none'; }
 }
 
+// Cheapest-first, so the line answers "who would be cheaper?" at a glance
+// rather than making you compare four numbers.
+function _saasCompare(e, prefix) {
+    const all = [
+        ['Coconut', e.coconut_usd], ['Qencode', e.commercial_usd],
+        ['MediaConvert', e.mediaconvert_usd], ['Bitmovin', e.bitmovin_usd],
+    ].filter(([, v]) => v > 0).sort((a, b) => a[1] - b[1]);
+    if (!all.length) return '';
+    return ` · ${prefix || 'vs '}` + all.map(([n, v]) => `$${v.toFixed(2)} ${n}`).join(', ');
+}
+
 function _estimateHtml(e, nFiles) {
     const mins = (e.duration_s || 0) / 60;
     const src = `${nFiles} file${nFiles > 1 ? 's' : ''} · ${mins.toFixed(1)} min`;
@@ -2505,7 +2516,7 @@ function _estimateHtml(e, nFiles) {
         // cloud figure is the useful part of showing this at all.
         return `<b>Estimated cost</b> ${src} → <b style="color:#6ab04c">$0.00</b> `
              + `<span style="color:#889">local encode, nothing billed`
-             + (e.commercial_usd > 0 ? ` · would be $${e.commercial_usd.toFixed(2)} on Qencode, $${e.mediaconvert_usd.toFixed(2)} on MediaConvert` : '')
+             + _saasCompare(e, 'would be ')
              + `</span>`;
     }
     const parts = [`$${(e.spot_usd || 0).toFixed(2)} compute`];
@@ -2513,7 +2524,7 @@ function _estimateHtml(e, nFiles) {
     else parts.push(`<span style="color:#6ab04c">no egress — media stays in S3</span>`);
     return `<b>Estimated cost</b> ${src} → <b>$${(e.total_usd || 0).toFixed(2)}</b> `
          + `<span style="color:#889">${parts.join(' · ')}`
-         + (e.commercial_usd > 0 ? ` · vs $${e.commercial_usd.toFixed(2)} Qencode, $${e.mediaconvert_usd.toFixed(2)} MediaConvert` : '')
+         + _saasCompare(e)
          + `</span>`;
 }
 
@@ -2567,7 +2578,10 @@ function renderJobStats(el, j) {
         + (cloud ? stat('efficiency', (j.efficiency_pct || 0).toFixed(0) + '%') : '')
         + (j.slowest_job ? stat('slowest chunk', escapeHtml(slowest) + ' <span class="u">' + formatDuration(j.slowest_job_s || 0) + '</span>') : '')
         + (j.saved_usd > 0 || j.egress_usd > 0 ? stat('cost', _runCostHtml(j)) : '')
-        + ((j.commercial_usd > 0 || j.mediaconvert_usd > 0 || j.aws_spot_usd > 0 || j.local_wall_s > 0) ? stat('would cost', `<span title="Commercial rates are TRANSCODE ONLY — those services bill delivery separately. Our figure now includes egress, so this comparison understates them by roughly whatever delivery would cost.">MediaConvert</span> $${(j.mediaconvert_usd || 0).toFixed(2)} · <span title="Qencode, per output-minute per rendition. Compared against their cheapest preset — their published multipliers (1.25-2x H.264/HEVC, up to 8x AV1) are not modelled, so the real figure is higher.">Qencode</span> $${(j.commercial_usd || 0).toFixed(2)} · AWS on-demand $${(j.aws_ondemand_usd || 0).toFixed(2)} · AWS spot $${(j.aws_spot_usd || 0).toFixed(2)} · <span class="u">local hardware ~${formatDuration(j.local_wall_s || totalS)} of your time</span>`) : '');
+        + ((j.commercial_usd > 0 || j.mediaconvert_usd > 0 || j.aws_spot_usd > 0 || j.local_wall_s > 0) ? stat('would cost', `<span title="Commercial rates are TRANSCODE ONLY — those services bill delivery separately. Our figure now includes egress, so this comparison understates them by roughly whatever delivery would cost.">MediaConvert</span> $${(j.mediaconvert_usd || 0).toFixed(2)} · <span title="Qencode, per output-minute per rendition. Compared against their cheapest preset — their published multipliers (1.25-2x H.264/HEVC, up to 8x AV1) are not modelled, so the real figure is higher.">Qencode</span> $${(j.commercial_usd || 0).toFixed(2)}`
+            + (j.coconut_usd ? ` · <span title="Coconut — flat per output-minute by resolution, no codec multiplier, so AV1 costs the same as H.264 there.">Coconut</span> $${j.coconut_usd.toFixed(2)}` : '')
+            + (j.bitmovin_usd ? ` · <span title="Bitmovin — $0.02/output-min x resolution (2x HD, 4x UHD) x codec (2x HEVC) x passes (1.25x two-pass). Their 2,000 free min/month are deliberately not modelled, same as AWS free tiers. AV1 factor is unpublished; 2x assumed, so this is a floor.">Bitmovin</span> $${j.bitmovin_usd.toFixed(2)}` : '')
+            + ` · AWS on-demand $${(j.aws_ondemand_usd || 0).toFixed(2)} · AWS spot $${(j.aws_spot_usd || 0).toFixed(2)} · <span class="u">local hardware ~${formatDuration(j.local_wall_s || totalS)} of your time</span>`) : '');
     el.title = 'efficiency = avg vCPUs busy ÷ max vCPUs (how full the fleet ran). '
         + 'slowest chunk = the makespan floor — nothing finishes faster than this one chunk.';
     el.style.display = '';

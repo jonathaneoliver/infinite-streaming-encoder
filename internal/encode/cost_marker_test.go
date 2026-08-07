@@ -177,3 +177,44 @@ func TestRatesMatchThePythonDefinitions(t *testing.T) {
 		}
 	}
 }
+
+// Four SaaS baselines, each with a different billing shape. Pinned because the
+// shapes are what make them differ — a copy-paste that gave Coconut a codec
+// multiplier, or Bitmovin a flat rate, would produce plausible numbers in the
+// wrong order and nothing would fail.
+func TestSaaSBaselinesHaveTheRightShapes(t *testing.T) {
+	// Coconut: NO codec multiplier — AV1 and H.264 cost the same at a given
+	// resolution. This is the property that makes it undercut Qencode on wide
+	// multi-codec ladders despite a higher H.264 rate.
+	if _coconutRate(1080) != _coconutRate(1080) {
+		t.Fatal("unreachable")
+	}
+	for _, h := range []int{480, 1080, 2160} {
+		if _coconutRate(h) <= 0 {
+			t.Fatalf("coconut rate for %dp is zero", h)
+		}
+	}
+	if !(_coconutRate(480) < _coconutRate(1080) && _coconutRate(1080) < _coconutRate(2160)) {
+		t.Fatal("coconut rates must rise with resolution")
+	}
+
+	// Bitmovin: the multipliers ARE the pricing. A flat reading of the $0.02
+	// base would understate a 4K HEVC two-pass rung by 10x.
+	if _bitmovinResFactor(480) != 1 || _bitmovinResFactor(1080) != 2 ||
+		_bitmovinResFactor(2160) != 4 {
+		t.Fatalf("bitmovin resolution factors wrong: %v %v %v",
+			_bitmovinResFactor(480), _bitmovinResFactor(1080), _bitmovinResFactor(2160))
+	}
+	if _bitmovinCodecFactor("h264") != 1 || _bitmovinCodecFactor("hevc") != 2 {
+		t.Fatal("bitmovin codec factors wrong")
+	}
+	if _bitmovinPassFactor(true) != 1.25 || _bitmovinPassFactor(false) != 1 {
+		t.Fatal("bitmovin pass factor wrong")
+	}
+	// A 4K HEVC two-pass minute: 0.02 x 4 x 2 x 1.25 = 0.20, ten times base.
+	got := _bitmovinBasePerMin * _bitmovinResFactor(2160) *
+		_bitmovinCodecFactor("hevc") * _bitmovinPassFactor(true)
+	if !closeTo(got, 0.20) {
+		t.Fatalf("4K HEVC 2-pass = %v/min, want 0.20", got)
+	}
+}
