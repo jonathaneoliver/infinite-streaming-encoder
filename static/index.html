@@ -364,6 +364,11 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 /* ?developer=1 indicator. Deliberately loud: it means every "are you sure?" is
    answered yes automatically, and the flag survives a bookmark. */
 .dev-chip { display: none; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; color: #1a1a2e; background: #ffd166; border-radius: 4px; padding: 3px 8px; cursor: help; }
+/* Controls only ?developer=1 shows. _applyDeveloperMode() removes the class and
+   the element falls back to its own rule (.control-group is flex). !important
+   because the whole point is that nothing else can accidentally reveal it —
+   an inline display, or any later rule, would otherwise win. */
+.dev-only { display: none !important; }
 
 .player-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 2000; display: flex; align-items: center; justify-content: center; }
 .player-container { background: #111; border-radius: 8px; padding: 16px; max-width: 1000px; width: 90vw; }
@@ -381,7 +386,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
     <div style="display:flex;align-items:center;gap:10px">
         <h1 style="margin:0">Infinite Streaming Encoder</h1>
         <span class="dev-chip" id="dev-chip"
-              title="?developer=1 — confirmation prompts are skipped and cloud media is left in S3 by default. Remove the URL argument to restore them.">DEV</span>
+              title="?developer=1 — confirmation prompts are skipped, cloud media is left in S3 by default, and the VMAF encoding options are shown. Remove the URL argument to restore normal behaviour.">DEV</span>
     </div>
     <label id="watcher-toggle" title="Auto-encode new files dropped into the source folder. Persists across restarts." style="display:flex;align-items:center;gap:7px;font-size:13px;color:#aaa;cursor:pointer;user-select:none">
         <input type="checkbox" id="watcher-enabled" onchange="setWatcher(this.checked)" style="cursor:pointer;width:15px;height:15px">
@@ -513,7 +518,13 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="pink">Pink</option>
                 </select>
             </div>
-            <div class="control-group" style="align-self:center;padding-top:16px">
+            <!-- developer-only: .dev-only hides it in CSS, and
+                 _applyDeveloperMode() removes the class under ?developer=1.
+                 Hidden by default in the markup rather than by script, so a JS
+                 failure leaves the option OFF-and-absent rather than
+                 offered-and-broken. Both boxes default unchecked, so a hidden
+                 group submits exactly what an untouched visible one would. -->
+            <div class="control-group dev-only" id="vmaf-group" style="align-self:center;padding-top:16px">
                 <label title="Measure per-rendition VMAF quality after encoding (each rendition vs the source at source resolution). Slow — adds a post-encode pass per rung, fanned across the workers. Off by default. Scores show in the Outputs VMAF column. Ticking this clears Burn-in, since the overlay biases VMAF."><input type="checkbox" id="measure-vmaf" onchange="_vmafBurninSync(true)" style="width:auto;min-width:auto"> Measure VMAF</label>
                 <label title="#109: build a near-lossless pre-scaled VMAF reference ONCE PER WORKER BOX, so the audit decodes a small fast H.264 file instead of re-downscaling the native (4K/AV1) mezzanine on every chunk. VMAF-SPEED only — scores are identical within ~0.4 and it auto-skips when it wouldn't pay off (fewer than 2 renditions, source no slower than the ref, or too big). Needs Measure VMAF on." style="display:block;margin-top:4px"><input type="checkbox" id="vmaf-prescale" style="width:auto;min-width:auto"> VMAF pre-decode</label>
             </div>
@@ -5504,7 +5515,7 @@ loadVersion();
 loadLadders();
 loadSettings();
 loadPromoteConfig();
-_renderDevChip();
+_applyDeveloperMode();
 
 function _renderWatcher(enabled) {
     const cb = document.getElementById('watcher-enabled');
@@ -5529,12 +5540,24 @@ function isDeveloperMode() {
     catch (e) { return false; }   // very old browser / opaque origin
 }
 
-// The flag lives in the URL, so it survives a bookmark and outlives the session
-// somebody set it for. Since its main effect is the ABSENCE of a prompt, there
-// is nothing else on the page to notice — hence a permanent marker.
-function _renderDevChip() {
+// Everything ?developer=1 changes about the page's chrome, in one pass.
+//
+// The chip: the flag lives in the URL, so it survives a bookmark and outlives
+// the session somebody set it for. Since its main effect is the ABSENCE of a
+// prompt, there is nothing else on the page to notice — hence a permanent
+// marker.
+//
+// .dev-only: controls that answer a question about the ENCODER rather than
+// about the output — the VMAF pair costs a post-encode pass per rung and is
+// only ever wanted while investigating quality, so it is noise on the form for
+// anyone producing content. The elements stay in the DOM either way, because
+// startEncode reads .checked from them unconditionally; hidden simply means
+// they read false, which is their default anyway.
+function _applyDeveloperMode() {
+    if (!isDeveloperMode()) return;
     const chip = document.getElementById('dev-chip');
-    if (chip && isDeveloperMode()) chip.style.display = 'inline-block';
+    if (chip) chip.style.display = 'inline-block';
+    document.querySelectorAll('.dev-only').forEach(el => el.classList.remove('dev-only'));
 }
 
 // S3 egress rate, $/GB, from the server (encode.EgressUSDPerGB). Held here so
