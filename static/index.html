@@ -2412,10 +2412,18 @@ function _encoderProvenance(p) {
 function _runCostHtml(j) {
     const spot = j.spot_usd || 0, eg = j.egress_usd || 0;
     const total = j.total_usd || (spot + eg);
-    let html = `$${total.toFixed(2)}`;
+    const excl = j.cost_unmodelled
+        ? ` title="Full-rate estimate — free tiers deliberately ignored, so this is what the run would cost once every allowance is spent. NOT included: ${j.cost_unmodelled.split(',').join(', ')}."`
+        : ' title="Full-rate estimate — free tiers deliberately ignored."';
+    let html = `<span${excl}>$${total.toFixed(2)}${j.cost_unmodelled ? '<sup>+</sup>' : ''}</span>`;
     const parts = [];
     if (spot > 0) parts.push(`$${spot.toFixed(2)} compute`);
     if (eg > 0) parts.push(`$${eg.toFixed(2)} egress (${(j.egress_gb || 0).toFixed(2)} GB)`);
+    // Small lines, but shown because they are priced at FULL rate — several are
+    // $0 on the actual bill only because a free allowance has not run out, and
+    // hiding them would put us back to reporting a fraction as if it were all.
+    const small = (j.sfn_usd || 0) + (j.request_usd || 0) + (j.storage_usd || 0);
+    if (small > 0) parts.push(`$${small.toFixed(2)} sfn+requests+storage`);
     if (parts.length) html += ` <span class="u">${parts.join(' · ')}</span>`;
     if (j.saved_usd > 0) html += ` <span class="u">· saved $${j.saved_usd.toFixed(2)} on spot</span>`;
     // Only meaningful when the run left media in S3; silent otherwise.

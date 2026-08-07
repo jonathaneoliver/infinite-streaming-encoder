@@ -93,6 +93,36 @@ func TestCostIsKeyedByExecNotAccumulated(t *testing.T) {
 	}
 }
 
+// Full-rate lines must reach the total. Several of these bill $0.00 on the real
+// invoice today purely because a free allowance has not run out — Step Functions
+// is already at 4,000/4,000, SQS at 29% — so a total that only summed what AWS
+// currently charges would drift the moment an allowance was crossed.
+func TestFullRateLinesAreIncludedInTheTotal(t *testing.T) {
+	j := &Job{}
+	if !j.parseMarker("[[ENCODER-COST exec=e1 spot_usd=0.30 ondemand_usd=0.78 " +
+		"saved_usd=0.48 vcpu_hours=21 egress_gb=2.6 egress_usd=0.2340 " +
+		"sfn_transitions=812 sfn_usd=0.0203 s3_get=1486 s3_request_usd=0.0006 " +
+		"storage_usd=0.0004 total_usd=0.5553 " +
+		"unmodelled=s3-put,cloudwatch-logs,sqs]]") {
+		t.Fatal("marker not consumed")
+	}
+	if !closeTo(j.SfnUSD, 0.0203) || !closeTo(j.RequestUSD, 0.0006) ||
+		!closeTo(j.StorageUSD, 0.0004) {
+		t.Fatalf("full-rate lines lost: sfn=%v req=%v store=%v",
+			j.SfnUSD, j.RequestUSD, j.StorageUSD)
+	}
+	want := 0.30 + 0.2340 + 0.0203 + 0.0006 + 0.0004
+	if !closeTo(j.TotalUSD, want) {
+		t.Fatalf("total = %v, want %v — a line was dropped from the sum",
+			j.TotalUSD, want)
+	}
+	// The gap must be carried, not swallowed: a partial total that looks
+	// complete is exactly what #217 was filed about.
+	if j.CostUnmodelled == "" {
+		t.Fatal("unmodelled list dropped — the UI could not disclose the gap")
+	}
+}
+
 // Go and Python cannot share a constant, so the only defence against them
 // drifting is a test that reads the other language's file. #217 exists because
 // three copies of the spot rate disagreed (0.011 / 0.013 / 0.0155).

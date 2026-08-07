@@ -2624,7 +2624,8 @@ def _emit_machine_rental(exec_name: str, jobs: list) -> tuple | None:
 
 
 def _emit_cost_summary(exec_name: str, log_state: dict | None = None,
-                       egress_bytes: int = 0, egress_avoided_bytes: int = 0) -> None:
+                       egress_bytes: int = 0, egress_avoided_bytes: int = 0,
+                       egress_files: int = 0, staged_bytes: int = 0) -> None:
     """At job end, sum the execution's Batch compute and emit two markers the
     control plane consumes: ENCODER-COST (spot-vs-on-demand savings, accumulated
     into 'saved by using spot') and ENCODER-STATS (run efficiency: encode wall,
@@ -2696,12 +2697,49 @@ def _emit_cost_summary(exec_name: str, log_state: dict | None = None,
     eg_gb = (egress_bytes or 0) / 1e9
     eg_usd = pricing.egress_usd(egress_bytes)
     avoided_gb = (egress_avoided_bytes or 0) / 1e9
+
+    # Everything below is priced at FULL RATE with no free-tier discount, so the
+    # answer is "what would this run cost if every allowance were already
+    # spent?" — the number that matters when deciding whether to run it a
+    # hundred more times. A line that reads $0.00 today only because an
+    # allowance has not run out yet is not information.
+    #
+    # Step Functions is the case in point: this account is already at 4,000/4,000
+    # free transitions, so it bills TODAY. Modelling only what is currently
+    # charged would have given an answer with a shelf life.
+    sfn_txns = int((log_state or {}).get("_sfn_transitions", 0))
+    sfn_cost = pricing.sfn_usd(sfn_txns)
+
+    # Tier2 GETs we can attribute exactly: one per object the sync-back fetched.
+    # Worker-side GETs and every Tier1 PUT are NOT attributable from here — see
+    # the note on `unmodelled` below.
+    get_n = int(egress_files or 0)
+    req_usd = pricing.s3_request_usd(tier2=get_n)
+
+    # Staging held for the run's duration. GB-HOURS, not GB-months: treating a
+    # day's staging as a month over-states by ~30x.
+    store_usd = pricing.s3_storage_usd(
+        (staged_bytes or 0) / 1e9, max(wall_s, 0.0) / 3600.0)
+
+    total = spot + eg_usd + sfn_cost + req_usd + store_usd
+
+    # Name what is NOT in the total. #217 existed because a partial number looked
+    # complete; repeating that with a longer list of terms would be worse, not
+    # better. S3 PUTs are the big omission and are called out by name: 591,572
+    # Tier1 requests cost $2.96 over 1-3 Aug, but they happen across the workers
+    # and the packager, not here, so attributing them per-run needs counters
+    # those paths do not yet keep.
+    unmodelled = ",".join(("s3-put",) + pricing.UNMODELLED)
+
     print(f"[[ENCODER-COST exec={exec_name} spot_usd={spot:.4f} "
           f"ondemand_usd={ondemand:.4f} saved_usd={saved:.4f} "
           f"vcpu_hours={billed_vh:.2f} "
           f"egress_gb={eg_gb:.3f} egress_usd={eg_usd:.4f} "
           f"egress_avoided_gb={avoided_gb:.3f} "
-          f"total_usd={spot + eg_usd:.4f}]]", flush=True)
+          f"sfn_transitions={sfn_txns} sfn_usd={sfn_cost:.4f} "
+          f"s3_get={get_n} s3_request_usd={req_usd:.4f} "
+          f"storage_usd={store_usd:.4f} "
+          f"total_usd={total:.4f} unmodelled={unmodelled}]]", flush=True)
     print(f"[[ENCODER-STATS exec={exec_name} wall_s={wall_s:.1f} vcpu_h={vh:.3f} "
           f"longest_s={longest_s:.1f} slowest={slowest or '-'} jobs={n} "
           f"max_vcpus={max_vcpus}]]", flush=True)
@@ -2784,6 +2822,12 @@ def cmd_poll(args: argparse.Namespace) -> int:
             token = hist.get("nextToken")
             if not token:
                 break
+        # Free: the poll already has every event. Counting here rather than with
+        # a second API call at summary time, and the last poll's count is the
+        # complete one because this refetches from the start each iteration.
+        if log_state is not None:
+            log_state["_sfn_transitions"] = sum(
+                1 for e in events if str(e.get("type", "")).endswith("StateEntered"))
         _translate_events(events, seen)
         # Then refine chunk cells to queued/running from live Batch status
         # (runs after _translate_events so it wins over the enter-event's
@@ -2901,7 +2945,9 @@ def cmd_poll(args: argparse.Namespace) -> int:
                     # measured rather than assumed.
                     _emit_cost_summary(exec_name, log_state,
                                        egress_bytes=res.bytes,
-                                       egress_avoided_bytes=res.skipped_bytes)
+                                       egress_avoided_bytes=res.skipped_bytes,
+                                       egress_files=res.files,
+                                       staged_bytes=res.bytes + res.skipped_bytes)
                 except Exception:  # noqa: BLE001 — cost summary is best-effort
                     pass
                 return 0

@@ -691,9 +691,14 @@ func (j *Job) parseMarker(line string) bool {
 			return true // malformed; consumed, but nothing to record
 		}
 		num := func(k string) float64 { v, _ := strconv.ParseFloat(kv[k], 64); return v }
-		j.recordCost(kv["exec"], num("spot_usd"), num("ondemand_usd"),
-			num("saved_usd"), num("vcpu_hours"), num("egress_gb"), num("egress_usd"),
-			num("egress_avoided_gb"))
+		j.recordCost(kv["exec"], execCost{
+			Spot: num("spot_usd"), OnDemand: num("ondemand_usd"),
+			Saved: num("saved_usd"), VCPUHours: num("vcpu_hours"),
+			EgressGB: num("egress_gb"), EgressUSD: num("egress_usd"),
+			EgressAvoidedGB: num("egress_avoided_gb"),
+			SfnUSD:          num("sfn_usd"), RequestUSD: num("s3_request_usd"),
+			StorageUSD: num("storage_usd"),
+		}, kv["unmodelled"])
 		return true
 	}
 	if m := machinesMarkerRe.FindStringSubmatch(line); m != nil {
@@ -850,16 +855,14 @@ func (j *Job) recordRunStats(exec string, s runStat) {
 // Egress is summed here with compute because a run's cost is ONE number to a
 // person. Reporting compute alone is how this shipped for months quoting 21% of
 // the bill as though it were all of it (#217).
-func (j *Job) recordCost(exec string, spot, ondemand, saved, vcpuH,
-	egressGB, egressUSD, egressAvoidedGB float64) {
+func (j *Job) recordCost(exec string, c execCost, unmodelled string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.costByExec == nil {
 		j.costByExec = map[string]execCost{}
 	}
-	j.costByExec[exec] = execCost{spot, ondemand, saved, vcpuH,
-		egressGB, egressUSD, egressAvoidedGB}
-	var s, o, sv, eg, eu, ea float64
+	j.costByExec[exec] = c
+	var s, o, sv, eg, eu, ea, sf, rq, st float64
 	for _, v := range j.costByExec {
 		s += v.Spot
 		o += v.OnDemand
@@ -867,11 +870,20 @@ func (j *Job) recordCost(exec string, spot, ondemand, saved, vcpuH,
 		eg += v.EgressGB
 		eu += v.EgressUSD
 		ea += v.EgressAvoidedGB
+		sf += v.SfnUSD
+		rq += v.RequestUSD
+		st += v.StorageUSD
 	}
 	j.SpotUSD, j.OnDemandUSD, j.SavedUSD = s, o, sv
 	j.EgressGB, j.EgressUSD, j.EgressAvoidedGB = eg, eu, ea
-	// The headline: what the run actually cost, not what one component of it did.
-	j.TotalUSD = s + eu
+	j.SfnUSD, j.RequestUSD, j.StorageUSD = sf, rq, st
+	// The headline: what the run cost at full rate, not what one component did.
+	j.TotalUSD = s + eu + sf + rq + st
+	// Carried so the UI can say what the total EXCLUDES. A partial number that
+	// looks complete is the whole reason #217 was filed.
+	if unmodelled != "" {
+		j.CostUnmodelled = unmodelled
+	}
 }
 
 // execCost is one execution's contribution. A named struct rather than the old
@@ -879,6 +891,11 @@ func (j *Job) recordCost(exec string, spot, ondemand, saved, vcpuH,
 type execCost struct {
 	Spot, OnDemand, Saved, VCPUHours     float64
 	EgressGB, EgressUSD, EgressAvoidedGB float64
+	// Priced at FULL RATE with no free-tier discount, so the total answers
+	// "what would this cost if every allowance were spent?" rather than "what
+	// did AWS happen to charge this month". Step Functions is why that matters:
+	// the account is already at 4,000/4,000 free transitions.
+	SfnUSD, RequestUSD, StorageUSD float64
 }
 
 // parseMarkerFields splits "a=1 b=2" into a map. Values cannot contain spaces,
@@ -1228,9 +1245,16 @@ type Job struct {
 	EgressGB        float64 `json:"egress_gb,omitempty"`
 	EgressUSD       float64 `json:"egress_usd,omitempty"`
 	EgressAvoidedGB float64 `json:"egress_avoided_gb,omitempty"`
-	TotalUSD        float64 `json:"total_usd,omitempty"`
-	OnDemandUSD     float64 `json:"ondemand_usd,omitempty"`
-	SavedUSD        float64 `json:"saved_usd,omitempty"`
+	// Step Functions, S3 requests and S3 storage, all at full rate.
+	SfnUSD     float64 `json:"sfn_usd,omitempty"`
+	RequestUSD float64 `json:"request_usd,omitempty"`
+	StorageUSD float64 `json:"storage_usd,omitempty"`
+	TotalUSD   float64 `json:"total_usd,omitempty"`
+	// Comma-separated list of cost lines the total does NOT include, so the UI
+	// can show the gap rather than implying there isn't one.
+	CostUnmodelled string  `json:"cost_unmodelled,omitempty"`
+	OnDemandUSD    float64 `json:"ondemand_usd,omitempty"`
+	SavedUSD       float64 `json:"saved_usd,omitempty"`
 	// CommercialUSD / MediaConvertUSD are what this job's output ladder would have
 	// cost on hosted transcoders (a generic commercial cloud encoder, and AWS
 	// MediaConvert) — comparison baselines against our own spot/local cost. Both
