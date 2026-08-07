@@ -63,6 +63,41 @@ def test_every_jobconfig_field_is_reachable_from_the_command_line() -> None:
     assert not stale, f"CLI maps fields JobConfig does not have: {stale}"
 
 
+PAGE = (Path(__file__).resolve().parent.parent / "static" / "index.html")
+
+
+def test_the_cli_can_send_everything_the_browser_can() -> None:
+    """The Go struct is not the only authority on what is a user field.
+
+    output_tag proved it: JobConfig's comment said "Not a user field — filled
+    from the selected ladder", so it went in _NOT_USER_FIELDS and the drift test
+    was satisfied. Meanwhile static/index.html had a text box for it and the
+    server prefers a supplied value over the ladder default, so the UI could ask
+    for something the CLI could not — a capability gap in a tool whose premise
+    is the full surface.
+
+    So this reads the OTHER end of the same contract: the payload startEncode
+    actually builds.
+    """
+    src = PAGE.read_text()
+    start = src.index("async function startEncode")
+    body = src[src.index("const body = {", start):src.index("};", start)]
+    sent = set(re.findall(r"^\s*([a-z_]+):", body, re.M))
+    # Added after the literal, for cloud targets only.
+    sent |= set(re.findall(r"body\.([a-z_]+)\s*=", src[start:start + 4000]))
+
+    mapped = (set(encoder_cli._STR_FIELDS.values())
+              | set(encoder_cli._BOOL_FIELDS.values())
+              | set(encoder_cli._TRISTATE_FIELDS.values())
+              | set(encoder_cli._NOT_USER_FIELDS))
+    assert len(sent) > 10, f"only parsed {sent} from startEncode — the scrape broke"
+    missing = sorted(sent - mapped)
+    assert not missing, (
+        f"the browser sends these and the CLI cannot: {missing}. "
+        "Add a flag — do NOT park it in _NOT_USER_FIELDS, which is where this "
+        "class of gap hides.")
+
+
 def test_every_mapped_field_has_a_real_argparse_flag() -> None:
     # The maps could name a field and still have no flag behind it, which would
     # satisfy the test above while leaving the option unreachable.
@@ -72,6 +107,26 @@ def test_every_mapped_field_has_a_real_argparse_flag() -> None:
                   encoder_cli._TRISTATE_FIELDS):
         for dest in table:
             assert dest in dests, f"{dest} is mapped but has no argparse argument"
+
+
+def test_every_flag_has_help_text() -> None:
+    """A bare flag in --help tells the reader nothing, and --help is the whole
+    discoverability story for a tool with 30 of them. Four shipped without any
+    (--segment-duration, --gop-duration, --keep-mezzanine, --poll-interval) and
+    nothing caught it because argparse is perfectly happy to print a blank."""
+    missing = [max(a.option_strings, key=len) or a.dest
+               for a in encoder_cli.build_parser()._actions
+               if not (a.help or "").strip()]
+    assert not missing, f"flags with no help text: {missing}"
+
+
+def test_argument_groups_have_distinct_headings() -> None:
+    # A group called "options" collides with argparse's own heading for the
+    # top-level flags, so --help printed "options:" twice with different
+    # content under each — which reads as a formatting bug.
+    p = encoder_cli.build_parser()
+    titles = [g.title for g in p._action_groups]
+    assert len(titles) == len(set(titles)), f"duplicate --help headings: {titles}"
 
 
 def test_unset_options_are_omitted_so_server_defaults_apply() -> None:
@@ -128,6 +183,8 @@ def test_enums_are_rejected_locally() -> None:
     import contextlib
     import io
     for bad in (["c.mp4", "--codec", "h265"],          # it is "hevc"
+                ["c.mp4", "--codec", "h264,h265"],     # one bad token in a list
+                ["c.mp4", "--codec", ","],             # nothing selected
                 ["c.mp4", "--target", "cloud-batch"],  # server alias, not a flag value
                 ["c.mp4", "--cpu-arch", "arm"],
                 ["c.mp4", "--hls-format", "dash"],
@@ -141,6 +198,32 @@ def test_enums_are_rejected_locally() -> None:
         except SystemExit:
             continue
         raise AssertionError(f"accepted {bad}")
+
+
+def test_codec_subsets_the_browser_can_pick_are_reachable_from_the_cli() -> None:
+    """A fixed choices= list made "h264 + av1, not hevc" IMPOSSIBLE to ask for,
+    while the browser sends exactly that: codecValue() joins the ticked boxes,
+    and parseCodecSel splits on commas. An option the UI has and the CLI does
+    not is a defect in a tool whose whole point is the full surface."""
+    p = encoder_cli.build_parser()
+
+    def sel(v):
+        return encoder_cli.build_body(p.parse_args(["c.mp4", "--codec", v])).get("codec")
+
+    assert sel("h264,av1") == "h264,av1"
+    assert sel("hevc,av1") == "hevc,av1"
+
+    # Normalised the way codecValue() would, so the same three boxes produce the
+    # same request whichever surface asked. Canonical order, deduped, and the
+    # two aliases collapse.
+    assert sel("av1,h264") == "h264,av1", "not put in canonical order"
+    assert sel("hevc,h264") == "both", "h264+hevc should collapse to the alias"
+    assert sel("av1,hevc,h264") == "all"
+    assert sel("h264,h264") == "h264", "duplicate not deduped"
+
+    # Single codecs and the aliases still work.
+    for v in ("h264", "hevc", "av1", "both", "all"):
+        assert sel(v) == v, v
 
 
 def test_unusual_but_valid_resolutions_are_accepted() -> None:

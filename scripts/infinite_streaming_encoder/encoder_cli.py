@@ -61,6 +61,40 @@ def _res(value: str) -> str:
         f"{value!r} is not a resolution tier (expected e.g. 720p, 1080p, 2160p)")
 
 
+_CODECS = ("h264", "hevc", "av1")
+
+
+def _codec(value: str) -> str:
+    """A codec selection: an alias, or a comma list.
+
+    A fixed choices= list was WRONG here. parseCodecSel accepts a comma list
+    and the browser sends one for any subset that is not exactly h264+hevc
+    (codecValue joins the ticked boxes), so "h264,av1" is a selection the UI can
+    make and the server understands — and choices= made it unreachable from the
+    command line. The whole point of this tool is the full configuration
+    surface, so an option the browser has and it does not is a defect.
+
+    Normalised to the canonical order and to the aliases the server would pick
+    anyway, so `--codec av1,h264` and `--codec h264,hevc` produce the same
+    request the UI would for the same boxes ticked.
+    """
+    v = value.strip().lower()
+    if v in ("", "both", "all"):
+        return v
+    parts = [p.strip() for p in v.split(",") if p.strip()]
+    bad = [p for p in parts if p not in _CODECS]
+    if bad or not parts:
+        raise argparse.ArgumentTypeError(
+            f"{value!r}: expected 'both', 'all', or a comma list of "
+            f"{'/'.join(_CODECS)} (got {bad or 'nothing'})")
+    picked = [c for c in _CODECS if c in parts]   # canonical order, deduped
+    if picked == ["h264", "hevc"]:
+        return "both"
+    if len(picked) == 3:
+        return "all"
+    return ",".join(picked)
+
+
 def _chunk(value: str) -> str:
     """"dynamic" | "whole" | a seconds count. The multiple-of-segment rule is
     the server's to enforce; this only rejects a typo like "12s"."""
@@ -96,6 +130,7 @@ _STR_FIELDS = {
     "hls_format": "hls_format",
     "padding": "padding",
     "cpu_arch": "cpu_arch",
+    "output_tag": "output_tag",
 }
 
 # Plain booleans: false IS the default, so sending it changes nothing.
@@ -120,10 +155,15 @@ _TRISTATE_FIELDS = {
     "use_spot": "use_spot",
 }
 
-# Filled by the server from the selected ladder's output_tag, not typed by a
-# user (see JobConfig.OutputTag). Named here so the drift test can tell
-# "deliberately absent" from "forgotten".
-_NOT_USER_FIELDS = ("files", "output_tag")
+# Not settable as an option: `files` is the positional argument.
+#
+# Keep this list as short as the truth allows. It is the one place the drift
+# test cannot see, so anything parked here is unguarded by definition —
+# output_tag sat here on the strength of a stale comment in JobConfig ("Not a
+# user field"), while the UI had a text box for it all along and the server
+# prefers a supplied value over the ladder's default. The escape hatch hid the
+# exact gap the test exists to catch.
+_NOT_USER_FIELDS = ("files",)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -150,8 +190,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "interrupted download resumes.")
 
     g = p.add_argument_group("what to encode")
-    g.add_argument("--codec", choices=["h264", "hevc", "av1", "both", "all"],
-                   default="", help="codec selection (server default: both)")
+    g.add_argument("--codec", type=_codec, default="", metavar="SEL",
+                   help="h264 | hevc | av1 | both (h264+hevc) | all, or a comma "
+                        "list such as 'h264,av1' (server default: both)")
     g.add_argument("--ladder", default="",
                    help="bitrate ladder by name (see --list-ladders)")
     g.add_argument("--max-res", type=_res, default="", metavar="TIER",
@@ -160,6 +201,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="floor tier — with --max-res, selects a band")
     g.add_argument("--time", default="", metavar="SECONDS",
                    help="encode only the first N seconds of each file")
+    g.add_argument("--output-tag", default="", metavar="SUFFIX",
+                   help="suffix for the output dir name (<stem>_<suffix>_<codec>). "
+                        "Keeps comparison encodes of one source side by side "
+                        "instead of archiving each other — e.g. 'local12'. "
+                        "Blank uses the ladder's default (usually 'xs').")
 
     g = p.add_argument_group("where to run it")
     g.add_argument("--target", choices=["local", "cloud"], default="",
@@ -173,15 +219,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="'dynamic', 'whole', or seconds")
 
     g = p.add_argument_group("packaging")
-    g.add_argument("--segment-duration", default="", metavar="SECONDS")
+    g.add_argument("--segment-duration", default="", metavar="SECONDS",
+                   help="HLS/DASH segment length. A fixed --chunk-duration must "
+                        "be a multiple of this; the server enforces that.")
     g.add_argument("--partial-duration", default="", metavar="MS",
                    help="LL-HLS part target, in milliseconds")
-    g.add_argument("--gop-duration", default="", metavar="SECONDS")
-    g.add_argument("--hls-format", choices=["fmp4", "ts", "both"], default="")
+    g.add_argument("--gop-duration", default="", metavar="SECONDS",
+                   help="keyframe interval in seconds; KEYINT = round(fps x this)")
+    g.add_argument("--hls-format", choices=["fmp4", "ts", "both"], default="",
+                   help="segment container (server default: fmp4)")
     g.add_argument("--padding", choices=["", "black", "pink"], default="",
                    help="pad to a segment boundary with this colour")
 
-    g = p.add_argument_group("options")
+    g = p.add_argument_group("encode options")
     g.add_argument("--burnin", action=argparse.BooleanOptionalAction, default=None,
                    help="diagnostic text overlay (unset: on). Biases VMAF.")
     g.add_argument("--skip-media-download", action=argparse.BooleanOptionalAction,
@@ -191,7 +241,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--force-reencode", action="store_true",
                    help="re-encode even where output exists; the old output is "
                         "archived, not deleted")
-    g.add_argument("--keep-mezzanine", action="store_true")
+    g.add_argument("--keep-mezzanine", action="store_true",
+                   help="keep the intermediate mezzanine instead of discarding "
+                        "it once the variants are encoded")
     g.add_argument("--promote", action="store_true",
                    help="rsync each output to PROMOTE_DESTS on success")
     g.add_argument("--hevc-single-pass", action="store_true",
@@ -211,7 +263,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "non-zero if any did not finish 'done'")
     g.add_argument("--quiet", action="store_true",
                    help="with --wait, print only terminal transitions")
-    g.add_argument("--poll-interval", type=float, default=5.0, metavar="S")
+    g.add_argument("--poll-interval", type=float, default=5.0, metavar="S",
+                   help="seconds between --wait status checks")
     g.add_argument("--timeout", type=float, default=3600.0, metavar="S",
                    help="give up waiting after this long (the encode keeps going)")
     g.add_argument("--list-sources", action="store_true",
