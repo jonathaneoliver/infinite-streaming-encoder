@@ -168,6 +168,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build, to
 	printf '  py outfetch    '; \
 	if out=$$(python3 scripts/test_output_fetch.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py cli         '; \
+	if out=$$(python3 scripts/test_encoder_cli.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  python compile '; \
 	if out=$$(cd scripts && python3 -m compileall -q infinite_streaming_encoder 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
@@ -1094,7 +1097,16 @@ farm-dev-down: farm-down   ## take the dev farm down (identical to `make farm-do
 # End-to-end single-device check (docs/TESTING.md, test 1): generate a tiny clip,
 # bring up a 1-box farm from the working tree, encode it, assert the output.
 # The multi-box and cloud topologies are manual (hardware / cost).
-.PHONY: smoke
+.PHONY: smoke encode
+# The command-line encode client. Run from the repo so it needs no install; it
+# is a plain HTTP client, so nothing but python3 is required on this side.
+# `make smoke` and `make oobe` both drive it — they each used to hand-roll the
+# same curl-and-poll block, with subtly different failure handling.
+ENCODE_CLI = PYTHONPATH=scripts python3 -m infinite_streaming_encoder.encoder_cli
+
+encode:               ## submit an encode from the CLI: make encode ARGS="clip.mp4 --target cloud --wait" (--help for the full option list)
+	@$(ENCODE_CLI) --server http://localhost:$(PORT) $(ARGS)
+
 SMOKE_SRC ?= $(SOURCE_DIR)/smoke.mp4
 # Open the jobs page in a browser during the run; set SMOKE_OPEN=0 to skip.
 SMOKE_OPEN ?= 1
@@ -1113,17 +1125,9 @@ smoke: require-paths build   ## end-to-end single-device smoke: tiny clip -> loc
 	@echo ">>> [smoke] opening the jobs page (set SMOKE_OPEN=0 to skip)..."
 	@[ "$(SMOKE_OPEN)" = "0" ] || ( open http://localhost:$(PORT)/ 2>/dev/null || xdg-open http://localhost:$(PORT)/ 2>/dev/null ) || echo "    watch it at http://localhost:$(PORT)/"
 	@echo ">>> [smoke] submitting encode (h264, 720p, 12s chunks) + waiting (timeout ~300s)..."
-	@id=$$(curl -sf -X POST http://localhost:$(PORT)/api/encode -H 'Content-Type: application/json' \
-	    -d '{"files":["smoke.mp4"],"target":"local","codec":"h264","max_res":"720p","chunk_duration":"12"}' \
-	    | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["id"])'); \
-	  echo "    job $$id"; st=pending; \
-	  for i in $$(seq 1 60); do \
-	    st=$$(curl -sf http://localhost:$(PORT)/api/jobs | python3 -c "import sys,json; j=[x for x in json.load(sys.stdin) if x['id']=='$$id']; print(j[0]['status'] if j else 'gone')"); \
-	    echo "    status=$$st"; \
-	    case "$$st" in done) break;; failed|gone) echo '>>> SMOKE FAIL: job '"$$st"; exit 1;; esac; \
-	    sleep 5; \
-	  done; \
-	  [ "$$st" = done ] || { echo '>>> SMOKE FAIL: timed out'; exit 1; }
+	@$(ENCODE_CLI) --server http://localhost:$(PORT) \
+	    smoke.mp4 --target local --codec h264 --max-res 720p --chunk-duration 12 \
+	    --wait --timeout 300 || { echo '>>> SMOKE FAIL: encode did not finish'; exit 1; }
 	@d=$$(ls -d $(OUTPUT_DIR)/smoke_p200*h264* 2>/dev/null | head -1); \
 	 if [ -n "$$d" ] && ls "$$d"/*.m3u8 >/dev/null 2>&1; then \
 	   echo ">>> SMOKE PASS: $$d (has playlists)"; \
@@ -1176,15 +1180,9 @@ oobe: build   ## isolated first-run test: own dirs/ports/cluster -> encode -> as
 	@echo ">>> [oobe] waiting for the isolated server (:$(OOBE_PORT))..."
 	@for i in $$(seq 1 30); do curl -sf http://localhost:$(OOBE_PORT)/api/jobs >/dev/null 2>&1 && break; sleep 1; done
 	@echo ">>> [oobe] submitting encode + waiting (timeout ~300s)..."
-	@id=$$(curl -sf -X POST http://localhost:$(OOBE_PORT)/api/encode -H 'Content-Type: application/json' \
-	    -d '{"files":["smoke.mp4"],"target":"local","codec":"h264","max_res":"720p","chunk_duration":"12"}' \
-	    | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["id"])'); \
-	  echo "    job $$id"; st=pending; \
-	  for i in $$(seq 1 60); do \
-	    st=$$(curl -sf http://localhost:$(OOBE_PORT)/api/jobs | python3 -c "import sys,json; j=[x for x in json.load(sys.stdin) if x['id']=='$$id']; print(j[0]['status'] if j else 'gone')"); \
-	    echo "    status=$$st"; \
-	    case "$$st" in done) break;; failed|gone) break;; esac; sleep 5; \
-	  done; \
+	@if $(ENCODE_CLI) --server http://localhost:$(OOBE_PORT) \
+	      smoke.mp4 --target local --codec h264 --max-res 720p --chunk-duration 12 \
+	      --wait --timeout 300; then st=done; else st=failed; fi; \
 	  d=$$(ls -d $(OOBE_DIR)/output/smoke_p200*h264* 2>/dev/null | head -1); \
 	  if [ "$$st" = done ] && [ -n "$$d" ] && ls "$$d"/*.m3u8 >/dev/null 2>&1; then res="OOBE PASS: $$d (has playlists)"; else res="OOBE FAIL (status=$$st)"; fi; \
 	  if [ "$(OOBE_KEEP)" = "1" ]; then echo ">>> [oobe] OOBE_KEEP=1 — leaving instance up (logs at http://localhost:$(OOBE_PORT); 'make oobe-down' to clean)"; \
