@@ -492,6 +492,9 @@ farm and remote workers pull — never moves until you deliberately release.
 | 6. Deploy cloud | `make infra-plan IMAGE_TAG=<tag> && make infra-apply` | Batch job definitions re-pin |
 | 7. Re-bake AMI | `make ami-up && make infra-apply` | spot boxes cold-start fast again (optional) |
 
+Stages 6 and 7 collapse into `make deploy USE_AMI=1`, which bakes the AMI in the
+one slot that costs a **single** infra apply instead of two — see below.
+
 **Why stage 2 exists.** `farm-dev-up` bind-mounts your working-tree
 `scripts/infinite_streaming_encoder` over the image's copy. That is what makes
 iteration fast, and it also means the mount hides packaging bugs — a file
@@ -538,8 +541,23 @@ looks one up by the *current* tag — so the moment you promote a new image, the
 baked AMI stops matching and cloud silently falls back to pull-on-boot. Nothing
 breaks; encodes just get slower with no warning. Re-bake and re-apply to wire
 the new one in, or `make ami-down` to clear it and accept pull-on-boot
-deliberately. `make cloud-up USE_AMI=1` does the bake, wait and second apply in
-one go.
+deliberately.
+
+**Do it in one command: `make deploy USE_AMI=1`.** The bake has exactly one
+valid slot in the pipeline — after `publish`, because packer bakes the image
+that was just pushed, and before `infra-plan`, because the plan reads
+`WORKER_AMI`, which only resolves once the AMI is registered *and* available.
+Running it outside that slot (`deploy`, then `ami-up`, then `deploy` again) is
+not just three commands instead of one: it costs a **second compute-environment
+update**, and each one parks Batch in `UPDATING` with scale-down paused, so idle
+spot boxes linger. `make cloud-up USE_AMI=1` does the same for a from-scratch
+provision (two applies there by necessity — it applies before `publish` to
+create ECR).
+
+A `deploy` *without* `USE_AMI=1` ends by checking whether the wired AMI still
+matches `IMAGE_TAG`, and says so if it does not — this is the failure that
+otherwise costs you a week of slow cold starts before anyone thinks to run
+`make status`.
 
 Rolling back is the same mechanism: `make cloud-dev-down` restores the tag cloud
 ran before, and `make promote FROM=<older-tag>` moves `:latest` back.

@@ -723,10 +723,7 @@ cloud-up:             ## provision/reconcile the cloud stack to current code + v
 	$(MAKE) publish
 	@if [ "$(USE_AMI)" = 1 ]; then \
 	  $(MAKE) ami-up; \
-	  echo ">>> waiting for the baked AMI to be queryable (EC2 is eventually consistent)..."; \
-	  until [ -n "$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
-	      --filters Name=tag:image_tag,Values=$(IMAGE_TAG) Name=state,Values=available \
-	      --query 'Images[0].ImageId' --output text 2>/dev/null | grep -v '^None$$')" ]; do sleep 3; done; \
+	  $(MAKE) ami-wait; \
 	  $(MAKE) infra-plan; $(MAKE) infra-apply; \
 	  echo ">>> AMI baked + wired — cold starts skip the ECR pull (~\$$1.50/mo until cloud-clear)."; \
 	else echo ">>> skipping AMI bake (USE_AMI unset -> pull-on-boot). Set USE_AMI=1 for warm starts."; fi
@@ -782,20 +779,37 @@ cloud-check:          ## live cloud readiness: AWS creds + state machine + S3 bu
 # NOTE no in-flight guard, unlike cloud-dev-up: infra-apply deregisters job-def
 # revisions and farm-up bounces workers, so running this mid-encode will break
 # it. Check `make status` / the UI first.
-deploy: require-idle  ## push image + bring the whole farm up + plan + APPLY infra (one shot)
+# USE_AMI=1 bakes the worker AMI as PART of the deploy, in the one slot where it
+# works: after publish (packer bakes the image that was just pushed) and before
+# infra-plan (the plan reads WORKER_AMI, which only resolves once the AMI is
+# registered and available).
+#
+# That slot is the whole point. Baking outside the pipeline — deploy, ami-up,
+# deploy — costs a SECOND compute-env update, and each one parks Batch in
+# UPDATING with scale-down paused, so idle spot boxes linger. Same three
+# artifacts, one apply instead of two.
+#
+# Off by default: the bake takes ~5min and the AMI carries a standing ~$1.50/mo,
+# which is not worth it for a Go-only change that never re-pins IMAGE_TAG.
+DEPLOY_AMI_STEP := $(if $(filter 1,$(USE_AMI)),$(MAKE) ami-up && $(MAKE) ami-wait &&,)
+DEPLOY_AMI_NOTE := $(if $(filter 1,$(USE_AMI)),- AMI baked + wired,)
+DEPLOY_AMI_BANNER := $(if $(filter 1,$(USE_AMI)),+AMI bake,)
+
+deploy: require-idle  ## push image + bring the whole farm up + plan + APPLY infra (one shot; USE_AMI=1 also bakes + wires the worker AMI)
 	@start=$$(date +%s); \
-	echo ">>> deploy started $$(date '+%H:%M:%S')  worker=$(IMAGE_TAG)"; \
-	if $(MAKE) publish && $(MAKE) farm-up && $(MAKE) infra-plan && $(MAKE) infra-apply; then \
+	echo ">>> deploy started $$(date '+%H:%M:%S')  worker=$(IMAGE_TAG) $(DEPLOY_AMI_BANNER)"; \
+	if $(MAKE) publish && $(DEPLOY_AMI_STEP) $(MAKE) farm-up && $(MAKE) infra-plan && $(MAKE) infra-apply; then \
 		el=$$(( $$(date +%s) - start )); \
 		printf '\a\n\033[1;32m==================================================\n'; \
 		printf '  DEPLOY COMPLETE  %dm %02ds   worker=%s\n' $$((el/60)) $$((el%60)) "$(IMAGE_TAG)"; \
-		printf '  image pushed - farm up on :latest - infra applied\n'; \
+		printf '  image pushed - farm up on :latest - infra applied $(DEPLOY_AMI_NOTE)\n'; \
 		printf '==================================================\033[0m\n'; \
 	else \
 		el=$$(( $$(date +%s) - start )); \
 		printf '\a\n\033[1;31m!!! DEPLOY FAILED after %dm %02ds - see output above\033[0m\n' $$((el/60)) $$((el%60)); \
 		exit 1; \
 	fi
+	@$(if $(filter 1,$(USE_AMI)),true,$(MAKE) ami-check)
 
 deploy-review:        ## like deploy but stop at the plan (review before infra-apply)
 	$(MAKE) ecr-publish
@@ -840,6 +854,48 @@ ami-up:             ## build a worker AMI with the current image pre-pulled (kee
 	    for s in $$snaps; do echo "  delete snapshot $$s"; aws ec2 delete-snapshot --region $(AWS_REGION) --snapshot-id $$s; done; \
 	  done
 	@echo ">>> Baked infinite-streaming-encoder-worker-$(IMAGE_TAG) (1 AMI total). Now: make infra-apply  (wires it in)"
+
+# EC2 is eventually consistent: an AMI packer has just registered is not
+# necessarily queryable yet. That matters more than it sounds, because
+# WORKER_AMI resolving EMPTY does not fail anything — infra-plan simply plans
+# pull-on-boot, the bake is silently thrown away, and you find out a week later
+# in cold-start times. So the wait is part of the contract, not a nicety.
+#
+# Bounded, because an unbounded `until` is how a failed bake turns into a hung
+# deploy — the exact failure mode #239 was about, in a different costume.
+AMI_WAIT_TRIES ?= 60
+ami-wait:           ## block until the AMI baked for IMAGE_TAG is queryable (used by deploy/cloud-up)
+	@echo ">>> waiting for the baked AMI to be queryable (EC2 is eventually consistent)..."
+	@i=0; until [ -n "$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
+	      --filters Name=tag:image_tag,Values=$(IMAGE_TAG) Name=state,Values=available \
+	      --query 'Images[0].ImageId' --output text 2>/dev/null | grep -v '^None$$')" ]; do \
+	  i=$$((i+1)); \
+	  if [ $$i -ge $(AMI_WAIT_TRIES) ]; then \
+	    echo "!!! no available AMI tagged image_tag=$(IMAGE_TAG) after $$((i*5))s — did the bake fail?"; \
+	    exit 1; \
+	  fi; \
+	  sleep 5; \
+	done; \
+	echo ">>> AMI for $(IMAGE_TAG) is available."
+
+# Best-effort staleness warning. The wired AMI carries the image_tag it was baked
+# for, and WORKER_AMI looks one up by the CURRENT tag — so promoting a new image
+# silently unpins the AMI and cloud falls back to pull-on-boot with nothing
+# broken and nothing said. `make status` reports it, but only if you go and look;
+# this puts it in front of the one person who just changed the image.
+ami-check:          ## warn when the wired worker AMI was baked for a different image tag
+	@-wired=$$(aws batch describe-compute-environments --region $(AWS_REGION) \
+	    --query "computeEnvironments[?contains(computeEnvironmentName,'infinite-streaming-encoder')].computeResources.ec2Configuration[0].imageIdOverride | [0]" \
+	    --output text 2>/dev/null); \
+	  [ "$$wired" = "None" ] && wired=""; \
+	  if [ -n "$$wired" ]; then \
+	    baked=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) --image-ids $$wired \
+	      --query "Images[0].Tags[?Key=='image_tag'].Value | [0]" --output text 2>/dev/null); \
+	    if [ "$$baked" != "$(IMAGE_TAG)" ]; then \
+	      printf '\033[1;33m!!! worker AMI %s is baked for %s, not %s — cloud workers will cold-pull.\n    Bake and wire it in one pass with:  make deploy USE_AMI=1\033[0m\n' \
+	        "$$wired" "$$baked" "$(IMAGE_TAG)"; \
+	    fi; \
+	  fi
 
 ami-down:           ## clear the compute-env AMI pointer, THEN delete the AMIs (self-clearing, no dangling ref)
 	# Clear the compute env's image_id_override FIRST so we never delete an AMI
