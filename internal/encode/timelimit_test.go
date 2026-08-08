@@ -16,9 +16,16 @@ func TestTimeLimitSeconds(t *testing.T) {
 	}{
 		{"", 0, false},
 		{"   ", 0, false},
+		// Already a segment multiple — unchanged.
 		{"30", 30, true},
 		{" 30 ", 30, true},
-		{"2.5", 2.5, true},
+		// Snapped to the nearest whole 6s segment: a partial final segment is
+		// what every consumer downstream disagrees about.
+		{"10", 12, true},
+		{"8", 6, true},
+		{"9", 12, true},
+		{"2.5", 6, true}, // floor of one segment, never zero
+		{"0.1", 6, true},
 		// Garbage in a free-text field is "no limit", not a broken encode.
 		{"full clip", 0, false},
 		{"30s", 0, false},
@@ -36,19 +43,41 @@ func TestTimeLimitSeconds(t *testing.T) {
 	}
 }
 
+// The snap follows the job's resolved segment duration, not a hardcoded 6 —
+// resolveTimings fills it from the ladder before either target dispatches.
+func TestTimeLimitSnapsToJobSegmentDuration(t *testing.T) {
+	for _, tc := range []struct {
+		seg, in string
+		want    float64
+	}{
+		{"4", "10", 12},  // nearest multiple of 4
+		{"4", "9", 8},    //
+		{"10", "12", 10}, //
+		{"", "10", 12},   // unset → the global 6s default
+		{"0", "10", 12},  // nonsense → the global 6s default
+	} {
+		cfg := JobConfig{Time: tc.in, SegmentDuration: tc.seg}
+		if got, _ := cfg.TimeLimitSeconds(); got != tc.want {
+			t.Errorf("segment=%q Time=%q → %v, want %v", tc.seg, tc.in, got, tc.want)
+		}
+	}
+}
+
 // The limit must reach the orchestrator, and only when it is real — the whole
 // bug in #184 was a value that stopped at the Go boundary.
 func TestDistArgsCarryTimeLimit(t *testing.T) {
 	base := JobConfig{Codec: "h264", Files: []string{"clip.mp4"}}
 	withLimit := base
-	withLimit.Time = "30"
+	// 10 snaps to 12; the orchestrator must receive the SNAPPED value, or it
+	// would key its mezzanine cache on a limit the encode never used.
+	withLimit.Time = "10"
 	args := withLimit.distArgsForFile("/src", "/out", "clip.mp4", "job1", 0)
 	i := slices.Index(args, "--time")
 	if i < 0 || i+1 >= len(args) {
 		t.Fatalf("--time absent from %v", args)
 	}
-	if args[i+1] != "30" {
-		t.Errorf("--time %s, want 30", args[i+1])
+	if args[i+1] != "12" {
+		t.Errorf("--time %s, want 12", args[i+1])
 	}
 
 	for _, junk := range []string{"", "full clip", "0"} {

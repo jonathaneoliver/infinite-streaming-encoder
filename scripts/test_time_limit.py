@@ -49,19 +49,43 @@ check("None limit == no limit", full == full_explicit)
 check("0 hashes as unlimited", zero == full)
 
 # --- what counts as a limit --------------------------------------------------
-info = FakeInfo(duration_s=20.0)
-check("real limit is kept", _effective_time_limit(info, 10) == 10.0)
-check("limit at clip length is not a limit", _effective_time_limit(info, 20) is None)
-check("limit past clip length is not a limit", _effective_time_limit(info, 99) is None)
-check("no limit", _effective_time_limit(info, None) is None)
-check("zero is no limit", _effective_time_limit(info, 0) is None)
-check("negative is no limit", _effective_time_limit(info, -5) is None)
+# Snapped to whole 6s segments: chunk boundaries land on segments, so a limit
+# that isn't a multiple leaves a plan that cannot end where the media does.
+info = FakeInfo(duration_s=60.0)
+check("already a multiple is unchanged", _effective_time_limit(info, 12) == 12.0)
+check("rounds up to nearest segment", _effective_time_limit(info, 10) == 12.0)
+check("rounds down to nearest segment", _effective_time_limit(info, 8) == 6.0)
+check("half rounds up", _effective_time_limit(info, 9) == 12.0)
+check("never snaps to zero", _effective_time_limit(info, 1) == 6.0)
+check("idempotent on a snapped value",
+      _effective_time_limit(info, _effective_time_limit(info, 10)) == 12.0)
+
+# The clip test is applied to the SNAPPED value, not the request, so the rule is
+# "the limit is a whole number of segments, and it must be shorter than the clip".
+# On a 20s clip (not itself a segment multiple) a request of 19, 20 or 21 all land
+# on the last whole segment, 18 — asking for the full length is what a BLANK field
+# is for. A request that snaps up past the clip is dropped, so a limit can never
+# describe more media than exists.
+short = FakeInfo(duration_s=20.0)
+check("snapped down stays a limit", _effective_time_limit(short, 19) == 18.0)
+check("request at clip length snaps to the last segment",
+      _effective_time_limit(short, 20) == 18.0)
+check("request that snaps up past the clip is not a limit",
+      _effective_time_limit(short, 21) is None)  # 21 -> 24 > 20
+check("limit past clip length is not a limit", _effective_time_limit(short, 99) is None)
+# Half-segment requests round UP (floor(x+0.5)), matching Go's math.Round rather
+# than Python's banker's round() — which would give 12 here.
+check("half rounds away from zero, like Go", _effective_time_limit(info, 15) == 18.0)
+check("snapped past the clip is not a limit", _effective_time_limit(short, 22) is None)
+check("no limit", _effective_time_limit(short, None) is None)
+check("zero is no limit", _effective_time_limit(short, 0) is None)
+check("negative is no limit", _effective_time_limit(short, -5) is None)
 
 # --- the plan is built against the truncated length --------------------------
-check("clamped", _apply_time_limit(info, 10).duration_s == 10.0)
-check("unclamped without a limit", _apply_time_limit(info, None).duration_s == 20.0)
+check("clamped", _apply_time_limit(short, 12).duration_s == 12.0)
+check("unclamped without a limit", _apply_time_limit(short, None).duration_s == 20.0)
 # An over-length limit must not stretch the plan past the media.
-check("never stretches", _apply_time_limit(info, 99).duration_s == 20.0)
+check("never stretches", _apply_time_limit(short, 99).duration_s == 20.0)
 
 # --- the plan-vs-media rule --------------------------------------------------
 # Mirrors cli_phase's check. Under a limit the plan is a deliberate PREFIX: `-t`

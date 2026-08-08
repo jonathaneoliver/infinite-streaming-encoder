@@ -3211,6 +3211,18 @@ func (cfg *JobConfig) outputCodecDir(filename, codec string) string {
 // entry. The history line used to be written from the raw string while nothing
 // else read it at all, which is how a full-length encode came to record a time
 // limit it never had.
+// The limit is SNAPPED to the nearest whole segment. A limit that isn't a
+// segment multiple ends the clip mid-segment, and a partial segment is the one
+// thing every consumer downstream handles differently: the packager writes a
+// runt final segment, chunk boundaries have to align to segments so the plan
+// can't end where the media does, and a comparison run against a differently
+// limited encode is no longer comparing equal spans. Snapping costs at most
+// half a segment of content and removes all of that.
+//
+// Nearest, not floor — "as close as it can be" to what was asked — with a floor
+// of one segment, so a 2s request on 6s segments yields one segment rather than
+// zero. Callers still drop a snapped limit that reaches the clip length; that
+// rule lives with the clip duration, which this doesn't have.
 func (cfg *JobConfig) TimeLimitSeconds() (float64, bool) {
 	s := strings.TrimSpace(cfg.Time)
 	if s == "" {
@@ -3220,7 +3232,30 @@ func (cfg *JobConfig) TimeLimitSeconds() (float64, bool) {
 	if err != nil || v <= 0 {
 		return 0, false
 	}
-	return v, true
+	return snapToSegment(v, cfg.effectiveSegmentSeconds()), true
+}
+
+// effectiveSegmentSeconds is the job's resolved segment duration. resolveTimings
+// fills SegmentDuration from the ladder (then the global default) before either
+// target dispatches, so by the time anything asks for the time limit this is the
+// value the encode will actually segment with.
+func (cfg *JobConfig) effectiveSegmentSeconds() float64 {
+	if v, err := strconv.ParseFloat(cfg.SegmentDuration, 64); err == nil && v > 0 {
+		return v
+	}
+	return 6
+}
+
+// snapToSegment rounds secs to the nearest positive multiple of segS.
+func snapToSegment(secs, segS float64) float64 {
+	if segS <= 0 {
+		return secs
+	}
+	n := math.Round(secs / segS)
+	if n < 1 {
+		n = 1
+	}
+	return n * segS
 }
 
 // BurninEnabled reports whether the text overlay should be burnt in. Default is
@@ -4086,7 +4121,9 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	// A duration limit (#184) truncates the mezzanine, and every variant, chunk
 	// and the audio are cut from that — so the clip IS shorter, and the chunk
 	// plan, the priority scores and the cost estimate must all describe the
-	// shorter one. Clamping the single duration they share is the whole change;
+	// shorter one. timeLimitS arrives already snapped to a whole segment by
+	// TimeLimitSeconds; planChunks below aligns boundaries to segments, so a
+	// limit that wasn't a segment multiple could not end where the media does. Clamping the single duration they share is the whole change;
 	// planChunks below then simply plans fewer chunks. A limit at or above the
 	// clip is not a limit (matching cli_local_dist's rule).
 	if timeLimitS > 0 && timeLimitS < clipDurationS {

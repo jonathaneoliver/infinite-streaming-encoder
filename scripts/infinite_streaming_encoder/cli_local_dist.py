@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import os
 import re
 import signal
@@ -202,10 +203,40 @@ def _apply_time_limit(info, time_limit_s: float | None):
 def _effective_time_limit(info, time_limit_s: float | None) -> float | None:
     """The limit that will actually be applied, or None. Mirrors
     _apply_time_limit's "at or above the clip is not a limit" rule so the cache
-    key and the mezzanine env agree with the plan."""
-    if not time_limit_s or time_limit_s <= 0 or time_limit_s >= info.duration_s:
+    key and the mezzanine env agree with the plan.
+
+    SNAPPED to the nearest whole segment first, because a limit that isn't a
+    segment multiple ends the clip mid-segment: chunk boundaries must land on
+    segments, so the plan could not end where the media does. Snapped against
+    _SEGMENT_DURATION_S specifically — the value plan_chunks below is given — so
+    this path stays self-consistent whatever the caller sent. The Go control
+    plane snaps too, against the job's ladder-resolved segment duration, and this
+    is idempotent on an already-snapped value; running cli_local_dist by hand
+    gets the same treatment.
+
+    Snap BEFORE the clip-length test, so a request that rounds up past the clip
+    correctly becomes "no limit" rather than a limit longer than the media."""
+    if not time_limit_s or time_limit_s <= 0:
         return None
-    return float(time_limit_s)
+    snapped = _snap_to_segment(float(time_limit_s), _SEGMENT_DURATION_S)
+    if snapped >= info.duration_s:
+        return None
+    return snapped
+
+
+def _snap_to_segment(secs: float, seg_s: float) -> float:
+    """Round secs to the nearest positive multiple of seg_s (min one segment).
+
+    floor(x + 0.5), not round(): Python's round() is banker's rounding, so
+    round(2.5) == 2 while Go's math.Round(2.5) == 3. The Go control plane snaps
+    first and this is idempotent on its output, so the two only meet at a
+    half-segment request typed directly at this CLI — but a rule that disagrees
+    with itself across the two languages is exactly the kind of thing that gets
+    found months later, in a comparison run that quietly wasn't comparing equal
+    spans."""
+    if seg_s <= 0:
+        return secs
+    return max(1, math.floor(secs / seg_s + 0.5)) * seg_s
 
 
 def _touch_prefix(bucket: str, rel: str) -> None:
@@ -963,10 +994,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chunk-duration", type=float, default=12.0,
                    dest="chunk_duration_s", help="seconds; multiple of segment (6)")
     p.add_argument("--time", type=float, default=None, dest="time_limit_s",
-                   help="encode only the first N seconds (default: whole clip). "
-                        "Applied by truncating the mezzanine, and folded into the "
-                        "mezzanine cache key so a limited run can never serve a "
-                        "truncated mezzanine to a later full encode.")
+                   help="encode only the first N seconds (default: whole clip); "
+                        "SNAPPED to the nearest whole segment, since chunk "
+                        "boundaries must land on segments. Applied by truncating "
+                        "the mezzanine, and folded into the mezzanine cache key so "
+                        "a limited run can never serve a truncated mezzanine to a "
+                        "later full encode.")
     p.add_argument("--encode-threads", type=int, default=0, dest="encode_threads",
                    help="threads/encode → slot sizing (0=2)")
     # MinIO

@@ -206,6 +206,17 @@ ladder's chunk sizing, the cost estimate and the progress totals then describe
 the truncated clip without any of them knowing a limit exists. A limit at or
 above the clip is **not** a limit, on both paths.
 
+**The limit is snapped to the nearest whole segment** (6s by default; the job's
+ladder-resolved `SegmentDuration`). Chunk boundaries must land on segments, so a
+limit that isn't a multiple leaves a plan that cannot end where the media does,
+plus a runt final segment and a comparison run that isn't comparing equal spans.
+`JobConfig.TimeLimitSeconds()` snaps, so the encoder argument, the cache key, the
+cloud plan and the history line all get the snapped value automatically;
+`cli_local_dist` snaps again, idempotently, against the segment duration its own
+`plan_chunks` uses, so running it by hand behaves the same. Both round half
+**away from zero** — Python's `round()` is banker's rounding and would disagree
+with Go's `math.Round` at exactly half a segment.
+
 Two rules that are easy to get wrong:
 
 - **The limit is part of the mezzanine cache key** (`sourceMezzKey` in Go,
