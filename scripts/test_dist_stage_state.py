@@ -183,6 +183,38 @@ def test_promotion_is_emitted_once_not_every_poll() -> None:
         f"running re-announced on the second poll: {again}")
 
 
+def test_temporal_is_the_only_backend() -> None:
+    """Temporal is the only backend, and asking for the removed one must FAIL.
+
+    The `pool` backend was a second implementation of this orchestrator that
+    Temporal replaced and nobody deleted. It survived as the CLI's DEFAULT while
+    the Go server always passed `--backend temporal`, so the path that shipped
+    and the path you got by hand were different — and they drifted (#173 fixed
+    the packaging env on one of them).
+
+    Deleting the code is not enough on its own: `--backend pool` lives in shell
+    histories and in muscle memory. If argparse silently accepted it, or the
+    default reverted, the failure would be a wrong-looking encode rather than an
+    error. So this pins both halves.
+    """
+    p = D.build_parser()
+    base = ["--input", "x.mp4", "--output", "x", "--output-dir", "/tmp",
+            "--s3-bucket", "b", "--job-prefix", "jobs/x"]
+    args = p.parse_args(base)
+    assert args.backend == "temporal", args.backend
+
+    try:
+        p.parse_args(base + ["--backend", "pool"])
+    except SystemExit as e:
+        assert e.code != 0, "--backend pool exited 0"
+    else:
+        raise AssertionError("--backend pool was accepted; it must fail loudly")
+
+    assert not hasattr(D, "run_phase"), "pool helper run_phase survived"
+    assert not hasattr(D, "build_pool"), "pool helper build_pool survived"
+    assert not hasattr(D, "encode_chunks_distributed"), "pool dispatch survived"
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
