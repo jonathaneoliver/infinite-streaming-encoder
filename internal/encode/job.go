@@ -2161,35 +2161,90 @@ func (m *Manager) run(job *Job, startIdx int) {
 	m.notify(job)
 }
 
-// persistSpotSample appends this finished cloud-batch job's spot-vs-on-demand
-// cost and reclaim-waste to a rolling log in TmpDir (host-mounted, survives
-// restarts) so the AWS view can show the accumulated "saved by spot" and the
-// trailing-24h reclaim-waste %. No-op for jobs without cost/reclaim data.
-func (m *Manager) persistSpotSample(job *Job) {
-	if job.EncodeTotalS <= 0 && job.SavedUSD <= 0 {
-		return
-	}
-	type sample struct {
-		Ts          int64   `json:"ts"`
-		LostS       float64 `json:"lost_s"`
-		TotalS      float64 `json:"total_s"`
-		SpotUSD     float64 `json:"spot_usd"`
-		OnDemandUSD float64 `json:"ondemand_usd"`
-		SavedUSD    float64 `json:"saved_usd"`
-	}
-	path := filepath.Join(m.TmpDir, "spot_samples.json")
-	var samples []sample
-	if data, err := os.ReadFile(path); err == nil {
+// RunSample is one finished cloud-batch run's durable cost record, appended to
+// $TMP_DIR/spot_samples.json (host-mounted, so it survives a restart of the
+// server's container).
+//
+// TWO READERS WITH DIFFERENT RULES, which is why the fields are documented here
+// rather than at each use:
+//
+//   - the AWS view's "saved by spot" / trailing-24h reclaim waste, via
+//     inventory.py's _spot_and_reclaim_stats. It reads by NAME and ignores what
+//     it doesn't know, so adding fields is safe — renaming one silently zeroes
+//     that panel.
+//   - projectCloudCost's fleet-idle allowance (#237), via fleetIdleFraction.
+//
+// StartedAt/EndedAt are the run's own span, recorded solely so the idle reader
+// can spot runs that OVERLAPPED. That matters because _emit_machine_rental
+// counts a concurrent run's time on a shared instance as this run's idle — it
+// says so in its own narration — so an overlapping sample reads high for a
+// reason that has nothing to do with how the fleet packs one run.
+type RunSample struct {
+	Ts          int64   `json:"ts"`
+	LostS       float64 `json:"lost_s"`
+	TotalS      float64 `json:"total_s"`
+	SpotUSD     float64 `json:"spot_usd"`
+	OnDemandUSD float64 `json:"ondemand_usd"`
+	SavedUSD    float64 `json:"saved_usd"`
+	// Machine-vs-allocated accounting from the run's FINAL ENCODER-MACHINES
+	// emission (the marker is re-emitted as a run progresses; the parse
+	// overwrites, and this runs once at terminal, so last-write-wins is the
+	// final value by construction).
+	//
+	// IdlePct is a LOWER BOUND on the eventual figure: boxes still alive when
+	// the run ends have their lifetime measured to now, and the scale-down tail
+	// after that is never seen. Erring low is the safe direction here — it
+	// under-corrects an estimate that was already low, rather than inventing
+	// idle that nobody paid for.
+	IdlePct            float64 `json:"idle_pct,omitempty"`
+	MachineVCPUHours   float64 `json:"machine_vcpu_hours,omitempty"`
+	AllocatedVCPUHours float64 `json:"allocated_vcpu_hours,omitempty"`
+	StartedAt          int64   `json:"started_at,omitempty"`
+	EndedAt            int64   `json:"ended_at,omitempty"`
+}
+
+// runSamplesPath is the single definition of the rolling log's location. Shared
+// with fleetIdleFraction; inventory.py holds the Python-side copy (SPOT_LOG).
+func (m *Manager) runSamplesPath() string {
+	return filepath.Join(m.TmpDir, "spot_samples.json")
+}
+
+// readRunSamples loads the rolling log. Absent or corrupt reads as empty — a
+// missing history must degrade to "no measurement", never to a wrong one.
+func (m *Manager) readRunSamples() []RunSample {
+	var samples []RunSample
+	if data, err := os.ReadFile(m.runSamplesPath()); err == nil {
 		_ = json.Unmarshal(data, &samples)
 	}
-	samples = append(samples, sample{
+	return samples
+}
+
+// persistSpotSample appends this finished cloud-batch job's spot-vs-on-demand
+// cost, reclaim-waste and machine-rental accounting to the rolling log. No-op
+// for jobs with none of the three.
+func (m *Manager) persistSpotSample(job *Job) {
+	if job.EncodeTotalS <= 0 && job.SavedUSD <= 0 && job.IdlePct <= 0 {
+		return
+	}
+	var started, ended int64
+	if !job.StartedAt.IsZero() {
+		started = job.StartedAt.Unix()
+	}
+	if job.EndedAt != nil {
+		ended = job.EndedAt.Unix()
+	}
+	samples := append(m.readRunSamples(), RunSample{
 		Ts: time.Now().Unix(), LostS: job.ReclaimLostS, TotalS: job.EncodeTotalS,
 		SpotUSD: job.SpotUSD, OnDemandUSD: job.OnDemandUSD, SavedUSD: job.SavedUSD,
+		IdlePct: job.IdlePct, MachineVCPUHours: job.MachineVCPUHours,
+		AllocatedVCPUHours: job.AllocatedVCPUHours,
+		StartedAt:          started, EndedAt: ended,
 	})
 	if len(samples) > 5000 {
 		samples = samples[len(samples)-5000:]
 	}
 	if data, err := json.MarshalIndent(samples, "", " "); err == nil {
+		path := m.runSamplesPath()
 		tmp := path + ".tmp"
 		if os.WriteFile(tmp, data, 0644) == nil {
 			_ = os.Rename(tmp, path)
