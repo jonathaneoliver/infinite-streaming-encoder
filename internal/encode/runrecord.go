@@ -104,8 +104,16 @@ type RunRecord struct {
 	// RunRecovery) would otherwise marshal `{}` here, and an empty config is a
 	// perfectly valid-looking config — a reader would take defaults for facts,
 	// which is #202 with extra steps.
-	Config     *JobConfig            `json:"config,omitempty"`
-	Phases     []PhaseStat           `json:"phases,omitempty"`
+	Config *JobConfig  `json:"config,omitempty"`
+	Phases []PhaseStat `json:"phases,omitempty"`
+	// Stages is the per-chunk detail behind Phases: which chunk ran when, on
+	// which machine, and whether it was reused from an earlier run. What the
+	// timeline is drawn from, and the reason it survives a restart at all —
+	// this only ever existed in the running Job before.
+	Stages []StageProgress `json:"stages,omitempty"`
+	// FfmpegArgv is the literal command per rung (see Job.FfmpegArgv), narrowed
+	// to this output's codec.
+	FfmpegArgv map[string][]string   `json:"ffmpeg_argv,omitempty"`
 	Cost       *RunCost              `json:"cost,omitempty"`
 	Efficiency *RunEfficiency        `json:"efficiency,omitempty"`
 	Vmaf       map[string]*VmafScore `json:"vmaf,omitempty"`
@@ -247,6 +255,25 @@ func vmafForCodec(vmaf map[string]*VmafScore, codec string) map[string]*VmafScor
 	return out
 }
 
+// argvForCodec narrows the job's recorded ffmpeg commands to one codec's rungs.
+// Keys are "<codec>/<rung>" with an optional " (pass N)" suffix, so the codec
+// prefix is the whole test.
+func argvForCodec(argv map[string][]string, codec string) map[string][]string {
+	if len(argv) == 0 || codec == "" {
+		return nil
+	}
+	out := map[string][]string{}
+	for k, v := range argv {
+		if strings.HasPrefix(k, codec+"/") {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // buildRunRecord assembles one output dir's record from the finished job.
 // Exported behaviour is tested through this rather than the file write, so the
 // attribution rules (which phases, which rungs, which source) are checked
@@ -288,6 +315,7 @@ func buildRunRecord(job *Job, cfg JobConfig, dirName string) RunRecord {
 		ReclaimLostS: job.ReclaimLostS, EncodeTotalS: job.EncodeTotalS,
 	}
 	vmaf := vmafForCodec(job.Vmaf, codec)
+	argv := argvForCodec(job.FfmpegArgv, codec)
 	job.mu.Unlock()
 
 	effCfg := EffectiveConfig(cfg)
@@ -305,6 +333,8 @@ func buildRunRecord(job *Job, cfg JobConfig, dirName string) RunRecord {
 		Rungs:         rungsForCodec(phases, codec),
 		Config:        &effCfg,
 		Phases:        phases,
+		Stages:        job.StagesFor(fileFilter, codec),
+		FfmpegArgv:    argv,
 		Vmaf:          vmaf,
 		BootAMI:       bootAMI,
 	}

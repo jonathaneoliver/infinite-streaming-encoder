@@ -228,6 +228,14 @@ def encode_phase(spec: dict) -> list[str]:
             # history fetch then carries. The cloud path's copy lands in
             # CloudWatch rather than the job log too, so container logs are the
             # symmetric place to diff the two.
+            #
+            # ENCODER-ARGV carries the same text and IS relayed, which is not a
+            # reversal of that: it is emitted once per (codec, rung, pass) per
+            # process rather than once per chunk, so the same 336-chunk run
+            # relays ~12-24 markers instead of 336. The rule being applied is
+            # still "per-chunk argv is too expensive to relay" — see
+            # progress.emit_ffmpeg_argv, which owns the throttle that makes it
+            # true.
             if is_marker(last) or last.startswith("[ffmpeg] "):
                 print(last, flush=True)
             if is_marker(last):

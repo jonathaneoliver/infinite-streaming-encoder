@@ -23,6 +23,7 @@ stream, and emits STAGE markers at a bounded rate.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -271,6 +272,56 @@ def emit_codec_lib(codec: str) -> None:
     m = pat.search((out.stderr or "") + (out.stdout or ""))
     if m:
         emit(f"[[ENCODER-CODECLIB codec={codec} lib={encoder} version={m.group(1)}]]")
+
+
+_ARGV_EMITTED: set[str] = set()
+
+
+def emit_ffmpeg_argv(codec: str, label: str, pass_num: int,
+                     argv: list[str]) -> None:
+    """Report the literal ffmpeg argv that encodes this rung.
+
+    The last unrecorded input to a rendition. encode.json records the profile
+    that IMPLIES the encode — ladder, maxrate %, bufsize multiplier, passes,
+    extra_args, GOP — so reproducing one means re-deriving the invocation from
+    all of those plus the code that assembled them, at the commit that produced
+    the output. #117 captured which ffmpeg and which encoder library ran; this
+    is what they were told to do.
+
+    Not the same thing as the `[ffmpeg] ` line run_ffmpeg_with_progress already
+    prints, and it does not replace it. That line is emitted per INVOCATION and
+    is deliberately never relayed — temporal_worker says why: ~0.5-1.5 KB from
+    every chunk would push hundreds of KB into Temporal workflow history, which
+    every later history fetch then carries. It is a container-log artifact, and
+    container logs are exactly what does not survive to the output dir.
+
+    This is the same text at a different cardinality: once per (codec, rung,
+    pass) per process rather than once per chunk, so a 336-chunk / 12-rung run
+    relays ~12-24 markers instead of 336 — kilobytes, not hundreds. That is what
+    makes it affordable to relay, and it is the whole reason for the throttle.
+    If the throttle is ever removed, that decision has to be revisited with it.
+
+    Base64 of JSON, not a shell string. A filter chain contains spaces, quotes
+    and commas (drawtext alone has all three), and a marker whose parsing
+    depends on quoting rules is a marker that eventually gets parsed wrong. The
+    payload is opaque to every relay between here and the record.
+
+    Once per (codec, rung, pass) per process: a worker encoding 28 chunks of one
+    rung has 28 identical commands but for the input window and output path.
+    Different workers each report, and the control plane keeps the first —
+    cheaper than any cross-worker coordination, and they agree by construction.
+
+    Unclassified on purpose, so telemetry.marker_class defaults it to RECORD and
+    every consumer forwards it without being taught about it.
+    """
+    key = f"{codec}/{label}/{pass_num}"
+    if key in _ARGV_EMITTED:
+        return
+    _ARGV_EMITTED.add(key)
+    blob = base64.b64encode(
+        json.dumps(argv, separators=(",", ":")).encode()).decode()
+    emit(f"[[ENCODER-ARGV codec={codec} label={label} "
+         f"pass={pass_num} argv={blob}]]")
 
 
 def emit_boot_ami() -> None:

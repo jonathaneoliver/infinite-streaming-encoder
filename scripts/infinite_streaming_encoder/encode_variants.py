@@ -24,7 +24,7 @@ from infinite_streaming_encoder.ladder import (
     Rung,
 )
 from infinite_streaming_encoder.progress import (
-    emit_codec_lib, emit_ffmpeg_version, emit_stage,
+    emit_codec_lib, emit_ffmpeg_argv, emit_ffmpeg_version, emit_stage,
     run_ffmpeg_with_progress)
 
 
@@ -394,6 +394,22 @@ def encode_variant(
     else:
         two_pass = ctx.hevc_two_pass and codec == "hevc"
 
+    def cmd_for(pass_num: int | None) -> list[str]:
+        """This pass's argv, recorded before it runs.
+
+        Wrapped rather than emitted at each of the three call sites below so a
+        pass variant added later cannot skip the recording — and the omission
+        would be silent, since a missing argv looks exactly like an older
+        output that never had one.
+        """
+        argv = build_ffmpeg_cmd(ctx, codec, rung, pass_num=pass_num,
+                                chunk=chunk, threads=threads)
+        # 0 means single-pass, NOT "pass 1". A two-pass encode's first pass is a
+        # different command from a single-pass encode of the same rung (it
+        # writes stats and discards its output), so they must not share a key.
+        emit_ffmpeg_argv(codec, rung.label, pass_num or 0, argv)
+        return argv
+
     try:
         if two_pass:
             # Pass 1 profiles complexity into the stats file (output
@@ -406,20 +422,20 @@ def encode_variant(
             # reads as lost work). Pass 1's stats ARE used by pass 2; nothing is
             # discarded except the pass-1 muxed output.
             run_ffmpeg_with_progress(
-                build_ffmpeg_cmd(ctx, codec, rung, pass_num=1, chunk=chunk, threads=threads),
+                cmd_for(1),
                 duration_s=total_duration_s,
                 stage_key=stage_key,
                 pct_lo=0.0, pct_hi=50.0, terminal=False,
             )
             run_ffmpeg_with_progress(
-                build_ffmpeg_cmd(ctx, codec, rung, pass_num=2, chunk=chunk, threads=threads),
+                cmd_for(2),
                 duration_s=total_duration_s,
                 stage_key=stage_key,
                 pct_lo=50.0, pct_hi=100.0,
             )
         else:
             run_ffmpeg_with_progress(
-                build_ffmpeg_cmd(ctx, codec, rung, chunk=chunk, threads=threads),
+                cmd_for(None),
                 duration_s=total_duration_s,
                 stage_key=stage_key,
             )

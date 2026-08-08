@@ -2592,6 +2592,8 @@ function renderRunPanel(run) {
     if (run.cost) html += `<div style="font-size:12px;color:#aab;margin:2px 0 8px">cost ${_runCostHtml(run.cost)}</div>`;
     html += _runEfficiencyHtml(run.efficiency);
     html += _runPhaseTable(run.phases);
+    html += _runTimeline(run);
+    html += _runArgvBlock(run.ffmpeg_argv, run.rungs);
     html += _runConfigBlock(run.config);
     return html + '</div>';
 }
@@ -2698,6 +2700,176 @@ function _runEfficiencyHtml(e) {
     if (e.local_wall_s > 0 && !e.cpu_vcpu_h) parts.push(`${_runSecs(e.local_wall_s)} predicted local wall`);
     if (!parts.length) return '';
     return `<div style="font-size:12px;color:#aab;margin:2px 0 8px">${parts.join(' · ')}</div>`;
+}
+
+// Chunk timeline: which chunk ran when, and on what.
+//
+// The phase table above says a rung took 46 minutes. This says whether that was
+// one long chunk or twenty-eight staggered ones, where the gaps were, and which
+// box was carrying the tail — the question you actually open a slow run to ask.
+//
+// Deliberately NOT _fleetLanesHtml. That one is framed around billing (rentals,
+// launch-to-termination, vCPU-h, "still on") and reads live fleet state; this is
+// a finished run being replayed from its own record. Threading a synthetic job
+// through the billing renderer to get lanes would put the live Jobs/AWS panels
+// at risk for no gain.
+//
+// Colour encodes the RUNG, and rung is a magnitude (height) rather than an
+// identity — so it is one hue light-to-dark, not twelve cycled hues. On a dark
+// surface brighter reads as more, so the tallest rung is the brightest. Every
+// step clears 3:1 against the panel and the ramp is monotonic in lightness.
+const _RUNG_RAMP = ['#3d80b8', '#4a93c9', '#57a6da', '#66b9e8', '#7dcbf3', '#9fe0ff'];
+// Reused chunks are a STATE, not another rung, so they get a reserved neutral
+// plus a stripe — never a step of the ramp, which would read as a rung.
+const _REUSED_FILL = '#5b6373';
+
+function _rungOf(key) {
+    const parts = (key || '').split(':');
+    return parts[0] === 'encode' && parts.length >= 3 ? parts[2] : '';
+}
+
+function _runTimeline(run) {
+    const stages = (run.stages || []).filter(s => s.started_at && s.ended_at);
+    if (stages.length < 2) return '';
+    const t = s => new Date(s).getTime();
+    const t0 = Math.min(...stages.map(s => t(s.started_at)));
+    const t1 = Math.max(...stages.map(s => t(s.ended_at)));
+    const span = t1 - t0;
+    if (span <= 0) return '';
+
+    // Rungs ordered tallest-first so the ramp maps onto real magnitude; the
+    // ordering is by height, not by first-seen, or colour would follow
+    // scheduling order instead of the thing it encodes.
+    const rungs = [...new Set(stages.map(s => _rungOf(s.key)).filter(Boolean))]
+        .sort((a, b) => (parseInt(b) || 0) - (parseInt(a) || 0));
+    const fillFor = r => {
+        const i = rungs.indexOf(r);
+        if (i < 0 || rungs.length === 0) return _RUNG_RAMP[0];
+        // Tallest -> brightest. Interpolating onto the ramp rather than cycling
+        // means a 14-rung ladder and a 3-rung one both read correctly.
+        const f = rungs.length === 1 ? 1 : 1 - (i / (rungs.length - 1));
+        return _RUNG_RAMP[Math.round(f * (_RUNG_RAMP.length - 1))];
+    };
+
+    // Group by machine when the run recorded one (cloud, and local-dist with
+    // more than one box); by rung otherwise, which is the only grouping a
+    // single-box run can support.
+    const byMachine = stages.some(s => s.instance);
+    const lanes = new Map();
+    for (const s of stages) {
+        const lane = byMachine ? (s.instance || 'unplaced') : (_rungOf(s.key) || 'other');
+        if (!lanes.has(lane)) lanes.set(lane, []);
+        lanes.get(lane).push(s);
+    }
+    const laneNames = [...lanes.keys()].sort((a, b) => byMachine
+        ? a.localeCompare(b)
+        : (parseInt(b) || 0) - (parseInt(a) || 0));
+
+    const pos = ms => ((ms - t0) / span) * 100;
+    const rows = laneNames.map(name => {
+        const busy = lanes.get(name).reduce((n, s) => n + (t(s.ended_at) - t(s.started_at)), 0);
+        const bars = lanes.get(name).map(s => {
+            const a = t(s.started_at), b = t(s.ended_at);
+            const w = ((b - a) / span) * 100;
+            const rung = _rungOf(s.key);
+            const fill = s.reused ? _REUSED_FILL : fillFor(rung);
+            // 2px surface gap so adjacent chunks in a lane stay countable
+            // instead of fusing into one block.
+            const stripe = s.reused
+                ? 'background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.14) 0 3px,transparent 3px 6px);'
+                : '';
+            return `<div style="position:absolute;left:${pos(a)}%;width:${Math.max(w, 0.4)}%;top:0;bottom:0;`
+                + `background:${fill};${stripe}border-radius:2px;box-shadow:0 0 0 1px #181826"`
+                + ` title="${escapeAttr(`${s.key}${s.reused ? ' (reused from an earlier run — not re-encoded)' : ''}\n`
+                    + `+${_runSecs((a - t0) / 1000)} for ${_runSecs((b - a) / 1000)}`
+                    + (s.instance ? `\non ${s.instance}` : ''))}"></div>`;
+        }).join('');
+        return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:3px">
+            <div style="width:150px;flex:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:#9aa3b0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeAttr(name)}">${escapeHtml(name)}</div>
+            <div style="position:relative;flex:1;height:14px;background:#12121c;border-radius:3px">${bars}</div>
+            <div style="width:64px;flex:none;text-align:right;font-size:10.5px;color:#6f7887;font-variant-numeric:tabular-nums">${_runSecs(busy / 1000)}</div>
+        </div>`;
+    }).join('');
+
+    // The ramp is a scale, so it is labelled at its ends rather than given a
+    // swatch per rung — and every bar names its rung in the tooltip, so identity
+    // never rests on colour alone.
+    const legend = rungs.length > 1
+        ? `<span style="display:inline-flex;align-items:center;gap:5px">
+             <span style="color:#6f7887">${escapeHtml(rungs[rungs.length - 1])}</span>
+             <span style="display:inline-block;width:56px;height:9px;border-radius:2px;background:linear-gradient(90deg,${_RUNG_RAMP[0]},${_RUNG_RAMP[_RUNG_RAMP.length - 1]})"></span>
+             <span style="color:#6f7887">${escapeHtml(rungs[0])}</span>
+           </span>` : '';
+    const reusedN = stages.filter(s => s.reused).length;
+    const reusedKey = reusedN
+        ? `<span style="display:inline-flex;align-items:center;gap:5px"><i style="width:11px;height:11px;border-radius:2px;background:${_REUSED_FILL};background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.14) 0 3px,transparent 3px 6px)"></i>${reusedN} reused</span>`
+        : '';
+    const ticks = [0, .25, .5, .75, 1].map(f =>
+        `<div style="position:absolute;left:${f * 100}%;transform:translateX(${f === 0 ? '0' : f === 1 ? '-100%' : '-50%'});color:#6f7887;font-size:10px;font-variant-numeric:tabular-nums">${_runSecs(span * f / 1000)}</div>`).join('');
+
+    return `<div style="margin-top:14px;border-top:1px solid #2a2a3a;padding-top:10px">
+        <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+            <div style="font-size:12px;color:#ccc;font-weight:600">Chunk timeline</div>
+            <div style="font-size:11px;color:#7f8899">${stages.length} stages over ${_runSecs(span / 1000)}, ${byMachine ? 'by machine' : 'by rung'} — colour is the rung</div>
+            <div style="margin-left:auto;display:flex;gap:12px;font-size:10.5px;color:#8a94a2;align-items:center">${legend}${reusedKey}</div>
+        </div>
+        ${rows}
+        <div style="display:flex;gap:8px;margin-top:2px">
+            <div style="width:150px;flex:none"></div>
+            <div style="position:relative;flex:1;height:13px">${ticks}</div>
+            <div style="width:64px;flex:none"></div>
+        </div>
+    </div>`;
+}
+
+// The literal ffmpeg command per rung.
+//
+// The last unrecorded input to a rendition: encode.json records the profile that
+// IMPLIES the encode — ladder, maxrate %, bufsize, passes, extra_args, GOP — so
+// without this, reproducing one means re-deriving the invocation from all of
+// those plus the code that assembled them, at the commit that made the output.
+// #117 captured which ffmpeg and which library ran; this is what they were told
+// to do.
+function _runArgvBlock(argv, rungs) {
+    if (!argv || !Object.keys(argv).length) return '';
+    // Tallest rung first, and a rung's passes adjacent, so the list reads in the
+    // same order as the ladder table above it.
+    const keys = Object.keys(argv).sort((a, b) => {
+        const h = k => parseInt((k.split('/')[1] || '')) || 0;
+        return h(b) - h(a) || a.localeCompare(b);
+    });
+    const body = keys.map(k => `<div style="margin:8px 0 0">
+        <div style="font-size:11px;color:#8cf;font-family:ui-monospace,SFMono-Regular,Menlo,monospace">${escapeHtml(k)}</div>
+        <pre style="background:#12121c;border:1px solid #2a2a3a;border-radius:6px;padding:8px;overflow-x:auto;font-size:11px;color:#cfe6f5;margin:3px 0 0;white-space:pre-wrap;word-break:break-all">${escapeHtml(_shellJoin(argv[k]))}</pre>
+    </div>`).join('');
+    // Coverage is stated against the rungs that ACTUALLY ran, because it can
+    // legitimately be partial and would otherwise look complete. A rung whose
+    // chunks all landed on a worker running an older image emits no marker at
+    // all, so its command is simply absent — measured on a mixed-version farm,
+    // where 2 of 7 rungs ran only on the box that had not been updated. A
+    // deploy closes it; a silent "5 commands" heading would not have shown it.
+    const covered = new Set(keys.map(k => (k.split('/')[1] || '').split(' ')[0]));
+    const total = (rungs || []).length;
+    const missing = total ? (rungs || []).filter(r => !covered.has(r)) : [];
+    const count = missing.length
+        ? `<span style="color:#d0a24a" title="${escapeAttr(
+              'No command was recorded for: ' + missing.join(', ') +
+              '.\nA rung emits this from the worker that encoded it, so a rung whose chunks all ran on a worker running an older image has none. Re-encoding on an updated farm records it.')}"
+           >${covered.size} of ${total} rungs</span>`
+        : `${keys.length}`;
+    return `<details style="margin-top:6px">
+        <summary style="cursor:pointer;font-size:12px;color:#8cf">ffmpeg command per rung (${count})</summary>
+        ${body}
+    </details>`;
+}
+
+// Display-only quoting. The record holds an argv ARRAY — which is what actually
+// ran and what a re-run should use — so this exists to make it readable, not to
+// be pasted back in as gospel.
+function _shellJoin(argv) {
+    return (argv || []).map(a =>
+        /^[A-Za-z0-9_@%+=:,./-]+$/.test(a) ? a : "'" + String(a).replace(/'/g, `'\\''`) + "'"
+    ).join(' ');
 }
 
 // The complete submitted config, verbatim, as the body that would resubmit this
