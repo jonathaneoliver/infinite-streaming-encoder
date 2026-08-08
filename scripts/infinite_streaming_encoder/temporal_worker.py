@@ -95,11 +95,19 @@ _PERF_CORES = 0
 # one added — no error, an encode that passes, telemetry that is quietly a
 # subset. Reporting it is what makes that visible instead of inferable.
 #
-# IMAGE_TAG (content hash), not GIT_SHA: two boxes on the same IMAGE_TAG behave
-# identically even when HEAD moved for doc-only commits, so it is the tag that
-# answers "will these two emit the same markers". "unknown" when the image
-# predates the ENV stamps in the Dockerfile — which is itself the signal that
-# the box is running something old.
+# IMAGE_TAG, not GIT_SHA: two boxes on the same IMAGE_TAG run the same encoder
+# payload even when HEAD moved for commits that changed no shipped code, so it
+# is the tag that answers "will these two emit the same markers". "unknown" when
+# the image predates the ENV stamps in the Dockerfile — which is itself the
+# signal that the box is running something old.
+#
+# It answers "which ENCODER PAYLOAD", not "which build". The Makefile derives it
+# over Dockerfile/requirements.txt/scripts/static, excluding internal/ and cmd/,
+# so a Go-only change does not move it and is invisible here BY CONSTRUCTION.
+# That is deliberate — a chunk's encode behaviour lives in scripts/, and this
+# value exists to explain a chunk's telemetry — but it means a server-side skew
+# is not something this can ever surface. See the Dockerfile note for the bound
+# that does matter (rollback restores the payload, not the binary).
 _VERSION = os.environ.get("ENCODER_IMAGE_TAG") or "unknown"
 _CPU_LOCK = threading.Lock()
 _CPU_PREV = {"t": 0.0, "total": 0, "idle": 0, "busy": 0.0}

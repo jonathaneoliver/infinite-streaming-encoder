@@ -1186,9 +1186,17 @@ type StageProgress struct {
 	// stage's Batch job ran on — set from ENCODER-HOST, used by the UI to
 	// colour the chunk plot by instance. Empty until the job is placed.
 	Instance string `json:"instance,omitempty"`
-	// Version is the BUILD that machine was running (the image's content hash),
-	// also from ENCODER-HOST. Instance answers "where did this chunk run";
-	// without this, nothing answers "running what" (#248).
+	// Version is the ENCODER PAYLOAD that machine was running, also from
+	// ENCODER-HOST. Instance answers "where did this chunk run"; without this,
+	// nothing answers "running what" (#248).
+	//
+	// Payload, not build — the distinction matters when reading a run.json.
+	// It is the image's IMAGE_TAG, which the Makefile derives over
+	// Dockerfile/requirements.txt/scripts/static and NOT over internal/ or
+	// cmd/. So two chunks agreeing here ran identical encoder code, which is
+	// the question this field exists to answer; they may still have run under
+	// different server binaries, and this will never say so. Chasing a skew it
+	// declines to show is chasing something it was never measuring.
 	//
 	// This is the durable half, and it is why the field lives on the stage
 	// rather than only on the live fleet view: `RunRecord.Stages` persists it
