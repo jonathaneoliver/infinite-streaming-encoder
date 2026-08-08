@@ -2491,12 +2491,17 @@ function renderResBadges(d) {
 
 async function loadOutputDetail(name) {
     try {
-        const [filesRes, ladderRes] = await Promise.all([
+        const [filesRes, ladderRes, runRes] = await Promise.all([
             fetch('/api/outputs/' + encodeURIComponent(name)),
             fetch('/api/outputs/' + encodeURIComponent(name) + '/ladder'),
+            // run.json — 404 for every output encoded before it shipped, which
+            // is the normal case, not a failure. Fetched here rather than by a
+            // poller: the detail view is opened, not watched (#228).
+            fetch('/api/outputs/' + encodeURIComponent(name) + '/run'),
         ]);
         const files = await filesRes.json();
         const ladder = ladderRes.ok ? await ladderRes.json() : null;
+        const run = runRes.ok ? await runRes.json() : null;
         const list = document.getElementById('outputs-list');
 
         document.getElementById('outputs-header').innerHTML = `
@@ -2509,7 +2514,7 @@ async function loadOutputDetail(name) {
             return;
         }
 
-        list.innerHTML = renderLadderTable(ladder) + files.map(f => `
+        list.innerHTML = renderLadderTable(ladder) + renderRunPanel(run) + files.map(f => `
             <div class="output-file">
                 <span class="output-file-icon">${f.dir ? '&#128193;' : '&#128196;'}</span>
                 <span class="output-file-name">${escapeHtml(f.name)}</span>
@@ -2519,6 +2524,166 @@ async function loadOutputDetail(name) {
     } catch (e) {
         document.getElementById('outputs-list').innerHTML = '<div class="no-files">Failed to load directory</div>';
     }
+}
+
+// The run panel: what RUN made this output, from its run.json sidecar.
+//
+// The ladder table above it describes the ARTIFACT and is re-derivable from the
+// files on disk at any time. Nothing here is. Stage timings, cost and the
+// submitted config live in the in-memory Job, and Reconcile rebuilds only
+// ACTIVE jobs — so before the sidecar existed, a server restart left the raw
+// text log as the sole trace of how an output came to be, keyed by a job id
+// nothing in the Outputs tab could look up.
+//
+// Absent run.json (every output encoded before it shipped) renders nothing at
+// all, exactly as this view did before — same contract as a missing encode.json.
+function renderRunPanel(run) {
+    if (!run) return '';
+    const st = run.status || 'unknown';
+    const stColour = st === 'done' ? '#3aa76d' : st === 'failed' ? '#d9534f' : '#e9c46a';
+    const bits = [];
+    if (run.target) bits.push(escapeHtml(run.target));
+    if (run.wall_s > 0) bits.push(_runSecs(run.wall_s) + ' wall');
+    if (run.started_at) bits.push(new Date(run.started_at).toLocaleString());
+    // The rungs that ACTUALLY ran, not the ladder's. Ladders are editable
+    // through the API after the fact and Max/MinRes narrow them per job, so the
+    // profile name above is not an answer to "what did this encode produce".
+    if (run.rungs && run.rungs.length) {
+        bits.push(`${run.rungs.length} rungs: ${run.rungs.map(escapeHtml).join(', ')}`);
+    }
+    if (run.boot_ami) bits.push('AMI ' + escapeHtml(run.boot_ami));
+    // The record summarises the log, it doesn't replace it — everything not
+    // rolled up here is still in that file, so always offer the way through.
+    const log = run.log_file
+        ? ` · <a href="/logs/${encodeURIComponent(run.log_file)}" target="_blank" style="color:#8cf">job log</a>`
+        : '';
+
+    let html = `<div class="ladder-panel">
+        <div class="ladder-title">Encode run — <span style="color:${stColour}">${escapeHtml(st)}</span></div>
+        <div style="font-size:12px;color:#aab;margin:2px 0 8px">
+            ${bits.join(' · ')}
+            <span style="color:#889"> · job ${escapeHtml(run.job_id || '?')}</span>${log}
+        </div>`;
+    if (run.error) {
+        html += `<div style="font-size:12px;color:#d9534f;margin:2px 0 8px">${escapeHtml(run.error)}</div>`;
+    }
+    if (run.cost) html += `<div style="font-size:12px;color:#aab;margin:2px 0 8px">cost ${_runCostHtml(run.cost)}</div>`;
+    html += _runEfficiencyHtml(run.efficiency);
+    html += _runPhaseTable(run.phases);
+    html += _runConfigBlock(run.config);
+    return html + '</div>';
+}
+
+function _runSecs(s) {
+    if (!s || s < 1) return (s || 0).toFixed(1) + 's';
+    if (s < 90) return s.toFixed(s < 10 ? 1 : 0) + 's';
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ${Math.round(s % 60)}s`;
+    return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+// Phase rollup. Three different times, because they answer different questions
+// and get conflated constantly:
+//
+//   span     first start -> last end, so parallel chunks count ONCE. "How long
+//            did this phase take."
+//   Σ job    sum of per-stage wall clock — includes container start, the
+//            mezzanine fetch, the upload.
+//   Σ worker the worker's own timer over the same phases. The gap against Σ job
+//            is precisely the non-encoding overhead.
+//
+// cores = Σ cpu / Σ worker: what the phase used against what it reserved.
+function _runPhaseTable(phases) {
+    if (!phases || !phases.length) return '';
+    const rows = phases.map(p => {
+        const num = v => v > 0 ? v : null;
+        return `<tr>
+            <td class="ladder-res">${escapeHtml(p.phase)}${p.shared
+                ? ` <span style="color:#776" title="Served every codec in this run (the mezzanine, the audio extract, the source upload). It is counted in each output's record, so two sibling outputs' phase times do not sum to the run.">shared</span>` : ''}</td>
+            <td class="ladder-num">${p.n || 1}</td>
+            <td class="ladder-num">${num(p.span_s) ? _runSecs(p.span_s) : '—'}</td>
+            <td class="ladder-num">${num(p.job_wall_s) ? _runSecs(p.job_wall_s) : '—'}</td>
+            <td class="ladder-num">${num(p.worker_s) ? _runSecs(p.worker_s) : '—'}</td>
+            <td class="ladder-num">${num(p.cpu_s) ? _runSecs(p.cpu_s) : '—'}</td>
+            <td class="ladder-num">${num(p.cores) ? p.cores.toFixed(2) : '—'}</td>
+            <td class="ladder-num">${num(p.peak_mib) ? Math.round(p.peak_mib) : '—'}</td>
+        </tr>`;
+    }).join('');
+    const totCpu = phases.reduce((a, p) => a + (p.cpu_s || 0), 0);
+    const totWork = phases.reduce((a, p) => a + (p.worker_s || 0), 0);
+    const total = totWork > 0 ? `<tr>
+            <td class="ladder-res"><b>total</b></td><td></td><td></td><td></td>
+            <td class="ladder-num">${_runSecs(totWork)}</td>
+            <td class="ladder-num">${_runSecs(totCpu)}</td>
+            <td class="ladder-num">${(totCpu / totWork).toFixed(2)}</td><td></td>
+        </tr>` : '';
+    return `<div style="overflow-x:auto">
+        <table class="ladder-table">
+            <thead><tr>
+                <th>Phase</th>
+                <th class="num" title="chunks collapsed into this row">n</th>
+                <th class="num" title="first start to last end — parallel chunks count once">span</th>
+                <th class="num" title="sum of per-stage wall clock, including container start, mezzanine fetch and upload">&Sigma; job</th>
+                <th class="num" title="the worker's own timer over the same phases; the gap against the job wall is non-encoding overhead">&Sigma; worker</th>
+                <th class="num" title="getrusage user+sys">&Sigma; cpu</th>
+                <th class="num" title="cpu / worker — cores actually used against cores reserved">cores</th>
+                <th class="num" title="peak RSS, MiB">peak MiB</th>
+            </tr></thead>
+            <tbody>${rows}${total}</tbody>
+        </table>
+    </div>`;
+}
+
+function _runEfficiencyHtml(e) {
+    if (!e) return '';
+    const parts = [];
+    if (e.cpu_vcpu_h > 0) parts.push(`${e.cpu_vcpu_h.toFixed(2)} vCPU-h`);
+    if (e.encode_wall_s > 0) parts.push(`${_runSecs(e.encode_wall_s)} encode span`);
+    if (e.avg_concurrency > 0) parts.push(`${e.avg_concurrency.toFixed(1)} avg vCPUs busy`);
+    if (e.efficiency_pct > 0) parts.push(`${e.efficiency_pct.toFixed(0)}% of the fleet ceiling`);
+    if (e.instances > 0) parts.push(`${e.instances} instances`);
+    if (e.job_count > 0) parts.push(`${e.job_count} batch jobs`);
+    // The makespan floor: no amount of fan-out finishes the run sooner than its
+    // single longest chunk.
+    if (e.slowest_job_s > 0) {
+        parts.push(`<span title="The makespan floor — the run cannot finish faster than its longest single chunk, however wide the fan-out.">slowest chunk ${_runSecs(e.slowest_job_s)}${e.slowest_job ? ' (' + escapeHtml(e.slowest_job) + ')' : ''}</span>`);
+    }
+    if (e.reclaim_count > 0 && e.encode_total_s > 0) {
+        parts.push(`<span style="color:#e9c46a" title="Encode wall-seconds thrown away by spot reclaims and re-run.">${e.reclaim_count} reclaimed, ${(100 * e.reclaim_lost_s / e.encode_total_s).toFixed(0)}% of encoding lost</span>`);
+    }
+    if (e.local_wall_s > 0 && !e.cpu_vcpu_h) parts.push(`${_runSecs(e.local_wall_s)} predicted local wall`);
+    if (!parts.length) return '';
+    return `<div style="font-size:12px;color:#aab;margin:2px 0 8px">${parts.join(' · ')}</div>`;
+}
+
+// The complete submitted config, verbatim, as the body that would resubmit this
+// encode through POST /api/encode.
+//
+// Whole-config rather than a curated summary because a curated summary is what
+// failed: #202 was a rerun rebuilt from a record that silently used the default
+// ladder, and the very next rerun — after the ladder line was added — silently
+// used dynamic chunking instead of the fixed 12s, cutting 41 chunks where the
+// run being reproduced cut 336. Two different fields, one root cause: the record
+// was a subset, and nothing made the omission visible.
+function _runConfigBlock(cfg) {
+    if (!cfg) return '';
+    return `<details style="margin-top:6px">
+        <summary style="cursor:pointer;font-size:12px;color:#8cf">Full config (POST /api/encode)</summary>
+        <div style="margin:6px 0">
+            <button class="btn-select" onclick="_copyRunConfig(this)">Copy JSON</button>
+        </div>
+        <pre style="background:#12121c;border:1px solid #2a2a3a;border-radius:6px;padding:10px;overflow-x:auto;font-size:11px;color:#cfe6f5;margin:0">${escapeHtml(JSON.stringify(cfg, null, 2))}</pre>
+    </details>`;
+}
+
+// Reads the rendered block rather than closing over the object, so what lands
+// on the clipboard is exactly what is on screen.
+function _copyRunConfig(btn) {
+    const pre = btn.closest('details').querySelector('pre');
+    navigator.clipboard.writeText(pre.textContent).then(() => {
+        btn.textContent = 'Copied';
+        setTimeout(() => { btn.textContent = 'Copy JSON'; }, 1500);
+    }, () => { btn.textContent = 'Copy failed'; });
 }
 
 // A VMAF score is only interpretable alongside the burn-in state of the encode

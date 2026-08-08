@@ -89,13 +89,21 @@ type metaRung struct {
 }
 
 // writeEncodeMetaForDirs writes encode.json + a one-line manifest comment into
-// each just-moved output dir. Best-effort — never fails the job.
+// each just-moved output dir, plus the run record (run.json) describing the run
+// that produced it. Best-effort — never fails the job.
+//
+// Both are written here, before promote, so a promoted copy carries them. They
+// answer different questions and neither subsumes the other: encode.json is
+// about the ARTIFACT (the profile and properties of these renditions, all of it
+// re-derivable), run.json is about the RUN (config, timings, cost, machines —
+// none of which survives the server process, see RunRecordFile).
 func (m *Manager) writeEncodeMetaForDirs(job *Job, dirs []string) {
 	for _, name := range dirs {
 		if IsDatedBackup(name) || strings.HasPrefix(name, ".") {
 			continue
 		}
 		m.writeEncodeMeta(name, job.Config, job.Vmaf, job)
+		m.writeRunRecord(name, job.Config, job)
 	}
 }
 
@@ -174,22 +182,9 @@ func vmafStateFor(cfg JobConfig, hasScores bool) string {
 // default. Size+mtime, not a content hash: this runs on every encode and sources
 // reach multi-GB, but a swapped/edited source still changes one of the two.
 func (m *Manager) sourceFingerprint(cfg JobConfig, dirName string) (int64, string) {
-	var src string
-	switch len(cfg.Files) {
-	case 0:
+	src := sourceForDir(cfg, dirName)
+	if src == "" {
 		return 0, ""
-	case 1:
-		src = cfg.Files[0]
-	default:
-		for _, f := range cfg.Files {
-			if strings.HasPrefix(dirName, cfg.OutputStem(filepath.Base(f))) {
-				src = f
-				break
-			}
-		}
-		if src == "" {
-			return 0, ""
-		}
 	}
 	// A source is always a plain name resolved WITHIN SourceDir (the encoder joins
 	// it the same way). Reject an absolute path or any "../" traversal so a crafted

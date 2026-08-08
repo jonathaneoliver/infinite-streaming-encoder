@@ -2429,24 +2429,17 @@ func (m *Manager) writeHistory(job *Job) {
 // Marshalling JobConfig itself inverts that. A new option is recorded from the
 // day the field lands rather than the day someone notices a rerun didn't match.
 //
-// Three fields are resolved to their effective values first, because for them an
-// absent value does not mean "no value" — it means a default applied elsewhere
-// (DefaultLadderName, "dynamic", burn-in on). Recording them raw would leave the
-// reader deducing the default from code, which is the thing that went wrong.
-// Every other omitempty field is honestly absent-means-default.
+// Three fields are resolved to their effective values first (EffectiveConfig),
+// because for them an absent value does not mean "no value" — it means a default
+// applied elsewhere (DefaultLadderName, "dynamic", burn-in on). Recording them
+// raw would leave the reader deducing the default from code, which is the thing
+// that went wrong. Every other omitempty field is honestly absent-means-default.
+//
+// The resolution lives in EffectiveConfig, not here, because the per-output
+// run.json records the same config: two copies of the same run's settings that
+// resolve defaults differently would reintroduce #202 between themselves.
 func writeConfigBlock(f *os.File, cfg JobConfig) {
-	cfg.Ladder = EffectiveLadder(cfg)
-	// "" -> "dynamic" only. NOT chunkModeLabel, which renders a fixed size as
-	// "12s" — a display string that fails ParseFloat on the way back in and
-	// silently becomes the 30s default. The block has to round-trip, so every
-	// value written here must be one variantChunkSeconds accepts.
-	if cfg.ChunkDuration == "" {
-		cfg.ChunkDuration = "dynamic"
-	}
-	burnin := cfg.BurninEnabled()
-	cfg.Burnin = &burnin
-
-	body, err := json.MarshalIndent(cfg, "", "  ")
+	body, err := json.MarshalIndent(EffectiveConfig(cfg), "", "  ")
 	if err != nil {
 		// Never fail the history entry over its appendix; the prose above is
 		// still the record, and a marshal error here is worth saying out loud.
@@ -2530,21 +2523,52 @@ type PhaseStat struct {
 	CPUS     float64 `json:"cpu_s,omitempty"`
 	Cores    float64 `json:"cores,omitempty"`
 	PeakMiB  float64 `json:"peak_mib,omitempty"`
+	// Shared marks a phase that served every codec in the job (the mezzanine,
+	// the audio extract, the source upload) and so appears in each output dir's
+	// record. Flagged rather than dropped or silently attributed: dropping it
+	// loses time that was really spent, and attributing it makes two dirs'
+	// records sum to more than the run. The reader needs to know which it is.
+	Shared bool `json:"shared,omitempty"`
 }
 
-// PhaseRollup aggregates the job's stages by phase, collapsing a rung's chunks
-// into one row. Shared by the on-disk timing summary and the per-output stats
-// sidecar so the two can never disagree.
-func (j *Job) PhaseRollup() []PhaseStat {
+// PhaseRollup aggregates the whole job's stages by phase, collapsing a rung's
+// chunks into one row.
+func (j *Job) PhaseRollup() []PhaseStat { return j.PhaseRollupFor("", "") }
+
+// PhaseRollupFor is PhaseRollup narrowed to one source file and one codec, for
+// the per-output run record: a job that encoded h264 and hevc wrote two dirs,
+// and each must account for its own encode time only.
+//
+// Both filters are empty-means-everything. A codec filter keeps the phases with
+// no codec in their key (mezzanine, audio, upload:source) and marks them Shared
+// — they genuinely served this output, they just also served its siblings.
+//
+// Shared by the on-disk timing summary and the per-output run record so the two
+// can never disagree.
+func (j *Job) PhaseRollupFor(file, codec string) []PhaseStat {
 	j.mu.Lock()
 	stages := append([]StageProgress(nil), j.Stages...)
 	history := append([]FileStages(nil), j.StagesHistory...)
+	currentFile := j.CurrentFile
 	j.mu.Unlock()
 	var all []StageProgress
-	for _, h := range history {
-		all = append(all, h.Stages...)
+	// A stage set whose file is unknown does not match a filter. An
+	// unattributed rollup comes out visibly empty, where guessing would
+	// silently credit one file's encode time to another file's record.
+	sameFile := func(name string) bool {
+		if file == "" {
+			return true
+		}
+		return name != "" && filepath.Base(name) == filepath.Base(file)
 	}
-	all = append(all, stages...)
+	for _, h := range history {
+		if sameFile(h.File) {
+			all = append(all, h.Stages...)
+		}
+	}
+	if sameFile(currentFile) {
+		all = append(all, stages...)
+	}
 
 	type agg struct {
 		n              int
@@ -2553,12 +2577,18 @@ func (j *Job) PhaseRollup() []PhaseStat {
 		cpu, work, mem float64
 	}
 	groups := map[string]*agg{}
+	shared := map[string]bool{}
 	var order []string
 	for _, st := range all {
+		c := stageCodec(st.Key)
+		if codec != "" && c != "" && c != codec {
+			continue
+		}
 		g := st.Key
 		if i := strings.LastIndex(g, ":chunk"); i > 0 {
 			g = g[:i]
 		}
+		shared[g] = c == ""
 		a := groups[g]
 		if a == nil {
 			a = &agg{}
@@ -2587,7 +2617,7 @@ func (j *Job) PhaseRollup() []PhaseStat {
 	for _, g := range order {
 		a := groups[g]
 		row := PhaseStat{Phase: g, N: a.n, JobWallS: a.jobWall.Seconds(),
-			WorkerS: a.work, CPUS: a.cpu, PeakMiB: a.mem}
+			WorkerS: a.work, CPUS: a.cpu, PeakMiB: a.mem, Shared: shared[g]}
 		if !a.first.IsZero() && !a.last.IsZero() {
 			row.SpanS = a.last.Sub(a.first).Seconds()
 		}
