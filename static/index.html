@@ -674,10 +674,6 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <div class="aws-metric-value" id="aws-hourly">—</div>
             </div>
             <div class="aws-metric">
-                <div class="aws-metric-label" title="Distributed-local encoder machines currently available (workers polling Temporal). One encode's chunks spread across these boxes; hover the value for names.">Local machines</div>
-                <div class="aws-metric-value" id="aws-dist-machines">—</div>
-            </div>
-            <div class="aws-metric">
                 <div class="aws-metric-label" title="Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box instead of cold-starting. 0 when idle; WARM_MIN_VCPUS (a whole box) during a run.">Keep warm</div>
                 <div class="aws-metric-value" id="aws-warm">—</div>
             </div>
@@ -1108,9 +1104,12 @@ registerPoller('sources', loadSources, 60000, () => activeTab() === 'originals')
 // only change when an encode finishes, and the SSE terminal-transition hook
 // already reloads them, so the timer has no reason to run off the Outputs tab.
 registerPoller('outputs', loadOutputs, 60000, () => activeTab() === 'outputs');
-// The CPU sparkline + machine pills this feeds live on Jobs and AWS only.
-registerPoller('dist-workers', pollDistWorkers, 5000,
-    () => activeTab() === 'jobs' || activeTab() === 'aws');
+// Jobs only. Everything this feeds — the CPU sparkline, the Local Fleet rows,
+// the machine pills — is drawn by renderLocalFleet/renderDistMachines into the
+// Jobs tab. The AWS tab used to carry a copy of the pills; with that gone it
+// consumes nothing from /api/dist/workers, so polling it there is a 5s timer
+// for a view that no longer exists (#227, #228).
+registerPoller('dist-workers', pollDistWorkers, 5000, () => activeTab() === 'jobs');
 // The cloud inventory: the AWS tab's tables, and the compact fleet line on Jobs.
 // Called with no arguments, so wantS3 is falsy and the timer NEVER pays for the
 // S3 staging walk — the expensive part, and the part with nothing live to say.
@@ -5099,9 +5098,14 @@ function renderLocalFleet() {
     if (mrow) mrow.innerHTML = _localMetricsTiles();
 }
 
+// The machine pills live in the Jobs tab's Local Fleet metrics row — the AWS
+// tab is cloud-only. Repaint that row so a toggle lands optimistically instead
+// of waiting for the next fleet render; skip it while the panel is hidden, so
+// this never paints tiles into a row renderLocalFleet has deliberately left bare.
 function renderDistMachines() {
-    const el = document.getElementById('aws-dist-machines');
-    if (el) el.innerHTML = machinePillsHtml();
+    const panel = document.getElementById('jobs-local-fleet-panel');
+    const el = document.getElementById('jobs-local-metrics');
+    if (el && panel && panel.style.display !== 'none') el.innerHTML = _localMetricsTiles();
 }
 
 async function toggleMachine(name, enabled) {
@@ -5126,8 +5130,8 @@ async function pollDistWorkers() {
         renderLocalFleet();
     } catch (e) { /* cluster not up */ }
 }
-// Polled every 5s to keep the live CPU sparkline current — but only while a
-// view that draws it (Jobs, AWS) is on screen. See registerPoller above.
+// Polled every 5s to keep the live CPU sparkline current — but only while the
+// view that draws it (Jobs) is on screen. See registerPoller above.
 
 // Single overall completion % for an encode, WEIGHTED BY EXPECTED ENCODE COST —
 // a 4K HEVC 2-pass rendition is ~200× the compute of an h264 360p one, so it must
