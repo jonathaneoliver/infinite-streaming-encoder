@@ -37,6 +37,50 @@ jobs:
       - name: go build
         run: go build ./...
 
+  # The Python half had NO CI at all. `make check` runs a ruff F821 pass and ten
+  # test scripts, but nothing ran them except a human typing `make check` — and
+  # the ruff step skips silently when ruff is not installed, which it was not.
+  # So the encoder itself, which is where the Python lives, was covered only by
+  # smoke.yml's end-to-end run.
+  #
+  # That is how an undefined `is_record` sat in cli_batch's telemetry drain: on
+  # a replayed SQS message it raised NameError, the drain thread's blanket
+  # `except Exception: pass` swallowed it, and the rest of that pass was
+  # abandoned — losing exactly the RECORDS (TIMING/SPEED/VMAF) the replay branch
+  # existed to protect, silently. Static analysis had the answer the whole time
+  # and was never asked.
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      # F821 only, matching `make check`. The wider F rules currently report
+      # unused imports/locals, which are noise rather than defects; F821 is the
+      # one whose findings are always a real NameError waiting to happen.
+      - name: ruff (undefined names)
+        run: |
+          python -m pip install --quiet ruff
+          ruff check --select F821 scripts/
+
+      - name: python compile
+        run: python -m compileall -q scripts/
+
+      # Same scripts, same order as `make check`. They are dependency-light by
+      # design and skip themselves when boto3 is absent, so no install is needed
+      # for them to be meaningful.
+      - name: python tests
+        run: |
+          set -e
+          for t in telemetry stage_state fleet_version_marker machine_rental \
+                   encode_threads dist_stage_state mezz_cache package_fetch \
+                   output_fetch encoder_cli; do
+            echo "--- $t"
+            python3 "scripts/test_$t.py"
+          done
+
   terraform:
     runs-on: ubuntu-latest
     steps:
