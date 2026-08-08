@@ -2459,9 +2459,17 @@ async function toggleOutputDetail(i, name) {
     if (det.dataset.loaded) return;
     det.innerHTML = '<div class="no-files" style="padding:6px 24px">Loading…</div>';
     try {
-        const res = await fetch('/api/outputs/' + encodeURIComponent(name) + '/ladder');
+        // Ladder AND run record: this fold is how a package is opened, so it is
+        // where both belong. The file-browsing view (loadOutputDetail) renders
+        // the same two panels, but it is reachable only from the context menu —
+        // putting the run panel solely there hid it from every normal click.
+        const [res, runRes] = await Promise.all([
+            fetch('/api/outputs/' + encodeURIComponent(name) + '/ladder'),
+            fetch('/api/outputs/' + encodeURIComponent(name) + '/run'),
+        ]);
         const ladder = res.ok ? await res.json() : null;
-        det.innerHTML = renderLadderTable(ladder)
+        const run = runRes.ok ? await runRes.json() : null;
+        det.innerHTML = (renderLadderTable(ladder) + renderRunPanel(run))
             || '<div class="no-files" style="padding:6px 24px">No ladder data for this package</div>';
         det.dataset.loaded = '1';
     } catch (e) {
