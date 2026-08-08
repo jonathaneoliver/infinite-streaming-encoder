@@ -643,7 +643,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <input type="checkbox" id="aws-auto-refresh" checked onchange="onAwsAutoRefreshToggled()">
                     auto-refresh 10s
                 </label>
-                <button class="btn btn-small" onclick="refreshAws()">Refresh</button>
+                <button class="btn btn-small" onclick="refreshAws(true)"
+                        title="Refresh everything, including re-measuring S3 staging sizes (the only part that costs anything to read).">Refresh</button>
             </div>
         </div>
 
@@ -1037,6 +1038,10 @@ let outputsView = 'list'; // 'list' or 'detail'
 // 10s, which is a bill. A page left open on Originals overnight did all of it
 // and displayed none of it.
 //
+// Gating fixed the tabs nobody was looking at; it did not fix the tab someone
+// WAS. The S3 walk still ran on the Jobs and AWS polls and remained the largest
+// line on the AWS bill, so it is no longer on a timer at all — see refreshAws.
+//
 // Three gates, all required:
 //   - the browser tab is not hidden — the commonest idle case by far, and it
 //     needs no timeout logic at all
@@ -1059,9 +1064,12 @@ function _pollerWanted(p) {
     return document.visibilityState !== 'hidden' && !pollingIdle() && p.when();
 }
 
-function _runPoller(p) {
+// args are forwarded to the poller's fn — used by pollNow to run a poller in a
+// more expensive mode than its timer ever does (see the aws-inventory poller,
+// whose timer must never pay for the S3 walk but whose tab-open must).
+function _runPoller(p, ...args) {
     p.lastRun = Date.now();
-    try { p.fn(); } catch (e) { /* one bad poll must not stop the others */ }
+    try { p.fn(...args); } catch (e) { /* one bad poll must not stop the others */ }
 }
 
 // Start/stop every timer to match the current view + visibility. Call this
@@ -1083,9 +1091,9 @@ function syncPollers() {
 // Fetch now, on the tab you just opened, and record it as that poller's latest
 // run — otherwise syncPollers' resume-fetch fires the same request a moment
 // later, which for /api/outputs means walking 108k files twice per tab switch.
-function pollNow(name) {
+function pollNow(name, ...args) {
     const p = _pollers.find(x => x.name === name);
-    if (p) _runPoller(p);
+    if (p) _runPoller(p, ...args);
 }
 
 function activeTab() {
@@ -1104,6 +1112,9 @@ registerPoller('outputs', loadOutputs, 60000, () => activeTab() === 'outputs');
 registerPoller('dist-workers', pollDistWorkers, 5000,
     () => activeTab() === 'jobs' || activeTab() === 'aws');
 // The cloud inventory: the AWS tab's tables, and the compact fleet line on Jobs.
+// Called with no arguments, so wantS3 is falsy and the timer NEVER pays for the
+// S3 staging walk — the expensive part, and the part with nothing live to say.
+// Opening the AWS tab and the Refresh button pass true; see refreshAws.
 registerPoller('aws-inventory', refreshAws, 10000, () => {
     const chk = document.getElementById('aws-auto-refresh');
     return !!(chk && chk.checked) && (activeTab() === 'aws' || activeTab() === 'jobs');
@@ -1215,7 +1226,10 @@ function switchTab(name) {
         }
     }
     if (name === 'outputs') pollNow('outputs');
-    if (name === 'aws') pollNow('aws-inventory');
+    // Opening the AWS tab is the one moment someone is actually looking at the
+    // S3 Staging table, so it is the moment worth measuring it. The 10s timer
+    // that follows never re-measures.
+    if (name === 'aws') pollNow('aws-inventory', true);
     if (name === 'about') loadVersion();
     if (name === 'ladders') renderLaddersTab();
     // Start the timers this view needs and stop the ones it doesn't. The
@@ -3826,6 +3840,13 @@ function formatBytes(n) {
     return n.toFixed(i === 0 ? 0 : 2) + ' ' + units[i];
 }
 
+// null/undefined total_s3_bytes means the staging walk was SKIPPED, not that the
+// bucket is empty — and those two must never render the same. "0 B" on a tab
+// nobody asked to measure is the one wrong answer available here.
+function stagedBytesText(bytes) {
+    return bytes == null ? '—' : formatBytes(bytes);
+}
+
 function formatDuration(sec) {
     if (!sec || sec < 60) return Math.round(sec || 0) + 's';
     const m = Math.floor(sec / 60);
@@ -3834,10 +3855,24 @@ function formatDuration(sec) {
     return h + 'h ' + (m % 60) + 'm';
 }
 
-async function refreshAws() {
+// wantS3 asks the server to re-enumerate S3 staging (per-prefix sizes) as part
+// of this inventory. It is DELIBERATELY opt-in and rare.
+//
+// That walk lists every object under jobs/ and mezz/, and because the caller is
+// this machine rather than an in-region worker, S3 bills every byte of the
+// listing XML as internet egress. On the 10s poll it was ~144 walks/day and, on
+// days with no encoding at all, 20 GB of egress and ~$2 — the single largest
+// line on the AWS bill, for a table that is usually not on screen.
+//
+// So: the timer passes nothing (falsy). Opening the AWS tab and pressing
+// Refresh pass true, as does anything that just deleted staging — those are the
+// moments the number is both wanted and actually different. The server floors
+// the rate on top of this (s3PrefixMinInterval) and stamps the result with when
+// it was measured, which renderAwsS3 shows.
+async function refreshAws(wantS3) {
     const lastEl = document.getElementById('aws-last-refresh');
     try {
-        const res = await fetch('/api/aws/inventory');
+        const res = await fetch('/api/aws/inventory' + (wantS3 ? '?s3=1' : ''));
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         // fleet_cpu = per-machine CPU array; data.fleet stays the summary object
@@ -3872,7 +3907,11 @@ function renderAws(data) {
     orphEl.textContent = orphans;
     orphEl.className = 'aws-metric-value' + (orphans > 0 ? ' warn' : ' ok');
 
-    document.getElementById('aws-s3-size').textContent = formatBytes(s.total_s3_bytes || 0);
+    const s3El = document.getElementById('aws-s3-size');
+    s3El.textContent = stagedBytesText(s.total_s3_bytes);
+    s3El.title = s.total_s3_bytes == null
+        ? 'Not measured on this refresh. Press Refresh to enumerate S3 staging — it is the only reading here that costs money to take.'
+        : '';
     const hourlyEl = document.getElementById('aws-hourly');
     hourlyEl.textContent = '$' + hourly.toFixed(2);
     hourlyEl.className = 'aws-metric-value' + (hourly > 0 ? ' warn' : ' ok');
@@ -3902,7 +3941,9 @@ function renderAws(data) {
     renderAwsVolumes(data.volumes || []);
     // s3_prefixes_at is present only when the server served a CACHED staging
     // walk (#227). Absent means it was measured on this very call.
-    renderAwsS3(data.s3_prefixes || [], data.s3_prefixes_at);
+    // NOT `|| []` — null means "not measured on this refresh" and renderAwsS3
+    // says so. Collapsing it to an empty array would claim the bucket is clean.
+    renderAwsS3(data.s3_prefixes, data.s3_prefixes_at);
 }
 
 function renderAwsExecutions(execs) {
@@ -4824,11 +4865,20 @@ function renderAwsVolumes(volumes) {
 // not this call. Listing every staged object is the one O(objects-held) call in
 // the inventory, so the server reuses one walk for a few minutes (#227) — say so
 // rather than presenting a ten-minute-old size as this second's.
+// prefixes === null means the walk was skipped on this refresh — the normal
+// case, since only opening this tab and pressing Refresh pay for it. Say so
+// rather than showing an empty table, which reads as "nothing staged".
 function renderAwsS3(prefixes, measuredAt) {
     const el = document.getElementById('aws-s3');
+    const measure = '<span class="aws-row-action" onclick="refreshAws(true)">measure now</span>';
+    if (prefixes == null) {
+        el.innerHTML = `<div class="aws-empty">Not measured on this refresh — ${measure}.<br>`
+            + `<span style="font-size:0.8rem;opacity:0.75">Enumerating every staged object is the only reading on this page that costs money, so it is taken when you open this tab, not on the 10s poll.</span></div>`;
+        return;
+    }
     const stamp = measuredAt
         ? `<div class="aws-refresh-time" style="margin-bottom:6px">sizes measured `
-          + `${new Date(measuredAt).toLocaleTimeString()}</div>`
+          + `${new Date(measuredAt).toLocaleTimeString()} · ${measure}</div>`
         : '';
     if (prefixes.length === 0) {
         el.innerHTML = stamp + '<div class="aws-empty">No S3 staging.</div>';
@@ -5152,7 +5202,12 @@ function renderJobsMetrics(s) {
         tile('Active batch jobs', `<div class="${cls(bjobs)}">${bjobs}</div>`),
         tile('Running instances', `<div class="${cls(running)}">${running}</div>`),
         tile('Orphan volumes', `<div class="${cls(orphans)}">${orphans}</div>`),
-        tile('S3 staged', `<div class="aws-metric-value">${formatBytes(s.total_s3_bytes || 0)}</div>`),
+        // Cached-only, by design: the Jobs tab never asks for the staging walk
+        // (refreshAws's wantS3 is false on the poll), so this shows the last
+        // measurement taken on the AWS tab, and "—" until one has been. One
+        // number is not worth enumerating the bucket every 10s from here.
+        tile('S3 staged', `<div class="aws-metric-value">${stagedBytesText(s.total_s3_bytes)}</div>`,
+            'Last measured on the AWS tab. Open it (or press Refresh there) to re-measure.'),
         tile('Est. hourly spend', `<div class="${cls(hourly)}">$${hourly.toFixed(2)}</div>`),
         tile('Keep warm', `<div class="aws-metric-value${(s.min_vcpus || 0) > 0 ? ' ok' : ''}">${s.min_vcpus || 0} vCPU</div>`, 'Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box (0 when idle).'),
         tile('Max vCPUs', vcpuHtml, 'Batch compute-env max vCPUs. 2× runs ~twice as many machines → roughly half the wall-clock for ~the same total cost.'),
@@ -5199,7 +5254,9 @@ async function deleteS3Prefix(prefix) {
             body: JSON.stringify({ prefix }),
         });
         if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
-        await refreshAws();
+        // Re-measure: a staging row that survives the refresh after a delete
+        // reads as a failed delete.
+        await refreshAws(true);
     } catch (e) {
         showToast('Delete failed: ' + e.message, 'error');
     }
@@ -5315,7 +5372,7 @@ async function cleanupJob(jobId, instanceHint) {
     try {
         const res = await fetch('/api/aws/jobs/' + encodeURIComponent(jobId) + '/cleanup', { method: 'POST' });
         if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text());
-        await refreshAws();
+        await refreshAws(true); // this dropped the job's staging — re-measure it
     } catch (e) {
         showToast('Cleanup failed: ' + e.message, 'error');
     }
@@ -5370,7 +5427,7 @@ async function executeClear() {
         }
         if (res.ok) {
             btn.textContent = 'Done';
-            await refreshAws();
+            await refreshAws(true); // the sweep emptied staging — re-measure it
         } else {
             btn.textContent = 'Failed';
             btn.disabled = false;

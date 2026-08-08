@@ -265,10 +265,34 @@ Server-side, the corresponding rule is that the AWS inventory's S3 staging walk
 (`_s3_prefix_inventory`) is the only part whose cost is O(objects held) rather
 than O(resources running), and it feeds exactly one display. So `awswatch`
 passes `--no-s3-prefixes` (it reads instances/executions/Batch jobs and nothing
-else), and the HTTP handler computes it on demand and reuses it for
-`s3PrefixTTL`. `null` s3_prefixes means "not measured" — never cache it as
-"nothing staged", and every user-facing path that deletes staging must call
-`invalidateS3Prefixes`.
+else), and **the walk is opt-in per HTTP request (`?s3=1`), never on a timer.**
+
+Gating it to the visible tab was not enough, because the tab someone is
+*looking at* polls every 10s and the walk is expensive in a way nothing else
+here is: the caller is the Mac, not an in-region worker, so S3 bills every byte
+of the listing XML as **internet egress**. Measured over 23 days on the real
+account, egress tracks Tier1 (LIST) count at r=0.99 and spot hours at only
+r=0.33 — it is nearly independent of whether anything is encoding. On a day
+with zero encodes that was 62,865 LIST requests and 20.3 GB out, ~$2/day and
+~79% of the whole bill, for a table usually not on screen. And because `jobs/`
+has a 7-day lifecycle, every object a run leaves keeps being re-listed for a
+week after it ends.
+
+So the walk happens when a human asks: opening the AWS tab (`pollNow('aws-inventory', true)`),
+the Refresh button, and any path that just deleted staging. `shouldWalkS3`
+floors the rate at `s3PrefixMinInterval`; in between, the last measurement is
+spliced in with an `s3_prefixes_at` stamp so the tab says how old it is. The
+10s poll passes nothing and pays nothing.
+
+`null` s3_prefixes means "not measured" — never cache it as "nothing staged",
+and never render it as `0 B` either (`stagedBytesText` → `—`, and `renderAwsS3`
+must be handed the raw value, not `|| []`). Every user-facing path that deletes
+staging must call `invalidateS3Prefixes`.
+
+Same shape of rule for `awswatch`'s `gc_failed_staging`: it enforces an
+*hours*-scale retention (`FailedStagingMaxAge`), so it runs on its own
+`FailedStagingInterval` rather than on the 60s inventory tick. Idempotent is
+not free — each pass is a LIST plus a `head_object` per job prefix.
 
 ## Things to know when editing
 

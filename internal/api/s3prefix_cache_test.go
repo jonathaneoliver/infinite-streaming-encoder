@@ -44,8 +44,9 @@ func TestStoreAndReuseS3Prefixes(t *testing.T) {
 	}
 }
 
-// The skipped-walk shape says "not measured". Caching it would turn one cheap
-// call into ten minutes of a UI claiming the bucket is empty.
+// The skipped-walk shape says "not measured". Caching it would leave the UI
+// claiming the bucket is empty until something invalidated it — and now that
+// the walk is opt-in, most requests carry this shape.
 func TestNullPrefixesNotCached(t *testing.T) {
 	s := &Server{}
 	s.storeS3Prefixes([]byte(noWalkInv), s.s3Generation())
@@ -54,14 +55,44 @@ func TestNullPrefixesNotCached(t *testing.T) {
 	}
 }
 
-func TestStaleCacheMisses(t *testing.T) {
+// An old measurement is still served — it is spliced in with its timestamp so
+// the tab can say how old it is. Age must not silently trigger a walk: that
+// wall clock is what billed ~$2/day of LIST egress on days with no encoding.
+func TestAgedCacheIsStillServed(t *testing.T) {
 	s := &Server{}
 	s.storeS3Prefixes([]byte(fullInv), s.s3Generation())
 	s.s3Mu.Lock()
-	s.s3At = time.Now().Add(-s3PrefixTTL - time.Second)
+	s.s3At = time.Now().Add(-24 * time.Hour)
 	s.s3Mu.Unlock()
-	if _, _, _, ok := s.cachedS3Prefixes(); ok {
-		t.Error("cache older than the TTL was served")
+	if _, _, _, ok := s.cachedS3Prefixes(); !ok {
+		t.Error("a day-old measurement was dropped; the poll now has nothing to splice")
+	}
+}
+
+// The walk is opt-in per request, and floored so Refresh cannot be held down.
+func TestShouldWalkS3(t *testing.T) {
+	fresh := time.Now().Add(-time.Minute)
+	stale := time.Now().Add(-s3PrefixMinInterval - time.Second)
+	cases := []struct {
+		name  string
+		asked bool
+		have  bool
+		at    time.Time
+		want  bool
+	}{
+		{"poll never walks, even with nothing measured", false, false, time.Time{}, false},
+		{"poll never walks, even with a stale measurement", false, true, stale, false},
+		{"asked with nothing measured walks", true, false, time.Time{}, true},
+		{"asked again within the floor does not", true, true, fresh, false},
+		{"asked past the floor walks", true, true, stale, true},
+		// invalidateS3Prefixes zeroes both, so a delete re-measures at once.
+		{"asked after an invalidate walks", true, false, time.Time{}, true},
+	}
+	for _, c := range cases {
+		if got := shouldWalkS3(c.asked, c.have, c.at); got != c.want {
+			t.Errorf("%s: shouldWalkS3(%v,%v,…) = %v, want %v",
+				c.name, c.asked, c.have, got, c.want)
+		}
 	}
 }
 
