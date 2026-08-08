@@ -97,9 +97,49 @@ check("host with a realistic cloud key",
       HOST_RE, instance="i-0abc123def456", version="84df69e")
 
 
+# --- emission timing --------------------------------------------------------
+# The above pins the marker FORMAT. What the first cut got wrong was WHEN the
+# marker is emitted, which no format test can catch: a real run tagged 2 of 14
+# chunks because a chunk is normally first seen (via last_worker_identity)
+# before its worker's first heartbeat lands, so the first emission carried no
+# version — and deduping on machine alone then suppressed every retry.
+from infinite_streaming_encoder.cli_local_dist import (  # noqa: E402
+    should_emit_host,
+)
+
+seen: dict = {}
+
+# Poll 1: the chunk is visible, but no heartbeat has arrived, so the box's
+# build is not known yet. Emitting is still right — the chunk plot needs the
+# colour immediately — it just cannot carry a version.
+if not should_emit_host("enc-1", "ubuntu", "", seen):
+    failures.append("timing: first sighting did not emit at all")
+
+# Poll 2: nothing new. Must NOT spam.
+if should_emit_host("enc-1", "ubuntu", "", seen):
+    failures.append("timing: re-emitted with no new information")
+
+# Poll 3: a heartbeat has landed and the box has said what it is running. THIS
+# is the emission the original code never made.
+if not should_emit_host("enc-1", "ubuntu", "3676141", seen):
+    failures.append("timing: learning the build did not re-emit — "
+                    "this is the 2-of-14 bug")
+
+# Poll 4: same box, same build. Quiet again.
+if should_emit_host("enc-1", "ubuntu", "3676141", seen):
+    failures.append("timing: re-emitted after the version was already known")
+
+# Failover to another box re-tags, even at the same version.
+if not should_emit_host("enc-1", "mac", "3676141", seen):
+    failures.append("timing: failover to another machine did not re-tag")
+
+# An activity with no identity yet is not emittable at all.
+if should_emit_host("enc-2", "", "3676141", seen):
+    failures.append("timing: emitted for an activity with no machine")
+
 if failures:
     print("test_fleet_version_marker: FAILED")
     for f in failures:
         print("  " + f)
     raise SystemExit(1)
-print("test_fleet_version_marker: ok")
+print("test_fleet_version_marker: ok (format + emission timing)")
