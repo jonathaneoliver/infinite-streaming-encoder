@@ -94,18 +94,30 @@ jobs:
       - name: python compile
         run: python -m compileall -q scripts/
 
-      # Same scripts, same order as `make check`. They are dependency-light by
-      # design and skip themselves when boto3 is absent, so no install is needed
-      # for them to be meaningful.
+      # GLOBBED, not enumerated. The first version of this step listed the ten
+      # tests that existed when it was written, and was stale one merge later —
+      # #184 landed scripts/test_time_limit.py and the list silently did not run
+      # it. A CI job that skips a test it believes it is running is the same
+      # class of bug this whole job exists to catch, so the list is derived from
+      # the filesystem rather than restated here.
+      #
+      # These are dependency-light by design and skip themselves when boto3 is
+      # absent, so no install is needed for them to be meaningful.
       - name: python tests
         run: |
           set -e
-          for t in telemetry stage_state fleet_version_marker machine_rental \
-                   encode_threads dist_stage_state mezz_cache package_fetch \
-                   output_fetch encoder_cli; do
+          shopt -s nullglob
+          found=0
+          for t in scripts/test_*.py; do
             echo "--- $t"
-            python3 "scripts/test_$t.py"
+            python3 "$t"
+            found=$((found + 1))
           done
+          if [ "$found" -eq 0 ]; then
+            echo "no scripts/test_*.py found — the glob is wrong, not the repo"
+            exit 1
+          fi
+          echo "ran $found python test scripts"
 
   terraform:
     runs-on: ubuntu-latest

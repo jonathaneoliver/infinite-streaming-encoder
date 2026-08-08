@@ -668,16 +668,35 @@ def phase_mezzanine(args: argparse.Namespace) -> int:
         emit_stage("mezzanine", "done", 100.0)
         return 0
 
-    # Download source. `--s3-in` is the full object URI; pull the
-    # basename for the local filename.
+    # `--s3-in` is normally the full s3:// object URI. It also accepts a LOCAL
+    # PATH, which is what lets this same phase run on the HOST (#266): the
+    # source is already on the control plane's disk — it is the file the encode
+    # was submitted against — so uploading it just to download it back into a
+    # Batch container is a round trip over the home link for no gain.
+    #
+    # Deliberately the SAME code either way rather than a host-side
+    # reimplementation. The mezzanine's exact duration is what the chunk plan is
+    # built from, and cli_phase already refuses when the two drift; a second
+    # implementation would be a second thing to keep in step with that, which is
+    # the shape of bug this repo keeps finding.
     src_uri = args.s3_in
-    _, src_key = _parse(src_uri)
-    src_basename = src_key.rsplit("/", 1)[-1]
-    local_in = work / src_basename
-    # One continuous mezzanine bar: download 0-45%, stream-copy 45-55%,
-    # upload 55-100% (the download + upload of the ~full-size file dominate).
-    print(f"[phase mezzanine] downloading {src_uri}", flush=True)
-    _download(src_uri, local_in, stage=("mezzanine", 0.0, 45.0))
+    local_src = Path(src_uri)
+    if not src_uri.startswith("s3://") and local_src.is_file():
+        # Read in place. No copy into the work dir: the source can be many GB
+        # and nothing here writes to it.
+        local_in = local_src
+        print(f"[phase mezzanine] reading local source {local_in} "
+              f"(no download)", flush=True)
+        copy_lo, copy_hi = 0.0, 55.0
+    else:
+        _, src_key = _parse(src_uri)
+        src_basename = src_key.rsplit("/", 1)[-1]
+        local_in = work / src_basename
+        # One continuous mezzanine bar: download 0-45%, stream-copy 45-55%,
+        # upload 55-100% (the download + upload of the ~full-size file dominate).
+        print(f"[phase mezzanine] downloading {src_uri}", flush=True)
+        _download(src_uri, local_in, stage=("mezzanine", 0.0, 45.0))
+        copy_lo, copy_hi = 45.0, 55.0
 
     out_path = work / "mezzanine.mp4"
     info = probe(local_in)
@@ -715,7 +734,9 @@ def phase_mezzanine(args: argparse.Namespace) -> int:
         # limited run's bar reaches 100% rather than stalling at limit/full.
         duration_s=(min(info.duration_s, time_limit_s)
                     if time_limit_s else info.duration_s),
-        pct_lo=45.0, pct_hi=55.0, terminal=False,
+        # Widened to 0-55 on the local-source path, where there was no download
+        # to occupy the first 45. The bar still runs 0->100 once either way.
+        pct_lo=copy_lo, pct_hi=copy_hi, terminal=False,
     )
 
     out_uri = args.s3_out.rstrip("/") + "/mezzanine.mp4"
