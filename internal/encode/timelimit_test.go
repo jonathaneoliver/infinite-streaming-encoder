@@ -43,6 +43,39 @@ func TestTimeLimitSeconds(t *testing.T) {
 	}
 }
 
+// "If the clipped length ends up bigger than the whole content, just do the
+// whole content" — a limit can never describe more media than exists.
+func TestTimeLimitForClip(t *testing.T) {
+	for _, tc := range []struct {
+		in    string
+		clip  float64
+		want  float64
+		isLim bool
+	}{
+		{"10", 60, 12, true},   // snaps to 12, well inside the clip
+		{"19", 20, 18, true},   // snaps DOWN, still a real limit
+		{"21", 20, 0, false},   // snaps up to 24, past the clip → whole content
+		{"99", 20, 0, false},   // far past → whole content
+		{"24", 24, 0, false},   // exactly the clip length is not a limit
+		{"12", 12.5, 12, true}, // just inside stays a limit
+		// Duration unknown (probe failed) keeps the limit: dropping it on a
+		// number we never measured would silently encode the whole clip when a
+		// short one was asked for.
+		{"12", 0, 12, true},
+		{"12", -1, 12, true},
+		// No request is still no limit, whatever the clip.
+		{"", 20, 0, false},
+		{"junk", 20, 0, false},
+	} {
+		cfg := JobConfig{Time: tc.in}
+		got, ok := cfg.TimeLimitFor(tc.clip)
+		if got != tc.want || ok != tc.isLim {
+			t.Errorf("Time=%q clip=%v → (%v, %v), want (%v, %v)",
+				tc.in, tc.clip, got, ok, tc.want, tc.isLim)
+		}
+	}
+}
+
 // The snap follows the job's resolved segment duration, not a hardcoded 6 —
 // resolveTimings fills it from the ladder before either target dispatches.
 func TestTimeLimitSnapsToJobSegmentDuration(t *testing.T) {

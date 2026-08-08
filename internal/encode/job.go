@@ -3235,6 +3235,24 @@ func (cfg *JobConfig) TimeLimitSeconds() (float64, bool) {
 	return snapToSegment(v, cfg.effectiveSegmentSeconds()), true
 }
 
+// TimeLimitFor resolves the limit against the clip it will be applied to: a
+// snapped limit that reaches the clip length is no limit at all — encode the
+// whole content rather than a limit describing more media than exists.
+//
+// clipDurationS <= 0 means "not probed", which keeps the limit. Dropping it on
+// a duration we failed to measure would silently encode the whole clip when a
+// short one was asked for, and the mezzanine truncation still works without it.
+func (cfg *JobConfig) TimeLimitFor(clipDurationS float64) (float64, bool) {
+	secs, ok := cfg.TimeLimitSeconds()
+	if !ok {
+		return 0, false
+	}
+	if clipDurationS > 0 && secs >= clipDurationS {
+		return 0, false
+	}
+	return secs, true
+}
+
 // effectiveSegmentSeconds is the job's resolved segment duration. resolveTimings
 // fills SegmentDuration from the ladder (then the global default) before either
 // target dispatches, so by the time anything asks for the time limit this is the
@@ -3701,9 +3719,24 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// OUTPUTS, not the source mezzanine. To force the mezzanine to regenerate,
 		// clear the mezz cache (source changes bump the key automatically).
 		localSrc := filepath.Join(m.SourceDir, filename)
+		// Probe BEFORE keying the mezzanine. A limit that snaps past the clip
+		// means "encode the whole clip", so it must not key the mezzanine as if
+		// it were limited — the mezzanine written there would hold the FULL clip
+		// under a limited prefix, and the next unlimited run of the same source
+		// would miss the cache and rebuild an identical file. The probe is on the
+		// local source and this path runs it anyway, just later; it is only moved
+		// up. 0 (probe failed) means "unknown", which keeps the limit rather than
+		// dropping it on a number we don't have.
+		srcDurationS := 0.0
+		if d, err := probeDurationSeconds(localSrc); err == nil {
+			srcDurationS = d
+		}
 		s3Mezz := s3Prefix // fallback: mezzanine stays in the job prefix
 		cacheHit := false
-		timeLimitS, _ := job.Config.TimeLimitSeconds()
+		timeLimitS, limited := job.Config.TimeLimitFor(srcDurationS)
+		if !limited {
+			timeLimitS = 0
+		}
 		if key, ok := sourceMezzKey(localSrc, timeLimitS); ok {
 			s3Mezz = fmt.Sprintf("s3://%s/mezz/%s", bucket, key)
 			if s3ObjectExists(s3Mezz+"/mezzanine.mp4") &&
@@ -3804,12 +3837,17 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// Probe the source duration so each variant can size its own chunks
 		// (buildSFNInput does the per-variant planning). ffprobe runs in the
 		// worker image; if unavailable, 0 duration collapses to whole variants.
-		durationS := 0.0
-		if d, err := probeDurationSeconds(localSrc); err != nil {
-			job.AppendLog(fmt.Sprintf("[cloud-batch] ffprobe failed (%v); encoding %s as whole variants", err, filename))
+		// Already probed above, to resolve the duration limit before the mezzanine
+		// key. Reused rather than re-run.
+		durationS := srcDurationS
+		if durationS <= 0 {
+			job.AppendLog(fmt.Sprintf("[cloud-batch] ffprobe failed; encoding %s as whole variants", filename))
 		} else {
-			durationS = d
 			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: %.1fs — chunking mode %q (per-variant by complexity)", filename, durationS, chunkModeLabel(job.Config.ChunkDuration)))
+		}
+		if secs, ok := job.Config.TimeLimitSeconds(); ok && timeLimitS == 0 {
+			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: --time %gs is at or past the %.1fs clip — encoding the whole clip",
+				filename, secs, durationS))
 		}
 
 		// Probe the source width so the ladder is capped at native resolution
@@ -4126,7 +4164,11 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	// limit that wasn't a segment multiple could not end where the media does. Clamping the single duration they share is the whole change;
 	// planChunks below then simply plans fewer chunks. A limit at or above the
 	// clip is not a limit (matching cli_local_dist's rule).
-	if timeLimitS > 0 && timeLimitS < clipDurationS {
+	// clipDurationS <= 0 means the probe failed; keep the limit (the mezzanine
+	// still truncates) rather than dropping it on a number we don't have. The
+	// caller has already applied the "snapped limit reaches the clip → whole
+	// clip" rule; this repeats it so a direct caller can't skip it.
+	if timeLimitS > 0 && (clipDurationS <= 0 || timeLimitS < clipDurationS) {
 		if logf != nil {
 			logf(fmt.Sprintf("[cloud-batch] --time %s: planning against %ss of %ss",
 				strconv.FormatFloat(timeLimitS, 'f', -1, 64),

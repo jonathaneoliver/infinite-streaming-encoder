@@ -206,6 +206,16 @@ ladder's chunk sizing, the cost estimate and the progress totals then describe
 the truncated clip without any of them knowing a limit exists. A limit at or
 above the clip is **not** a limit, on both paths.
 
+**A limit that reaches the clip length is not a limit** — encode the whole
+content, since a limit can never describe more media than exists.
+`JobConfig.TimeLimitFor(clipDurationS)` is that rule, and the cloud path probes
+the source *before* keying the mezzanine so it applies to the key too: otherwise
+a non-binding limit files a FULL mezzanine under a limited prefix, and the next
+unlimited run of the same source misses the cache and rebuilds an identical
+file. An unknown duration (probe failed, `<= 0`) **keeps** the limit — dropping
+it on a number nobody measured would encode the whole clip when a short one was
+asked for.
+
 **The limit is snapped to the nearest whole segment** (6s by default; the job's
 ladder-resolved `SegmentDuration`). Chunk boundaries must land on segments, so a
 limit that isn't a multiple leaves a plan that cannot end where the media does,
