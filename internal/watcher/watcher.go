@@ -1,3 +1,9 @@
+// Package watcher auto-submits new source files on an interval.
+//
+// A file is submitted only once it has been SEEN BEFORE at the same size, which
+// is how a still-copying file is told from a finished one without any
+// filesystem notification API. The first scan after startup seeds that set and
+// submits nothing, so restarting the server does not re-encode the library.
 package watcher
 
 import (

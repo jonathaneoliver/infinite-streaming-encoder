@@ -161,7 +161,6 @@ def _codec_specific_args(
     stats_path: Path | None = None,
     threads_override: int | None = None,
 ) -> list[str]:
-    maxrate_k = target_kbps  # placeholder — real value is set in build_ffmpeg_cmd
     # Size the encoder's threads. On Batch, the cgroup quota caps each job to its
     # allocated vCPUs (co-located jobs mustn't each spin up a host-wide pool and
     # thrash). Locally there's no cgroup, so `threads_override` is how the parallel

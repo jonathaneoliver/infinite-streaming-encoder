@@ -43,7 +43,7 @@ func managerWithSamples(t *testing.T, samples []RunSample) *Manager {
 func sample(i int, idlePct float64) RunSample {
 	start := int64(1_000_000 + i*10_000)
 	return RunSample{
-		Ts: start + 5_000, IdlePct: idlePct, MachineVCPUHours: 10,
+		TS: start + 5_000, IdlePct: idlePct, MachineVCPUHours: 10,
 		AllocatedVCPUHours: 10 * (1 - idlePct/100),
 		StartedAt:          start, EndedAt: start + 5_000,
 	}
@@ -71,8 +71,8 @@ func TestIdleAllowanceIgnoresRunsWithNoRentalMeasurement(t *testing.T) {
 	// figure. Treating a zero as "0% idle" would drag the median towards a
 	// number nobody measured and quietly restore the undercount.
 	m := managerWithSamples(t, []RunSample{
-		{Ts: 1, SpotUSD: 1}, // no IdlePct, no MachineVCPUHours
-		{Ts: 2, IdlePct: 41, MachineVCPUHours: 0},
+		{TS: 1, SpotUSD: 1}, // no IdlePct, no MachineVCPUHours
+		{TS: 2, IdlePct: 41, MachineVCPUHours: 0},
 	})
 	got, runs, measured := m.fleetIdleFraction()
 	if measured || runs != 0 || got != assumedFleetIdleFraction {
@@ -103,9 +103,9 @@ func TestIdleAllowanceExcludesOverlappingRuns(t *testing.T) {
 	// instance to whichever run is reporting, so an overlapping sample reads
 	// high for a reason that says nothing about how the fleet packs one run.
 	// Counting those turns a systematic undercount into a systematic overcount.
-	overlapA := RunSample{Ts: 30, IdlePct: 90, MachineVCPUHours: 10, StartedAt: 100, EndedAt: 200}
-	overlapB := RunSample{Ts: 31, IdlePct: 88, MachineVCPUHours: 10, StartedAt: 150, EndedAt: 250}
-	solo := RunSample{Ts: 32, IdlePct: 40, MachineVCPUHours: 10, StartedAt: 400, EndedAt: 500}
+	overlapA := RunSample{TS: 30, IdlePct: 90, MachineVCPUHours: 10, StartedAt: 100, EndedAt: 200}
+	overlapB := RunSample{TS: 31, IdlePct: 88, MachineVCPUHours: 10, StartedAt: 150, EndedAt: 250}
+	solo := RunSample{TS: 32, IdlePct: 40, MachineVCPUHours: 10, StartedAt: 400, EndedAt: 500}
 
 	m := managerWithSamples(t, []RunSample{overlapA, overlapB, solo})
 	got, runs, measured := m.fleetIdleFraction()
@@ -125,8 +125,8 @@ func TestIdleAllowanceKeepsSamplesWithNoRecordedSpan(t *testing.T) {
 	// them as "might have overlapped" would strand the allowance on its
 	// assumption for another ten runs, so they count.
 	m := managerWithSamples(t, []RunSample{
-		{Ts: 1, IdlePct: 44, MachineVCPUHours: 10},
-		{Ts: 2, IdlePct: 44, MachineVCPUHours: 10},
+		{TS: 1, IdlePct: 44, MachineVCPUHours: 10},
+		{TS: 2, IdlePct: 44, MachineVCPUHours: 10},
 	})
 	got, runs, measured := m.fleetIdleFraction()
 	if !measured || runs != 2 {

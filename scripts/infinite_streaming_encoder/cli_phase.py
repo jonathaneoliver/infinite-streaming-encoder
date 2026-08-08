@@ -48,7 +48,7 @@ from infinite_streaming_encoder.encode_variants import (
 )
 from infinite_streaming_encoder.ffprobe import probe
 from infinite_streaming_encoder.hls import (
-    TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls,
+    generate_byteranges_sidecars, generate_fmp4_hls,
 )
 from infinite_streaming_encoder.manifests import write_fragmented_mpd
 from infinite_streaming_encoder.ladder import (
@@ -57,7 +57,6 @@ from infinite_streaming_encoder.ladder import (
 )
 from infinite_streaming_encoder.mezzanine import MezzanineSpec, create_mezzanine
 from infinite_streaming_encoder.packager import PackageSpec, package
-from infinite_streaming_encoder.padding import multi_duration_lcm, plan_padding
 from infinite_streaming_encoder.progress import (
     emit_boot_ami, emit_stage, prime_fleet_cpu)
 from infinite_streaming_encoder.telemetry import emit, flush as flush_telemetry
@@ -407,7 +406,6 @@ def _fetch_mezz_cached(mezz_uri: str, mezz_local: Path,
     cache_dir = os.environ.get("MEZZ_CACHE_DIR")
     if not cache_dir:
         return _download_if_complete(mezz_uri, mezz_local)
-    import fcntl
     import hashlib
     os.makedirs(cache_dir, exist_ok=True)
     key = hashlib.sha256(mezz_uri.encode()).hexdigest()[:16]

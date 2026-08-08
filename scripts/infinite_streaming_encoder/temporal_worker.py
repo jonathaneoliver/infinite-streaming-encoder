@@ -389,7 +389,6 @@ class EncodeWorkflow:
                               {}, "audio", priority_key=job_top)
 
         cd = plan["chunk_duration_s"]
-        n = plan["n_chunks"]
         # Explicit boundaries from the orchestrator. Required — a plan without
         # them comes from a pre-#176 orchestrator, and the worker it would reach
         # no longer derives its own, so failing here beats encoding blind.

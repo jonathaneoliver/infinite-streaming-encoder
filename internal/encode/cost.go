@@ -162,7 +162,7 @@ func median(v []float64) float64 {
 //
 // "graviton" is hardcoded, and must stay that way while there is one compute
 // environment. infra/terraform/modules/compute/main.tf launches c8g/c7g only, so
-// a cloud-batch job CANNOT land on Intel or AMD — quoting JobConfig.CpuArch's
+// a cloud-batch job CANNOT land on Intel or AMD — quoting JobConfig.CPUArch's
 // speeds would price hardware the run can never reach. (The form's cpu-arch
 // control is hidden as retired legacy for the same reason, and the estimate
 // request does not send the field.) Wire it up when a second compute env exists,

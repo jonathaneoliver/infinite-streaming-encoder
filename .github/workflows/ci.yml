@@ -58,10 +58,13 @@ jobs:
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
-      # staticcheck, ALL checks including ST* style. Adopted at zero
-      # outstanding findings, so anything it reports from here is new.
+      # -checks all is NOT the default, and the difference is the point. Bare
+      # `staticcheck` runs its default set, which silently excludes seven ST*
+      # rules (ST1000/1003/1016/1020/1021/1022/1023) — so the previous comment
+      # here claiming "ALL checks including ST*" was wrong by 20 findings.
+      # Adopted at zero, so anything reported from here is new.
       - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest -checks all ./...
 
   # The Python half had NO CI at all. `make check` runs a ruff F821 pass and ten
   # test scripts, but nothing ran them except a human typing `make check` — and
@@ -83,13 +86,35 @@ jobs:
         with:
           python-version: '3.x'
 
-      # F821 only, matching `make check`. The wider F rules currently report
-      # unused imports/locals, which are noise rather than defects; F821 is the
-      # one whose findings are always a real NameError waiting to happen.
-      - name: ruff (undefined names)
+      # The whole F (pyflakes) family, not just F821.
+      #
+      # F821 was chosen alone on the grounds that the rest are "unused
+      # imports/locals — noise rather than defects". Half right: F541 is
+      # cosmetic. But F401 is the Python twin of the dead `cloudEnvPassthrough`
+      # that staticcheck's U1000 had just found on the Go side — an unused
+      # import is how a REMOVED mechanism keeps looking present, and reading
+      # it as still wired is how CLAUDE.md came to describe a code path that
+      # no longer existed.
+      #
+      # Cleared to zero on adoption: 9 unused imports, 5 dead assignments,
+      # 2 placeholder f-strings.
+      #
+      # Deliberately NOT widened further. `--select ALL` reports thousands and
+      # is dominated by things this codebase does on purpose: 305 T201 (print
+      # is the mandated telemetry transport for cli_batch), 217 S101 (the test
+      # scripts), plus D*/ANN* house style nobody has agreed to. The
+      # bug-shaped families (B/PLW/RUF/PIE) were measured too and found
+      # nothing real — an unused loop index, an intentional `body =
+      # body.rstrip()` rebind, a doubled startswith.
+      #
+      # S110/BLE001 (try-except-pass, blind except) are the pattern that
+      # swallowed the is_record NameError below, and are still not enabled:
+      # this codebase uses them deliberately for best-effort housekeeping, so
+      # they are a review judgement, not a lint rule.
+      - name: ruff (pyflakes)
         run: |
           python -m pip install --quiet ruff
-          ruff check --select F821 scripts/
+          ruff check --select F scripts/
 
       - name: python compile
         run: python -m compileall -q scripts/

@@ -23,9 +23,7 @@ import os
 import resource
 import shutil
 import sys
-import tempfile
 import time
-from fractions import Fraction
 from pathlib import Path
 
 from infinite_streaming_encoder.audio import AudioSpec, create_audio
