@@ -38,6 +38,12 @@ type Config struct {
 	// the Retry UI a runway to resume from prior work without letting
 	// staging accumulate indefinitely. Zero disables.
 	FailedStagingMaxAge time.Duration
+	// How often to run that GC. It rides the inventory poll, but it enforces an
+	// HOURS-scale retention (FailedStagingMaxAge), so running it once per
+	// Interval was ~1,440 LIST calls plus a head_object per job prefix per day
+	// to act on something that changes at most a few times a day. Zero falls
+	// back to every tick (the old behaviour).
+	FailedStagingInterval time.Duration
 	// WarmMinVCPUs keeps the Batch compute environment's minvCpus at this
 	// value while a cloud-batch run is active, then resets it to 0 when idle —
 	// so the packaging tail lands on a hot instance instead of cold-starting.
@@ -77,6 +83,27 @@ type inventoryDoc struct {
 // which also resets any value leaked by a crash mid-run). Accessed only from
 // the single awswatch goroutine, so no lock needed.
 var lastSetMinVCPUs = -1
+
+// lastFailedStagingGC is when gcFailedStaging last ran, so it can keep its own
+// (much slower) cadence while riding this loop's tick. Zero value = never, so
+// the first tick always runs it. Same single-goroutine contract as above.
+var lastFailedStagingGC time.Time
+
+// maybeGCFailedStaging runs the failed-staging GC if it is enabled and due.
+// Both the quiet and the busy path call it; the schedule lives here so they
+// cannot drift apart.
+func maybeGCFailedStaging(cfg Config) {
+	if cfg.FailedStagingMaxAge <= 0 {
+		return
+	}
+	if time.Since(lastFailedStagingGC) < cfg.FailedStagingInterval {
+		return
+	}
+	lastFailedStagingGC = time.Now()
+	if err := gcFailedStaging(cfg.FailedStagingMaxAge); err != nil {
+		log.Printf("awswatch: gc_failed_staging failed: %v", err)
+	}
+}
 
 // Run polls the AWS inventory on `cfg.Interval` until ctx is cancelled.
 // Returns immediately if cfg.Interval == 0.
@@ -129,11 +156,7 @@ func runCheck(cfg Config) {
 	if inv.Summary.RunningInstances == 0 && inv.Summary.OrphanVolumes == 0 {
 		// Quiet — but still run the staging GC since failed prefixes
 		// aren't reflected in the inventory summary.
-		if cfg.FailedStagingMaxAge > 0 {
-			if err := gcFailedStaging(cfg.FailedStagingMaxAge); err != nil {
-				log.Printf("awswatch: gc_failed_staging failed: %v", err)
-			}
-		}
+		maybeGCFailedStaging(cfg)
 		return
 	}
 
@@ -165,14 +188,11 @@ func runCheck(cfg Config) {
 		}
 	}
 
-	// GC S3 staging for failed jobs past their retention window.
-	// Runs every tick; the Python side cheaply skips prefixes without
-	// a _FAILED marker, so this is idempotent and low-cost.
-	if cfg.FailedStagingMaxAge > 0 {
-		if err := gcFailedStaging(cfg.FailedStagingMaxAge); err != nil {
-			log.Printf("awswatch: gc_failed_staging failed: %v", err)
-		}
-	}
+	// GC S3 staging for failed jobs past their retention window, on its own
+	// slower cadence — it is idempotent, but "idempotent" is not "free": each
+	// pass is a LIST plus a head_object per job prefix, billed as requests and
+	// (from outside the region) as egress.
+	maybeGCFailedStaging(cfg)
 }
 
 // reconcileWarmCapacity sets the compute environment's min_vcpus to WarmMinVCPUs

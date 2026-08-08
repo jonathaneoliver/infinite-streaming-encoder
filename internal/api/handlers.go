@@ -45,9 +45,9 @@ type Server struct {
 	// s3Mu/s3Prefixes/s3Bytes/s3At cache the S3 staging enumeration — the one
 	// part of the inventory whose cost is O(objects held) rather than O(running
 	// resources), and the only part no background caller wants (#227). It is
-	// recomputed at most once per s3PrefixTTL and spliced into every inventory
-	// served in between, so an open AWS tab polling every 10s pays for one walk
-	// per TTL and a closed one pays for none.
+	// recomputed only when a request opts in (see awsInventory) and spliced into
+	// every inventory served in between, so a 10s poll pays nothing and an open
+	// AWS tab pays for one walk per visit.
 	s3Mu       sync.Mutex
 	s3Prefixes json.RawMessage
 	s3Bytes    int64
@@ -1173,7 +1173,12 @@ func validCloudArg(a string) bool {
 	return true
 }
 
-func runPythonCloud(module string, args ...any) ([]byte, error) {
+// Indirected so tests can observe what the handlers ask Python for — which, for
+// the inventory, is the whole point: the difference between a poll and a
+// measurement is one argument, and it is the argument that costs money.
+var runPythonCloud = runPythonCloudExec
+
+func runPythonCloudExec(module string, args ...any) ([]byte, error) {
 	// The module name is always a compile-time constant at every call site; the
 	// ARGS are what carry user input, so they are what is checked.
 	fullArgs := []string{"-m", "infinite_streaming_encoder.cloud." + module, "--json"}
@@ -1223,29 +1228,59 @@ func runPythonCloud(module string, args ...any) ([]byte, error) {
 // being papered over indefinitely.
 const invStaleWindow = 2 * time.Minute
 
-// s3PrefixTTL is how long one S3 staging enumeration is reused.
-//
-// Staging changes on the timescale of an encode, not of a poll: the page asks
-// for the inventory every 10s while the AWS or Jobs tab is open, and a walk per
-// poll is ~9 LIST pages of a bill for a number that has not moved. Deletions do
-// not wait for it — every path a user can press invalidates the cache — so the
-// only staleness this can show is staging that GREW, which the next TTL picks
-// up. (The one deleter that does not invalidate is awswatch's failed-staging
-// GC: it runs on its own schedule in another package, so its rows age out on
-// the TTL like any other change.)
-const s3PrefixTTL = 10 * time.Minute
+// s3PrefixMinInterval floors how often the S3 staging enumeration may be
+// recomputed, even for a caller that explicitly asked for it — so holding down
+// Refresh, or bouncing in and out of the AWS tab, cannot walk the bucket in a
+// loop. A delete resets it (invalidateS3Prefixes zeroes the timestamp), because
+// a row that survives the refresh after a delete reads as a failed delete.
+const s3PrefixMinInterval = 5 * time.Minute
 
+// shouldWalkS3 decides whether one request pays for a bucket enumeration.
+// `asked` is the caller opting in (`?s3=1`); a poll never does. `have`/`at`
+// describe the cached measurement, if any.
+func shouldWalkS3(asked, have bool, at time.Time) bool {
+	if !asked {
+		return false
+	}
+	return !have || time.Since(at) >= s3PrefixMinInterval
+}
+
+// The staging walk is OPT-IN PER REQUEST (`?s3=1`), not on a timer.
+//
+// It is the one part of the inventory whose cost is O(objects held) rather than
+// O(resources running), and — this is the part that bit us — the caller is the
+// Mac, not an in-region worker, so S3 bills every byte of the listing XML as
+// internet egress. Measured over 23 days on the real account: egress tracks
+// Tier1 (LIST) request count at r=0.99, at 120–535 KB per request, which is
+// simply the size of a 1000-key list_objects_v2 page. It tracks spot hours at
+// r=0.33 — i.e. it is very nearly independent of whether anything is encoding.
+//
+// On a wall clock this ran ~144×/day for a `jobs/` prefix the 7-day lifecycle
+// rule keeps re-listing long after the run that wrote it. On a day with ZERO
+// encoding that was 62,865 LIST requests and 20.3 GB of egress: ~$2/day, ~79%
+// of the entire monthly bill, for a table nobody had on screen.
+//
+// So it is measured when a human is actually looking at it — the AWS tab being
+// opened, or the Refresh button — and never on the 10s poll that keeps the
+// instance/execution/Batch tables live. Between measurements the cached value
+// is spliced in, stamped with when it was taken (`s3_prefixes_at`), so the tab
+// says how old the number is rather than implying it is current.
+//
+// A caller that does not ask gets `s3_prefixes: null` when nothing has ever
+// been measured. That is "not measured", and it must never be rendered as
+// "nothing staged" — see renderAwsS3 and the S3-staged tile.
 func (s *Server) awsInventory(w http.ResponseWriter, r *http.Request) {
-	prefixes, sizeBytes, at, cached := s.cachedS3Prefixes()
+	prefixes, sizeBytes, at, have := s.cachedS3Prefixes()
+	walk := shouldWalkS3(r.URL.Query().Get("s3") == "1", have, at)
 	gen := s.s3Generation()
 	var (
 		out []byte
 		err error
 	)
-	if cached {
-		out, err = runPythonCloud("inventory", "--no-s3-prefixes")
-	} else {
+	if walk {
 		out, err = runPythonCloud("inventory")
+	} else {
+		out, err = runPythonCloud("inventory", "--no-s3-prefixes")
 	}
 	if err != nil {
 		// Log it: this path was previously silent, so the fleet blanking left no
@@ -1265,10 +1300,10 @@ func (s *Server) awsInventory(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 502)
 		return
 	}
-	if cached {
-		out = mergeS3Prefixes(out, prefixes, sizeBytes, at)
-	} else {
+	if walk {
 		s.storeS3Prefixes(out, gen)
+	} else if have {
+		out = mergeS3Prefixes(out, prefixes, sizeBytes, at)
 	}
 	s.invMu.Lock()
 	s.invLast, s.invAt = out, time.Now()
@@ -1278,12 +1313,17 @@ func (s *Server) awsInventory(w http.ResponseWriter, r *http.Request) {
 	w.Write(out)
 }
 
-// cachedS3Prefixes returns the cached staging enumeration when it is still
-// within s3PrefixTTL. ok=false means the caller must ask Python to walk again.
+// cachedS3Prefixes returns the last staging enumeration and when it was taken.
+// ok=false means none has ever been taken (or a delete invalidated the last
+// one), so there is nothing to splice and the payload says "not measured".
+//
+// Deliberately NOT age-gated: age is reported to the caller (`s3_prefixes_at`)
+// rather than used to trigger a walk, because a walk is only worth its egress
+// when someone asked for the number. s3PrefixMinInterval bounds the asking.
 func (s *Server) cachedS3Prefixes() (prefixes json.RawMessage, sizeBytes int64, at time.Time, ok bool) {
 	s.s3Mu.Lock()
 	defer s.s3Mu.Unlock()
-	if s.s3Prefixes == nil || time.Since(s.s3At) >= s3PrefixTTL {
+	if s.s3Prefixes == nil {
 		return nil, 0, time.Time{}, false
 	}
 	return s.s3Prefixes, s.s3Bytes, s.s3At, true

@@ -149,6 +149,10 @@ func main() {
 		MaxLifetime:         *awsMaxLifetime,
 		AutoTerminateStale:  *awsAutoTerminate,
 		FailedStagingMaxAge: 1 * time.Hour,
+		// Enforced on its own clock, not the 60s inventory tick: the retention
+		// window above is measured in hours, and each pass costs a LIST plus a
+		// head_object per job prefix.
+		FailedStagingInterval: 30 * time.Minute,
 		// Keep one box warm while cloud work is active so the packaging tail
 		// (and the next queued job) doesn't cold-start; 0 disables.
 		WarmMinVCPUs: intEnv("WARM_MIN_VCPUS", 2),
