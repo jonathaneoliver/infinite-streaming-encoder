@@ -2686,7 +2686,25 @@ function _runEfficiencyHtml(e) {
     if (e.cpu_vcpu_h > 0) parts.push(`${e.cpu_vcpu_h.toFixed(2)} vCPU-h`);
     if (e.encode_wall_s > 0) parts.push(`${_runSecs(e.encode_wall_s)} encode span`);
     if (e.avg_concurrency > 0) parts.push(`${e.avg_concurrency.toFixed(1)} avg vCPUs busy`);
-    if (e.efficiency_pct > 0) parts.push(`${e.efficiency_pct.toFixed(0)}% of the fleet ceiling`);
+    // Work you got vs machine time you PAID for — the one ratio here whose
+    // denominator is the bill. It leads, and `% of the fleet ceiling` no longer
+    // appears next to it: that figure is avg-busy over max_vcpus, so raising the
+    // ceiling halves it with nothing about the run changing, and two percentages
+    // side by side invite being read as the same measurement (they differ in
+    // both numerator and denominator). Ceiling headroom stays available on hover.
+    if (e.machine_vcpu_hours > 0 && e.allocated_vcpu_hours > 0) {
+        const pct = 100 * e.allocated_vcpu_hours / e.machine_vcpu_hours;
+        const ceiling = e.efficiency_pct > 0
+            ? ` The fleet also ran at ${e.efficiency_pct.toFixed(0)}% of its ${e.max_vcpus}-vCPU ceiling, which is headroom, not waste.`
+            : '';
+        parts.push(`<span title="Allocated vCPU-hours over machine vCPU-hours rented (launch to termination). AWS bills the instance, not the reservation, so this is the ratio that maps to money: boot, image pull, the fan-in wait and the scale-down tail all land in the denominator.${ceiling}">`
+            + `<b>${pct.toFixed(0)}% of rented machine time did work</b>`
+            + ` <span class="u">(${e.allocated_vcpu_hours.toFixed(2)} of ${e.machine_vcpu_hours.toFixed(2)} vCPU-h)</span></span>`);
+    } else if (e.efficiency_pct > 0) {
+        // Older records have no rental figures. Say which ratio this is rather
+        // than letting it stand in for the one above.
+        parts.push(`<span title="avg vCPUs busy over the compute env's max vCPUs — fleet headroom, NOT work-per-money. Machine rental was not recorded for this run.">${e.efficiency_pct.toFixed(0)}% of the fleet ceiling</span>`);
+    }
     if (e.instances > 0) parts.push(`${e.instances} instances`);
     if (e.job_count > 0) parts.push(`${e.job_count} batch jobs`);
     // The makespan floor: no amount of fan-out finishes the run sooner than its

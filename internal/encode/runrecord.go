@@ -63,10 +63,32 @@ type RunEfficiency struct {
 	JobCount       int     `json:"job_count,omitempty"`
 	MaxVcpus       int     `json:"max_vcpus,omitempty"`
 	Instances      int     `json:"instances,omitempty"`
-	LocalWallS     float64 `json:"local_wall_s,omitempty"`
-	ReclaimCount   int     `json:"reclaim_count,omitempty"`
-	ReclaimLostS   float64 `json:"reclaim_lost_s,omitempty"`
-	EncodeTotalS   float64 `json:"encode_total_s,omitempty"`
+	// Machine rental vs allocation — the work-you-got-for-what-you-paid view,
+	// and the only one here whose denominator is the bill.
+	//
+	// EfficiencyPct above is AvgConcurrency ÷ MaxVcpus: how full the fleet ran
+	// against the ceiling you configured. That is a real number but it is not a
+	// property of the run — raise max_vcpus and it halves with nothing else
+	// changing. These three are anchored to what AWS actually charged for:
+	// MachineVCPUHours is instance lifetimes (launch to termination),
+	// AllocatedVCPUHours is the sum of each job's reservation, and IdlePct is
+	// the share of rented time with no job on it at all.
+	//
+	// Persisted here because they were already computed per run and written
+	// only to $TMP_DIR/spot_samples.json, which is keyed by time and not by
+	// output — so the one place someone asks "what did this encode cost me in
+	// machine time" could not answer. Same #94 reasoning as the fields above.
+	//
+	// IdlePct is a LOWER BOUND: boxes still alive at terminal have their
+	// lifetime measured to now, and the scale-down tail after that is never
+	// seen. It errs low, which under-states idle rather than inventing it.
+	MachineVCPUHours   float64 `json:"machine_vcpu_hours,omitempty"`
+	AllocatedVCPUHours float64 `json:"allocated_vcpu_hours,omitempty"`
+	IdlePct            float64 `json:"idle_pct,omitempty"`
+	LocalWallS         float64 `json:"local_wall_s,omitempty"`
+	ReclaimCount       int     `json:"reclaim_count,omitempty"`
+	ReclaimLostS       float64 `json:"reclaim_lost_s,omitempty"`
+	EncodeTotalS       float64 `json:"encode_total_s,omitempty"`
 }
 
 // RunRecord is what one output dir's encode run was.
@@ -311,6 +333,8 @@ func buildRunRecord(job *Job, cfg JobConfig, dirName string) RunRecord {
 		AvgConcurrency: job.AvgConcurrency, EfficiencyPct: job.EfficiencyPct,
 		SlowestJob: job.SlowestJob, SlowestJobS: job.SlowestJobS,
 		JobCount: job.JobCount, MaxVcpus: job.MaxVcpus, Instances: job.Instances,
+		MachineVCPUHours:   job.MachineVCPUHours,
+		AllocatedVCPUHours: job.AllocatedVCPUHours, IdlePct: job.IdlePct,
 		LocalWallS: job.LocalWallSeconds, ReclaimCount: job.ReclaimCount,
 		ReclaimLostS: job.ReclaimLostS, EncodeTotalS: job.EncodeTotalS,
 	}
