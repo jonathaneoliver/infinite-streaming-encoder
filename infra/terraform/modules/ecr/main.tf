@@ -1,6 +1,19 @@
-# Private repo for the encoder image. Batch tasks run in private
-# subnets and reach ECR via the Interface endpoints from the network
-# module — no internet egress.
+# Private repo for the encoder image. Batch workers pull it over the
+# INTERNET GATEWAY: they run in the network module's PUBLIC subnets with
+# auto-assigned public IPs, behind an egress-only security group.
+#
+# There are no ecr.api / ecr.dkr interface endpoints to pull through. That
+# layout was considered and rejected on cost — interface endpoints bill
+# ~$22/mo standing whether or not anything encodes, and this fleet is idle
+# most of the time. Only the free S3 Gateway endpoint is kept. See the
+# header of modules/network/main.tf, which is authoritative for the
+# topology.
+#
+# Said explicitly because the previous comment here claimed the opposite
+# ("private subnets… via the Interface endpoints… no internet egress"),
+# and #188 spent time reasoning about worker reachability against it.
+# Workers DO have egress; what they lack is anything to reach the server
+# ON, since it sits behind home NAT with no public address.
 
 resource "aws_ecr_repository" "encoder_worker" {
   name                 = "infinite-streaming-encoder-worker"
