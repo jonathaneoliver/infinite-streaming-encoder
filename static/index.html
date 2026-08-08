@@ -3201,7 +3201,7 @@ function _estimateHtml(e, nFiles) {
              + `</span>`
              + _excludedRungsNote(e);
     }
-    const parts = [`$${(e.spot_usd || 0).toFixed(2)} compute`];
+    const parts = [`$${(e.spot_usd || 0).toFixed(2)} compute${_idleNote(e)}`];
     if (e.egress_usd > 0) parts.push(`$${e.egress_usd.toFixed(2)} egress (${e.egress_gb.toFixed(2)} GB)`);
     else parts.push(`<span style="color:#6ab04c">no egress — media stays in S3</span>`);
     return `<b>Estimated cost</b> ${src} → <b>$${(e.total_usd || 0).toFixed(2)}</b> `
@@ -3209,6 +3209,32 @@ function _estimateHtml(e, nFiles) {
          + _saasCompare(e)
          + `</span>`
          + _excludedRungsNote(e);
+}
+
+// The fleet-idle allowance, stated rather than folded in (#237).
+//
+// The compute figure predicts ALLOCATED vCPU-hours; AWS bills the instance from
+// launch to termination — boot, image pull and the scale-down tail included — so
+// the estimate used to come in at ~60% of what the same app then reported when
+// the run finished. It now carries the measured gap, and this says so, because
+// an invisible 1.7x multiplier next to the Encode button is exactly how the
+// original discrepancy survived unnoticed.
+//
+// Says which basis it is on: measured over N runs, or the documented assumption
+// while no cloud run has finished here yet.
+function _idleNote(e) {
+    const pct = e.idle_pct || 0;
+    if (pct <= 0) return '';
+    const measured = !!e.idle_measured;
+    const n = e.idle_runs || 0;
+    const how = measured
+        ? `median of the last ${n} cloud run${n === 1 ? '' : 's'}`
+        : 'assumed — no cloud run measured here yet';
+    const title = measured
+        ? `Instances are billed launch-to-termination, so a run pays for boot, image pull and the scale-down tail on top of the time its chunks allocate. Measured at ${pct.toFixed(0)}% across the last ${n} cloud run${n === 1 ? '' : 's'} (runs that overlapped another encode are excluded — a shared instance's time is attributed to whichever run reports it). Without this the estimate quotes allocated time and lands ~40% under the bill.`
+        : `Instances are billed launch-to-termination, so a run pays for boot, image pull and the scale-down tail on top of the time its chunks allocate. No cloud run has been measured on this install yet, so this is the documented ${pct.toFixed(0)}% assumption; the first finished cloud run replaces it with a real figure.`;
+    return ` <span style="color:${measured ? '#889' : '#e9c46a'}" title="${title}">`
+         + `(incl. ${pct.toFixed(0)}% fleet idle — ${how})</span>`;
 }
 
 function _jobConfigHtml(c) {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"sort"
 	"strconv"
 )
 
@@ -43,24 +44,161 @@ const (
 // apart in three files, and this must not become the fourth.
 const EgressUSDPerGB = 0.09
 
+// assumedFleetIdleFraction prices the gap between allocated and rented time
+// before any cloud run has been measured on this install.
+//
+// 0.40 is the midpoint of the 38-44% band measured across every run tabulated
+// in #208 and #237. It is an ASSUMPTION, labelled as one everywhere it is
+// shown, and it is self-correcting: the first finished cloud run replaces it
+// with that run's own figure, so nobody ever has to edit this constant to track
+// a fleet that got better at packing.
+const assumedFleetIdleFraction = 0.40
+
+// maxFleetIdleFraction caps what the measurement is allowed to claim. A sample
+// approaching 1.0 divides the estimate towards infinity, and the sample most
+// likely to do that is a degenerate one — a run whose instances were almost
+// entirely someone else's. Clamping keeps a bad measurement merely wrong
+// instead of catastrophic.
+const maxFleetIdleFraction = 0.85
+
+// fleetIdleRuns is how many recent cloud runs the allowance is taken over. Small
+// enough that a fleet-packing improvement shows up within a working session,
+// large enough that one unusual run cannot swing it. The MEDIAN, not the mean —
+// #208's own tabulation spans 38-44% with outliers well outside it, and a single
+// pathological run must not set the price of every future estimate.
+const fleetIdleRuns = 10
+
+// fleetIdleFraction is the share of rented machine time that no job allocated,
+// measured over recent cloud runs. Returns (fraction, runs, measured) — `runs`
+// is how many samples backed it, and `measured` is false when the answer is the
+// stated assumption rather than an observation.
+//
+// This exists because the estimate and the finished run were computed on
+// different bases and disagreed by 1.6-1.8x (#237). projectCloudCost predicts
+// ALLOCATED vCPU-hours; AWS bills the INSTANCE, launch to termination, boot and
+// image pull and scale-down tail included. The two reconcile through exactly one
+// term — machine = allocated / (1 - idle) — and this measures it.
+//
+// OVERLAPPING RUNS ARE EXCLUDED. _emit_machine_rental attributes a concurrent
+// run's time on a shared instance to whichever run is reporting, so a sample
+// taken while another encode was live reads high for a reason that says nothing
+// about how the fleet packs one run. Including those biases the allowance up and
+// turns a systematic undercount into a systematic overcount.
+func (m *Manager) fleetIdleFraction() (fraction float64, runs int, measured bool) {
+	samples := m.readRunSamples()
+	var usable []float64
+	for i, s := range samples {
+		if s.IdlePct <= 0 || s.MachineVCPUHours <= 0 {
+			continue // not a cloud run, or rental could not be measured
+		}
+		if runOverlapsAny(s, samples, i) {
+			continue
+		}
+		usable = append(usable, s.IdlePct/100.0)
+	}
+	if len(usable) == 0 {
+		return assumedFleetIdleFraction, 0, false
+	}
+	if len(usable) > fleetIdleRuns {
+		usable = usable[len(usable)-fleetIdleRuns:]
+	}
+	f := median(usable)
+	if f < 0 {
+		f = 0
+	}
+	if f > maxFleetIdleFraction {
+		f = maxFleetIdleFraction
+	}
+	return f, len(usable), true
+}
+
+// runOverlapsAny reports whether samples[i]'s run span intersects any other
+// sample's. A sample missing its span is treated as NOT overlapping: those are
+// records written before the span was recorded, and dropping the whole back
+// catalogue would leave the allowance on its assumption for ten more runs.
+func runOverlapsAny(s RunSample, all []RunSample, i int) bool {
+	if s.StartedAt <= 0 || s.EndedAt <= s.StartedAt {
+		return false
+	}
+	for j, o := range all {
+		if j == i || o.StartedAt <= 0 || o.EndedAt <= o.StartedAt {
+			continue
+		}
+		if s.StartedAt < o.EndedAt && o.StartedAt < s.EndedAt {
+			return true
+		}
+	}
+	return false
+}
+
+// median of a non-empty slice. Copies before sorting — the caller's slice is a
+// window into the sample log and must not be reordered under it.
+func median(v []float64) float64 {
+	c := append([]float64(nil), v...)
+	sort.Float64s(c)
+	n := len(c)
+	if n%2 == 1 {
+		return c[n/2]
+	}
+	return (c[n/2-1] + c[n/2]) / 2
+}
+
 // projectCloudCost estimates what a job's full output ladder would cost to
 // encode on our AWS Batch Graviton fleet, and is authoritative for the UI's
 // "AWS spot / on-demand" numbers (the Python marker only supplies the SaaS
-// commercial + MediaConvert baselines now). Cost is COMPUTE-based, exactly how
-// AWS bills: for every variant (codec × ladder rung) it takes the LEARNED
-// graviton encode speed — content-seconds per wall-second, seeded from the model
-// until observed — turns the clip's content duration into encode wall-hours,
-// and multiplies by the variant's vCPU request and the $/vCPU-hour rate. Summed
-// over all variants. As the graviton speed table fills in from real encodes,
-// this sharpens automatically. Returns (spot, ondemand); (0,0) if it can't size
-// the ladder (unknown duration, no store, empty ladder).
+// commercial + MediaConvert baselines now). For every variant (codec × ladder
+// rung) it takes the LEARNED graviton encode speed — content-seconds per
+// wall-second, seeded from the model until observed — turns the clip's content
+// duration into encode wall-hours, and multiplies by the variant's vCPU request.
+// Summed over all variants, that is ALLOCATED vCPU-hours; the fleet-idle
+// allowance below converts it to the MACHINE hours AWS actually bills. As the
+// graviton speed table and the idle history fill in from real encodes, this
+// sharpens automatically.
+//
+// Returns (spot, ondemand); (0,0) if it can't size the ladder (unknown duration,
+// no store, empty ladder).
+//
+// TWO THINGS HERE ARE DELIBERATE AND WILL LOOK LIKE BUGS:
+//
+// "graviton" is hardcoded, and must stay that way while there is one compute
+// environment. infra/terraform/modules/compute/main.tf launches c8g/c7g only, so
+// a cloud-batch job CANNOT land on Intel or AMD — quoting JobConfig.CpuArch's
+// speeds would price hardware the run can never reach. (The form's cpu-arch
+// control is hidden as retired legacy for the same reason, and the estimate
+// request does not send the field.) Wire it up when a second compute env exists,
+// not before.
+//
+// variantResourcesFor is the RESERVATION, not measured utilisation, and pricing
+// the reservation is correct here rather than merely convenient. The idle
+// allowance is defined as (machine - allocated)/machine where `allocated` sums
+// each job's RESERVED vCPU × duration, so the reservation appears on both sides
+// of the calibration and cancels. Substituting measured busy-cores would price
+// against a ratio that was never measured that way and reintroduce the very
+// undercount this fixes. Batch also packs by reservation, so it is the term that
+// actually drives instance lifetime — the thing being billed.
 func (m *Manager) projectCloudCost(cfg JobConfig, sourceWidth, fps int, durationS float64) (spot, ondemand float64) {
+	spot, ondemand, _, _, _ = m.projectCloudCostDetail(cfg, sourceWidth, fps, durationS)
+	return spot, ondemand
+}
+
+// projectCloudCostDetail is projectCloudCost plus the idle allowance it applied,
+// for callers that must SHOW the allowance rather than fold it in silently. An
+// invisible 1.7x multiplier on a number sitting next to the Encode button is how
+// this went unnoticed in the first place.
+func (m *Manager) projectCloudCostDetail(cfg JobConfig, sourceWidth, fps int, durationS float64) (spot, ondemand, idle float64, idleRuns int, idleMeasured bool) {
+	idle, idleRuns, idleMeasured = m.fleetIdleFraction()
 	if m.Speeds == nil || m.Ladders == nil || durationS <= 0 {
-		return 0, 0
+		return 0, 0, idle, idleRuns, idleMeasured
 	}
 	ladderName := cfg.Ladder
 	if ladderName == "" {
 		ladderName = DefaultLadderName
+	}
+	// machine = allocated / (1 - idle). Guarded because a clamped-but-still-high
+	// fraction divides hard; maxFleetIdleFraction keeps this well away from zero.
+	scale := 1.0
+	if d := 1.0 - idle; d > 0 {
+		scale = 1.0 / d
 	}
 	for _, c := range parseCodecSel(cfg.Codec) {
 		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
@@ -72,11 +210,11 @@ func (m *Manager) projectCloudCost(cfg JobConfig, sourceWidth, fps int, duration
 			vcpuStr, _ := variantResourcesFor(c, r.Height)
 			vcpu, _ := strconv.ParseFloat(vcpuStr, 64)
 			wallHours := (durationS / sp) / 3600.0
-			spot += wallHours * vcpu * awsSpotVCPUHourUSD
-			ondemand += wallHours * vcpu * awsOndemandVCPUHourUSD
+			spot += wallHours * vcpu * awsSpotVCPUHourUSD * scale
+			ondemand += wallHours * vcpu * awsOndemandVCPUHourUSD * scale
 		}
 	}
-	return spot, ondemand
+	return spot, ondemand, idle, idleRuns, idleMeasured
 }
 
 // localFleetPerfCores is the local fleet's total parallel perf-core budget: the
@@ -425,6 +563,16 @@ type EstimateResult struct {
 	MediaConvertUSD float64 `json:"mediaconvert_usd"`
 	CoconutUSD      float64 `json:"coconut_usd"`
 	BitmovinUSD     float64 `json:"bitmovin_usd"`
+	// The fleet-idle allowance folded into SpotUSD/OnDemandUSD, surfaced so the
+	// UI can state it. IdleMeasured false means IdlePct is the documented
+	// assumption, not an observation, and the UI must say which — an allowance
+	// nobody can see is the defect this fixes, not the fix (#237).
+	//
+	// PERCENT (0-100), matching ENCODER-MACHINES' unallocated_pct and what the
+	// UI prints, not the 0-1 fraction the arithmetic uses.
+	IdlePct      float64 `json:"idle_pct"`
+	IdleRuns     int     `json:"idle_runs"`
+	IdleMeasured bool    `json:"idle_measured"`
 	// Local targets write straight to disk: no egress, no AWS spend at all.
 	Local bool `json:"local"`
 }
@@ -481,7 +629,10 @@ func (m *Manager) EstimateCost(cfg JobConfig) (EstimateResult, error) {
 		return out, nil
 	}
 
-	out.SpotUSD, out.OnDemandUSD = m.projectCloudCost(cfg, out.Width, out.Fps, totalDur)
+	var idle float64
+	out.SpotUSD, out.OnDemandUSD, idle, out.IdleRuns, out.IdleMeasured =
+		m.projectCloudCostDetail(cfg, out.Width, out.Fps, totalDur)
+	out.IdlePct = idle * 100
 	// Output size = the ladder's total bitrate x duration. The same bytes drive
 	// egress and (via the fitted per-GB rate) the Tier1 estimate, so a run that
 	// leaves media in S3 correctly shows near-zero here.
