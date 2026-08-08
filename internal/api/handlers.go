@@ -1322,7 +1322,7 @@ func (s *Server) awsInventory(w http.ResponseWriter, r *http.Request) {
 			w.Write(s.attachFleetCPU(cached))
 			return
 		}
-		http.Error(w, err.Error(), 502)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	if walk {
@@ -1554,7 +1554,7 @@ func (s *Server) uiLog(w http.ResponseWriter, r *http.Request) {
 func (s *Server) awsImageState(w http.ResponseWriter, r *http.Request) {
 	out, err := runPythonCloud("image_state")
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1585,16 +1585,15 @@ func (s *Server) awsClearAll(w http.ResponseWriter, r *http.Request) {
 	defer s.invalidateS3Prefixes()
 	out, err := runPythonCloud("cleanup", "--sweep-all")
 	if err != nil {
-		// Non-zero exit from cleanup means at least one action failed —
-		// we still want to return the structured report so the UI can
-		// render a partial-success state.
-		if strings.Contains(err.Error(), "exited 1") {
-			// cleanup.py prints the JSON report to stdout before
-			// exit(1), so we should re-invoke WITHOUT piping stderr
-			// to get that output. Simpler: just fall back to returning
-			// the error message as a plain-text response.
-		}
-		http.Error(w, err.Error(), 502)
+		// Non-zero exit from cleanup means at least one action failed. The
+		// structured report would be nicer than a bare string — cleanup.py
+		// prints its JSON to stdout before exit(1), so recovering it means
+		// re-invoking without piping stderr — but that was never built, and
+		// the empty `if strings.Contains(err, "exited 1")` left behind read
+		// as a partial-success path that existed. It didn't. Every non-zero
+		// exit lands here as plain text; if the structured report is wanted,
+		// it is new work rather than a branch to fill in.
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	s.invalidateRemoteOutputs(out, "emergency clear removed all AWS staging")
@@ -1613,7 +1612,7 @@ func (s *Server) awsCleanupJob(w http.ResponseWriter, r *http.Request) {
 	defer s.invalidateS3Prefixes() // this drops the job's staging prefix
 	out, err := runPythonCloud("cleanup", "--job-id", cloudVal(id))
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	s.invalidateRemoteOutputs(out, "job cleanup deleted the staging prefix")
@@ -1668,7 +1667,7 @@ func (s *Server) awsDeleteS3Prefix(w http.ResponseWriter, r *http.Request) {
 	defer s.invalidateS3Prefixes() // the row the user just deleted must not come back
 	out, err := runPythonCloud("cleanup", "--delete-prefix", cloudVal(body.Prefix))
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	s.invalidateRemoteOutputs(out, "staging prefix was deleted from the AWS tab")
@@ -1706,7 +1705,7 @@ func runPythonDist(args ...string) ([]byte, error) {
 func (s *Server) distStagingUsage(w http.ResponseWriter, r *http.Request) {
 	out, err := runPythonDist("--usage")
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1737,7 +1736,7 @@ func (s *Server) distStagingGC(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := runPythonDist(args...)
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1764,13 +1763,13 @@ func (s *Server) distStagingDeletePrefix(w http.ResponseWriter, r *http.Request)
 	want := strings.Trim(body.Prefix, "/")
 	for _, p := range s.Manager.ActiveDistPrefixes() {
 		if strings.Trim(p, "/") == want {
-			http.Error(w, "refused: that job is still queued or running", 409)
+			http.Error(w, "refused: that job is still queued or running", http.StatusConflict)
 			return
 		}
 	}
 	listed, err := runPythonDist("--usage")
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	var doc struct {
@@ -1779,7 +1778,7 @@ func (s *Server) distStagingDeletePrefix(w http.ResponseWriter, r *http.Request)
 		} `json:"prefixes"`
 	}
 	if err := json.Unmarshal(listed, &doc); err != nil {
-		http.Error(w, "could not list staging prefixes: "+err.Error(), 502)
+		http.Error(w, "could not list staging prefixes: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	target := ""
@@ -1795,7 +1794,7 @@ func (s *Server) distStagingDeletePrefix(w http.ResponseWriter, r *http.Request)
 	}
 	out, err := runPythonDist("--delete-prefix", target)
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1814,7 +1813,7 @@ func (s *Server) awsSetMaxVCPUs(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := runPythonCloud("compute_env", "--set-max-vcpus", strconv.Itoa(body.MaxVCPUs))
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1836,7 +1835,7 @@ func (s *Server) awsStopExecution(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := runPythonCloud("batch_admin", "stop-execution", "--arn", cloudVal(body.Arn))
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1858,7 +1857,7 @@ func (s *Server) awsTerminateBatchJob(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := runPythonCloud("batch_admin", "terminate-job", "--id", cloudVal(body.ID))
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1870,7 +1869,7 @@ func (s *Server) awsTerminateBatchJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) awsBatchStopAll(w http.ResponseWriter, r *http.Request) {
 	out, err := runPythonCloud("batch_admin", "stop-all")
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

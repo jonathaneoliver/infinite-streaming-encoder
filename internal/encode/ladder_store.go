@@ -531,10 +531,15 @@ func (m *Manager) ValidateResBand(cfg JobConfig) error {
 			return fmt.Errorf("ladder %q defines no %s rungs", ladderName, c)
 		}
 		switch {
+		// Lead lowercase (ST1005) while keeping "Min Res" / "Max Res" — those are
+		// the form's own field labels, and naming the control the user actually
+		// touched is what makes the message actionable. static/index.html carries
+		// an independent client-side copy of the same rule; nothing parses these
+		// strings, so the two need to agree in meaning, not in wording.
 		case minSet && minH > hi:
-			return fmt.Errorf("Min Res %s: this ladder's %s tops at %dp — no rung qualifies", cfg.MinRes, c, hi)
+			return fmt.Errorf("no rung qualifies: Min Res %s, but this ladder's %s tops at %dp", cfg.MinRes, c, hi)
 		case maxSet && maxH < lo:
-			return fmt.Errorf("Max Res %s: this ladder's %s starts at %dp — no rung qualifies", cfg.MaxRes, c, lo)
+			return fmt.Errorf("no rung qualifies: Max Res %s, but this ladder's %s starts at %dp", cfg.MaxRes, c, lo)
 		default:
 			return fmt.Errorf("no %s rung falls in the selected resolution band — this ladder's %s spans %dp–%dp", c, c, lo, hi)
 		}

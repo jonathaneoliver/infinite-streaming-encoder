@@ -115,8 +115,13 @@ setup-hooks:
 	@echo "'make check' now also runs on every push."
 
 .PHONY: check
-check:                ## run the same static checks CI runs (gofmt/vet/build, tofu fmt, py compile, page JS)
+check:                ## run the same static checks CI runs (gofmt/vet/build/test, staticcheck, govulncheck, tofu fmt, py compile, page JS)
 	@fail=0; \
+	: 'go install drops binaries in $$(go env GOPATH)/bin, which is not on PATH'; \
+	: 'by default on macOS. Without this, staticcheck/govulncheck report'; \
+	: '"skipped (go install ...)" to someone who has already installed them —'; \
+	: 'a gate that lies about being absent is worse than one that is.'; \
+	PATH="$$PATH:$$(go env GOPATH)/bin"; export PATH; \
 	printf '  gofmt          '; \
 	unformatted=$$(gofmt -l . 2>/dev/null); \
 	if [ -n "$$unformatted" ]; then \
@@ -139,6 +144,14 @@ check:                ## run the same static checks CI runs (gofmt/vet/build, to
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  go test        '; \
 	if out=$$(go test -race ./... 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  staticcheck    '; \
+	if ! command -v staticcheck >/dev/null 2>&1; then echo "skipped (go install honnef.co/go/tools/cmd/staticcheck@latest)"; \
+	elif out=$$(staticcheck ./... 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  govulncheck    '; \
+	if ! command -v govulncheck >/dev/null 2>&1; then echo "skipped (go install golang.org/x/vuln/cmd/govulncheck@latest)"; \
+	elif out=$$(govulncheck ./... 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py undefined   '; \
 	if ! command -v ruff >/dev/null 2>&1; then echo "skipped (pip install ruff)"; \

@@ -4534,15 +4534,18 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 	return runArgs
 }
 
-var cloudEnvPassthrough = []string{
-	"AWS_REGION", "AWS_PROFILE",
-	"S3_BUCKET",
-	"INSTANCE_TYPE", "INSTANCE_TYPE_FALLBACKS",
-	"USE_SPOT", "AMI_ID",
-	"SUBNET_ID", "SECURITY_GROUP_ID", "INSTANCE_PROFILE",
-	"GHCR_USERNAME", "GHCR_PAT",
-	"DOCKER_IMAGE",
-}
+// cloudEnvPassthrough was the env allow-list handed to a spawned cli_cloud.py
+// worker container — the single-box EC2 target, retired when cloud encoding
+// moved to Step Functions + Batch. Nothing has read it since: SUBNET_ID,
+// INSTANCE_PROFILE, GHCR_PAT and the rest appeared in this list and nowhere
+// else in the Go tree, so the variables it names are configured on the Batch
+// job definition now, not passed through here.
+//
+// Deleted rather than kept "in case", because a list that looks like the
+// mechanism but is wired to nothing is worse than no list: CLAUDE.md described
+// it as how cloud workers receive their AWS/GHCR credentials, which was
+// untrue for as long as this sat here compiling cleanly. staticcheck's U1000
+// is what surfaced it.
 
 // attachAndWait streams the worker container's logs into the job log buffer
 // and blocks until the container exits. Returns an error if the container
