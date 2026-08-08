@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha1"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -182,6 +183,13 @@ var (
 	// version stays identical.
 	ffmpegMarkerRe   = regexp.MustCompile(`^\[\[ENCODER-FFMPEG version=(.+)\]\]$`)
 	codecLibMarkerRe = regexp.MustCompile(`^\[\[ENCODER-CODECLIB codec=(\S+) lib=(\S+) version=(\S+)\]\]$`)
+	// ENCODER-ARGV reports the literal ffmpeg argv for one rung's encode, as
+	// base64 of a JSON string array — a filter chain has spaces, quotes and
+	// commas in it, so any format that needs quoting rules eventually gets
+	// parsed wrong. One per (codec, rung, pass) per worker process; the control
+	// plane keeps the first, since every worker on a rung builds the same
+	// command bar the input window and output path.
+	argvMarkerRe = regexp.MustCompile(`^\[\[ENCODER-ARGV codec=(\S+) label=(\S+) pass=(\d+) argv=(\S+)\]\]$`)
 	// ENCODER-SPEED reports a completed encode's content-seconds vs wall-seconds
 	// so the control plane can learn each variant's speed for the dynamic chunk
 	// selector, cost, and ETA. Keyed by every dimension that moves encode time:
@@ -674,6 +682,35 @@ func (j *Job) parseMarker(line string) bool {
 		// "libx265 4.2+37-b81f650e" — lib name kept with the version so the
 		// record stays readable without knowing the codec->library mapping.
 		j.CodecLibs[m[1]] = m[2] + " " + m[3]
+		j.mu.Unlock()
+		return true
+	}
+	if m := argvMarkerRe.FindStringSubmatch(line); m != nil {
+		raw, err := base64.StdEncoding.DecodeString(m[4])
+		if err != nil {
+			return true // consumed: a mangled payload is not a log line
+		}
+		var argv []string
+		if json.Unmarshal(raw, &argv) != nil || len(argv) == 0 {
+			return true
+		}
+		// pass=0 is a single-pass encode. A two-pass encode's pass 1 is a
+		// DIFFERENT command from a single-pass encode of the same rung — it
+		// writes stats and discards its output — so the two never share a key.
+		key := m[1] + "/" + m[2]
+		if m[3] != "0" {
+			key += " (pass " + m[3] + ")"
+		}
+		j.mu.Lock()
+		if j.FfmpegArgv == nil {
+			j.FfmpegArgv = map[string][]string{}
+		}
+		// First wins. Every worker on a rung reports the same command apart
+		// from its own input window and output path, so later ones add nothing
+		// and would just churn the record.
+		if _, seen := j.FfmpegArgv[key]; !seen {
+			j.FfmpegArgv[key] = argv
+		}
 		j.mu.Unlock()
 		return true
 	}
@@ -1239,6 +1276,15 @@ type Job struct {
 	// h264 entry as "not recorded".
 	FfmpegVersion string            `json:"ffmpeg_version,omitempty"`
 	CodecLibs     map[string]string `json:"codec_libs,omitempty"`
+
+	// FfmpegArgv is the literal command that encoded each rung, keyed
+	// "<codec>/<rung>" (plus " (pass N)" for a two-pass encode's passes), from
+	// ENCODER-ARGV. The last unrecorded input to a rendition: encode.json
+	// records the profile that IMPLIES the encode, so without this,
+	// reproducing one means re-deriving the invocation from ladder + maxrate +
+	// bufsize + passes + extra_args + GOP and the code that assembled them, at
+	// the commit that produced the output.
+	FfmpegArgv map[string][]string `json:"ffmpeg_argv,omitempty"`
 
 	// Spot-reclaim accounting for this file's encode (from ENCODER-RECLAIM).
 	// ReclaimCount = chunks reclaimed; ReclaimLostS = encode wall-seconds thrown
@@ -2534,6 +2580,45 @@ type PhaseStat struct {
 // PhaseRollup aggregates the whole job's stages by phase, collapsing a rung's
 // chunks into one row.
 func (j *Job) PhaseRollup() []PhaseStat { return j.PhaseRollupFor("", "") }
+
+// StagesFor returns the job's individual stages — one per chunk, uncollapsed —
+// narrowed to one source file and one codec by the same rules as
+// PhaseRollupFor. This is the detail behind the rollup: the rollup says a rung
+// took 46 minutes, these say which chunk ran when, and on what.
+//
+// Kept separate from the rollup rather than replacing it. On a 336-chunk run
+// this is ~350 rows, which is a timeline to look at and not a table to read —
+// the rollup stays the thing you read.
+func (j *Job) StagesFor(file, codec string) []StageProgress {
+	j.mu.Lock()
+	stages := append([]StageProgress(nil), j.Stages...)
+	history := append([]FileStages(nil), j.StagesHistory...)
+	currentFile := j.CurrentFile
+	j.mu.Unlock()
+	sameFile := func(name string) bool {
+		if file == "" {
+			return true
+		}
+		return name != "" && filepath.Base(name) == filepath.Base(file)
+	}
+	var out []StageProgress
+	keep := func(in []StageProgress) {
+		for _, s := range in {
+			if c := stageCodec(s.Key); codec == "" || c == "" || c == codec {
+				out = append(out, s)
+			}
+		}
+	}
+	for _, h := range history {
+		if sameFile(h.File) {
+			keep(h.Stages)
+		}
+	}
+	if sameFile(currentFile) {
+		keep(stages)
+	}
+	return out
+}
 
 // PhaseRollupFor is PhaseRollup narrowed to one source file and one codec, for
 // the per-output run record: a job that encoded h264 and hevc wrote two dirs,

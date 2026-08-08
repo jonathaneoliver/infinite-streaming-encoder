@@ -238,6 +238,35 @@ func TestWriteAndReadRunRecord(t *testing.T) {
 	}
 }
 
+// The timeline is drawn from the UNCOLLAPSED stages, so they need the same
+// per-output narrowing the rollup gets — otherwise an hevc output's timeline
+// shows h264 chunks it never contained.
+func TestStagesForNarrowsLikeTheRollup(t *testing.T) {
+	j := &Job{Stages: []StageProgress{
+		stage("mezzanine", 0, 2, 100, 120),
+		stage("encode:h264:1080p:chunk0", 2, 4, 200, 120),
+		stage("encode:h264:1080p:chunk1", 3, 5, 200, 120),
+		stage("encode:hevc:1080p:chunk0", 2, 9, 900, 420),
+	}}
+	hevc := j.StagesFor("", "hevc")
+	// Chunks stay SEPARATE here — that is the whole point against the rollup.
+	if len(hevc) != 2 {
+		t.Fatalf("want mezzanine + 1 hevc chunk, got %d: %+v", len(hevc), hevc)
+	}
+	for _, s := range hevc {
+		if strings.Contains(s.Key, "h264") {
+			t.Fatalf("h264 chunk leaked into the hevc timeline: %s", s.Key)
+		}
+	}
+	if got := j.StagesFor("", "h264"); len(got) != 3 {
+		t.Fatalf("want mezzanine + 2 h264 chunks, got %d", len(got))
+	}
+	// Unfiltered keeps everything, for a job-level view.
+	if got := j.StagesFor("", ""); len(got) != 4 {
+		t.Fatalf("unfiltered should keep all 4, got %d", len(got))
+	}
+}
+
 // A record reconstructed from a source that never captured the config must omit
 // it entirely. An empty JobConfig marshals as a perfectly valid-looking config,
 // so a reader would take a wall of defaults for facts — #202 with extra steps.
