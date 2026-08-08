@@ -135,6 +135,35 @@ boto3 chain — without that guard it would resolve to real AWS S3 and start
 deleting the *cloud* bucket's staging. Manual controls: `make minio-usage` /
 `make minio-clean` and `GET /api/dist/staging` + `POST /api/dist/staging/gc`.
 
+### TMP_DIR staging lifecycle (all targets)
+
+The local-disk twin of the above, and the same failure mode: `Manager.run`'s
+finalize path clears `$TMP_DIR/<job_id>/` on every terminal outcome, so only a
+job whose process *never reached* that path — server container killed or crashed
+mid-encode — leaves one behind. Nothing else could see them: `Reconcile`
+enumerates `$TMP_DIR/jobs/*.json`, and the state file dies with the payload, so
+the directory is orphaned from the only index that indexes it (#207).
+
+**`internal/tmpstage`** sweeps on `-tmp-staging-interval` (30m) for directories
+idle longer than `-tmp-staging-max-age` (24h, the crashed-job debugging window),
+with `Manager.ActiveJobIDs()` plus the `jobs/*.json` state files as the
+keep-list.
+
+`$TMP_DIR` holds four kinds of thing and only one is garbage, so **eligibility
+is the `^[0-9]+$` job-ID directory shape, not age** — the `encode_<stem>/`
+mezzanine caches, the learned state that sizes every chunk plan
+(`encode_speeds.json`, `ladders.json`, `quality-curves.json`) and the permanent
+record (`logs/`, `history.md`, `failed/`) are out of scope structurally rather
+than by a rule someone can forget. `MaxAge` of 0 means *disabled* at both the
+loop and the sweep, because read literally it puts the cutoff at now and takes
+every job directory with it.
+
+Idle is measured over the whole tree, not the top-level directory's own mtime,
+which an encode writing deep inside it never touches. The walk stops at the
+first recent file, so a live directory costs a few stats and only a doomed one
+is walked in full — which is where the reclaimed byte count in the log comes
+from.
+
 ### Worker telemetry (`[[ENCODER-*]]` markers)
 
 Every worker reports the same way — a stream of `[[ENCODER-…]]` marker lines —
@@ -298,6 +327,7 @@ not free — each pass is a LIST plus a `head_object` per job prefix.
 
 - Output dir naming is a contract shared by `OutputStem`, the encode script (appends `_<codec>`), `parseOutputMeta`, `resolveCodec`, and the watcher's `alreadyEncoded`. Changing the format means touching all of them.
 - The worker container name format (`encoder_job_<id>_f<idx>`) is a contract between `runFileContainer` and `Reconcile` — changing it means losing the ability to reattach to workers started by older server versions.
+- The all-digits job ID (`Submit` → `time.Now().UnixMilli()`) is a contract with `internal/tmpstage`, which uses that shape to tell a reclaimable job directory from the caches and learned state sharing `$TMP_DIR`. Give IDs a prefix and the sweeper stops seeing them (a silent leak); name anything else in `$TMP_DIR` with digits alone and it becomes eligible.
 - The docker.sock mount is what lets the Go server spawn and talk to worker containers. Without it, `docker run` / `docker logs -f` / `docker inspect` all fail and no encoding happens.
 - Host paths: the server needs both container-side paths (`SOURCE_DIR`, `OUTPUT_DIR`, `TMP_DIR` — used for all in-process file I/O) and host-side paths (`HOST_*` — used only for `-v` flags when launching workers). Workers mount host paths at the same paths the Go server uses, so script args don't need translation.
 - `move to OutputDir` only happens on success. A failed job leaves nothing in `OutputDir` (the `$TMP_DIR/<job_id>/` is unconditionally removed in `run`'s defer path).

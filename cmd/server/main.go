@@ -13,6 +13,7 @@ import (
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/awswatch"
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/diststage"
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/encode"
+	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/tmpstage"
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/watcher"
 )
 
@@ -97,6 +98,16 @@ func main() {
 	distStageLifecycleDays := flag.Int("dist-staging-lifecycle-days",
 		intEnv("DIST_STAGING_LIFECYCLE_DAYS", 3),
 		"MinIO bucket expiry for jobs/, in days; 0 disables")
+
+	// $TMP_DIR/<job_id>/ reclaim (#207) — the local-disk twin of the MinIO sweep
+	// above. run's finalize path clears the directory on every terminal outcome;
+	// this collects what a killed or crashed server left behind, which nothing
+	// else can see once the jobs/<id>.json state file is gone with it.
+	tmpStageInterval := flag.Duration("tmp-staging-interval", 30*time.Minute,
+		"TMP_DIR job-staging sweep interval; 0 disables")
+	tmpStageMaxAge := flag.Duration("tmp-staging-max-age",
+		time.Duration(intEnv("TMP_STAGING_MAX_AGE_H", 24))*time.Hour,
+		"reclaim job staging idle longer than this (also the crashed-job debugging window)")
 	flag.Parse()
 
 	// Buffered so a job start/finalize never blocks on nudging the keep-warm
@@ -169,6 +180,15 @@ func main() {
 		LifecycleDays: *distStageLifecycleDays,
 		// Never reclaim staging a queued/running job is still using.
 		ActivePrefixes: mgr.ActiveDistPrefixes,
+	})
+
+	// Started after Reconcile, so a job resumed from a state file is already in
+	// the keep-list before the first sweep looks at its directory.
+	go tmpstage.Run(context.Background(), tmpstage.Config{
+		Dir:       *tmpDir,
+		Interval:  *tmpStageInterval,
+		MaxAge:    *tmpStageMaxAge,
+		ActiveIDs: mgr.ActiveJobIDs,
 	})
 
 	srv := api.NewServer(mgr)
