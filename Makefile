@@ -1372,12 +1372,29 @@ smoke-cloud: require-paths require-s3-bucket  ## end-to-end CLOUD smoke against 
 	  echo "    stack, and bouncing the farm would not change what Batch runs."; \
 	  echo "    Bring one up with 'make farm-up' (or 'make run') and re-run."; exit 1; }
 	@echo ">>> [smoke-cloud] testing the DEPLOYED image + state machine + job definitions."
-	@echo "    Your working tree is NOT under test here. Deploy first if you meant to test it."
+	@echo "    A change to the WORKER (encode/package phases) is under test only if"
+	@echo "    you deployed it — Batch runs the ECR image, not your working tree."
+	@echo "    A change to the CONTROL PLANE (the server: submission, the host-side"
+	@echo "    phases, the sync-back) IS under test if you rebuilt and restarted the"
+	@echo "    server, which this target deliberately does not do for you."
 	@echo "    This launches spot capacity and transfers media: it costs money."
 	@echo ">>> [smoke-cloud] generating $(SMOKE_SRC) (if missing)..."
 	@[ -f "$(SMOKE_SRC)" ] || docker run --rm -v "$(SOURCE_DIR):/src" --entrypoint ffmpeg $(IMAGE_NAME) \
 	  -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 \
 	  -t 20 -pix_fmt yuv420p -c:v libx264 -c:a aac -shortest -y /src/smoke.mp4
+	@# Force a mezzanine cache MISS, or this target silently stops testing the
+	@# mezzanine at all. The cache is keyed on name|size|mtime and this file is
+	@# reused across runs, so every run after the first hit the cache and skipped
+	@# straight to fan-out — the mezzanine phase has not been exercised on the
+	@# cloud path since whenever smoke.mp4 was first created. It looked like a
+	@# pass: no mezz Batch job, straight to chunk encodes, exactly what a working
+	@# skip-the-job change would produce. The same shape for the opposite reason.
+	@#
+	@# touch, not delete: bumping the mtime moves the key, so the stale entry is
+	@# simply orphaned and ages out on the bucket's existing lifecycle rule. No
+	@# S3 deletion from a test target.
+	@echo ">>> [smoke-cloud] touching $(SMOKE_SRC) to force a mezzanine cache miss..."
+	@touch "$(SMOKE_SRC)"
 	@echo ">>> [smoke-cloud] clearing any prior smoke output..."
 	@rm -rf $(OUTPUT_DIR)/smoke_p200* 2>/dev/null || true
 	@echo ">>> [smoke-cloud] submitting (h264, 720p, 12s chunks, media forced home);"

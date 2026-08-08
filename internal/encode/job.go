@@ -2038,6 +2038,26 @@ func (j *Job) isLaunchComplete() bool {
 	return j.launchComplete
 }
 
+// mezzanineEnv builds the environment for a host-side mezzanine run.
+//
+// Extracted so the handoff is testable. Skipping the Mezzanine state takes its
+// ContainerOverrides with it, so TIME_LIMIT_S has to be supplied HERE or the
+// cloud half of the duration limit is silently dead — and silently is the
+// operative word: the chunk plan is clamped to the limit independently, so the
+// output still comes out the right length. What breaks is the invariant that a
+// limited cache key holds limited media, and no smoke run can see that.
+//
+// ENCODER_WORK_DIR gets a dedicated scratch dir because cli_phase rmtree's it on
+// entry, so it must not be shared. Under TmpDir rather than the container's /tmp
+// because the mezzanine is source-sized.
+func mezzanineEnv(base []string, work string, timeLimitS float64) []string {
+	env := append(append([]string{}, base...), "ENCODER_WORK_DIR="+work)
+	if timeLimitS > 0 {
+		env = append(env, "TIME_LIMIT_S="+strconv.FormatFloat(timeLimitS, 'f', -1, 64))
+	}
+	return env
+}
+
 // buildMezzanineOnHost runs the mezzanine phase locally and uploads the result
 // to s3Mezz, so the cloud pipeline can skip both the source upload and the
 // mezzanine Batch job (#266).
@@ -2058,16 +2078,8 @@ func (m *Manager) buildMezzanineOnHost(job *Job, localSrc, s3Mezz, tmpDir string
 
 	cmd := exec.Command("python3", "-m", "infinite_streaming_encoder.cli_phase",
 		"mezzanine", "--s3-in", localSrc, "--s3-out", s3Mezz)
-	// A dedicated scratch dir: cli_phase rmtree's ENCODER_WORK_DIR on entry, so
-	// it must not be shared with anything. Under TmpDir rather than the
-	// container's /tmp because the mezzanine is source-sized.
 	work := filepath.Join(tmpDir, "mezz-work")
-	env := append(os.Environ(), "ENCODER_WORK_DIR="+work)
-	if timeLimitS > 0 {
-		env = append(env, fmt.Sprintf("TIME_LIMIT_S=%s",
-			strconv.FormatFloat(timeLimitS, 'f', -1, 64)))
-	}
-	cmd.Env = env
+	cmd.Env = mezzanineEnv(os.Environ(), work, timeLimitS)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("mezzanine stdout pipe: %w", err)
