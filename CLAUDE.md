@@ -15,18 +15,35 @@ do not assume one and do not invent commands beyond these three:
   pins the Go chunk planner to golden vectors generated from the Python one.
   Both paths must cut a clip in the same places or local and cloud encodes stop
   being comparable.
-- `make smoke` — a REAL short encode end to end (synthetic 30s clip, chunked),
-  asserting the job reaches `done` AND produced playlists. `TARGET=cloud` for
-  the cloud path, `WHOLE=1` for the whole-variant path.
+- `make smoke` — a REAL short encode end to end (synthetic clip, chunked) on the
+  **local-dist** path, asserting the job reaches `done` AND produced playlists.
+  Builds and brings the master up from your working tree, so it tests uncommitted
+  code. It reports the fleet it ran on rather than claiming a single device — see
+  `make fleet-check` (#248).
+- `make smoke-cloud` — the cloud twin, and a **different kind of test**: it runs
+  against the **DEPLOYED** ECR image, state machine and job definitions, so your
+  working tree is not under test and it deliberately neither builds nor bounces
+  the farm. Run it *after* `make deploy`. It forces the media home
+  (`--no-skip-media-download`) and asserts segments on disk with no `.remote.json`,
+  because a metadata-only output dir passes every other check (#225). It launches
+  spot capacity and transfers media, so **it costs money**; `SMOKE_CLOUD_TIMEOUT`
+  (default 1800s) covers spot boot + image pull before the encode even starts.
+  There is no `WHOLE=1` — the whole-variant path has no smoke.
 
 **`make check` passing is not evidence the code runs.** #176 passed every static
 check and still broke both encode paths: a Batch job definition gained a `Ref::`
 its whole-variant caller never supplied, and a log line referenced a list the
 worker no longer built. Both were in the seams between orchestrator, worker and
 job definition. Run `make smoke` before merging anything that touches the
-chunk/dispatch contract — and `make smoke TARGET=cloud` too when the state
-machine or job definitions change, since the cloud submission path has no local
-equivalent.
+chunk/dispatch contract — and `make smoke-cloud` when the state machine or job
+definitions change, since the cloud submission path has no local equivalent.
+
+That second instruction used to read `make smoke TARGET=cloud`, and **no such
+variable ever existed** — make accepts an override nothing reads without
+complaint, so the command ran the LOCAL smoke and printed PASS. A confident
+green for the path it claimed to be covering, which is worse than no gate at
+all. If you add a knob to a target here, add it to the target and not only to
+this file.
 
 ## Commands
 
