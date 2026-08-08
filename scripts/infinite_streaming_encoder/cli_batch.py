@@ -32,7 +32,7 @@ from typing import NamedTuple
 # telemetry, or it would republish what it just drained.
 from infinite_streaming_encoder import pricing
 from infinite_streaming_encoder.telemetry import (
-    is_gauge, is_marker, queue_name, trim_execution_name)
+    is_gauge, is_marker, is_record, queue_name, trim_execution_name)
 
 try:
     import boto3
