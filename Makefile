@@ -1271,7 +1271,28 @@ SMOKE_OPEN ?= 1
 # the chunk/dispatch contract, so a claim it cannot keep is worse here than
 # anywhere else — the gate would read as held when the run had spanned two code
 # versions. It reports the fleet it actually got instead; see fleet-check.
-smoke: require-paths build   ## end-to-end smoke: tiny clip -> local-dist encode -> assert output (reports the fleet it ran on)
+# Adding `smoke-cloud` gives people a correct command; it does nothing about the
+# WRONG one. `make smoke TARGET=cloud` was documented from 2026-07-31, has never
+# been read by anything, and make accepts an override for a variable nothing
+# consumes without complaint — so it ran the LOCAL smoke and printed SMOKE PASS
+# for the cloud path. Anyone with that in muscle memory, a shell history or a
+# script keeps getting the same confident lie unless it is made to fail. A knob
+# is only real if something breaks when it is set wrong; this is what breaks.
+#
+# FIRST prerequisite, before `build`: prerequisites run left to right, and
+# failing after a multi-minute docker build would be a poor way to say "that
+# flag has never done anything".
+.PHONY: reject-stale-target
+reject-stale-target:
+	@if [ -n "$(TARGET)" ]; then \
+	  echo "!!! TARGET=$(TARGET) is not read by 'make smoke' and never has been."; \
+	  echo "    This target only ever runs the LOCAL (local-dist) path — passing"; \
+	  echo "    TARGET did nothing except make the output look like it covered"; \
+	  echo "    something it did not."; \
+	  echo "    For the cloud path:  make smoke-cloud"; \
+	  exit 1; fi
+
+smoke: reject-stale-target require-paths build   ## end-to-end smoke: tiny clip -> local-dist encode -> assert output (reports the fleet it ran on)
 	@echo ">>> [smoke] generating $(SMOKE_SRC) (if missing)..."
 	@[ -f "$(SMOKE_SRC)" ] || docker run --rm -v "$(SOURCE_DIR):/src" --entrypoint ffmpeg $(IMAGE_NAME) \
 	  -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 \
