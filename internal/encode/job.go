@@ -3391,6 +3391,23 @@ func (m *Manager) ActiveDistPrefixes() []string {
 	return out
 }
 
+// ActiveJobIDs lists every queued/running job's ID — the TmpDir sweeper's
+// keep-list (#207). A job's $TMP_DIR/<id>/ is removed by run's finalize path on
+// every terminal outcome, so anything still named here is by definition being
+// written to. Unlike ActiveDistPrefixes this is target-independent: every
+// target stages through TmpDir, only local-dist stages through MinIO.
+func (m *Manager) ActiveJobIDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, j := range m.jobs {
+		if j.Status == StatusQueued || j.Status == StatusRunning {
+			out = append(out, j.ID)
+		}
+	}
+	return out
+}
+
 // effectiveTiming resolves one profile timing value with precedence
 // job > ladder > global default. "" means "unset" at both the job and ladder
 // level; "0" is an explicit value (e.g. partial="0" turns LL-HLS parts off).
