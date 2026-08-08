@@ -172,13 +172,26 @@ services:
       # docker-compose.dev.yml / make farm-dev). Empty in normal runs.
       HOST_SCRIPTS_DIR: ${HOST_SCRIPTS_DIR:-}
       # Behavior / defaults.
+      # This block is an ALLOW-LIST: the server only sees what is named here, so
+      # an env var the Go side reads but this file omits is silently inert under
+      # compose — which is the only way the server actually ships. Adding an
+      # os.Getenv/env() to cmd/server means adding a line here too.
       AUTO_WATCH: ${AUTO_WATCH:-true}
       DEFAULT_TARGET: ${DEFAULT_TARGET:-local}
       DEFAULT_CODEC: ${DEFAULT_CODEC:-both}
+      DEFAULT_LADDER: ${DEFAULT_LADDER:-}
       DEFAULT_MAX_RES: ${DEFAULT_MAX_RES:-}
+      DEFAULT_MIN_RES: ${DEFAULT_MIN_RES:-}
       MAX_CONCURRENT: ${MAX_CONCURRENT:-1}
       WARM_MIN_VCPUS: ${WARM_MIN_VCPUS:-}
       PROMOTE_DESTS: ${PROMOTE_DESTS:-}
+      # Staging reclaim knobs (MinIO via internal/diststage, TMP_DIR via
+      # internal/tmpstage). Passed through EMPTY rather than with a default
+      # repeated here, so the flag defaults in cmd/server/main.go stay the one
+      # place the numbers live.
+      DIST_STAGING_MAX_AGE_H: ${DIST_STAGING_MAX_AGE_H:-}
+      DIST_STAGING_LIFECYCLE_DAYS: ${DIST_STAGING_LIFECYCLE_DAYS:-}
+      TMP_STAGING_MAX_AGE_H: ${TMP_STAGING_MAX_AGE_H:-}
       # Distributed-local (Temporal + MinIO) wiring. Cluster addresses default to
       # the master's own host-published ports.
       TEMPORAL_UI_ADDR: ${TEMPORAL_UI_ADDR:-http://host.docker.internal:8233}
@@ -202,6 +215,10 @@ services:
       DOCKER_IMAGE: ${DOCKER_IMAGE:-}
       WORKER_AMI_ID: ${WORKER_AMI:-}
       STATE_MACHINE_ARN: ${STATE_MACHINE_ARN:-}
+      # The awswatch kill switch. Defaults true in the Go flag, so omitting it
+      # here didn't just lose a setting — it made "warn, don't terminate"
+      # unreachable from .env on the deployed server.
+      AUTO_TERMINATE_STALE: ${AUTO_TERMINATE_STALE:-}
       GHCR_PAT: ${GHCR_PAT:-}
       # GHCR twin of the ECR worker image — About reads its version labels from GHCR.
       GHCR_IMAGE: ${GHCR_IMAGE:-}

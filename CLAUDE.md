@@ -71,6 +71,18 @@ rewrite services to compose-DNS names (`temporal:7233`). See
 
 `.env` at the repo root is auto-loaded by the Makefile and passed through. Key vars: `SOURCE_DIR`, `OUTPUT_DIR`, `TMP_DIR` (host paths), `AUTO_WATCH`, `DEFAULT_TARGET` (cloud|local), `DEFAULT_CODEC` (h264|hevc|both|all), `DEFAULT_MAX_RES`, `MAX_CONCURRENT`, plus AWS vars (`S3_BUCKET`, `SUBNET_ID`, `SECURITY_GROUP_ID`, `INSTANCE_PROFILE`, `INSTANCE_TYPE`, `GHCR_PAT`) for cloud encoding. The Makefile additionally exports `HOST_SOURCE_DIR` / `HOST_OUTPUT_DIR` / `HOST_TMP_DIR` / `HOST_AWS_DIR` / `ENCODER_IMAGE` into the server container — the server needs the host-side view of those paths to spawn worker containers (see "Worker containers" below).
 
+**`.env` reaches the server only through the `environment:` allow-list on the
+`server` service.** Compose enumerates that block, so a var the Go side reads
+but the block omits is silently inert *under the only configuration that
+ships* — it works when you `go run ./cmd/server` on the host and does nothing in
+the container, which is the hard way round to discover. `TMP_STAGING_MAX_AGE_H`,
+`DIST_STAGING_MAX_AGE_H`, `DIST_STAGING_LIFECYCLE_DAYS`, `DEFAULT_LADDER`,
+`DEFAULT_MIN_RES` and `AUTO_TERMINATE_STALE` were all inert this way. Adding an
+`env()` / `os.Getenv` to `cmd/server` means adding a line to that block too.
+`LISTEN_ADDR` is deliberately NOT passed (compose owns the published port, and a
+mismatch with the `ports:` mapping would just make the server unreachable), and
+`DEV_MOUNT` comes from `docker-compose.dev.yml` by design.
+
 ## Architecture
 
 Three Go packages plus a scripts directory. The interesting coordination is in `internal/encode`.
