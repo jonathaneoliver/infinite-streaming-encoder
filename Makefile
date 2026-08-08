@@ -795,10 +795,22 @@ DEPLOY_AMI_STEP := $(if $(filter 1,$(USE_AMI)),$(MAKE) ami-up && $(MAKE) ami-wai
 DEPLOY_AMI_NOTE := $(if $(filter 1,$(USE_AMI)),- AMI baked + wired,)
 DEPLOY_AMI_BANNER := $(if $(filter 1,$(USE_AMI)),+AMI bake,)
 
+# The require-idle prerequisite below fires ONCE, at entry. `publish` then runs
+# a multi-arch build and two registry pushes — minutes — before anything
+# disruptive happens, so the entry check can be arbitrarily stale by the time
+# `farm-up` bounces workers or `infra-apply` deregisters job definitions. A job
+# submitted in that window was unguarded AND the guard had already reported the
+# farm idle (#248: a smoke encode started 29s after a deploy's entry check
+# passed, and lost its pre-bounce worker's telemetry).
+#
+# So it is re-checked immediately before each disruptive step. Each `$(MAKE)` is
+# a fresh sub-process, so the recipe genuinely re-runs rather than being skipped
+# as an already-satisfied target. Entry keeps its check too: failing before a
+# five-minute build beats failing after one.
 deploy: require-idle  ## push image + bring the whole farm up + plan + APPLY infra (one shot; USE_AMI=1 also bakes + wires the worker AMI)
 	@start=$$(date +%s); \
 	echo ">>> deploy started $$(date '+%H:%M:%S')  worker=$(IMAGE_TAG) $(DEPLOY_AMI_BANNER)"; \
-	if $(MAKE) publish && $(DEPLOY_AMI_STEP) $(MAKE) farm-up && $(MAKE) infra-plan && $(MAKE) infra-apply; then \
+	if $(MAKE) publish && $(MAKE) require-idle && $(DEPLOY_AMI_STEP) $(MAKE) farm-up && $(MAKE) infra-plan && $(MAKE) require-idle && $(MAKE) infra-apply; then \
 		el=$$(( $$(date +%s) - start )); \
 		printf '\a\n\033[1;32m==================================================\n'; \
 		printf '  DEPLOY COMPLETE  %dm %02ds   worker=%s\n' $$((el/60)) $$((el%60)) "$(IMAGE_TAG)"; \
@@ -1114,7 +1126,9 @@ farm-up: require-paths require-ghcr ## bring the whole master farm up from GHCR 
 	ENCODER_IMAGE=$(REMOTE_IMAGE) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) $(COMPOSE_BASE) --profile master pull
 	ENCODER_IMAGE=$(REMOTE_IMAGE) ENCODE_SLOTS=$(FARM_ENCODE_SLOTS) DOCKER_IMAGE=$(DOCKER_IMAGE) $(COMPOSE_BASE) --profile master up -d --no-build
 	@echo ">>> [farm-up] remote workers (from GHCR)..."
-	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-ghcr; else echo "    (no DIST_WORKERS — master-only farm)"; fi
+	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-ghcr; else \
+	  echo "    (no DIST_WORKERS — not updating remote workers. This does NOT stop them: any that"; \
+	  echo "     are up stay on the shared queue and keep taking chunks on their OLD image.)"; fi
 	@echo ">>> farm up:  UI http://localhost:$(PORT)   Temporal UI http://localhost:$${TEMPORAL_UI_PORT:-8233}"
 
 # Third farm mode, between farm-up (:latest, known-good) and farm-dev-up (local
@@ -1156,7 +1170,10 @@ farm-dev-up: require-paths   ## dev farm from your WORKING TREE (uncommitted): l
 	  DOCKER_IMAGE=$(DOCKER_IMAGE) \
 	  $(COMPOSE_DEV) --profile master up -d --build
 	@echo ">>> [farm-dev-up] remote workers (rsync code + transfer/build image)..."
-	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-workers; else echo "    (no DIST_WORKERS — master-only)"; fi
+	@if [ -n "$(DIST_WORKERS)" ]; then $(MAKE) dist-deploy-workers; else \
+	  echo "    (no DIST_WORKERS — not updating remote workers. This does NOT stop them: any that"; \
+	  echo "     are up stay on the shared queue and keep taking chunks on their OLD image, so this"; \
+	  echo "     run can span two code versions. See 'make fleet-check'.)"; fi
 	@echo ">>> farm-dev-up complete (working tree — nothing committed/pushed). Re-run 'make farm-dev-up' after edits."
 
 # True inverse of `make farm-up`: stop the local master stack AND the remote workers
@@ -1185,7 +1202,31 @@ farm-dev-down: farm-down   ## take the dev farm down (identical to `make farm-do
 # End-to-end single-device check (docs/TESTING.md, test 1): generate a tiny clip,
 # bring up a 1-box farm from the working tree, encode it, assert the output.
 # The multi-box and cloud topologies are manual (hardware / cost).
-.PHONY: smoke encode
+.PHONY: smoke encode fleet-check
+
+# Who is ACTUALLY going to take chunks from the queue — as opposed to who the
+# Makefile was told about via DIST_WORKERS, which is what misled us in #248.
+# Empty DIST_WORKERS skips *deploying* to the remote boxes; it does not stop
+# them, so intent and reality diverge exactly when it matters. This asks the
+# server, which knows who is connected.
+#
+# Reports rather than fails: a colleague's box being powered on is not a reason
+# to refuse someone's smoke run. But it must be said out loud, because the
+# symptom of a mixed-version fleet is not an error — it is telemetry that is
+# quietly a subset, which reads as complete.
+fleet-check:            ## list the workers actually connected to the encode queue
+	@fleet=$$(curl -sf --max-time 5 http://localhost:$(PORT)/api/dist/workers 2>/dev/null); \
+	 if [ -z "$$fleet" ]; then echo ">>> [fleet] server not reachable on :$(PORT) — cannot tell who is connected"; exit 0; fi; \
+	 remote=$$(printf '%s' "$$fleet" | python3 -c \
+	   "import json,sys; print(' '.join(m.get('name','?') for m in json.load(sys.stdin).get('machines',[]) if not m.get('local')))" 2>/dev/null); \
+	 if [ -n "$$remote" ]; then \
+	   printf '\033[1;33m>>> [fleet] NOT master-only — remote worker(s) connected: %s\033[0m\n' "$$remote"; \
+	   echo "    They take chunks from the same queue on whatever image they last pulled, so a run"; \
+	   echo "    now can span code versions and drop the telemetry of whichever half is older."; \
+	   echo "    For a same-version fleet: 'make deploy' (updates every box), or stop those workers."; \
+	 else \
+	   echo ">>> [fleet] master only — no remote workers connected"; \
+	 fi
 # The command-line encode client. Run from the repo so it needs no install; it
 # is a plain HTTP client, so nothing but python3 is required on this side.
 # `make smoke` and `make oobe` both drive it — they each used to hand-roll the
@@ -1199,17 +1240,25 @@ SMOKE_SRC ?= $(SOURCE_DIR)/smoke.mp4
 # Open the jobs page in a browser during the run; set SMOKE_OPEN=0 to skip.
 SMOKE_OPEN ?= 1
 
-smoke: require-paths build   ## end-to-end single-device smoke: tiny clip -> local-dist encode -> assert output
+# NOTE: this used to call itself a "single-device" smoke. It is not one, and
+# cannot be: `farm-dev-up DIST_WORKERS=` rebuilds only the master, it does not
+# stop remote workers, so any that are up keep taking chunks on whatever image
+# they last pulled (#248). CLAUDE.md names this target as THE pre-merge gate for
+# the chunk/dispatch contract, so a claim it cannot keep is worse here than
+# anywhere else — the gate would read as held when the run had spanned two code
+# versions. It reports the fleet it actually got instead; see fleet-check.
+smoke: require-paths build   ## end-to-end smoke: tiny clip -> local-dist encode -> assert output (reports the fleet it ran on)
 	@echo ">>> [smoke] generating $(SMOKE_SRC) (if missing)..."
 	@[ -f "$(SMOKE_SRC)" ] || docker run --rm -v "$(SOURCE_DIR):/src" --entrypoint ffmpeg $(IMAGE_NAME) \
 	  -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 \
 	  -t 20 -pix_fmt yuv420p -c:v libx264 -c:a aac -shortest -y /src/smoke.mp4
 	@echo ">>> [smoke] clearing any prior smoke output..."
 	@rm -rf $(OUTPUT_DIR)/smoke_p200* 2>/dev/null || true
-	@echo ">>> [smoke] bringing up a single-device farm from the working tree..."
+	@echo ">>> [smoke] bringing up the master from the working tree..."
 	$(MAKE) farm-dev-up DIST_WORKERS=
 	@echo ">>> [smoke] waiting for the server (:$(PORT))..."
 	@for i in $$(seq 1 30); do curl -sf http://localhost:$(PORT)/api/jobs >/dev/null 2>&1 && break; sleep 1; done
+	@$(MAKE) --no-print-directory fleet-check
 	@echo ">>> [smoke] opening the jobs page (set SMOKE_OPEN=0 to skip)..."
 	@[ "$(SMOKE_OPEN)" = "0" ] || ( open http://localhost:$(PORT)/ 2>/dev/null || xdg-open http://localhost:$(PORT)/ 2>/dev/null ) || echo "    watch it at http://localhost:$(PORT)/"
 	@echo ">>> [smoke] submitting encode (h264, 720p, 12s chunks) + waiting (timeout ~300s)..."
