@@ -44,6 +44,19 @@ type Config struct {
 	// to act on something that changes at most a few times a day. Zero falls
 	// back to every tick (the old behaviour).
 	FailedStagingInterval time.Duration
+	// How often to sweep telemetry/state SQS queues and EventBridge rules
+	// stranded by orchestrators killed mid-run (a server restart kills the
+	// cli_batch subprocess; a cancel docker stops it). Zero disables.
+	//
+	// This exists because the sweep used to run ONLY at submit, so an orphan was
+	// reclaimed by the next cloud encode — and never at all for someone who
+	// stops encoding (#191). Submit still sweeps; this is what makes the reclaim
+	// independent of whether anyone submits again.
+	//
+	// Nothing is gained by going faster than the queues' 1h message retention:
+	// the sweep will not touch a queue younger than that, so a shorter period is
+	// pure SQS request spend on a set that cannot have changed.
+	TelemetryGCInterval time.Duration
 	// WarmMinVCPUs keeps the Batch compute environment's minvCpus at this
 	// value while a cloud-batch run is active, then resets it to 0 when idle —
 	// so the packaging tail lands on a hot instance instead of cold-starting.
@@ -105,6 +118,43 @@ func maybeGCFailedStaging(cfg Config) {
 	}
 }
 
+// lastTelemetryGC is when the SQS/EventBridge sweep last ran. Same
+// single-goroutine contract as lastFailedStagingGC above.
+var lastTelemetryGC time.Time
+
+// maybeGCTelemetryQueues sweeps orphaned telemetry/state channels if enabled
+// and due. Called from the quiet path as well as the busy one — an orphan is
+// left by a run that ALREADY ENDED, so the fleet being empty is the normal
+// state to find one in, not a reason to skip.
+//
+// Silently skipped without STATE_MACHINE_ARN, and that is deliberate. The ARN
+// is what scopes the keep-list; _active_execution_cores returns an empty set
+// without it, which makes the sweep MORE aggressive rather than less, and a run
+// outliving the 1h message retention sits at zero messages looking exactly like
+// an orphan. Declining to sweep is the safe degrade — the same "degrades open
+// is not automatically safe" lesson as #248's require-idle.
+func maybeGCTelemetryQueues(cfg Config) {
+	if cfg.TelemetryGCInterval <= 0 {
+		return
+	}
+	if time.Since(lastTelemetryGC) < cfg.TelemetryGCInterval {
+		return
+	}
+	arn := os.Getenv("STATE_MACHINE_ARN")
+	if arn == "" {
+		return
+	}
+	lastTelemetryGC = time.Now()
+	if err := gcTelemetryQueues(arn); err != nil {
+		log.Printf("awswatch: gc_telemetry_queues failed: %v", err)
+	}
+}
+
+// gcTelemetryQueues is a package var so the scheduling and the ARN guard above
+// can be tested without spawning python3 or reaching AWS. Same reason
+// internal/api made runPythonCloud one.
+var gcTelemetryQueues = runGCTelemetryQueues
+
 // Run polls the AWS inventory on `cfg.Interval` until ctx is cancelled.
 // Returns immediately if cfg.Interval == 0.
 func Run(ctx context.Context, cfg Config) {
@@ -154,9 +204,12 @@ func runCheck(cfg Config) {
 	healDanglingAMI()
 
 	if inv.Summary.RunningInstances == 0 && inv.Summary.OrphanVolumes == 0 {
-		// Quiet — but still run the staging GC since failed prefixes
-		// aren't reflected in the inventory summary.
+		// Quiet — but still run the housekeeping sweeps. Neither is reflected
+		// in the inventory summary, and an orphan is by definition left by a run
+		// that already ended, so an empty fleet is the normal state to find one
+		// in rather than a reason to skip.
 		maybeGCFailedStaging(cfg)
+		maybeGCTelemetryQueues(cfg)
 		return
 	}
 
@@ -193,6 +246,7 @@ func runCheck(cfg Config) {
 	// pass is a LIST plus a head_object per job prefix, billed as requests and
 	// (from outside the region) as egress.
 	maybeGCFailedStaging(cfg)
+	maybeGCTelemetryQueues(cfg)
 }
 
 // reconcileWarmCapacity sets the compute environment's min_vcpus to WarmMinVCPUs
@@ -269,6 +323,29 @@ func healDanglingAMI() {
 		log.Printf("awswatch: self-healed dangling worker AMI %s — compute env reset to pull-on-boot",
 			doc.ClearedAMI)
 	}
+}
+
+// gcTelemetryQueues shells out to the orchestrator's own bounded sweep rather
+// than reimplementing it in Go. The bounds it enforces (keep-list of RUNNING
+// executions, empty, no messages in flight, older than the retention window)
+// are the reason it is safe to call from anywhere, and duplicating them here
+// would be a second place for them to drift — the #217 shape of mistake.
+//
+// Nothing on stdout to parse: the sweep logs what it deletes to its own stderr
+// and is best-effort by design, so only a non-zero exit is worth reporting.
+func runGCTelemetryQueues(stateMachineARN string) error {
+	cmd := exec.Command("python3",
+		"-m", "infinite_streaming_encoder.cli_batch", "gc",
+		"--state-machine-arn", stateMachineARN)
+	cmd.Env = os.Environ()
+	if _, err := cmd.Output(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return &pyError{module: "cli_batch gc", code: ee.ExitCode(),
+				stderr: strings.TrimSpace(string(ee.Stderr))}
+		}
+		return err
+	}
+	return nil
 }
 
 func gcFailedStaging(maxAge time.Duration) error {

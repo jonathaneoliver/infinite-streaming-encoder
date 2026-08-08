@@ -1912,9 +1912,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # closed (that worker silently drops to stdout for its whole life).
     if name := kwargs.get("name"):
         _create_telemetry_queue(name)
-    # Sweep queues stranded by earlier runs that were killed mid-flight. Done at
-    # submit rather than on a timer: it is the one moment we are already talking
-    # to SQS and are not on the latency-sensitive poll path.
+    # Sweep queues stranded by earlier runs that were killed mid-flight. Submit
+    # is a good moment for it — already talking to SQS, off the latency-sensitive
+    # poll path — but it is NOT the only trigger, and must not be: an orphan
+    # cleaned up only by the next cloud encode persists forever once you stop
+    # encoding (#191). The server sweeps on its own hourly cadence via the `gc`
+    # subcommand below; this one keeps a busy account tidy between those ticks.
     _gc_telemetry_queues(args.state_machine_arn)
     resp = sfn.start_execution(**kwargs)
     print(resp["executionArn"], flush=True)
@@ -3052,6 +3055,30 @@ def cmd_poll(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# gc
+# ---------------------------------------------------------------------------
+
+def cmd_gc(args: argparse.Namespace) -> int:
+    """Sweep telemetry queues and state rules left by runs killed mid-flight.
+
+    The same bounded sweep submit runs, exposed so the CONTROL PLANE can trigger
+    it without a cloud encode having to happen (#191). Before this, an orphan was
+    reclaimed only by the next submit — fine at one orphan, wrong at a few
+    hundred, and never at all for someone who stops encoding.
+
+    --state-machine-arn is REQUIRED, and that is a safety property rather than
+    an ergonomic one. It is the source of the keep-list, and _active_execution_cores
+    returns an EMPTY set without it — which makes the sweep more aggressive, not
+    less. A run lasting longer than the 1h message retention sits at zero
+    messages and is indistinguishable from an orphan on the other bounds alone,
+    so an unscoped sweep could delete a live run's queue out from under it.
+    Refusing beats sweeping blind.
+    """
+    _gc_telemetry_queues(args.state_machine_arn)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # argparse
 # ---------------------------------------------------------------------------
 
@@ -3089,6 +3116,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="fetch manifests and metadata only, leaving segments "
                          "in S3 for an on-demand `fetch` (#214)")
     pp.set_defaults(fn=cmd_poll)
+
+    # gc — the submit-time sweep, on demand. The control plane calls this on an
+    # hourly timer so orphans do not wait for the next cloud encode (#191).
+    pg = sub.add_parser("gc")
+    pg.add_argument("--state-machine-arn", required=True, dest="state_machine_arn",
+                    help="scopes the keep-list; required because an unscoped "
+                         "sweep is MORE aggressive, not less (see cmd_gc)")
+    pg.set_defaults(fn=cmd_gc)
 
     args = p.parse_args(argv)
     return args.fn(args)
