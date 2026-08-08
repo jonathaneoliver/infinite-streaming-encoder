@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -234,6 +235,25 @@ func TestWriteAndReadRunRecord(t *testing.T) {
 	}
 	if ReadRunRecord(dir) != nil {
 		t.Fatal("an unreadable record must read as nil")
+	}
+}
+
+// A record reconstructed from a source that never captured the config must omit
+// it entirely. An empty JobConfig marshals as a perfectly valid-looking config,
+// so a reader would take a wall of defaults for facts — #202 with extra steps.
+func TestAbsentConfigIsOmittedNotEmptied(t *testing.T) {
+	b, err := json.Marshal(RunRecord{SchemaVersion: runRecordSchema, JobID: "x",
+		Recovered: &RunRecovery{From: "history.md", Missing: []string{"config"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"config":`) {
+		t.Fatalf("a record with no config must not emit one: %s", b)
+	}
+	// And the reconstruction must be self-declaring — same filename, same
+	// fields, same shape as a first-hand record otherwise.
+	if !strings.Contains(string(b), `"recovered"`) {
+		t.Fatalf("reconstructed records must say so: %s", b)
 	}
 }
 

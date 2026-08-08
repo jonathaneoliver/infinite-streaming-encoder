@@ -98,12 +98,44 @@ type RunRecord struct {
 	// would resubmit this encode through POST /api/encode. Marshalled whole
 	// rather than field-picked, so an option added tomorrow is recorded from
 	// the day its field lands. See EffectiveConfig.
-	Config     JobConfig             `json:"config"`
+	//
+	// A POINTER because absent has to be distinguishable from empty. A record
+	// reconstructed from a source that never captured the config (see
+	// RunRecovery) would otherwise marshal `{}` here, and an empty config is a
+	// perfectly valid-looking config — a reader would take defaults for facts,
+	// which is #202 with extra steps.
+	Config     *JobConfig            `json:"config,omitempty"`
 	Phases     []PhaseStat           `json:"phases,omitempty"`
 	Cost       *RunCost              `json:"cost,omitempty"`
 	Efficiency *RunEfficiency        `json:"efficiency,omitempty"`
 	Vmaf       map[string]*VmafScore `json:"vmaf,omitempty"`
 	BootAMI    string                `json:"boot_ami,omitempty"`
+	// Recovered is set ONLY on a record reconstructed after the fact. Absent
+	// means the run wrote this itself. See RunRecovery.
+	Recovered *RunRecovery `json:"recovered,omitempty"`
+}
+
+// RunRecovery marks a record that was reconstructed from a secondary source
+// rather than written by the run that produced the output, and states what that
+// source could not supply.
+//
+// Present because a reconstructed record is otherwise indistinguishable from a
+// first-hand one — same filename, same fields, same shape — and the difference
+// matters the moment anyone compares two runs. Missing is spelled out rather
+// than left as absent fields for the same reason encode.json says h264 has no
+// library entry BY DESIGN: an unexplained gap reads as "we forgot", and someone
+// eventually treats it as zero.
+type RunRecovery struct {
+	// From names the source, e.g. "history.md".
+	From string `json:"from"`
+	// At is when the reconstruction ran (RFC3339), not when the encode ran.
+	At string `json:"at"`
+	// Missing lists what this source cannot supply at all — "cost",
+	// "efficiency", "config", "phases".
+	Missing []string `json:"missing,omitempty"`
+	// Caveats are things present but weaker than a first-hand record's, e.g.
+	// phases that cover a whole multi-file job rather than this output's file.
+	Caveats []string `json:"caveats,omitempty"`
 }
 
 // EffectiveConfig resolves the three fields whose absence does NOT mean "no
@@ -258,6 +290,7 @@ func buildRunRecord(job *Job, cfg JobConfig, dirName string) RunRecord {
 	vmaf := vmafForCodec(job.Vmaf, codec)
 	job.mu.Unlock()
 
+	effCfg := EffectiveConfig(cfg)
 	rec := RunRecord{
 		SchemaVersion: runRecordSchema,
 		JobID:         job.ID,
@@ -270,7 +303,7 @@ func buildRunRecord(job *Job, cfg JobConfig, dirName string) RunRecord {
 		Error:         jobErr,
 		LogFile:       job.ID + ".log",
 		Rungs:         rungsForCodec(phases, codec),
-		Config:        EffectiveConfig(cfg),
+		Config:        &effCfg,
 		Phases:        phases,
 		Vmaf:          vmaf,
 		BootAMI:       bootAMI,

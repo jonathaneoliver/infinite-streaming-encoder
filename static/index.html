@@ -2567,11 +2567,34 @@ function renderRunPanel(run) {
     if (run.error) {
         html += `<div style="font-size:12px;color:#d9534f;margin:2px 0 8px">${escapeHtml(run.error)}</div>`;
     }
+    html += _runRecoveredNote(run.recovered);
     if (run.cost) html += `<div style="font-size:12px;color:#aab;margin:2px 0 8px">cost ${_runCostHtml(run.cost)}</div>`;
     html += _runEfficiencyHtml(run.efficiency);
     html += _runPhaseTable(run.phases);
     html += _runConfigBlock(run.config);
     return html + '</div>';
+}
+
+// A reconstructed record has to SAY it is reconstructed. It has the same
+// filename, fields and shape as one the run wrote itself, and the difference
+// only starts to matter at the moment someone compares two runs — which is
+// exactly when nobody is going to go and check the file.
+//
+// What's missing is named rather than left as blank fields, for the same reason
+// the encoder-provenance line says libx264 reports no version BY DESIGN: an
+// unexplained gap reads as an oversight, and an oversight eventually gets read
+// as a zero.
+function _runRecoveredNote(rec) {
+    if (!rec) return '';
+    const bits = [`reconstructed from ${escapeHtml(rec.from || 'an earlier record')}`];
+    if (rec.missing && rec.missing.length) bits.push(`no ${rec.missing.map(escapeHtml).join(', ')}`);
+    let html = `<div style="font-size:12px;color:#d0a24a;margin:2px 0 8px"
+        title="This record was rebuilt after the fact, not written by the run itself. It is accurate for what it contains, but what the source could not supply is listed here rather than shown as zero.">
+        &#9888; ${bits.join(' · ')}</div>`;
+    for (const c of rec.caveats || []) {
+        html += `<div style="font-size:12px;color:#889;margin:0 0 6px">${escapeHtml(c)}</div>`;
+    }
+    return html;
 }
 
 function _runSecs(s) {
