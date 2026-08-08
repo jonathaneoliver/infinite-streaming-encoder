@@ -1294,6 +1294,78 @@ smoke: require-paths build   ## end-to-end smoke: tiny clip -> local-dist encode
 	   echo ">>> SMOKE PASS: $$d (has playlists)"; \
 	 else echo ">>> SMOKE FAIL: no smoke output dir with playlists in $(OUTPUT_DIR)"; exit 1; fi
 
+# ---- Cloud smoke -------------------------------------------------------------
+# The cloud twin of `make smoke`. CLAUDE.md told people to run
+# `make smoke TARGET=cloud` for this; no TARGET variable ever existed, so that
+# command silently ran the LOCAL smoke and reported PASS — a confident green for
+# a path it never touched. This is the target that claim needed.
+#
+# THREE WAYS IT DIFFERS FROM `make smoke`, all deliberate:
+#
+# 1. It does NOT build, and does NOT bounce the farm. A cloud encode runs the
+#    image in ECR, under the deployed state machine and job definitions — none
+#    of which your working tree affects. Rebuilding the local server would
+#    change only who submits the job, which is the one part this is not
+#    testing. So it uses the server already running, and tells you what is
+#    actually under test: the DEPLOYED artifacts. Run it AFTER `make deploy`.
+#
+# 2. It forces the media home (`--no-skip-media-download`). The server default
+#    may be to leave segments in S3 (#214), and a metadata-only output dir has
+#    playlists, rung subdirs and a happy parseOutputMeta — it is indistinguishable
+#    from a complete one by every signal this would otherwise check (#225). An
+#    assertion that cannot tell those apart is not an assertion. So the download
+#    is forced and the segments are checked on disk.
+#
+# 3. It costs real money and takes real time: spot provisioning, a cold image
+#    pull, then the encode. Minutes, not seconds, hence the far larger timeout.
+SMOKE_CLOUD_TIMEOUT ?= 1800
+
+.PHONY: smoke-cloud
+smoke-cloud: require-paths require-s3-bucket  ## end-to-end CLOUD smoke against the DEPLOYED stack: tiny clip -> Batch -> assert media came back (COSTS MONEY)
+	@: $${STATE_MACHINE_ARN:?STATE_MACHINE_ARN is not set — the cloud-batch target is not configured, so there is nothing to smoke. See infra/terraform/README.md}
+	@curl -sf http://localhost:$(PORT)/api/jobs >/dev/null 2>&1 || { \
+	  echo ">>> SMOKE-CLOUD FAIL: no server on :$(PORT)."; \
+	  echo "    This target deliberately does not start one — it tests the DEPLOYED"; \
+	  echo "    stack, and bouncing the farm would not change what Batch runs."; \
+	  echo "    Bring one up with 'make farm-up' (or 'make run') and re-run."; exit 1; }
+	@echo ">>> [smoke-cloud] testing the DEPLOYED image + state machine + job definitions."
+	@echo "    Your working tree is NOT under test here. Deploy first if you meant to test it."
+	@echo "    This launches spot capacity and transfers media: it costs money."
+	@echo ">>> [smoke-cloud] generating $(SMOKE_SRC) (if missing)..."
+	@[ -f "$(SMOKE_SRC)" ] || docker run --rm -v "$(SOURCE_DIR):/src" --entrypoint ffmpeg $(IMAGE_NAME) \
+	  -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 \
+	  -t 20 -pix_fmt yuv420p -c:v libx264 -c:a aac -shortest -y /src/smoke.mp4
+	@echo ">>> [smoke-cloud] clearing any prior smoke output..."
+	@rm -rf $(OUTPUT_DIR)/smoke_p200* 2>/dev/null || true
+	@echo ">>> [smoke-cloud] submitting (h264, 720p, 12s chunks, media forced home);"
+	@echo "    waiting up to $(SMOKE_CLOUD_TIMEOUT)s — spot boot + image pull happen first..."
+	@$(ENCODE_CLI) --server http://localhost:$(PORT) \
+	    smoke.mp4 --target cloud --codec h264 --max-res 720p --chunk-duration 12 \
+	    --no-skip-media-download \
+	    --wait --timeout $(SMOKE_CLOUD_TIMEOUT) \
+	    || { echo '>>> SMOKE-CLOUD FAIL: encode did not finish (see the job log / AWS tab)'; exit 1; }
+	@$(MAKE) --no-print-directory smoke-cloud-assert
+
+# Split out so the assertions can be exercised against fixture directories
+# without launching spot capacity — otherwise the only way to find out whether
+# a FAIL branch works is to have a real cloud encode fail in that exact way.
+# Run it directly: make smoke-cloud-assert OUTPUT_DIR=/path/to/fixture
+.PHONY: smoke-cloud-assert
+smoke-cloud-assert:
+	@d=$$(ls -d $(OUTPUT_DIR)/smoke_p200*h264* 2>/dev/null | head -1); \
+	 if [ -z "$$d" ]; then \
+	   echo ">>> SMOKE-CLOUD FAIL: no smoke output dir in $(OUTPUT_DIR)"; exit 1; fi; \
+	 if ! ls "$$d"/*.m3u8 >/dev/null 2>&1; then \
+	   echo ">>> SMOKE-CLOUD FAIL: $$d has no playlists"; exit 1; fi; \
+	 if [ -f "$$d/.remote.json" ]; then \
+	   echo ">>> SMOKE-CLOUD FAIL: $$d is metadata-only — .remote.json says the media"; \
+	   echo "    is still in S3, despite --no-skip-media-download. Play would 404."; exit 1; fi; \
+	 segs=$$(find "$$d" -name '*.m4s' 2>/dev/null | wc -l | tr -d ' '); \
+	 if [ "$$segs" -eq 0 ]; then \
+	   echo ">>> SMOKE-CLOUD FAIL: $$d has playlists but ZERO segments — the manifest"; \
+	   echo "    describes media that is not on disk."; exit 1; fi; \
+	 echo ">>> SMOKE-CLOUD PASS: $$d ($$segs segments, playlists present, no remote sidecar)"
+
 # ---- OOBE (out-of-box experience) test ---------------------------------------
 # Runs a fully ISOLATED instance — its own dirs, ports, container names, and a
 # second Temporal/MinIO cluster — so the first-run-from-nothing path is exercised
