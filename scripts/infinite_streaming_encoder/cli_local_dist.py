@@ -954,7 +954,8 @@ def _activity_markers(attrs, client) -> list[str]:
 # Temporal PendingActivityState.STARTED — an activity actually executing on a
 # worker right now (vs SCHEDULED = still queued). Stable enum value.
 _PA_STARTED = 2
-_HOST_SEEN: dict = {}   # chunk activity_id -> machine, to dedup ENCODER-HOST
+_HOST_SEEN: dict = {}   # chunk activity_id -> (machine, version), dedups ENCODER-HOST
+_MACHINE_VERSION: dict = {}  # machine -> build (image content hash), once it says
 _RUN_SEEN: dict = {}    # activity_id -> 1 once promoted queued -> running
 
 
@@ -970,6 +971,28 @@ def fleet_marker(machine: str, busy, perf, version: str, chunks: list) -> str:
     ver = f"version={version} " if version else ""
     return (f"[[ENCODER-FLEET machine={machine} busy={busy} perf={perf} "
             f"{ver}chunks={'|'.join(chunks[:16])}]]")
+
+
+def should_emit_host(aid: str, machine: str, version: str, seen: dict) -> bool:
+    """Is (chunk on machine, running version) NEW information worth a marker?
+
+    Deduped on the PAIR, not on machine alone. Machine alone looks right and is
+    the version that shipped first: it re-tags on failover, which is the case
+    everyone thinks about. But a chunk is usually first seen via
+    last_worker_identity BEFORE its worker's first heartbeat arrives, so the
+    first emission carries no version — and keying on machine then suppressed
+    every later emission, permanently. Measured on a real run: 2 of 14 chunks
+    got a version.
+
+    Keying on the pair means learning the build re-emits exactly once. Mutates
+    `seen` when it returns True, so callers cannot record and test out of step.
+    """
+    if not machine:
+        return False
+    if seen.get(aid) == (machine, version):
+        return False
+    seen[aid] = (machine, version)
+    return True
 
 
 def host_marker(key: str, machine: str, version: str = "") -> str:
@@ -996,18 +1019,19 @@ async def _emit_fleet_cpu(handle, client) -> None:
     if raw is None:
         return
     pcv = client.data_converter.payload_converter
-    agg: dict = {}   # machine -> {"busy", "perf", "chunks": [activity_id, ...]}
+
+    # PASS 1 — decode every pending activity once, and harvest each box's build
+    # into _MACHINE_VERSION before anything is emitted.
+    #
+    # A box's build is a property of the BOX, not of the chunk whose heartbeat
+    # happened to carry it. Reading it off `cpu` per chunk (the first cut of
+    # this) tagged 2 of 14 chunks in a real run: a chunk is usually first seen
+    # via last_worker_identity BEFORE its first heartbeat lands, so its marker
+    # went out with no version — and the dedup below then suppressed the re-emit
+    # forever. Harvesting first means one chunk's heartbeat teaches every other
+    # chunk on that box, in the same poll.
+    seen: list = []
     for pa in getattr(raw, "pending_activities", []):
-        # A STARTED pending activity is one a worker is executing RIGHT NOW.
-        # Promote its stage here — for every activity kind, and before the
-        # machine checks below, which `continue` when identity is unknown. An
-        # activity with no reported identity is still running.
-        _aid = getattr(pa, "activity_id", "") or ""
-        if getattr(pa, "state", 0) == _PA_STARTED and _aid:
-            _k = _stage_key_for(_aid)
-            if _k and _RUN_SEEN.get(_aid) != 1:
-                _RUN_SEEN[_aid] = 1
-                emit_stage(_k, "running", 0.0)
         machine = getattr(pa, "last_worker_identity", "") or ""
         cpu = None
         hb = getattr(pa, "heartbeat_details", None)
@@ -1019,16 +1043,35 @@ async def _emit_fleet_cpu(handle, client) -> None:
                 cpu = None
         if cpu and cpu.get("machine"):
             machine = cpu["machine"]
+        if machine and cpu and cpu.get("version"):
+            _MACHINE_VERSION[machine] = cpu["version"]
+        seen.append((pa, machine, cpu))
+
+    # PASS 2 — stage promotion, per-machine aggregation, and the markers.
+    agg: dict = {}   # machine -> {"busy", "perf", "chunks": [activity_id, ...]}
+    for pa, machine, cpu in seen:
+        # A STARTED pending activity is one a worker is executing RIGHT NOW.
+        # Promote its stage here — for every activity kind, and before the
+        # machine checks below, which `continue` when identity is unknown. An
+        # activity with no reported identity is still running.
+        _aid = getattr(pa, "activity_id", "") or ""
+        if getattr(pa, "state", 0) == _PA_STARTED and _aid:
+            _k = _stage_key_for(_aid)
+            if _k and _RUN_SEEN.get(_aid) != 1:
+                _RUN_SEEN[_aid] = 1
+                emit_stage(_k, "running", 0.0)
         if not machine:
             continue
         a = agg.setdefault(machine, {"busy": 0, "perf": 0, "chunks": [],
                                      "version": ""})
         if cpu:
             a["busy"], a["perf"] = cpu.get("busy", 0), cpu.get("perf", 0)
-            # Which BUILD this box is running (#248). Absent from workers older
-            # than the heartbeat field, which is itself the answer: a box that
-            # cannot say is a box running something old.
-            a["version"] = cpu.get("version") or a["version"]
+        # Which BUILD this box is running (#248), from pass 1 rather than from
+        # this one chunk's heartbeat — so the fleet line reports it even on a
+        # poll where only the chunks WITHOUT fresh heartbeat details were seen.
+        # Absent from workers older than the heartbeat field, which is itself
+        # the answer: a box that cannot say is a box running something old.
+        a["version"] = _MACHINE_VERSION.get(machine, "") or a["version"]
         aid = getattr(pa, "activity_id", "") or ""
         if getattr(pa, "state", 0) == _PA_STARTED and aid.startswith("enc-"):
             a["chunks"].append(aid)
@@ -1037,16 +1080,22 @@ async def _emit_fleet_cpu(handle, client) -> None:
                 # Colour the grid cell by the machine running it, from the START —
                 # authoritative here (last_worker_identity) so the cell matches the
                 # fleet swatch + chip for the whole encode, not just at completion.
-                # Deduped per (chunk, machine) so failover re-tags but we don't spam.
-                if machine and _HOST_SEEN.get(aid) != machine:
-                    _HOST_SEEN[aid] = machine
-                    # version rides along so the PER-CHUNK record in run.json says
-                    # which build encoded it, not just which box (#248). That is
-                    # the half that answers the question months later, about a run
-                    # nobody was watching — a live fleet warning cannot.
-                    print(host_marker(key, machine,
-                                      (cpu or {}).get("version") or ""),
-                          flush=True)
+                #
+                # version rides along so the PER-CHUNK record in run.json says
+                # which build encoded it, not just which box (#248) — the half
+                # that answers the question months later, about a run nobody was
+                # watching. It comes from _MACHINE_VERSION (the box), not from
+                # this chunk's own heartbeat, which is usually not there yet the
+                # first time the chunk is seen.
+                #
+                # Deduped on (machine, version), NOT machine alone: failover
+                # re-tags, AND learning the build re-emits exactly once so a
+                # chunk first seen before any heartbeat still gets its version.
+                # Keying on machine alone tagged 2 of 14 chunks in a real run —
+                # the first, version-less emission suppressed every retry.
+                ver = _MACHINE_VERSION.get(machine, "")
+                if should_emit_host(aid, machine, ver, _HOST_SEEN):
+                    print(host_marker(key, machine, ver), flush=True)
                 # Real per-chunk progress: the worker rides ffmpeg's out_time/
                 # duration % on its heartbeat, so a chunk fills 0→100 as it actually
                 # encodes instead of snapping 0→100 on completion.
