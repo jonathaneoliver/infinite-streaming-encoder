@@ -958,6 +958,30 @@ _HOST_SEEN: dict = {}   # chunk activity_id -> machine, to dedup ENCODER-HOST
 _RUN_SEEN: dict = {}    # activity_id -> 1 once promoted queued -> running
 
 
+def fleet_marker(machine: str, busy, perf, version: str, chunks: list) -> str:
+    """Build one ENCODER-FLEET line. Pure, so the Go-side contract is testable.
+
+    `version` goes BEFORE chunks deliberately: the Go pattern reads chunks as
+    `[^\\]]*` (it has to, for the `|` separators), so any field after it would be
+    swallowed into the chunk list rather than parsed. Omitted entirely when
+    unknown — an absent field means "did not say", which the reader must not
+    confuse with agreement.
+    """
+    ver = f"version={version} " if version else ""
+    return (f"[[ENCODER-FLEET machine={machine} busy={busy} perf={perf} "
+            f"{ver}chunks={'|'.join(chunks[:16])}]]")
+
+
+def host_marker(key: str, machine: str, version: str = "") -> str:
+    """Build one ENCODER-HOST line — which box, and which build, ran a chunk.
+
+    The version is what makes the PER-CHUNK record in run.json self-describing
+    later; `instance` alone answers "where" but never "running what" (#248).
+    """
+    ver = f" version={version}" if version else ""
+    return f"[[ENCODER-HOST key={key} instance={machine}{ver}]]"
+
+
 async def _emit_fleet_cpu(handle, client) -> None:
     """Emit one ENCODER-FLEET marker per machine with its live CPU (busy/perf,
     from the workers' heartbeat details) AND the chunks currently RUNNING on it
@@ -997,9 +1021,14 @@ async def _emit_fleet_cpu(handle, client) -> None:
             machine = cpu["machine"]
         if not machine:
             continue
-        a = agg.setdefault(machine, {"busy": 0, "perf": 0, "chunks": []})
+        a = agg.setdefault(machine, {"busy": 0, "perf": 0, "chunks": [],
+                                     "version": ""})
         if cpu:
             a["busy"], a["perf"] = cpu.get("busy", 0), cpu.get("perf", 0)
+            # Which BUILD this box is running (#248). Absent from workers older
+            # than the heartbeat field, which is itself the answer: a box that
+            # cannot say is a box running something old.
+            a["version"] = cpu.get("version") or a["version"]
         aid = getattr(pa, "activity_id", "") or ""
         if getattr(pa, "state", 0) == _PA_STARTED and aid.startswith("enc-"):
             a["chunks"].append(aid)
@@ -1011,7 +1040,13 @@ async def _emit_fleet_cpu(handle, client) -> None:
                 # Deduped per (chunk, machine) so failover re-tags but we don't spam.
                 if machine and _HOST_SEEN.get(aid) != machine:
                     _HOST_SEEN[aid] = machine
-                    print(f"[[ENCODER-HOST key={key} instance={machine}]]", flush=True)
+                    # version rides along so the PER-CHUNK record in run.json says
+                    # which build encoded it, not just which box (#248). That is
+                    # the half that answers the question months later, about a run
+                    # nobody was watching — a live fleet warning cannot.
+                    print(host_marker(key, machine,
+                                      (cpu or {}).get("version") or ""),
+                          flush=True)
                 # Real per-chunk progress: the worker rides ffmpeg's out_time/
                 # duration % on its heartbeat, so a chunk fills 0→100 as it actually
                 # encodes instead of snapping 0→100 on completion.
@@ -1019,9 +1054,8 @@ async def _emit_fleet_cpu(handle, client) -> None:
                 if p is not None and 0 < p < 100:
                     emit_stage(key, "running", float(p))
     for m, a in agg.items():
-        chunks = "|".join(a["chunks"][:16])
-        print(f"[[ENCODER-FLEET machine={m} busy={a['busy']} perf={a['perf']} "
-              f"chunks={chunks}]]", flush=True)
+        print(fleet_marker(m, a["busy"], a["perf"], a["version"], a["chunks"]),
+              flush=True)
 
 
 def run_temporal(args: argparse.Namespace) -> int:

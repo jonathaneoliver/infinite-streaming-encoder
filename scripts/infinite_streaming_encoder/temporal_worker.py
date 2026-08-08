@@ -87,6 +87,20 @@ def _terminate(proc: subprocess.Popen) -> None:
 # target fully busy; >100% = SMT/E-core spill).
 _MACHINE = ""
 _PERF_CORES = 0
+# This box's build, stamped onto every heartbeat alongside the identity (#248).
+#
+# The farm runs `:latest` on every box, pulled independently whenever each was
+# last deployed, and `farm-dev-up` updates only the master. So a single run can
+# execute across two builds, and the older one silently omits whatever the newer
+# one added — no error, an encode that passes, telemetry that is quietly a
+# subset. Reporting it is what makes that visible instead of inferable.
+#
+# IMAGE_TAG (content hash), not GIT_SHA: two boxes on the same IMAGE_TAG behave
+# identically even when HEAD moved for doc-only commits, so it is the tag that
+# answers "will these two emit the same markers". "unknown" when the image
+# predates the ENV stamps in the Dockerfile — which is itself the signal that
+# the box is running something old.
+_VERSION = os.environ.get("ENCODER_IMAGE_TAG") or "unknown"
 _CPU_LOCK = threading.Lock()
 _CPU_PREV = {"t": 0.0, "total": 0, "idle": 0, "busy": 0.0}
 
@@ -202,7 +216,8 @@ def encode_phase(spec: dict) -> list[str]:
                 # + poll cancellation so we don't sleep through a cancel.
                 activity.heartbeat(last[:180], {
                     "machine": _MACHINE, "busy": round(_busy_cores(), 2),
-                    "perf": _PERF_CORES, "progress": round(progress, 1)})
+                    "perf": _PERF_CORES, "progress": round(progress, 1),
+                    "version": _VERSION})
                 if _cancelled():
                     raise asyncio.CancelledError
                 continue
@@ -272,7 +287,8 @@ def encode_phase(spec: dict) -> list[str]:
                         pass
             activity.heartbeat(last[:180], {
                 "machine": _MACHINE, "busy": round(_busy_cores(), 2),
-                "perf": _PERF_CORES, "progress": round(progress, 1)})
+                "perf": _PERF_CORES, "progress": round(progress, 1),
+                "version": _VERSION})
             if _cancelled():
                 raise asyncio.CancelledError
         rc = proc.wait()
@@ -565,7 +581,7 @@ async def main() -> None:
     _MACHINE, _PERF_CORES = identity, slots * 2
     client = await Client.connect(address, identity=identity)
     print(f"[temporal-worker] connected {address} queue={TASK_QUEUE} "
-          f"slots={slots} identity={identity}", flush=True)
+          f"slots={slots} identity={identity} version={_VERSION}", flush=True)
     with ThreadPoolExecutor(max_workers=slots) as pool:
         worker = Worker(
             client, task_queue=TASK_QUEUE,

@@ -153,6 +153,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build, to
 	printf '  py stagestate  '; \
 	if out=$$(python3 scripts/test_stage_state.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py fleetver    '; \
+	if out=$$(python3 scripts/test_fleet_version_marker.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py machinerent '; \
 	if out=$$(python3 scripts/test_machine_rental.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
@@ -1226,7 +1229,28 @@ fleet-check:            ## list the workers actually connected to the encode que
 	   echo "    For a same-version fleet: 'make deploy' (updates every box), or stop those workers."; \
 	 else \
 	   echo ">>> [fleet] master only — no remote workers connected"; \
-	 fi
+	 fi; \
+	 printf '%s' "$$fleet" | python3 -c "$$FLEET_VERSION_PY" 2>/dev/null || true
+
+# Reported builds per box, and whether they disagree (#248). Only workers that
+# have run a chunk since the server started have said — a box that has been idle
+# all session is 'not reported', which is NOT the same as agreeing.
+define FLEET_VERSION_PY
+import json, sys
+d = json.load(sys.stdin)
+vers, unknown = d.get("versions") or {}, d.get("versions_unknown") or []
+if not vers and not unknown:
+    print("    versions: none reported yet (no chunk has run since the server started)")
+    raise SystemExit
+for m in sorted(vers):
+    print(f"    {m:12} {vers[m]}")
+for m in unknown:
+    print(f"    {m:12} not reported")
+if d.get("version_mixed"):
+    print("\033[1;31m    MIXED BUILDS — this fleet will produce inconsistent telemetry.\033[0m")
+    print("    Run 'make deploy' to put every box on the same image.")
+endef
+export FLEET_VERSION_PY
 # The command-line encode client. Run from the repo so it needs no install; it
 # is a plain HTTP client, so nothing but python3 is required on this side.
 # `make smoke` and `make oobe` both drive it — they each used to hand-roll the

@@ -124,7 +124,19 @@ func (s *Server) distWorkers(w http.ResponseWriter, r *http.Request) {
 			fleet = append(fleet, e)
 		}
 	}
-	writeJSON(w, map[string]any{"count": on, "machines": out, "fleet": fleet})
+	// Version skew across the boxes currently encoding (#248). Surfaced here
+	// rather than left for the reader to diff `fleet[].version` themselves,
+	// because the whole point is that nobody thinks to look: a mixed fleet
+	// produces an encode that PASSES with telemetry that is quietly a subset.
+	// `versions_unknown` is reported separately from `version_mixed` — a box
+	// that never said cannot be called agreement.
+	mixed, byMachine, unknown := s.Manager.FleetVersionSkew()
+	writeJSON(w, map[string]any{
+		"count": on, "machines": out, "fleet": fleet,
+		"version_mixed":    mixed,
+		"versions":         byMachine,
+		"versions_unknown": unknown,
+	})
 }
 
 // toggleDistWorker enables/disables a machine's worker. Disable HARD-stops the
