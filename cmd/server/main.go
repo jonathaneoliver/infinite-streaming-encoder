@@ -164,6 +164,12 @@ func main() {
 		// window above is measured in hours, and each pass costs a LIST plus a
 		// head_object per job prefix.
 		FailedStagingInterval: 30 * time.Minute,
+		// Reclaim telemetry/state channels stranded by killed orchestrators
+		// without waiting for the next cloud submit (#191). Hourly because the
+		// sweep refuses to touch a queue younger than its 1h message retention,
+		// so anything faster is SQS request spend on a set that cannot have
+		// changed.
+		TelemetryGCInterval: 1 * time.Hour,
 		// Keep one box warm while cloud work is active so the packaging tail
 		// (and the next queued job) doesn't cold-start; 0 disables.
 		WarmMinVCPUs: intEnv("WARM_MIN_VCPUS", 2),
