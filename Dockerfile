@@ -30,6 +30,22 @@ LABEL org.opencontainers.image.revision="${GIT_SHA}"
 LABEL org.opencontainers.image.ref.name="${IMAGE_TAG}"
 LABEL org.opencontainers.image.source="https://github.com/jonathaneoliver/infinite-streaming-encoder"
 
+# The same stamps as ENV, because a LABEL is only readable from OUTSIDE the
+# container — and the process that needs to say which build it is, is inside it.
+#
+# The farm runs `:latest` on every box, pulled independently whenever each was
+# last deployed, so one run can span two builds and the older half silently
+# omits whatever the newer half added (#248). A worker can only report its
+# version if it can read it.
+#
+# IMAGE_TAG is the one that matters here, not GIT_SHA: it is the content hash,
+# so two boxes with the same IMAGE_TAG behave identically even if HEAD moved
+# under them for doc-only commits. Same reasoning as the ffmpeg note below —
+# record what actually ran, rather than inferring it from a line in this file.
+ENV ENCODER_IMAGE_TAG="${IMAGE_TAG}" \
+    ENCODER_GIT_SHA="${GIT_SHA}" \
+    ENCODER_VERSION="${VERSION}"
+
 # OS packages: CA certs + fonts for drawtext burn-ins (+ xz to unpack the static
 # ffmpeg below). ffmpeg itself is NOT from apt — see the static build next.
 RUN apt-get update && apt-get install -y --no-install-recommends \

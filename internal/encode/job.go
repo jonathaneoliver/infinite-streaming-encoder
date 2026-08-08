@@ -150,7 +150,13 @@ var (
 	// ENCODER-HOST reports the machine (EC2 instance-id, or a stable ARN slug)
 	// a stage's Batch job landed on — used to colour the chunk plot by instance
 	// so co-located heavy chunks are visible. Emitted once per (stage, instance).
-	hostMarkerRe = regexp.MustCompile(`^\[\[ENCODER-HOST key=(\S+) instance=(\S+)\]\]$`)
+	//
+	// `version` is the build that machine was running (#248), and it is OPTIONAL:
+	// the cloud path does not emit it (Batch job definitions pin one content-hash
+	// tag per execution, so its chunks cannot diverge), and a farm worker older
+	// than the heartbeat field cannot report it. Absent means unknown, never
+	// "same as everyone else".
+	hostMarkerRe = regexp.MustCompile(`^\[\[ENCODER-HOST key=(?P<key>\S+) instance=(?P<instance>\S+)( version=(?P<version>\S+))?\]\]$`)
 	// ENCODER-REUSED flags a chunk whose output a prior run already staged, so
 	// this run skips (not re-encodes) it — the orchestrator emits it once per
 	// reused chunk at startup. The UI styles those cells distinctly.
@@ -244,7 +250,10 @@ var (
 	// (4/4/8). Emitted by cli_local_dist from the workers' Temporal heartbeats,
 	// once per machine per poll. Consumed by Manager.recordFleetCPU (not per-job)
 	// to drive the local fleet CPU sparkline.
-	fleetMarkerRe = regexp.MustCompile(`^\[\[ENCODER-FLEET machine=(\S+) busy=([0-9.]+) perf=([0-9.]+)( chunks=([^\]]*))?\]\]$`)
+	// `version` is optional and sits BEFORE chunks on purpose: chunks is
+	// `[^\]]*` to allow its `|` separators, so anything after it would be
+	// swallowed into the chunk list rather than parsed.
+	fleetMarkerRe = regexp.MustCompile(`^\[\[ENCODER-FLEET machine=(?P<machine>\S+) busy=(?P<busy>[0-9.]+) perf=(?P<perf>[0-9.]+)( version=(?P<version>\S+))?( chunks=(?P<chunks>[^\]]*))?\]\]$`)
 	// ENCODER-COMMERCIAL reports what this job's output ladder would have cost on
 	// hosted transcoders — a generic commercial cloud encoder and AWS MediaConvert
 	// — as comparison baselines against our own spot/local cost. Emitted once per
@@ -625,11 +634,19 @@ func (j *Job) parseMarker(line string) bool {
 		return true
 	}
 	if m := hostMarkerRe.FindStringSubmatch(line); m != nil {
-		key, inst := m[1], m[2]
+		key := m[hostMarkerRe.SubexpIndex("key")]
+		inst := m[hostMarkerRe.SubexpIndex("instance")]
+		ver := m[hostMarkerRe.SubexpIndex("version")]
 		j.mu.Lock()
 		for i := range j.Stages {
 			if j.Stages[i].Key == key {
 				j.Stages[i].Instance = inst
+				// Only overwrite when this marker carried one — a re-tag after
+				// failover from a version-reporting worker to a silent one must
+				// not erase what we already knew about the chunk.
+				if ver != "" {
+					j.Stages[i].Version = ver
+				}
 				break
 			}
 		}
@@ -1169,6 +1186,21 @@ type StageProgress struct {
 	// stage's Batch job ran on — set from ENCODER-HOST, used by the UI to
 	// colour the chunk plot by instance. Empty until the job is placed.
 	Instance string `json:"instance,omitempty"`
+	// Version is the BUILD that machine was running (the image's content hash),
+	// also from ENCODER-HOST. Instance answers "where did this chunk run";
+	// without this, nothing answers "running what" (#248).
+	//
+	// This is the durable half, and it is why the field lives on the stage
+	// rather than only on the live fleet view: `RunRecord.Stages` persists it
+	// into every output's run.json, so a run.json with markers missing from
+	// some chunks can be explained MONTHS LATER, about a run nobody was
+	// watching — which is exactly how #248 presented. A live fleet warning
+	// helps only whoever is standing at the terminal at the time.
+	//
+	// Empty on the cloud path (one pinned image per execution — chunks there
+	// cannot diverge) and on farm workers too old to report it. Empty means
+	// unknown, NOT "matches the others".
+	Version string `json:"version,omitempty"`
 	// Reused is true when this chunk's output was already staged from a prior
 	// run and got skipped (not re-encoded) — set from ENCODER-REUSED. The UI
 	// styles reused cells with a distinct neutral so they don't read as a
@@ -1637,6 +1669,11 @@ type Manager struct {
 	fleetMu     sync.Mutex
 	fleetCPU    map[string][]fleetSample
 	fleetChunks map[string][]string
+	// fleetVersion is each machine's reported build (image content hash). Kept
+	// outside the sample ring because it is an attribute of the box, not a time
+	// series, and must survive the ring being trimmed. A machine absent here is
+	// one that has not reported a version — unknown, not "same as the others".
+	fleetVersion map[string]string
 	// fleetFirstSeen is when each machine first reported, used to order the
 	// fleet view oldest-first so a box that has been encoding since the start
 	// keeps its position and newly-scaled-up boxes append at the bottom.
@@ -1674,20 +1711,31 @@ func (m *Manager) recordFleetCPU(line string) bool {
 	if mm == nil {
 		return false
 	}
-	busy, _ := strconv.ParseFloat(mm[2], 64)
-	perf, _ := strconv.ParseFloat(mm[3], 64)
+	machine := mm[fleetMarkerRe.SubexpIndex("machine")]
+	busy, _ := strconv.ParseFloat(mm[fleetMarkerRe.SubexpIndex("busy")], 64)
+	perf, _ := strconv.ParseFloat(mm[fleetMarkerRe.SubexpIndex("perf")], 64)
+	version := mm[fleetMarkerRe.SubexpIndex("version")]
 	var chunks []string
-	if mm[5] != "" {
-		chunks = strings.Split(mm[5], "|")
+	if c := mm[fleetMarkerRe.SubexpIndex("chunks")]; c != "" {
+		chunks = strings.Split(c, "|")
 	}
 	m.fleetMu.Lock()
 	if m.fleetCPU == nil {
 		m.fleetCPU = map[string][]fleetSample{}
 		m.fleetChunks = map[string][]string{}
 		m.fleetFirstSeen = map[string]time.Time{}
+		m.fleetVersion = map[string]string{}
 	}
-	if _, seen := m.fleetFirstSeen[mm[1]]; !seen {
-		m.fleetFirstSeen[mm[1]] = time.Now()
+	if m.fleetVersion == nil { // maps predate this field on a warm Manager
+		m.fleetVersion = map[string]string{}
+	}
+	// Same rule as the stage record: only overwrite when this marker carried
+	// one, so a silent worker cannot erase a known version.
+	if version != "" {
+		m.fleetVersion[machine] = version
+	}
+	if _, seen := m.fleetFirstSeen[machine]; !seen {
+		m.fleetFirstSeen[machine] = time.Now()
 	}
 	// Throttle per machine. On the cloud path EVERY chunk container on a box
 	// emits this — /proc/stat is the host's, so 4 concurrent chunks all report
@@ -1700,18 +1748,18 @@ func (m *Manager) recordFleetCPU(line string) bool {
 	//
 	// The local path is unaffected — its orchestrator is a single reporter per
 	// machine and emits slower than this window.
-	if prev := m.fleetCPU[mm[1]]; len(prev) > 0 &&
+	if prev := m.fleetCPU[machine]; len(prev) > 0 &&
 		time.Since(prev[len(prev)-1].T) < fleetMinSampleGap {
-		m.fleetChunks[mm[1]] = chunks // chunk list still refreshes
+		m.fleetChunks[machine] = chunks // chunk list still refreshes
 		m.fleetMu.Unlock()
 		return true
 	}
-	s := append(m.fleetCPU[mm[1]], fleetSample{T: time.Now(), Busy: busy, Perf: perf})
+	s := append(m.fleetCPU[machine], fleetSample{T: time.Now(), Busy: busy, Perf: perf})
 	if len(s) > fleetHistoryLen {
 		s = s[len(s)-fleetHistoryLen:]
 	}
-	m.fleetCPU[mm[1]] = s
-	m.fleetChunks[mm[1]] = chunks
+	m.fleetCPU[machine] = s
+	m.fleetChunks[machine] = chunks
 	m.fleetMu.Unlock()
 	return true
 }
@@ -1745,6 +1793,42 @@ type FleetCPUEntry struct {
 	History []float64 `json:"history"`
 	AgeS    float64   `json:"age_s"`
 	Chunks  []string  `json:"chunks,omitempty"` // activity ids running on this box now
+	// Version is the build this box is running (image content hash). Empty =
+	// it has not said, which is not the same as matching the rest of the fleet.
+	Version string `json:"version,omitempty"`
+}
+
+// FleetVersionSkew reports whether the machines currently encoding are running
+// more than one build, and what they are running (#248).
+//
+// `mixed` is true only when two machines report DIFFERENT non-empty versions.
+// A machine that has not reported one cannot be compared, so it is listed in
+// `unknown` rather than counted as agreeing — claiming a uniform fleet on the
+// strength of boxes that never answered is the failure this exists to catch.
+//
+// Live view only: it describes who is encoding right now. The durable answer,
+// for a run nobody was watching, is StageProgress.Version in run.json.
+func (m *Manager) FleetVersionSkew() (mixed bool, byMachine map[string]string, unknown []string) {
+	byMachine = map[string]string{}
+	m.fleetMu.Lock()
+	defer m.fleetMu.Unlock()
+	now := time.Now()
+	seen := map[string]bool{}
+	for machine, samples := range m.fleetCPU {
+		// Same liveness rule as FleetCPU: a box silent past the TTL is gone, and
+		// a departed box's build is not a skew anyone can act on.
+		if len(samples) == 0 || now.Sub(samples[len(samples)-1].T) > fleetEntryTTL {
+			continue
+		}
+		if v := m.fleetVersion[machine]; v != "" {
+			byMachine[machine] = v
+			seen[v] = true
+		} else {
+			unknown = append(unknown, machine)
+		}
+	}
+	sort.Strings(unknown)
+	return len(seen) > 1, byMachine, unknown
 }
 
 // FleetCPU returns each machine's recent CPU history for the fleet endpoint,
@@ -1774,6 +1858,7 @@ func (m *Manager) FleetCPU() []FleetCPUEntry {
 			History: hist,
 			AgeS:    now.Sub(last.T).Seconds(),
 			Chunks:  m.fleetChunks[machine],
+			Version: m.fleetVersion[machine],
 		})
 	}
 	// Oldest-first by when the machine first reported. Sorting by machine name
