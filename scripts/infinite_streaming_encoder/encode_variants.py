@@ -198,13 +198,34 @@ def _codec_specific_args(
             "-pix_fmt", "yuv420p",
         ]
     if codec == "av1":
+        # `lp` (logical processors) is SVT-AV1's thread budget, and it is NOT
+        # ffmpeg's `-threads`: SVT runs its own pool and ignores the ffmpeg-level
+        # flag, which is why `-threads` is absent here while h264/hevc both set
+        # it. The mapping to the other codecs is therefore by INTENT — "use about
+        # this many cores" — not 1:1 semantics. lp=0 is SVT's auto, i.e. size the
+        # pool from whatever cores are visible, so an unset budget keeps exactly
+        # the previous behaviour.
+        #
+        # Without this, ENCODE_THREADS reached every codec except av1 (#183), and
+        # the gap is not theoretical. Measured on the 28-chunk local av1 run
+        # recorded in insane_fpv_shots_hydrofoil_windsurfing_p200_av1_xs:
+        #
+        #   effective threads per encode   4.16 median (p10 3.80, p90 4.82)
+        #   mean cores busy, encode phase  22.25
+        #   the same load at 2 threads     10.52
+        #
+        # 22 cores busy against a fleet whose perf-core budget is 16 means the
+        # work spilled onto SMT / E-cores — precisely what ENCODE_THREADS=2 plus
+        # `_default_slots` = physical/2 exists to prevent, since that sizing
+        # assumes 2 threads per encode and av1 was taking ~4.
+        lp = f":lp={n}" if n else ":lp=0"
         return [
             "-c:v", "libsvtav1",
             # preset 6 (was 8): SVT-AV1 parallelizes across more cores at slower
             # presets and gives better quality — 6 scales onto a big Graviton box
             # (where x265 stalls at ~2 cores) at a modest speed cost vs 8.
             "-preset", "6",
-            "-svtav1-params", f"keyint={k}:scd=0",
+            "-svtav1-params", f"keyint={k}:scd=0{lp}",
             "-g", str(k),
             "-force_key_frames", f"expr:gte(n,n_forced*{k})",
             "-pix_fmt", "yuv420p",
