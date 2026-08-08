@@ -6,15 +6,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Go HTTP server + single-page UI that drives video encoding. The Go code is a thin control plane — the actual encoding work lives in the Python package under `scripts/infinite_streaming_encoder/`, each run in its own **detached sibling Docker container** (so encodes survive a restart of the server's own container). The server submits encode jobs, tails their stdout via `docker logs -f` into a log buffer, and exposes a web UI for browsing sources, kicking off jobs, and playing back the resulting HLS output.
 
-Testing is thin and deliberately targeted — there is no broad unit-test suite, so
-do not assume one and do not invent commands beyond these three:
+Testing is targeted rather than broad — each test exists because something
+specific broke — but it is no longer thin: 127 Go tests plus ten Python test
+scripts. Do not invent commands beyond these four:
 
-- `make check` — the static gate: gofmt/vet/build, `go test ./...`, tofu fmt,
-  the Step Functions checks, `ruff` F821, python compile, page JS.
-- `go test ./...` — currently only `internal/encode/chunkplan_test.go`, which
-  pins the Go chunk planner to golden vectors generated from the Python one.
-  Both paths must cut a clip in the same places or local and cloud encodes stop
-  being comparable.
+- `make check` — the static gate: gofmt/vet/build, `go test -race ./...`,
+  staticcheck, govulncheck, tofu fmt, the Step Functions checks, `ruff` F821,
+  python compile, page JS. staticcheck/govulncheck **skip when not installed**
+  (like tofu and ruff) so the pre-push hook stays fast and offline; CI runs both
+  unconditionally via `go run …@latest`, so CI is the authority. Install locally
+  with `go install honnef.co/go/tools/cmd/staticcheck@latest` and
+  `go install golang.org/x/vuln/cmd/govulncheck@latest`.
+- `go test -race ./...` — 27 files, 127 tests across `internal/api`,
+  `internal/awswatch`, `internal/encode`, `internal/tmpstage`. `-race` is not
+  optional: #196 added it after proving a real SSE data race
+  (`json.Marshal(job)` walking `j.Stages` while `upsertStage` appended).
+  `chunkplan_test.go` is still the load-bearing one — it pins the Go chunk
+  planner to golden vectors generated from the Python one, and both paths must
+  cut a clip in the same places or local and cloud encodes stop being comparable.
 - `make smoke` — a REAL short encode end to end (synthetic clip, chunked) on the
   **local-dist** path, asserting the job reaches `done` AND produced playlists.
   Builds and brings the master up from your working tree, so it tests uncommitted
@@ -130,7 +139,9 @@ Two key naming/skip conventions in this file:
 - `JobConfig.OutputStem(filename)` — `<stem>_p<partialMs>[_padblack|_padpink]`. The encoding script then appends `_<codec>` to produce the final output dir name (e.g. `myclip_p200_h264`). The watcher and `parseOutputMeta` both rely on this layout.
 - `Manager.resolveCodec` — before encoding, checks which `<stem>_h264` / `_hevc` / `_av1` dirs already exist in `OutputDir` and narrows the codec flag to only the missing ones. Returns `""` → skip this file entirely. Bypassed when `ForceReencode=true`.
 
-The worker container's entrypoint is overridden to `scripts/infinite_streaming_encoder/cli_local.py` (local) or `scripts/infinite_streaming_encoder/cli_cloud.py` (cloud). Cloud workers additionally receive `HOST_AWS_DIR` as `/root/.aws:ro` and the AWS/GHCR env vars listed in `cloudEnvPassthrough`. Stdout is line-scanned into `job.logLines` (capped at 1000 lines, trimmed to last 500) and the latest line (ANSI-stripped) becomes `job.Progress`, which the SSE stream surfaces live.
+The worker container's entrypoint is overridden to `scripts/infinite_streaming_encoder/cli_local.py`. Stdout is line-scanned into `job.logLines` (capped at 1000 lines, trimmed to last 500) and the latest line (ANSI-stripped) becomes `job.Progress`, which the SSE stream surfaces live.
+
+This paragraph used to describe a `cli_cloud.py` worker receiving `HOST_AWS_DIR` and an env allow-list called `cloudEnvPassthrough`. **That path no longer exists** — the single-box EC2 target was retired when cloud encoding moved to Step Functions + Batch, and `cloudEnvPassthrough` sat unreferenced until staticcheck's U1000 found it. `SUBNET_ID` / `INSTANCE_PROFILE` / `GHCR_PAT` and friends are configured on the Batch job definition now. Cloud jobs do not spawn a worker container from the Go server at all; see "Batch state, event-driven (cloud)".
 
 ### MinIO staging lifecycle (local-dist)
 

@@ -37,6 +37,32 @@ jobs:
       - name: go build
         run: go build ./...
 
+      # The suite `make check` has run via the pre-push hook since #196 added
+      # -race (it caught a real SSE data race). It was never in CI because when
+      # ci.yml was written there was effectively one Go test file; there are now
+      # 27 files / 127 tests, so the "no unit suite" premise has expired.
+      #
+      # A hook only guards machines that have it. A --no-verify push, a merge
+      # made in the GitHub UI, or an agent pushing from elsewhere all reached
+      # main without these ever running — including chunkplan_test.go, whose
+      # whole job is keeping the Go and Python chunk planners cutting clips in
+      # the same places.
+      - name: go test
+        run: go test -race ./...
+
+      # Reachable-vulnerability scan. Callgraph-aware, so it reports only what
+      # this code actually calls: on adoption it found 13 reachable stdlib
+      # vulnerabilities and correctly discarded 12 unreachable ones. There are
+      # no module dependencies, so what it guards is the toolchain floor in
+      # go.mod — see the comment there.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      # staticcheck, ALL checks including ST* style. Adopted at zero
+      # outstanding findings, so anything it reports from here is new.
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
   # The Python half had NO CI at all. `make check` runs a ruff F821 pass and ten
   # test scripts, but nothing ran them except a human typing `make check` — and
   # the ruff step skips silently when ruff is not installed, which it was not.
