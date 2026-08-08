@@ -38,10 +38,28 @@ LABEL org.opencontainers.image.source="https://github.com/jonathaneoliver/infini
 # omits whatever the newer half added (#248). A worker can only report its
 # version if it can read it.
 #
-# IMAGE_TAG is the one that matters here, not GIT_SHA: it is the content hash,
-# so two boxes with the same IMAGE_TAG behave identically even if HEAD moved
-# under them for doc-only commits. Same reasoning as the ffmpeg note below —
-# record what actually ran, rather than inferring it from a line in this file.
+# IMAGE_TAG is the one that matters here, not GIT_SHA: two boxes with the same
+# IMAGE_TAG run the same ENCODER PAYLOAD even if HEAD moved under them. Same
+# reasoning as the ffmpeg note below — record what actually ran, rather than
+# inferring it from a line in this file.
+#
+# Be precise about what it identifies, because "version" invites a stronger
+# reading than it can support. The Makefile derives it as
+#     git log -1 --format=%h -- Dockerfile requirements.txt scripts static
+# which EXCLUDES internal/ and cmd/ — while line 137 below copies the Go server
+# binary into this image. So a Go-only change produces different image content
+# under the SAME tag: IMAGE_TAG is not a content-unique id for the image, it is
+# an id for the encoder payload.
+#
+# That is the right identity for the question being asked (a chunk's encode
+# behaviour lives in scripts/), and it is bounded:
+#   - where the tag is load-bearing it is inert. Batch workers pull by
+#     IMAGE_TAG and run the Python payload; the Go binary is dead weight there.
+#   - the one place it bites is rollback. `make infra-plan IMAGE_TAG=<prev>`
+#     restores the encoder payload, NOT the server binary that shipped in that
+#     image. Nothing expects it to — the server is not deployed from the pinned
+#     tag — but "roll back to the previous image" and "roll back to the
+#     previous build" are not the same sentence.
 ENV ENCODER_IMAGE_TAG="${IMAGE_TAG}" \
     ENCODER_GIT_SHA="${GIT_SHA}" \
     ENCODER_VERSION="${VERSION}"
