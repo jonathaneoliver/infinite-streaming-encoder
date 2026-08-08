@@ -102,6 +102,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/outputs/{name}/files", s.listOutputFiles)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/playlists", s.listPlaylists)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/ladder", s.ladder)
+	s.Mux.HandleFunc("GET /api/outputs/{name}/run", s.outputRun)
 	s.Mux.HandleFunc("GET /api/outputs/{name}/logs", s.outputLogs)
 	s.Mux.HandleFunc("POST /api/outputs/{name}/promote", s.promoteOutput)
 	s.Mux.HandleFunc("POST /api/outputs/{name}/fetch", s.fetchOutput)
@@ -829,6 +830,30 @@ func (s *Server) listOutputContents(w http.ResponseWriter, r *http.Request) {
 		files = append(files, f)
 	}
 	writeJSON(w, files)
+}
+
+// outputRun returns one output dir's run record — the config, phase timings,
+// cost and machines of the encode that produced it (encode.RunRecordFile).
+//
+// A plain file read, deliberately: nothing on an /api/outputs path may make an
+// S3 call (the listing already costs ~0.8s over 30 dirs), and this is fetched
+// per detail-view open rather than polled.
+//
+// 404 when the dir has no record, which is the normal case for everything
+// encoded before run.json shipped — the client must degrade to the pre-record
+// view, not report a failure.
+func (s *Server) outputRun(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		http.Error(w, "invalid name", http.StatusBadRequest)
+		return
+	}
+	rec := encode.ReadRunRecord(filepath.Join(s.Manager.OutputDir, name))
+	if rec == nil {
+		http.Error(w, "no run record", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, rec)
 }
 
 // listOutputFiles walks one output dir and returns every FILE in it, as paths
