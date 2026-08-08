@@ -193,6 +193,72 @@ first recent file, so a live directory costs a few stats and only a doomed one
 is walked in full — which is where the reclaimed byte count in the log comes
 from.
 
+### Duration limit (the UI's "Duration (s)")
+
+Applied in **exactly one place** — `cli_phase`'s mezzanine step truncates the
+mezzanine, and every variant, chunk and the audio are cut from that, so nothing
+downstream applies it a second time (#184).
+
+Everything that must agree about *how long the content is* agrees by clamping
+one number: `cli_local_dist` clamps the probed `info.duration_s` immediately
+after the probe, and `buildSFNInput` clamps `clipDurationS`. The chunk plan, the
+ladder's chunk sizing, the cost estimate and the progress totals then describe
+the truncated clip without any of them knowing a limit exists. A limit at or
+above the clip is **not** a limit, on both paths.
+
+**A limit that reaches the clip length is not a limit** — encode the whole
+content, since a limit can never describe more media than exists.
+`JobConfig.TimeLimitFor(clipDurationS)` is that rule, and the cloud path probes
+the source *before* keying the mezzanine so it applies to the key too: otherwise
+a non-binding limit files a FULL mezzanine under a limited prefix, and the next
+unlimited run of the same source misses the cache and rebuilds an identical
+file. An unknown duration (probe failed, `<= 0`) **keeps** the limit — dropping
+it on a number nobody measured would encode the whole clip when a short one was
+asked for.
+
+**The limit is snapped to the nearest whole segment** (6s by default; the job's
+ladder-resolved `SegmentDuration`). Chunk boundaries must land on segments, so a
+limit that isn't a multiple leaves a plan that cannot end where the media does,
+plus a runt final segment and a comparison run that isn't comparing equal spans.
+`JobConfig.TimeLimitSeconds()` snaps, so the encoder argument, the cache key, the
+cloud plan and the history line all get the snapped value automatically;
+`cli_local_dist` snaps again, idempotently, against the segment duration its own
+`plan_chunks` uses, so running it by hand behaves the same. Both round half
+**away from zero** — Python's `round()` is banker's rounding and would disagree
+with Go's `math.Round` at exactly half a segment.
+
+Two rules that are easy to get wrong:
+
+- **The limit is part of the mezzanine cache key** (`sourceMezzKey` in Go,
+  `_mezz_cache_rel` in Python; the per-worker cache in `cli_phase` keys off the
+  resulting URI and follows for free). The mezzanine is only a pure function of
+  the source while the *whole* source is copied. Key on the source alone and one
+  30s encode serves a 30s mezzanine to every later full encode of that file —
+  right name, right manifests, silently short video, until the staging GC evicts
+  it. An unset limit hashes exactly as before, so existing cached mezzanines
+  still hit.
+- **The chunk plan is a deliberate PREFIX of a limited mezzanine, not a match
+  for it.** `-t` on a stream copy cuts on packet boundaries, so a 10s limit
+  yields ~10.07s of media — past the one-frame tolerance, every time. So
+  `cli_phase`'s plan-vs-media check flips under a limit: media *shorter* than
+  the plan is still fatal (chunks would reference frames that don't exist), an
+  overshoot is expected. Which is why `TIME_LIMIT_S` reaches the variant phases
+  too, even though they don't apply it — it is a property of the RUN.
+
+`TIME_LIMIT_S` travels as an environment variable, never a `Ref::` parameter: a
+caller that doesn't set it gets the full clip (the old behaviour) instead of a
+job definition that fails to launch (#176). On the cloud path `buildSFNInput`
+**always** emits `time_limit` (`"0"` when unset) because the ASL reads it with
+`Value.$`, and both Maps must project it in their `ItemSelector` — `make check`'s
+`sfn scopes` step catches a missed one.
+
+A `history.md` "Time limit" line is written only when a limit was actually
+applied. `JobConfig.TimeLimitSeconds()` is the single definition of "is this a
+real limit" — the field is free text, so unparseable or non-positive means no
+limit. Before #184 that line was written from the raw string while nothing
+passed it to an encoder, so full-length encodes recorded truncations that never
+happened.
+
 ### Worker telemetry (`[[ENCODER-*]]` markers)
 
 Every worker reports the same way — a stream of `[[ENCODER-…]]` marker lines —

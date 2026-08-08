@@ -28,7 +28,9 @@
         "ContainerOverrides": {
           "Environment": [
             { "Name": "ENCODER_TELEMETRY_EXEC", "Value.$": "$$.Execution.Name" },
-            { "Name": "JOB_ID", "Value.$": "$$.Execution.Name" }
+            { "Name": "JOB_ID", "Value.$": "$$.Execution.Name" },
+            { "Comment": "Duration limit (#184), applied by truncating the mezzanine — every variant, chunk and the audio are cut from it, so this is the only state that needs it. buildSFNInput ALWAYS supplies time_limit (\"0\" when unset): Value.$ on a key the input omits fails the state at runtime.",
+              "Name": "TIME_LIMIT_S", "Value.$": "$.time_limit" }
           ]
         }
       },
@@ -113,6 +115,7 @@
                 "segment_duration.$": "$.segment_duration",
                 "partial_duration.$": "$.partial_duration",
                 "gop_duration.$": "$.gop_duration",
+                "time_limit.$": "$.time_limit",
                 "burnin.$": "$.burnin",
                 "est_vmaf.$": "$$.Map.Item.Value.est_vmaf",
                 "est_vmaf_clamped.$": "$$.Map.Item.Value.est_vmaf_clamped",
@@ -163,6 +166,8 @@
                           { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" },
                           { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
                           { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" },
+                          { "Comment": "Not applied here — the mezzanine is already truncated. This tells the plan-vs-media check that the chunk plan is a deliberate PREFIX of the mezzanine, because -t on a stream copy overshoots the limit by a frame or two (#184).",
+                            "Name": "TIME_LIMIT_S", "Value.$": "$.time_limit" },
                           { "Name": "BURNIN", "Value.$": "$.burnin" },
                           { "Name": "EST_VMAF", "Value.$": "$.est_vmaf" },
                           { "Name": "EST_VMAF_CLAMPED", "Value.$": "$.est_vmaf_clamped" },
@@ -204,6 +209,7 @@
                       "bufsize_multiplier.$": "$.bufsize_multiplier",
                       "segment_duration.$": "$.segment_duration",
                       "gop_duration.$": "$.gop_duration",
+                      "time_limit.$": "$.time_limit",
                       "burnin.$": "$.burnin",
                       "est_vmaf.$": "$.est_vmaf",
                       "est_vmaf_clamped.$": "$.est_vmaf_clamped"
@@ -244,6 +250,8 @@
                                 { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" },
                                 { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
                                 { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" },
+                                { "Comment": "Not applied here — the mezzanine is already truncated. This tells the plan-vs-media check that the chunk plan is a deliberate PREFIX of the mezzanine, because -t on a stream copy overshoots the limit by a frame or two (#184).",
+                                  "Name": "TIME_LIMIT_S", "Value.$": "$.time_limit" },
                                 { "Name": "BURNIN", "Value.$": "$.burnin" },
                                 { "Name": "EST_VMAF", "Value.$": "$.est_vmaf" },
                                 { "Name": "EST_VMAF_CLAMPED", "Value.$": "$.est_vmaf_clamped" },
