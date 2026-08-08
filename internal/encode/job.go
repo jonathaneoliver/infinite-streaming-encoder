@@ -2579,8 +2579,13 @@ func (m *Manager) writeHistory(job *Job) {
 	if job.Config.MinRes != "" {
 		fmt.Fprintf(f, "- **Min Res:** %s\n", job.Config.MinRes)
 	}
-	if job.Config.Time != "" {
-		fmt.Fprintf(f, "- **Time limit:** %ss\n", job.Config.Time)
+	// Only record a limit that was actually applied. Until #184 this printed
+	// whatever the UI sent while nothing passed it to an encoder, so a
+	// full-length encode's history claimed it was truncated — a lie that only
+	// surfaced during a post-mortem, which is exactly when it did most damage.
+	if secs, ok := job.Config.TimeLimitSeconds(); ok {
+		fmt.Fprintf(f, "- **Time limit:** %ss\n",
+			strconv.FormatFloat(secs, 'f', -1, 64))
 	}
 	fmt.Fprintf(f, "- **Segment:** %ss / Partial: %ss / GOP: %ss\n",
 		defaultVal(job.Config.SegmentDuration, "6"),
@@ -3196,6 +3201,28 @@ func (cfg *JobConfig) outputCodecDir(filename, codec string) string {
 	return name
 }
 
+// TimeLimitSeconds resolves the UI's "Duration (s)" field to a usable limit
+// (#184). The field is free text, so anything unparseable or non-positive means
+// "no limit" — the same as leaving it blank.
+//
+// One definition, because three things must agree or the run is incoherent: the
+// argument passed to the encoder, the mezzanine cache key (a truncated
+// mezzanine must never be filed under the full one's key), and the history
+// entry. The history line used to be written from the raw string while nothing
+// else read it at all, which is how a full-length encode came to record a time
+// limit it never had.
+func (cfg *JobConfig) TimeLimitSeconds() (float64, bool) {
+	s := strings.TrimSpace(cfg.Time)
+	if s == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || v <= 0 {
+		return 0, false
+	}
+	return v, true
+}
+
 // BurninEnabled reports whether the text overlay should be burnt in. Default is
 // on: a nil Burnin (older jobs / omitted by the client) counts as enabled, and
 // only an explicit false disables it.
@@ -3346,6 +3373,11 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	}
 	if cfg.OutputTag != "" {
 		args = append(args, "--output-tag", cfg.OutputTag)
+	}
+	// Duration limit (#184). Sent only when set; cli_local_dist drops a limit at
+	// or above the clip length, so "30" on a 20s clip is not an error.
+	if secs, ok := cfg.TimeLimitSeconds(); ok {
+		args = append(args, "--time", strconv.FormatFloat(secs, 'f', -1, 64))
 	}
 	if cfg.HevcSinglePass {
 		args = append(args, "--hevc-single-pass")
@@ -3636,7 +3668,8 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		localSrc := filepath.Join(m.SourceDir, filename)
 		s3Mezz := s3Prefix // fallback: mezzanine stays in the job prefix
 		cacheHit := false
-		if key, ok := sourceMezzKey(localSrc); ok {
+		timeLimitS, _ := job.Config.TimeLimitSeconds()
+		if key, ok := sourceMezzKey(localSrc, timeLimitS); ok {
 			s3Mezz = fmt.Sprintf("s3://%s/mezz/%s", bucket, key)
 			if s3ObjectExists(s3Mezz+"/mezzanine.mp4") &&
 				s3ObjectExists(s3Mezz+"/mezzanine.mp4.done") {
@@ -3753,7 +3786,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// Source fps: keys the speed model (encode time ∝ frame count), so chunk
 		// sizes/priorities match the graviton keys learned at the same rate.
 		srcFps := probeSourceFps(localSrc)
-		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), srcWidth, srcFps, durationS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), m.vmafEstimates(job.Config), job.AppendLog)
+		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), srcWidth, srcFps, durationS, timeLimitS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), m.vmafEstimates(job.Config), job.AppendLog)
 		expectedEncodes = expEnc
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
@@ -3982,13 +4015,24 @@ func chunkModeLabel(cfg string) string {
 // sourceMezzKey derives a stable source-identity key for the mezzanine cache
 // from the file's name + size + mtime — cheap (a stat, no reading the file).
 // Any change to those re-mezzanines. Returns false if the file can't be stat'd.
-func sourceMezzKey(path string) (string, bool) {
+// sourceMezzKey keys the cross-job mezzanine cache. timeLimitS folds a #184
+// duration limit into the key: the mezzanine is only a pure function of the
+// source while the whole source is copied, and a limited run truncates it. Key
+// on the source alone and one 30s encode would serve a 30s mezzanine to every
+// later full encode of that file — right name, right manifests, silently short
+// video. 0 = no limit, which reproduces the pre-#184 key exactly, so existing
+// cached mezzanines still hit.
+func sourceMezzKey(path string, timeLimitS float64) (string, bool) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return "", false
 	}
-	sum := sha1.Sum([]byte(fmt.Sprintf("%s|%d|%d",
-		filepath.Base(path), fi.Size(), fi.ModTime().UnixNano())))
+	sig := fmt.Sprintf("%s|%d|%d",
+		filepath.Base(path), fi.Size(), fi.ModTime().UnixNano())
+	if timeLimitS > 0 {
+		sig += fmt.Sprintf("|t%s", strconv.FormatFloat(timeLimitS, 'f', -1, 64))
+	}
+	sum := sha1.Sum([]byte(sig))
 	return hex.EncodeToString(sum[:])[:16], true
 }
 
@@ -4035,9 +4079,26 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin bool, sourceWidth, sourceFps int, clipDurationS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int) {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin bool, sourceWidth, sourceFps int, clipDurationS, timeLimitS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int) {
 	if ladderName == "" {
 		ladderName = DefaultLadderName
+	}
+	// A duration limit (#184) truncates the mezzanine, and every variant, chunk
+	// and the audio are cut from that — so the clip IS shorter, and the chunk
+	// plan, the priority scores and the cost estimate must all describe the
+	// shorter one. Clamping the single duration they share is the whole change;
+	// planChunks below then simply plans fewer chunks. A limit at or above the
+	// clip is not a limit (matching cli_local_dist's rule).
+	if timeLimitS > 0 && timeLimitS < clipDurationS {
+		if logf != nil {
+			logf(fmt.Sprintf("[cloud-batch] --time %s: planning against %ss of %ss",
+				strconv.FormatFloat(timeLimitS, 'f', -1, 64),
+				strconv.FormatFloat(timeLimitS, 'f', -1, 64),
+				strconv.FormatFloat(clipDurationS, 'f', -1, 64)))
+		}
+		clipDurationS = timeLimitS
+	} else {
+		timeLimitS = 0
 	}
 	// Every Batch SchedulingPriorityOverride for this job rides inside a 1000-wide
 	// band (priorityBase): an EARLIER queued job gets a higher band, so ALL its
@@ -4211,6 +4272,12 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		"segment_duration": segDur,
 		"partial_duration": partDur,
 		"gop_duration":     gopDur,
+		// Duration limit (#184) → TIME_LIMIT_S on the Mezzanine job only; every
+		// later phase reads the already-truncated mezzanine. ALWAYS present, even
+		// unset ("0"), because the ASL references it with `Value.$` — a key the
+		// input omits fails the state at runtime rather than being treated as
+		// absent, which is the #176 trap in a different costume.
+		"time_limit": strconv.FormatFloat(timeLimitS, 'f', -1, 64),
 		// Text-overlay toggle → BURNIN env on every variant job (see the ASL
 		// containerOverrides). "true"/"false" so cli_phase's _env_flag_default_on
 		// reads it; on by default, only an explicit false disables it.

@@ -88,6 +88,11 @@ def _env_float(name: str, default: float) -> float:
 
 
 _SEGMENT_DURATION_S = _env_float("SEGMENT_DURATION", 6.0)
+# Duration limit (#184). A property of the RUN, not of one phase: the mezzanine
+# applies it, and the variant phases need only know that the chunk plan is
+# therefore a deliberate prefix of the mezzanine rather than a match for it.
+# 0/unset = full clip, which is every pre-#184 caller.
+_TIME_LIMIT_S = _env_float("TIME_LIMIT_S", 0.0)
 _PARTIAL_DURATION_S = _env_float("PARTIAL_DURATION", 0.2)
 _GOP_DURATION_S = _env_float("GOP_DURATION", 1.0)
 # How far the mezzanine's probed duration may drift from the duration the
@@ -677,11 +682,28 @@ def phase_mezzanine(args: argparse.Namespace) -> int:
     out_path = work / "mezzanine.mp4"
     info = probe(local_in)
 
+    # The duration limit (#184) is applied HERE and nowhere else: truncating the
+    # mezzanine truncates everything downstream, because every variant, chunk and
+    # audio track is cut from it. 0/unset = full clip.
+    #
+    # Safe to key off env rather than a Ref:: parameter precisely because it is
+    # applied at one point: a caller that doesn't set it gets the full clip,
+    # which is the old behaviour, instead of a job definition that fails to
+    # launch (#176).
+    #
+    # The truncated mezzanine MUST NOT be written under the unlimited one's cache
+    # key — the callers fold the limit into --s3-out for that, so a limited run
+    # and a full run of the same source never share a prefix.
+    time_limit_s = _TIME_LIMIT_S if _TIME_LIMIT_S > 0 else None
+    if time_limit_s:
+        print(f"[phase mezzanine] limiting to {time_limit_s:g}s "
+              f"of {info.duration_s:g}s", flush=True)
+
     create_mezzanine(
         MezzanineSpec(
             input_path=local_in,
             output_path=out_path,
-            time_limit_s=None,
+            time_limit_s=time_limit_s,
             # Normalize any VFR source to EXACT CFR here (lossless), so the
             # per-chunk encodes pass frames through 1:1 and the VMAF audit
             # can't drift on a jittery reference (see mezzanine.py docstring).
@@ -689,7 +711,10 @@ def phase_mezzanine(args: argparse.Namespace) -> int:
             fps_den=info.fps.denominator,
         ),
         stage_key="mezzanine",
-        duration_s=info.duration_s,
+        # Progress is measured against what will actually be written, so a
+        # limited run's bar reaches 100% rather than stalling at limit/full.
+        duration_s=(min(info.duration_s, time_limit_s)
+                    if time_limit_s else info.duration_s),
         pct_lo=45.0, pct_hi=55.0, terminal=False,
     )
 
@@ -846,15 +871,38 @@ def phase_variant(args: argparse.Namespace) -> int:
         # assume the stream copy preserved the duration exactly. Fail loudly if
         # it didn't — the alternative is every chunk boundary shifting by the
         # drift and the concatenated variant silently gaining or losing frames.
+        #
+        # Under a duration limit (#184) that assumption no longer holds, and the
+        # difference is not drift: the plan is deliberately a PREFIX of the
+        # mezzanine. `-t` on a stream copy cuts on packet boundaries, so a 10s
+        # limit yields ~10.07s of media — a couple of frames past the plan, every
+        # time, and past the one-frame tolerance. Those frames are simply never
+        # encoded; the chunks still describe real media.
+        #
+        # So the check flips from "must match" to "must COVER": media shorter
+        # than the plan is still fatal (chunks would reference frames that don't
+        # exist), a small overshoot is expected. It stays a real check — this is
+        # what caught a mezzanine built by a worker too old to apply the limit at
+        # all, which came back at the full 20s against a 10s plan.
         if args.content_duration is not None:
-            drift = abs(info.duration_s - args.content_duration)
-            if drift > _PLAN_DURATION_TOLERANCE_S:
-                print(f"error: chunk plan was built for a "
-                      f"{args.content_duration:.6f}s clip but this mezzanine is "
-                      f"{info.duration_s:.6f}s ({drift:.6f}s drift, tolerance "
-                      f"{_PLAN_DURATION_TOLERANCE_S}s). Every chunk boundary "
-                      f"would be wrong.", file=sys.stderr)
-                return 1
+            if _TIME_LIMIT_S > 0:
+                shortfall = args.content_duration - info.duration_s
+                if shortfall > _PLAN_DURATION_TOLERANCE_S:
+                    print(f"error: chunk plan covers {args.content_duration:.6f}s "
+                          f"but this mezzanine is only {info.duration_s:.6f}s "
+                          f"({shortfall:.6f}s short, tolerance "
+                          f"{_PLAN_DURATION_TOLERANCE_S}s). Chunks would "
+                          f"reference media that isn't there.", file=sys.stderr)
+                    return 1
+            else:
+                drift = abs(info.duration_s - args.content_duration)
+                if drift > _PLAN_DURATION_TOLERANCE_S:
+                    print(f"error: chunk plan was built for a "
+                          f"{args.content_duration:.6f}s clip but this mezzanine is "
+                          f"{info.duration_s:.6f}s ({drift:.6f}s drift, tolerance "
+                          f"{_PLAN_DURATION_TOLERANCE_S}s). Every chunk boundary "
+                          f"would be wrong.", file=sys.stderr)
+                    return 1
         # No total to report: this worker is handed one span and never builds
         # the full plan, so it does not know how many chunks there are.
         print(f"[phase variant] chunk {chunk.index}: "

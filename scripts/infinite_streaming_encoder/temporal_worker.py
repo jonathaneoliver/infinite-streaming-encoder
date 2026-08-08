@@ -375,8 +375,15 @@ class EncodeWorkflow:
         job_rank = int(plan.get("job_rank", 0))
         job_top = min(PRIORITY_LEVELS, job_rank * PRIORITY_BANDS + 1)
 
+        # Duration limit (#184): applied only to the mezzanine, because every
+        # chunk and the audio are cut from it. Absent in plans from an older
+        # orchestrator, which correctly reads as "full clip".
+        mezz_env = {}
+        if float(plan.get("time_limit_s") or 0) > 0:
+            mezz_env["TIME_LIMIT_S"] = str(plan["time_limit_s"])
         await self._phase(["mezzanine", "--s3-in", f"s3://{b}/{plan['src_key']}",
-                           "--s3-out", mezz], {}, "mezzanine", priority_key=job_top)
+                           "--s3-out", mezz], mezz_env, "mezzanine",
+                          priority_key=job_top)
         if plan.get("has_audio"):
             await self._phase(["audio", "--s3-mezz", mezz, "--s3-out", s3_work],
                               {}, "audio", priority_key=job_top)
@@ -472,6 +479,13 @@ class EncodeWorkflow:
                    # plan_chunks aligns chunk boundaries to it.
                    "GOP_DURATION": str(plan.get("gop_duration", "")),
                    "SEGMENT_DURATION": str(plan.get("segment_duration", "")),
+                   # Not applied here — the mezzanine is already truncated. It
+                   # tells the plan-vs-media check that the plan is a deliberate
+                   # PREFIX of the mezzanine, since `-t` on a stream copy
+                   # overshoots the limit by a frame or two (#184).
+                   "TIME_LIMIT_S": (str(plan["time_limit_s"])
+                                    if float(plan.get("time_limit_s") or 0) > 0
+                                    else ""),
                    "BURNIN": "1" if bn else "0", "ENCODE_THREADS": "2"}
             # An absent/blank value must not reach cli_phase as "" — _env_num
             # would read it as unset anyway, but dropping the key keeps the

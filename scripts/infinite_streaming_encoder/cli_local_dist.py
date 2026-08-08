@@ -48,6 +48,7 @@ import os
 import re
 import signal
 import sys
+from dataclasses import replace as dc_replace
 from pathlib import Path
 
 from infinite_streaming_encoder.chunking import plan_chunks
@@ -66,16 +67,6 @@ _SEGMENT_DURATION_S = 6.0
 # encode_variants._MIN_TAIL_CHUNK_S; the worker does the same via
 # the plan it ships, so the dispatched spans are exactly what gets encoded).
 _MAX_RETRIES_PER_CHUNK = 3
-
-
-
-
-
-
-
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -166,13 +157,55 @@ def _object_exists(bucket: str, key: str) -> bool:
 MEZZ_CACHE_PREFIX = "mezz-cache"
 
 
-def _mezz_cache_rel(input_path: Path) -> str:
+def _mezz_cache_rel(input_path: Path, time_limit_s: float | None = None) -> str:
     """Bucket-relative prefix (`mezz-cache/<key>`) for this source's shared
-    mezzanine. See MEZZ_CACHE_PREFIX."""
+    mezzanine. See MEZZ_CACHE_PREFIX.
+
+    The duration limit (#184) is part of the key, not just the content. A
+    limited run truncates the mezzanine, and this cache is shared across jobs
+    and outlives them — so keying on the source alone would let one 30s encode
+    serve a 30s mezzanine to every later full encode of the same file, silently
+    producing 30s outputs until the staging GC evicted it. The failure is
+    invisible until someone plays the result back."""
     st = input_path.stat()
     sig = f"{input_path.name}:{st.st_size}:{st.st_mtime_ns}"
+    if time_limit_s and time_limit_s > 0:
+        sig += f":t{time_limit_s:g}"
     key = hashlib.sha256(sig.encode()).hexdigest()[:32]
     return f"{MEZZ_CACHE_PREFIX}/{key}"
+
+
+def _apply_time_limit(info, time_limit_s: float | None):
+    """Clamp the probed duration to the requested limit (#184), returning the
+    info the rest of the run should plan against.
+
+    Applied once, immediately after the probe, because `info.duration_s` is the
+    single input to everything that has to agree about how long the content is:
+    the chunk plan, the ladder's chunk sizing, the cost estimate and the
+    progress totals. Clamping here means none of them has to know a limit
+    exists — they simply plan a shorter clip, which is exactly what the
+    truncated mezzanine will contain.
+
+    A limit at or above the clip is dropped rather than applied, so it can't
+    produce a plan longer than the media."""
+    if not time_limit_s or time_limit_s <= 0:
+        return info
+    if time_limit_s >= info.duration_s:
+        print(f"[dist] --time {time_limit_s:g}s >= clip {info.duration_s:g}s — "
+              f"encoding the whole clip", flush=True)
+        return info
+    print(f"[dist] --time {time_limit_s:g}s of {info.duration_s:g}s — planning "
+          f"against the truncated length", flush=True)
+    return dc_replace(info, duration_s=float(time_limit_s))
+
+
+def _effective_time_limit(info, time_limit_s: float | None) -> float | None:
+    """The limit that will actually be applied, or None. Mirrors
+    _apply_time_limit's "at or above the clip is not a limit" rule so the cache
+    key and the mezzanine env agree with the plan."""
+    if not time_limit_s or time_limit_s <= 0 or time_limit_s >= info.duration_s:
+        return None
+    return float(time_limit_s)
 
 
 def _touch_prefix(bucket: str, rel: str) -> None:
@@ -688,6 +721,10 @@ def run_temporal(args: argparse.Namespace) -> int:
     except ProbeError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    # Duration limit BEFORE _resolve_plan reads info.duration_s — the chunk plan,
+    # the ladder sizing and the cost estimate must all describe the truncated clip.
+    time_limit_s = _effective_time_limit(info, getattr(args, "time_limit_s", None))
+    info = _apply_time_limit(info, time_limit_s)
     # Resolve "whole variant" (0) to a clip-spanning single chunk before the
     # value fans out to _resolve_plan / the workflow plan / worker env.
     args.chunk_duration_s = _resolve_chunk_duration_s(
@@ -716,7 +753,7 @@ def run_temporal(args: argparse.Namespace) -> int:
     # source is ONLY consumed by that phase, we can skip uploading it entirely
     # (the biggest single I/O in the prep). On a miss, upload as usual and the
     # mezzanine phase populates the shared cache for the next job.
-    mezz_rel = _mezz_cache_rel(input_path)
+    mezz_rel = _mezz_cache_rel(input_path, time_limit_s)
     mezz_prefix = f"s3://{bucket}/{mezz_rel}"
     if _object_exists(bucket, f"{mezz_rel}/mezzanine.mp4.done"):
         print(f"[dist] mezzanine cache HIT {mezz_prefix} — skipping source "
@@ -736,6 +773,10 @@ def run_temporal(args: argparse.Namespace) -> int:
     plan = {
         "bucket": bucket, "job_prefix": prefix, "src_key": src_key,
         "mezz_prefix": mezz_prefix, "job_rank": args.job_rank,
+        # Duration limit (#184) — consumed by the mezzanine activity ONLY. The
+        # chunk boundaries below were already planned against the truncated
+        # length, so nothing else needs to know.
+        "time_limit_s": time_limit_s or 0,
         "has_audio": info.has_audio, "chunk_duration_s": args.chunk_duration_s,
         "n_chunks": n_chunks,
         # The boundaries themselves, so temporal_worker can hand each activity
@@ -921,6 +962,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bitrate-override-h264", default=None, dest="bitrate_override_h264")
     p.add_argument("--chunk-duration", type=float, default=12.0,
                    dest="chunk_duration_s", help="seconds; multiple of segment (6)")
+    p.add_argument("--time", type=float, default=None, dest="time_limit_s",
+                   help="encode only the first N seconds (default: whole clip). "
+                        "Applied by truncating the mezzanine, and folded into the "
+                        "mezzanine cache key so a limited run can never serve a "
+                        "truncated mezzanine to a later full encode.")
     p.add_argument("--encode-threads", type=int, default=0, dest="encode_threads",
                    help="threads/encode → slot sizing (0=2)")
     # MinIO

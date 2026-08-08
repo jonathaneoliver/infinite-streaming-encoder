@@ -168,6 +168,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build, to
 	printf '  py mezzcache   '; \
 	if out=$$(python3 scripts/test_mezz_cache.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py timelimit   '; \
+	if out=$$(python3 scripts/test_time_limit.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py pkgfetch    '; \
 	if out=$$(python3 scripts/test_package_fetch.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
