@@ -195,6 +195,11 @@ services:
       # SKIP_OUTPUT_MEDIA=1 would leave host packaging enabled and pull the whole
       # ladder home, which is the exact opposite of what was asked for.
       SKIP_OUTPUT_MEDIA: ${SKIP_OUTPUT_MEDIA:-}
+      # Deferred packaging (#272): don't package at encode time at all, leave
+      # the CHUNKS in S3 and package on demand. Off unless asked for — a
+      # deferred run leaves a directory holding one JSON file, which has to be
+      # chosen rather than inherited.
+      DEFER_PACKAGING: ${DEFER_PACKAGING:-}
       PROMOTE_DESTS: ${PROMOTE_DESTS:-}
       # Staging reclaim knobs (MinIO via internal/diststage, TMP_DIR via
       # internal/tmpstage). Passed through EMPTY rather than with a default

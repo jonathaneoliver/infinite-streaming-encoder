@@ -52,17 +52,34 @@ type RemoteInfo struct {
 	GoneReason     string `json:"gone_reason,omitempty"`
 }
 
+// stagingExpired is the one reading of an expires_at stamp, shared by the two
+// sidecars. Both describe the same clock — the bucket's `jobs/` lifecycle rule —
+// and a second copy of this would be free to disagree about the one case that
+// matters, which is what an unparseable or absent stamp means.
+//
+// Absent or unparseable => NOT expired. The stamp is advisory (the lifecycle
+// clock runs from each object's own creation, so it is a floor), and refusing
+// an action because a date could not be read would deny the user something that
+// is probably still there. The operation itself is the authority: it looks, and
+// says `gone` if the prefix is empty.
+func stagingExpired(expiresAt string) bool {
+	if expiresAt == "" {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, expiresAt)
+	if err != nil {
+		return false
+	}
+	return time.Now().After(t)
+}
+
 // Expired reports whether the staging prefix is past its advertised expiry, in
 // which case the media is gone and Download must not be offered.
 func (r *RemoteInfo) Expired() bool {
-	if r == nil || r.ExpiresAt == "" {
+	if r == nil {
 		return false
 	}
-	t, err := time.Parse(time.RFC3339, r.ExpiresAt)
-	if err != nil {
-		return false // unparseable: assume still fetchable, let the fetch say
-	}
-	return time.Now().After(t)
+	return stagingExpired(r.ExpiresAt)
 }
 
 // Fetchable reports whether Download can still succeed. The three states —

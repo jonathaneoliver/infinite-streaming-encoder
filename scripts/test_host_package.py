@@ -195,9 +195,13 @@ def test_poll_plans_the_codecs_it_encodes_not_the_ones_batch_packages() -> None:
     """
     poll = inspect.getsource(cli_batch.cmd_poll)
     assert 'inp.get("host_package")' in poll
-    assert 'do_h264 or "h264" in host_package' in poll, (
-        "the run plan is built from the state machine's packaging flags alone, "
-        "so a host-packaged run would report no codecs")
+    # #272 replaced the do_h264-OR-host_package union with an explicit
+    # encoded_codecs list, because deferring empties BOTH sets and the union
+    # would then be empty for a run that encoded perfectly well.
+    assert '"h264" in encoded_codecs' in poll, (
+        "the run plan is built from packaging flags rather than from the "
+        "encoded-codec set, so a host-packaged or deferred run reports no codecs")
+    assert 'inp.get("encoded_codecs")' in poll
 
 
 def _run() -> int:
