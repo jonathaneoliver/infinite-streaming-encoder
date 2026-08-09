@@ -1053,12 +1053,16 @@ let outputsView = 'list'; // 'list' or 'detail'
 const _POLL_FRESH_MS = 2000;
 const _pollers = [];
 
-function registerPoller(name, fn, intervalMs, when) {
-    _pollers.push({ name, fn, intervalMs, when, timer: null, lastRun: 0 });
+// holdOpen (optional): a predicate that earns this poller the LONG idle grace
+// even with no encode running. Per-poller on purpose — the grace is a cost
+// decision and they do not cost the same. /api/outputs walks 108k files, so it
+// must keep the short one whatever else is going on (#228).
+function registerPoller(name, fn, intervalMs, when, holdOpen) {
+    _pollers.push({ name, fn, intervalMs, when, holdOpen, timer: null, lastRun: 0 });
 }
 
 function _pollerWanted(p) {
-    return document.visibilityState !== 'hidden' && !pollingIdle() && p.when();
+    return document.visibilityState !== 'hidden' && !pollingIdle(p) && p.when();
 }
 
 // args are forwarded to the poller's fn — used by pollNow to run a poller in a
@@ -1118,7 +1122,7 @@ registerPoller('dist-workers', pollDistWorkers, 5000, () => activeTab() === 'job
 registerPoller('aws-inventory', refreshAws, 10000, () => {
     const chk = document.getElementById('aws-auto-refresh');
     return !!(chk && chk.checked) && (activeTab() === 'aws' || activeTab() === 'jobs');
-});
+}, machinesStillBilling);
 
 // ---------------------------------------------------------------------------
 // Idle: stop polling, and hand the page back to Originals (#227, #228)
@@ -1165,9 +1169,27 @@ function anyEncodeRunning() {
 // seconds, and watching a progress bar is not an activity that generates
 // pointer events — so polling gets the same hour the view does, and stops at
 // the same moment. It is the idle tail AFTER a run that this is really about.
-function pollingIdle() {
-    const limit = anyEncodeRunning() ? _IDLE_RETURN_MS : _IDLE_POLL_MS;
+function pollingIdle(p) {
+    // A poller may declare its own reason to stay awake. Called with no
+    // argument (the idle tick, _noteInteraction) this is exactly as before.
+    const live = anyEncodeRunning() || !!(p && p.holdOpen && p.holdOpen());
+    const limit = live ? _IDLE_RETURN_MS : _IDLE_POLL_MS;
     return Date.now() - _lastInteraction >= limit;
+}
+
+// Machines still up are still being BILLED, so the machine timeline still has
+// something to say — and what it has to say is the scale-down tail, which is
+// the largest single cost on a short run. anyEncodeRunning() alone treats "the
+// encode finished" as "nothing is happening", and the chart froze exactly while
+// the money was still accruing.
+//
+// Self-limiting, which is what makes it safe next to #228: boxes scale down
+// within minutes and _recordFleetLanes stamps `gone`, after which this goes
+// false on its own. A forgotten tab cannot hold it open, because a forgotten
+// tab is either hidden or on another tab and its when() gate has already shut.
+function machinesStillBilling() {
+    for (const rec of _fleetSeen.values()) if (!rec.gone) return true;
+    return false;
 }
 
 function viewExpired() {
