@@ -4994,6 +4994,14 @@ function _fleetLanesHtml(opts) {
             id, merged: [], vcpus: r.vcpus || 0, type: r.type || '',
             launch: r.launched_at * 1000,
             gone: (r.ended_at && !r.alive) ? r.ended_at * 1000 : null,
+            // Same SHAPE as a lane built from stages, even though every work
+            // field is empty. The per-chunk block work added these, and an
+            // injected lane without them threw on L.packed.map — which does not
+            // just drop this lane, it takes the whole panel's render with it.
+            // That is why the never-ran machine still did not appear after the
+            // rental data was fixed to include it.
+            rawMerged: [], work: [], packed: [], nrows: 1,
+            alive: !!r.alive,
         });
     });
     if (!lanes.length) return '';
@@ -5212,7 +5220,7 @@ function _fleetLanesHtml(opts) {
         //
         // A lane with less concurrency leaves its lower rows empty, which reads
         // correctly as exactly that.
-        const blocks = L.packed.map(k => {
+        const blocks = (L.packed || []).map(k => {
             const w = (k.b - k.a) / span * 100;
             if (w <= 0) return '';
             const h = 100 / laneRows;
@@ -5239,9 +5247,9 @@ function _fleetLanesHtml(opts) {
         // the SHAPE (how work clustered, how deep the concurrency went) and the
         // number answers "how many". Chunks specifically: a lane's work can also
         // include audio, which is a Batch job on an instance but is not a chunk.
-        const nChunks = L.work.filter(([, , k]) => (k || '').includes(':chunk')).length;
-        const nOther = L.work.length - nChunks;
-        const countTxt = L.work.length
+        const nChunks = (L.work || []).filter(([, , k]) => (k || '').includes(':chunk')).length;
+        const nOther = (L.work || []).length - nChunks;
+        const countTxt = (L.work || []).length
             ? `<span style="color:#7f8899" title="${escapeHtml(nChunks + ' chunk(s)'
                 + (nOther ? ' + ' + nOther + ' other job(s)' : '') + ' on this machine')}">`
               + `${nChunks || L.work.length}&times;</span> `
