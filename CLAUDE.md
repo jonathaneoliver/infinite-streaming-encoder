@@ -315,6 +315,74 @@ of `cli_batch`'s drop decisions, which each used to carry their own literal list
 marker and every consumer forwards it already. Getting it wrong that way costs
 bandwidth; getting it wrong the other way is #141.
 
+### Step Functions vs Batch: which one does what
+
+Everything in the cloud sections below assumes this split, so it is worth
+stating once.
+
+**Step Functions decides what runs when. Batch decides what machine it runs
+on.** Neither can be dropped: SFN cannot run a container or manage a fleet, and
+Batch has no concept of "these 336 jobs are one encode" or "audio must finish
+before packaging" — it is a queue, not a graph.
+
+The state machine (`infra/terraform/modules/workflow/definition.json.tpl`) is
+pure coordination and never touches a frame:
+
+```
+MezzCheck (Choice)            mezz_cached, or built on the host -> skip
+  └ Mezzanine (Task)
+FanOut (Parallel)             audio and video are independent
+  ├ Audio (Task)
+  └ Variants (Map)            one branch per codec x ladder rung
+      └ Chunked (Choice)      whole-variant, or...
+        └ EncodeChunks (Map)
+            └ EncodeChunk (Task)      <- the fan-out; 336 jobs on a full ladder
+PerCodec (Parallel)           do_h264 / do_hevc / do_av1 gate each branch
+  ├ H264Selected (Choice) -> PackageAllH264 | SkipH264
+  ├ HevcSelected (Choice) -> PackageAllHevc | SkipHevc
+  └ Av1Selected  (Choice) -> PackageAllAv1  | SkipAv1
+```
+
+Read that alongside "Which phases run on the HOST" below: **the graph still
+contains Mezzanine and the PackageAll tasks, and their job definitions are still
+registered, but a default run today skips both** via those Choice states. The
+shape is a superset of what a given execution actually does.
+
+It also supplies the **execution**, which is this system's unit of identity —
+the execution name scopes the per-run SQS telemetry queue and the EventBridge
+rule, which is why one run's chunk state can never leak into another's.
+
+Batch owns machines. Each `Task` names a **job definition**
+(`modules/jobs/main.tf`) — a container image plus a reservation:
+
+| job definition | vCPU | memory |
+| --- | --- | --- |
+| variant (the chunk encoder) | 8 | 16 GB |
+| mezzanine, audio, package, package-all | 2 | 4 GB |
+| hls, byteranges | 1 | 2 GB |
+
+Batch queues those, scales the spot compute env up, **packs them onto instances
+by that reservation**, and scales back down. The reservation is a packing weight
+rather than a hard cap (Batch uses CPU shares), which is why `projectCloudCost`
+must price the reservation on both sides of its calibration.
+
+**The job definition is the contract between the two layers**, and it is where
+they break. A `Ref::` added on the Batch side that the SFN caller does not
+supply fails at submit (#176), and `make deploy` mid-run deregisters job-def
+revisions — pulling the contract out from under a live execution.
+
+**Retries are Batch's, not the state machine's.** SFN's `Retry` covers only
+`Batch.AWSBatchException` / `States.Timeout` — submit-time blips — and its own
+ASL comment says re-running a genuinely failed job just repeats an unrecoverable
+failure. What retries a spot reclaim is the job definition's `retry_strategy`
+(`attempts = 3`, `evaluate_on_exit` on `HostTerminated`). Host phases have no
+such retry, deliberately; see below.
+
+**The local target does the same two jobs with different tools**: Temporal is
+the Step Functions equivalent (workflow, dependency graph, retries) and the
+worker pool is the Batch equivalent (which box picks up a chunk). Same shape, no
+AWS — which is why a chunk-plan change has to be checked on both paths.
+
 ### Which phases run on the HOST (cloud path)
 
 Two of the cloud pipeline's phases no longer run in Batch. Both moved for the
@@ -453,9 +521,12 @@ by reproducing it.
 (SFN history, the Batch census, worker markers) through channels with different
 latencies, so they disagree about the present tense. The chokepoint refuses to
 announce anything but `done` over an existing `done`. `failed` is deliberately
-not final — the state machine's Retry resubmits a new Batch job, so
-`failed → running` is real. Guarding at call sites was tried twice and failed
-twice: each time a different source was still speaking unguarded.
+not final — a reclaimed chunk is retried and goes back to running, so
+`failed → running` is real. (That retry is **Batch's** `evaluate_on_exit`, not
+the state machine's `Retry` — see the split above. This line used to credit SFN,
+which sends anyone debugging an odd retry to the wrong file.) Guarding at call
+sites was tried twice and failed twice: each time a different source was still
+speaking unguarded.
 
 **`internal/api/handlers.go`** — the HTTP surface. Routes defined in `NewServer`:
 - JSON API: `GET /api/sources`, `GET/POST` under `/api/encode`, `/api/jobs`, `/api/jobs/{id}/logs`, `/api/outputs`, `/api/outputs/{name}`, `/api/outputs/{name}/playlists`, `/api/outputs/{name}/logs`.

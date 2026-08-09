@@ -2,6 +2,8 @@
 
 Terraform that provisions the Batch + Step Functions pipeline described in [issue #14](https://github.com/jonathaneoliver/infinite-streaming-encoder/issues/14).
 
+**What each service is for** — Step Functions decides *what runs when* (the dependency graph: mezzanine → audio ‖ variants → package per codec, and the nested `Map` states that turn one encode into hundreds of chunk jobs); Batch decides *what machine it runs on* (queueing, spot fleet scale-up, packing by each job definition's vCPU reservation, and retrying a reclaimed chunk). This README is the operational half — deploy, troubleshoot, tear down. The design half, including the seams where the two layers break and which phases now run on the host instead, is in the repo-root `CLAUDE.md` under "Step Functions vs Batch: which one does what".
+
 ## First-run checklist
 
 End to end, the first deploy is:
