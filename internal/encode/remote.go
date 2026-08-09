@@ -242,6 +242,38 @@ func (m *Manager) skipMediaDownload(cfg JobConfig) bool {
 	return SkipMediaDownloadDefault
 }
 
+// PackageOnHostDefault moves the packaging chain (join → Shaka → byteranges →
+// HLS) off Batch and onto the control plane (#197). Same shape of knob as
+// SkipMediaDownloadDefault above, and the tail-side twin of #266's host
+// mezzanine.
+//
+// Default ON. On two measured runs the post-encode tail was 4m18s, of which
+// 141s was dead time bracketing the pkgall Batch job — 43s of queue wait and
+// container start before it, ~1m55s of state machine exit and poll latency
+// after it — plus a 26s `download:outputs` re-fetching what that job had just
+// uploaded. None of that survives packaging locally, and the host is the faster
+// machine per-stream anyway (median 1.58x over Graviton across 12 rungs,
+// measured in encode_speeds.json).
+var PackageOnHostDefault = func() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PACKAGE_ON_HOST"))) {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
+}()
+
+// packageOnHost decides whether THIS job packages locally.
+//
+// It is forced off when the run is leaving its media in S3. Those two features
+// want opposite things: skip-media-download exists so the segments never come
+// down the link, and host packaging cannot produce a playable output without
+// pulling every chunk. Honouring both would mean fetching the whole ladder and
+// then uploading the packaged result back so a later `fetch` could retrieve it —
+// strictly more transfer than either option alone.
+func (m *Manager) packageOnHost(cfg JobConfig) bool {
+	return PackageOnHostDefault && !m.skipMediaDownload(cfg)
+}
+
 // ErrFetchInFlight is returned when a download is already running for an
 // output — the second click on the Download button, which must be a no-op
 // rather than a second concurrent transfer.

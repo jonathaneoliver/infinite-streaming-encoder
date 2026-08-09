@@ -21,6 +21,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -1444,7 +1446,8 @@ _STEP_TO_STAGE: dict[str, str] = {
 
 
 def _emit_plan(variants: "list | None" = None,
-               do_h264: bool = True, do_hevc: bool = True) -> None:
+               do_h264: bool = True, do_hevc: bool = True,
+               sync_back: bool = True) -> None:
     """Announce the pipeline stages for THIS run. Only the codecs actually being
     encoded are listed, so a h264-only run doesn't render empty hevc rows.
     Package order is package -> fragments -> hls (the LL-HLS playlists embed the
@@ -1469,7 +1472,12 @@ def _emit_plan(variants: "list | None" = None,
     for codec, on in (("h264", do_h264), ("hevc", do_hevc)):
         if on:
             keys += [f"package:{codec}", f"fragments:{codec}", f"hls:{codec}"]
-    keys.append("download:outputs")
+    # Only when something is packaged in Batch and therefore has to come back
+    # from S3. Host packaging (#197) writes straight to the local output dir, so
+    # on an all-host run this stage never fires — and a declared stage that never
+    # fires is a row that sits pending forever at the end of every run.
+    if sync_back:
+        keys.append("download:outputs")
     seen: set = set()
     stages = []
     for k in keys:  # de-dupe, preserve order
@@ -2201,6 +2209,141 @@ def _parallel_get(s3, bucket: str, items: list, stage_key: str) -> tuple[int, in
 _MEDIA_SUFFIXES = (".m4s", ".byteranges")
 
 
+def _local_codec_dir(output_stem: str, codec: str, output_tag: str) -> str:
+    """`<stem>_<codec>[_<tag>]` — one spelling of a cloud run's local output dir.
+
+    The profile tag goes AFTER the codec so the `_p200_<codec>` shape that
+    OutputStem / resolveCodec / the watcher all key off stays intact. Two callers
+    now need this name — the sync-back that downloads a Batch-packaged run, and
+    host packaging (#197), which produces the directory directly — and they must
+    not spell it differently or the same clip lands in two places.
+    """
+    return f"{output_stem}_{codec}" + (f"_{output_tag}" if output_tag else "")
+
+
+# cli_phase's own fetch measurement, relayed so a host-packaged run still
+# accounts for the egress it caused. Kept as a contract with the print in
+# phase_package_all: change the wording there and the cost quietly reads zero,
+# so scripts/test_host_package.py pins the two together.
+_PKG_FETCH_RE = re.compile(
+    r"\[phase package-all\] fetched (\d+) objects, ([\d.]+) MB")
+
+
+def _package_on_host(codecs: list[str], s3_prefix: str, local_dir: Path,
+                     output_stem: str, output_tag: str,
+                     segment_duration: str, partial_duration: str) -> DownloadResult:
+    """Run the packaging chain on the CONTROL PLANE instead of in a Batch job.
+
+    The tail-side twin of #266. Same reasoning, opposite end of the pipeline: the
+    phase already exists, so this shells out to the SAME `cli_phase package-all`
+    the pkgall Batch job runs rather than reimplementing join/Shaka/HLS a second
+    time. It differs only in `--s3-out` being a local directory (see
+    cli_phase._deliver_dir).
+
+    ## What it removes, measured on two runs post-#209 (1785781612611, 1785863996086)
+
+    The post-encode tail was 4m18s on both, and only ~2m of it was work:
+
+        +0s .. +43s     nothing — Batch queue wait + container start for pkgall
+        +43s .. +1m48s  package:h264 (fetch + join + Shaka)
+        +1m56s          fragments + hls, ~10s
+        +1m57s .. +3m52s  nothing — state machine exit + orchestrator poll
+        +3m52s .. +4m18s  download:outputs, 26s
+
+    141s of 258s was dead time bracketing the Batch job, and `download:outputs`
+    re-fetches what packaging had just uploaded. Neither survives packaging here.
+
+    ## The bandwidth bet, and why it is already settled
+
+    #197 flags home bandwidth as the risk: the chunks now come down the home link
+    instead of being read in-region. But `download:outputs` already moves a
+    comparable volume — the packaged ladder — over that same link, and does it at
+    96.6 MB/s in 26s. The link is not the constraint it was when the issue was
+    filed with a 6m28s sync-back; that number was a USB 2.0 disk and
+    DOWNLOAD_CONCURRENCY=16, both since fixed.
+
+    ## No state machine change
+
+    do_h264 / do_hevc / do_av1 gate ONLY the per-codec packaging Choice states, so
+    the caller turning them off is enough to skip the whole PerCodec branch —
+    exactly how #266 skipped Mezzanine through the existing MezzCheck. Nothing in
+    infra/ changes and no deploy is required; rebuild the server and it takes
+    effect.
+
+    ## No Batch retry
+
+    Named as a risk in #197 and it is real: this runs once, and a failure fails
+    the job rather than being resubmitted onto fresh spot capacity. It is a
+    deliberate trade — the phase is minutes of local CPU on a machine that is
+    already up, not an hour of spot-reclaimable work — but it is the reason the
+    error below names the codec and tells you the chunks are still in S3, since
+    re-running with the flag off packages them without re-encoding anything.
+    """
+    fetched = {"files": 0, "bytes": 0}
+    for codec in codecs:
+        work = local_dir / f"pkg-work-{codec}"
+        # Each codec gets its own scratch: cli_phase._prepare_work_dir rmtree's
+        # ENCODER_WORK_DIR on entry, so a shared one would delete a sibling's
+        # inputs the moment two codecs ran together.
+        env = dict(os.environ)
+        env["ENCODER_WORK_DIR"] = str(work)
+        # Read off the execution input rather than this process's environment, so
+        # the packaging cannot disagree with the timing the chunks were encoded
+        # to. A segment duration mismatch here would produce playlists whose
+        # boundaries do not land on the media's keyframes.
+        env["SEGMENT_DURATION"] = segment_duration
+        env["PARTIAL_DURATION"] = partial_duration
+        # Deliberately NOT set: ENCODER_TELEMETRY_EXEC. On the host, stdout IS
+        # the channel to the server, so the SQS sink would be a second copy of
+        # markers that already arrive. telemetry.emit degrades to stdout-only
+        # when it is absent, which is precisely the wanted behaviour.
+        env.pop("ENCODER_TELEMETRY_EXEC", None)
+
+        print(f"    packaging {codec} on the host (no Batch job, no sync-back)",
+              flush=True)
+        t0 = time.monotonic()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "infinite_streaming_encoder.cli_phase",
+             "package-all", "--codec", codec,
+             "--s3-variants", s3_prefix, "--s3-audio", s3_prefix,
+             "--s3-out", str(local_dir)],
+            env=env, stdout=subprocess.PIPE, text=True, bufsize=1)
+        # Relay rather than inherit, so the phase's own fetch measurement can be
+        # picked up on the way past. It has to be: with packaging here, the bytes
+        # billed as egress are the CHUNKS this pulls, not the packaged output
+        # _download_outputs no longer fetches. Leaving it unaccounted would make
+        # a host-packaged run look nearly free next to a Batch-packaged one, and
+        # CLAUDE.md's rule is that the estimate and the finished cost stay on one
+        # basis. Every line is still printed, so stage markers reach the server.
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            print(line, flush=True)
+            m = _PKG_FETCH_RE.search(line)
+            if m:
+                fetched["files"] += int(m.group(1))
+                fetched["bytes"] += int(float(m.group(2)) * 1e6)
+        rc = proc.wait()
+        shutil.rmtree(work, ignore_errors=True)
+        if rc != 0:
+            raise RuntimeError(
+                f"host packaging failed for {codec} (exit {rc}). The encoded "
+                f"chunks are still in {s3_prefix} — re-running with host "
+                f"packaging disabled will package them without re-encoding.")
+
+        # cli_phase writes output_<codec>/; the local contract is
+        # <stem>_<codec>[_<tag>]/ so codecs of one clip coexist in OUTPUT_DIR.
+        src = local_dir / f"output_{codec}"
+        if output_stem:
+            dst = local_dir / _local_codec_dir(output_stem, codec, output_tag)
+            if dst.exists():
+                shutil.rmtree(dst)
+            src.rename(dst)   # same filesystem — a rename, not a copy
+            src = dst
+        print(f"    packaged {codec} in {time.monotonic() - t0:.0f}s -> {src.name}",
+              flush=True)
+    return DownloadResult(fetched["files"], fetched["bytes"], 0, 0)
+
+
 class DownloadResult(NamedTuple):
     """What a sync-back moved, and what it deliberately left in S3."""
     files: int
@@ -2232,7 +2375,6 @@ def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "",
     parseOutputMeta still infers resolutions from subdirectory existence and the
     run lists normally in the Outputs tab. Fetch the media later with
     `cli_batch.py fetch`."""
-    tag_suffix = f"_{output_tag}" if output_tag else ""
     if not s3_prefix.startswith("s3://"):
         return DownloadResult(0, 0, 0, 0)
     rest = s3_prefix[len("s3://"):].rstrip("/")
@@ -2248,7 +2390,7 @@ def _download_outputs(s3_prefix: str, local_dir: Path, output_stem: str = "",
         if not tail or not head.startswith("output_"):
             return None  # dir marker or unexpected key — skip
         codec = head[len("output_"):]
-        return local_dir / f"{output_stem}_{codec}{tag_suffix}" / tail
+        return local_dir / _local_codec_dir(output_stem, codec, output_tag) / tail
 
     # List everything first so the sync-back can drive a real progress bar
     # (weighted by bytes — segment counts vary wildly in size). This runs in the
@@ -2858,17 +3000,36 @@ def cmd_poll(args: argparse.Namespace) -> int:
     sfn = _sfn()
     # Read the execution input up front so the plan lists only the codecs we're
     # actually encoding (do_h264 / do_hevc from buildSFNInput).
-    do_h264 = do_hevc = True
+    # Defaults are the pre-#197 behaviour, which is also the right fallback when
+    # describe_execution fails: Batch packages everything and the sync-back runs.
+    do_h264 = do_hevc = do_av1 = True
     variants: list = []
+    # Codecs THIS process will package once the execution succeeds (#197).
+    # do_h264/do_hevc/do_av1 mean "the STATE MACHINE packages this codec" — that
+    # is the only thing the ASL reads them for — so the two sets are disjoint and
+    # the plan is their union. Empty list = the old behaviour, packaging in Batch.
+    host_package: list[str] = []
+    seg_dur = part_dur = ""
     try:
         inp = json.loads(sfn.describe_execution(
             executionArn=args.execution_arn).get("input") or "{}")
         do_h264 = bool(inp.get("do_h264", True))
         do_hevc = bool(inp.get("do_hevc", True))
+        do_av1 = bool(inp.get("do_av1", True))
         variants = inp.get("variants") or []
+        host_package = [c for c in (inp.get("host_package") or [])
+                        if c in ("h264", "hevc", "av1")]
+        seg_dur = str(inp.get("segment_duration") or "")
+        part_dur = str(inp.get("partial_duration") or "")
     except (ClientError, ValueError, TypeError):
         pass
-    _emit_plan(variants, do_h264, do_hevc)
+    # The plan must list what is being ENCODED, which is not what the state
+    # machine packages once packaging moves here.
+    _emit_plan(variants, do_h264 or "h264" in host_package,
+               do_hevc or "hevc" in host_package,
+               # The sync-back only has work if the STATE MACHINE packaged
+               # something; do_av1 counts here even though it has no plan row.
+               sync_back=do_h264 or do_hevc or do_av1)
     # Flag chunks left over from a prior (cancelled/failed) run as reused, so a
     # resume shows them distinctly instead of as fresh encodes.
     _emit_reused_chunks(args.s3_prefix)
@@ -3020,6 +3181,16 @@ def cmd_poll(args: argparse.Namespace) -> int:
                     if on:
                         for k in ("package", "fragments", "hls"):
                             _emit_stage(f"{k}:{codec}", "done", 100.0)
+                # Package here, before the sync-back — these codecs have no
+                # packaged output in S3 for _download_outputs to find, because
+                # the state machine skipped their PerCodec branch entirely.
+                pkg = DownloadResult(0, 0, 0, 0)
+                if host_package:
+                    pkg = _package_on_host(host_package, args.s3_prefix,
+                                           Path(args.local_dir),
+                                           getattr(args, "output_stem", ""),
+                                           getattr(args, "output_tag", ""),
+                                           seg_dur, part_dur)
                 media = not getattr(args, "no_media", False)
                 what = "outputs" if media else "manifests only"
                 print(f"    downloading {what} from {args.s3_prefix}", flush=True)
@@ -3031,10 +3202,15 @@ def cmd_poll(args: argparse.Namespace) -> int:
                 try:
                     # res is what the sync-back actually moved, so the cost is
                     # measured rather than assumed.
+                    # pkg is the chunk fetch host packaging paid for; res is what
+                    # the sync-back moved. Both are egress on the same link, and
+                    # host packaging TRADES one for the other rather than
+                    # avoiding it — counting only res would price the trade as a
+                    # saving it is not.
                     _emit_cost_summary(exec_name, log_state,
-                                       egress_bytes=res.bytes,
+                                       egress_bytes=res.bytes + pkg.bytes,
                                        egress_avoided_bytes=res.skipped_bytes,
-                                       egress_files=res.files,
+                                       egress_files=res.files + pkg.files,
                                        staged_bytes=res.bytes + res.skipped_bytes)
                 except Exception:  # noqa: BLE001 — cost summary is best-effort
                     pass
