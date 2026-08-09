@@ -4972,6 +4972,14 @@ function _fleetLanesHtml(opts) {
             })(),
             launch: (r && r.launched_at) ? r.launched_at * 1000 : (seen.launch || null),
             gone: (r && r.ended_at && !r.alive) ? r.ended_at * 1000 : (seen.gone || null),
+            // Known to be STILL UP. Distinct from "no termination timestamp",
+            // which also covers "we lost track of it" — the difference decides
+            // whether the post-encode idle can be drawn as fact or has to be
+            // left as unknown. The rental record is authoritative (it is what
+            // the orchestrator recorded); the live inventory is the fallback,
+            // and terminated boxes are filtered out of it, so appearing there
+            // at all means up as of the last poll.
+            alive: r ? !!r.alive : !!(seen.launch && !seen.gone),
             vcpus: (r && r.vcpus) || seen.vcpus || 0,
             type: (r && r.type) || seen.type || '',
         };
@@ -5130,7 +5138,22 @@ function _fleetLanesHtml(opts) {
         // from the one that carried it, which is the comparison this chart is
         // for. Cloud keeps per-instance bounds, because there a box really does
         // stop existing.
-        const tailTo = local ? runEnd : (L.gone || (jobLive ? now : null));
+        // A box still UP is still billing, whether or not the job is over. That
+        // window — last chunk done, machine not yet released — is the scale-down
+        // tail, and on a short run it is the single largest block of waste: the
+        // last smoke billed 0.78 of 0.83 vCPU-h with no job on the box.
+        //
+        // It was invisible. With the job terminal and no termination timestamp
+        // yet, this went null, and the whole tail block below is skipped: no
+        // band drawn, nothing added to tailMs, and billMs falling back to the
+        // last job's end. The chart stopped counting exactly where the waste
+        // starts, and the axis kept extending, so the costliest part of the run
+        // rendered as unbilled background.
+        //
+        // L.alive is what makes this provable rather than assumed — see the lane
+        // build. A box we have genuinely lost track of still yields null and
+        // still reads "freed time unknown", which is the honest answer there.
+        const tailTo = local ? runEnd : (L.gone || ((jobLive || L.alive) ? now : null));
         if (tailTo && tailTo > lastEnd) {
             const d = tailTo - lastEnd;
             tailMs += d * v;
