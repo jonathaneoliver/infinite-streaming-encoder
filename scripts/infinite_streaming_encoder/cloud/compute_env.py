@@ -1,9 +1,17 @@
-"""Adjust the encoder Batch compute environment's minvCpus at runtime.
+"""Adjust the encoder Batch compute environment's maxvCpus at runtime.
 
-Used by the Go awswatch loop to keep a warm box alive during active runs
-(so the packaging tail lands on a hot instance instead of cold-starting) and
-to drop back to 0 when idle. Live UpdateComputeEnvironment call — no redeploy;
-Terraform ignores min_vcpus so it won't fight this.
+Live UpdateComputeEnvironment call — no redeploy; Terraform ignores max_vcpus
+so it won't fight this.
+
+The minvCpus half of this was removed with the keep-warm floor. It existed to
+hold a box hot for the packaging tail, and #197 moved packaging off Batch
+entirely — so it was paying for a tail that no longer existed. It was also the
+wrong shape of call to make often: every UpdateComputeEnvironment puts the CE
+into UPDATING, and Batch pauses ALL scale-down while it is, so the change that
+dropped the floor to 0 at the idle transition was itself capable of delaying
+the drain it was asking for.
+
+Keep that in mind before automating maxvCpus per job for the same reason.
 """
 from __future__ import annotations
 
@@ -37,10 +45,6 @@ def _update(field: str, n: int) -> dict:
     return {"compute_environment": ce, field: int(n)}
 
 
-def set_min_vcpus(n: int) -> dict:
-    return _update("minvCpus", n)
-
-
 def set_max_vcpus(n: int) -> dict:
     # Terraform ignores max_vcpus (like min) so this live change isn't reverted.
     return _update("maxvCpus", n)
@@ -61,7 +65,6 @@ def get_vcpus() -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="infinite_streaming_encoder.cloud.compute_env")
-    p.add_argument("--set-min-vcpus", type=int, help="new minvCpus floor")
     p.add_argument("--set-max-vcpus", type=int, help="new maxvCpus ceiling")
     p.add_argument("--get", action="store_true", help="print current min/max/desired")
     # Output is always JSON; accept --json as a no-op so the Go server's
@@ -71,8 +74,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.set_max_vcpus is not None:
             report = set_max_vcpus(args.set_max_vcpus)
-        elif args.set_min_vcpus is not None:
-            report = set_min_vcpus(args.set_min_vcpus)
         else:
             report = get_vcpus()
         print(json.dumps(report))

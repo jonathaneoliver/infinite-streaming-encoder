@@ -110,8 +110,8 @@ func main() {
 		"reclaim job staging idle longer than this (also the crashed-job debugging window)")
 	flag.Parse()
 
-	// Buffered so a job start/finalize never blocks on nudging the keep-warm
-	// loop; a pending nudge coalesces with any already queued.
+	// Buffered so a job start/finalize never blocks on nudging the awswatch
+	// inventory refresh; a pending nudge coalesces with any already queued.
 	warmTrigger := make(chan struct{}, 1)
 	mgr := encode.NewManager(encode.ManagerConfig{
 		SourceDir:       *sourceDir,
@@ -126,7 +126,7 @@ func main() {
 		EncoderImage:    *encoderImage,
 		StateMachineArn: *stateMachineArn,
 		MaxConcurrent:   *maxConcurrent,
-		WarmReconcile: func() {
+		InventoryNudge: func() {
 			select {
 			case warmTrigger <- struct{}{}:
 			default:
@@ -170,13 +170,8 @@ func main() {
 		// so anything faster is SQS request spend on a set that cannot have
 		// changed.
 		TelemetryGCInterval: 1 * time.Hour,
-		// Keep one box warm while cloud work is active so the packaging tail
-		// (and the next queued job) doesn't cold-start; 0 disables.
-		WarmMinVCPUs: intEnv("WARM_MIN_VCPUS", 2),
-		// Hold the warm floor across the whole app job queue, not just while one
-		// job's AWS resources are live — so it drops only when the queue is empty.
-		ActiveJobs: mgr.ActiveCloudJobs,
-		// React immediately to a job start/finalize instead of on the next tick.
+		// Refresh the inventory immediately on a job start/finalize instead of
+		// on the next tick, so the fleet panel and machine timeline keep up.
 		Trigger: warmTrigger,
 	})
 

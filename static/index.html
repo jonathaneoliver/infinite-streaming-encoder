@@ -675,10 +675,6 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <div class="aws-metric-value" id="aws-hourly">—</div>
             </div>
             <div class="aws-metric">
-                <div class="aws-metric-label" title="Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box instead of cold-starting. 0 when idle; WARM_MIN_VCPUS (a whole box) during a run.">Keep warm</div>
-                <div class="aws-metric-value" id="aws-warm">—</div>
-            </div>
-            <div class="aws-metric">
                 <div class="aws-metric-label" title="Batch compute-env max vCPUs. 2x runs ~twice as many machines → roughly half the wall-clock for ~the same total cost (down to the slowest single chunk).">Max vCPUs</div>
                 <div class="aws-metric-value" id="aws-maxvcpu" style="font-size:0.9rem">—</div>
             </div>
@@ -4440,10 +4436,6 @@ function renderAws(data) {
     const hourlyEl = document.getElementById('aws-hourly');
     hourlyEl.textContent = '$' + hourly.toFixed(2);
     hourlyEl.className = 'aws-metric-value' + (hourly > 0 ? ' warn' : ' ok');
-    const warm = s.min_vcpus || 0;
-    const warmEl = document.getElementById('aws-warm');
-    warmEl.textContent = warm + ' vCPU';
-    warmEl.className = 'aws-metric-value' + (warm > 0 ? ' ok' : '');
     renderMaxVcpuRadio(s.max_vcpus || 0);
     document.getElementById('aws-region').textContent = data.region || '—';
 
@@ -5932,7 +5924,6 @@ function renderJobsMetrics(s) {
         tile('S3 staged', `<div class="aws-metric-value">${stagedBytesText(s.total_s3_bytes)}</div>`,
             'Last measured on the AWS tab. Open it (or press Refresh there) to re-measure.'),
         tile('Est. hourly spend', `<div class="${cls(hourly)}">$${hourly.toFixed(2)}</div>`),
-        tile('Keep warm', `<div class="aws-metric-value${(s.min_vcpus || 0) > 0 ? ' ok' : ''}">${s.min_vcpus || 0} vCPU</div>`, 'Batch min vCPUs kept warm while a run is active so the packaging tail lands on a hot box (0 when idle).'),
         tile('Max vCPUs', vcpuHtml, 'Batch compute-env max vCPUs. 2× runs ~twice as many machines → roughly half the wall-clock for ~the same total cost.'),
     ].join('');
     const cs = document.getElementById('cloud-fleet-summary');

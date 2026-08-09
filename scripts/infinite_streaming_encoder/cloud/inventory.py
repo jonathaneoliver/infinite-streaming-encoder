@@ -683,9 +683,12 @@ def _record_fleet_samples(hourly_usd: float, fleet: dict) -> dict:
 
 
 def _current_vcpus():
-    """The encoder compute env's current min/max vCPUs. Empty dict if unreadable
-    (never break inventory). max feeds the AWS panel's max-vCPUs radio; min is the
-    live keep-warm floor (0 idle, WARM_MIN_VCPUS while a run is active)."""
+    """The encoder compute env's current vCPU bounds. Empty dict if unreadable
+    (never break inventory). Only max is surfaced — it feeds the AWS panel's
+    max-vCPUs radio. min and desired are still read because `compute_env --get`
+    reports them and they are what distinguishes "Batch wants zero capacity and
+    EC2 has not reaped yet" from a genuinely stuck fleet; nothing sets min any
+    more (the keep-warm floor is gone)."""
     try:
         from infinite_streaming_encoder.cloud.compute_env import get_vcpus
         return get_vcpus()
@@ -796,7 +799,6 @@ def collect(include_s3_prefixes: bool = True) -> dict[str, Any]:
             "reclaim_24h_pct": fleet.get("reclaim_24h_pct", 0),
             "reclaim_24h_lost_min": fleet.get("reclaim_24h_lost_min", 0),
             "max_vcpus": _ce_vcpus.get("max_vcpus"),
-            "min_vcpus": _ce_vcpus.get("min_vcpus"),
             "running_executions": len(running_executions),
             "active_batch_jobs": len(active_batch_jobs),
         },

@@ -1658,11 +1658,11 @@ type Manager struct {
 	// (submitted all its jobs) before submitting its own execution. Age-ordered,
 	// not first-come — so an earlier job floods the fleet with its higher-priority
 	// jobs first regardless of upload timing (Batch never preempts).
-	launchMu      sync.Mutex
-	launchCond    *sync.Cond
-	warmReconcile func()
-	subscribers   []chan *Job
-	subMu         sync.Mutex
+	launchMu       sync.Mutex
+	launchCond     *sync.Cond
+	inventoryNudge func()
+	subscribers    []chan *Job
+	subMu          sync.Mutex
 
 	// fleetCPU holds recent per-machine CPU samples for the distributed-local
 	// fleet view (machine -> ring of samples); fleetChunks holds the chunks
@@ -1921,11 +1921,11 @@ func (m *Manager) olderStillLaunching(job *Job) bool {
 	return false
 }
 
-// triggerWarm nudges the awswatch keep-warm loop to re-evaluate now (job start /
-// finalize), so the floor doesn't lag a poll interval behind the queue.
+// triggerWarm asks awswatch to refresh the inventory now (job start / finalize)
+// so the fleet panel and machine timeline don't lag a poll interval behind.
 func (m *Manager) triggerWarm() {
-	if m.warmReconcile != nil {
-		m.warmReconcile()
+	if m.inventoryNudge != nil {
+		m.inventoryNudge()
 	}
 }
 
@@ -1942,10 +1942,16 @@ type ManagerConfig struct {
 	EncoderImage    string
 	StateMachineArn string
 	MaxConcurrent   int
-	// WarmReconcile, if set, is called on a job START and FINALIZE so the
-	// awswatch keep-warm floor reacts immediately (raise on start, drop when the
-	// queue empties) instead of waiting for its next poll. Non-blocking.
-	WarmReconcile func()
+	// InventoryNudge, if set, is called on a job START and FINALIZE so the
+	// awswatch loop refreshes the AWS inventory immediately instead of waiting
+	// for its next poll. That is what makes the fleet panel and the machine
+	// timeline reflect a run beginning or ending without a lag. Non-blocking.
+	//
+	// It used to exist for the keep-warm floor, which is gone: #197 moved
+	// packaging off Batch, so there was no longer a tail to keep a box hot for,
+	// and every min_vcpus change was an UpdateComputeEnvironment that put the
+	// compute environment into UPDATING — during which Batch pauses scale-down.
+	InventoryNudge func()
 }
 
 func NewManager(cfg ManagerConfig) *Manager {
@@ -1972,7 +1978,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		EncoderImage:    cfg.EncoderImage,
 		StateMachineArn: cfg.StateMachineArn,
 		sem:             make(chan struct{}, cfg.MaxConcurrent),
-		warmReconcile:   cfg.WarmReconcile,
+		inventoryNudge:  cfg.InventoryNudge,
 	}
 	m.launchCond = sync.NewCond(&m.launchMu)
 	return m
@@ -2016,24 +2022,6 @@ func (m *Manager) Jobs() []*Job {
 	out := make([]*Job, len(m.jobs))
 	copy(out, m.jobs)
 	return out
-}
-
-// ActiveCloudJobs counts submitted cloud jobs still queued or running — the
-// app's own job queue. The awswatch keep-warm loop uses this so a box is held
-// across the gap BETWEEN sequential jobs (one finishing before the next's AWS
-// resources appear), not only while a single job's Batch work is live — so the
-// next job in the queue doesn't cold-start.
-func (m *Manager) ActiveCloudJobs() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	n := 0
-	for _, j := range m.jobs {
-		if (j.Status == StatusQueued || j.Status == StatusRunning) &&
-			j.Config.Target == TargetCloudBatch {
-			n++
-		}
-	}
-	return n
 }
 
 // jobPriorityBase returns the SchedulingPriority band for a cloud job so EARLIER

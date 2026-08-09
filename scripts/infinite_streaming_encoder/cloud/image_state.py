@@ -134,7 +134,7 @@ def state() -> dict:
 def heal() -> dict:
     """Clear image_id_override iff the compute env is wired to a missing AMI.
     No-op for every safe state. Same live UpdateComputeEnvironment path as
-    compute_env.set_min_vcpus."""
+    compute_env.set_max_vcpus."""
     st = state()
     if st["status"] != "dangling":
         return {"healed": False, "status": st["status"], "reason": "no dangling AMI"}
