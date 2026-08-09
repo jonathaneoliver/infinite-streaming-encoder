@@ -311,6 +311,18 @@ func (s *Server) startEncode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no files specified", 400)
 		return
 	}
+	// OutputTag lands in the output directory NAME, and from there in
+	// filepath.Join on the Go side and in two Python write destinations that use
+	// pathlib — which does not normalise "..", so the OS resolves it at
+	// mkdir(parents=True). Unvalidated, `output_tag=../../../..` redirects an
+	// encode's whole output tree outside OUTPUT_DIR. cfg.Files is re-derived from
+	// the directory listing by ResolveSourceFiles below; this field had nothing.
+	if cfg.OutputTag != "" {
+		if err := encode.ValidPathSegment("output_tag", cfg.OutputTag); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	if cfg.Target == "" {
 		cfg.Target = encode.TargetLocalDist
 	}
@@ -766,6 +778,21 @@ func (s *Server) estimateEncode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request: "+err.Error(), 400)
 		return
 	}
+	// Same sanitising as the real submit, and for the same reason: EstimateCost
+	// does filepath.Join(SourceDir, f) on these names and hands the result to
+	// ffprobe. This endpoint took the same JobConfig as startEncode but skipped
+	// the one step that makes the filenames trustworthy, so
+	// {"files":["../../../../etc/passwd"]} probed an arbitrary host path — an
+	// existence oracle plus whatever metadata ffprobe reports.
+	//
+	// ResolveSourceFiles returns the DIRECTORY LISTING's string for each match,
+	// never the caller's, so what reaches the probe cannot traverse.
+	files, err := s.Manager.ResolveSourceFiles(cfg.Files)
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "reason": err.Error()})
+		return
+	}
+	cfg.Files = files
 	est, err := s.Manager.EstimateCost(cfg)
 	if err != nil {
 		writeJSON(w, map[string]any{"ok": false, "reason": err.Error()})

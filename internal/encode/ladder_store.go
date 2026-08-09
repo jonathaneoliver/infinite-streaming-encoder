@@ -342,6 +342,16 @@ func validateLadderDef(def LadderDef) error {
 	if len(def.Codecs) == 0 {
 		return fmt.Errorf("ladder needs at least one codec")
 	}
+	// A ladder's OutputTag is copied onto every job that selects it, and from
+	// there into the output directory name. Validated HERE rather than only in
+	// the handler because this one is PERSISTED: a traversal stored in a ladder
+	// would be applied to every later job that picks that profile, long after
+	// the request that planted it.
+	if def.OutputTag != "" {
+		if err := ValidPathSegment("output_tag", def.OutputTag); err != nil {
+			return err
+		}
+	}
 	total := 0
 	for codec, rows := range def.Codecs {
 		if codec != "h264" && codec != "hevc" && codec != "av1" {
