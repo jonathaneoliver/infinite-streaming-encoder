@@ -1,5 +1,0 @@
-# Makes the in-repo CodeQL model pack resolvable without publishing it to a
-# registry. `packs:` in .github/codeql/codeql-config.yml names the pack; this
-# tells pack resolution where to find it on disk.
-provide:
-  - .github/codeql/extensions/*/qlpack.yml
