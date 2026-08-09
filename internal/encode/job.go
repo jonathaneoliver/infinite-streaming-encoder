@@ -1103,9 +1103,18 @@ type JobConfig struct {
 	// localChunkSeconds) — "dynamic"/"" default to 2×segment there.
 	ChunkDuration string `json:"chunk_duration,omitempty"`
 	GopDuration   string `json:"gop_duration"`
-	// OutputTag is appended to the output dir name ("<stem>_<tag>_<codec>"). Not a
-	// user field — filled from the selected ladder's output_tag by resolveTimings,
+	// OutputTag is appended to the output dir name ("<stem>_<tag>_<codec>"),
 	// so a profile like apple-uniq-live-6s marks its outputs ("_6s") for go-live.
+	//
+	// IT IS A USER FIELD. This comment used to say it was not — "filled from the
+	// selected ladder's output_tag by resolveTimings" — and that was true when it
+	// was written and false by the time anyone relied on it: the encode form has
+	// a text box for it, the CLI has --output-tag, and resolveTimings PREFERS a
+	// supplied value over the ladder's. Believing the comment is how it reached
+	// filepath.Join and two Python write destinations with no validation at all,
+	// which is a directory traversal (`output_tag=../../..`) rather than a
+	// cosmetic bug. Validated at every entry point with ValidPathSegment; see
+	// there for why one shared rule rather than a per-site check.
 	OutputTag     string `json:"output_tag,omitempty"`
 	HlsFormat     string `json:"hls_format"`
 	Padding       string `json:"padding"`

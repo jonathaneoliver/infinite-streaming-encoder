@@ -83,8 +83,8 @@ func (m *Manager) autoPromote(job *Job, moved []string) {
 // (-a --partial); remote targets go over ssh with host-key auto-accept and
 // BatchMode so a missing key fails fast instead of hanging on a prompt.
 func (m *Manager) Promote(name string) ([]PromoteResult, error) {
-	if strings.ContainsAny(name, "/\\") || name == "" || strings.HasPrefix(name, ".") {
-		return nil, fmt.Errorf("invalid output name %q", name)
+	if err := ValidPathSegment("output name", name); err != nil {
+		return nil, err
 	}
 	src := filepath.Join(m.OutputDir, name)
 	if fi, err := os.Stat(src); err != nil || !fi.IsDir() {

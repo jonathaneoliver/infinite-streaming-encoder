@@ -328,9 +328,8 @@ func (m *Manager) FetchStateFor(name string) *FetchState {
 // outputDirFor resolves an output name to a directory inside OutputDir,
 // rejecting anything that escapes it. The name arrives from a request path.
 func (m *Manager) outputDirFor(name string) (string, error) {
-	if name == "" || name == "." || name == ".." ||
-		strings.ContainsAny(name, `/\`) {
-		return "", fmt.Errorf("invalid output name")
+	if err := ValidPathSegment("output name", name); err != nil {
+		return "", err
 	}
 	dir := filepath.Join(m.OutputDir, name)
 	fi, err := os.Stat(dir)
