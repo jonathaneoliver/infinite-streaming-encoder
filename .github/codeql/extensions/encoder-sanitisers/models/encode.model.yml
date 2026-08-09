@@ -1,0 +1,51 @@
+# CodeQL barrier models for this repo's own sanitisers.
+#
+# WHY THIS EXISTS
+#
+# CodeQL reported 5 alerts on internal/encode/job.go — 2 critical
+# go/command-injection, 3 high go/path-injection — all tracking `filename` from
+# an HTTP request body to exec.Command and filepath.Join. All 5 are false
+# positives, verified adversarially: every path runs through
+# Manager.ResolveSourceFiles, which iterates os.ReadDir(SourceDir), accepts only
+# a name that EXACTLY equals an existing entry, and then returns *the listing's
+# string* rather than the caller's. A POSIX filename cannot contain "/" or NUL,
+# so a value that survives that check structurally cannot traverse.
+#
+# CodeQL cannot infer that, because the sanitisation is "compare against the
+# filesystem and substitute the trusted copy" rather than an escape or a regex.
+# So it is declared here instead.
+#
+# WHAT IT IS NOT
+#
+# This is NOT a way to silence findings. A barrier claims something specific and
+# checkable — that data leaving this function is safe for these vulnerability
+# classes — and it is wrong to add one for a function that does not actually
+# sanitise. It is deliberately scoped to ONE function and TWO kinds; anything
+# else in this package keeps being analysed exactly as before.
+#
+# The alternative was dismissing the same alerts by hand forever: they are
+# fingerprinted by location, so any edit near them re-attributes them as new.
+# That is what happened on #268, which merely moved those lines and inherited
+# a fortnight-old alert as its own.
+#
+# THE REAL BUG THIS DID NOT COVER
+#
+# The one genuine vulnerability found in the same review (#269) was
+# JobConfig.OutputTag reaching a path with no validation at all. No model would
+# have hidden it, because it was not sanitised anywhere — it is fixed in code,
+# by ValidPathSegment. Worth stating so nobody reads this file as "we decided
+# path injection is not a problem here".
+extensions:
+  - addsTo:
+      pack: codeql/go-all
+      extensible: barrierModel
+    data:
+      # Manager.ResolveSourceFiles(names []string) ([]string, error)
+      #
+      # ReturnValue[0] is the []string of resolved names. Only that is a
+      # barrier — the error is not data anyone joins to a path, and marking the
+      # whole return would be a broader claim than the function supports.
+      #
+      # Columns: package, type, subtypes, name, signature, ext, output, kind, provenance
+      - ["github.com/jonathaneoliver/infinite-streaming-encoder/internal/encode", "Manager", False, "ResolveSourceFiles", "", "", "ReturnValue[0]", "path-injection", "manual"]
+      - ["github.com/jonathaneoliver/infinite-streaming-encoder/internal/encode", "Manager", False, "ResolveSourceFiles", "", "", "ReturnValue[0]", "command-injection", "manual"]

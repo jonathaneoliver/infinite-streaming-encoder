@@ -40,10 +40,15 @@ jobs:
         uses: github/codeql-action/init@v4.37.6
         with:
           languages: ${{ matrix.language }}
-          # `security-extended` adds a slightly broader query set than the
-          # default. Switch to `security-and-quality` if you want lint-style
-          # findings too.
-          queries: security-extended
+          # The query set moved into the config file: specifying `config-file`
+          # REPLACES this action's own `queries:` input rather than merging, so
+          # leaving it here would have quietly narrowed the analysis.
+          #
+          # The config loads a model pack declaring Manager.ResolveSourceFiles a
+          # barrier for path- and command-injection — see
+          # .github/codeql/extensions/encoder-sanitisers/models/encode.model.yml
+          # for the justification and for what it deliberately does NOT claim.
+          config-file: ./.github/codeql/codeql-config.yml
 
       - name: Build (autobuild)
         uses: github/codeql-action/autobuild@v4.37.6
