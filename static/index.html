@@ -5026,6 +5026,39 @@ function _fleetLanesHtml(opts) {
             alive: !!r.alive,
         });
     });
+    // ...and the same again from the LIVE inventory, for a box with no stages and
+    // no rental row.
+    //
+    // The rental record only exists once a run has FINISHED — _emit_machine_rental
+    // runs in the SUCCEEDED branch — so during a live run there are no rentals at
+    // all and the injection above cannot fire. A machine that booted and never
+    // got work is therefore invisible for the entire time it is running, which is
+    // exactly when seeing it would let you act. _fleetSeen already has it: the
+    // lane builder was using it as a fallback for launch/vcpus but never to
+    // create a lane.
+    //
+    // Scoped the same way as the server-side rental fix, and for the same reason:
+    // an app-tagged instance carries no execution id, so attribution is by the
+    // scale-out window. Launch, not work time — a box boots BEFORE work lands on
+    // it, so bracketing on work would exclude precisely the machines being looked
+    // for. Without a known launch to bracket against, nothing is injected at all:
+    // inventing a machine is worse than omitting one.
+    if (!local) {
+        const knownLaunch = lanes.map(L => L.launch).filter(Boolean);
+        const from = knownLaunch.length ? Math.min(...knownLaunch) - 120000 : null;
+        if (from !== null) {
+            const have = new Set(lanes.map(L => L.id));
+            _fleetSeen.forEach((rec, id) => {
+                if (have.has(id) || !rec.launch || rec.launch < from) return;
+                lanes.push({
+                    id, merged: [], rawMerged: [], work: [], packed: [], nrows: 1,
+                    vcpus: rec.vcpus || 0, type: rec.type || '',
+                    launch: rec.launch, gone: rec.gone || null,
+                    alive: !rec.gone,
+                });
+            });
+        }
+    }
     if (!lanes.length) return '';
 
     // A lane's own start: its launch if known, else its first piece of work.
