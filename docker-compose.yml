@@ -183,7 +183,6 @@ services:
       DEFAULT_MAX_RES: ${DEFAULT_MAX_RES:-}
       DEFAULT_MIN_RES: ${DEFAULT_MIN_RES:-}
       MAX_CONCURRENT: ${MAX_CONCURRENT:-1}
-      WARM_MIN_VCPUS: ${WARM_MIN_VCPUS:-}
       # Cloud packaging location (#197). Unset = on the host, which removes the
       # pkgall Batch job, its queue wait and the sync-back that re-fetches what
       # it just uploaded. Set 0/false to package in Batch as before.

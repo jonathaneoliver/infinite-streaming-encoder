@@ -57,16 +57,6 @@ type Config struct {
 	// the sweep will not touch a queue younger than that, so a shorter period is
 	// pure SQS request spend on a set that cannot have changed.
 	TelemetryGCInterval time.Duration
-	// WarmMinVCPUs keeps the Batch compute environment's minvCpus at this
-	// value while a cloud-batch run is active, then resets it to 0 when idle —
-	// so the packaging tail lands on a hot instance instead of cold-starting.
-	// Zero disables the feature (min_vcpus is left at whatever Terraform set).
-	WarmMinVCPUs int
-	// ActiveJobs returns the count of the app's own queued/running cloud jobs.
-	// The warm floor is held while this is > 0 (not just while AWS resources are
-	// live), so it stays warm across the gap between sequential jobs and only
-	// drops when the whole app job queue is empty. Nil disables this signal.
-	ActiveJobs func() int
 	// Trigger fires an immediate inventory check + warm reconcile out of band
 	// (e.g. a job just started or finalized), so the keep-warm floor reacts at
 	// once instead of on the next Interval tick. Nil = poll-only.
@@ -90,12 +80,6 @@ type inventoryDoc struct {
 		ActiveBatchJobs    int     `json:"active_batch_jobs"`
 	} `json:"summary"`
 }
-
-// lastSetMinVCPUs tracks the min_vcpus we last pushed to Batch so we only call
-// UpdateComputeEnvironment on a change. -1 = unknown (force a set on first tick,
-// which also resets any value leaked by a crash mid-run). Accessed only from
-// the single awswatch goroutine, so no lock needed.
-var lastSetMinVCPUs = -1
 
 // lastFailedStagingGC is when gcFailedStaging last ran, so it can keep its own
 // (much slower) cadence while riding this loop's tick. Zero value = never, so
@@ -192,11 +176,6 @@ func runCheck(cfg Config) {
 		return
 	}
 
-	// Warm-fleet control: keep min_vcpus > 0 while a run is active so the
-	// packaging tail lands on a hot box; drop to 0 when idle. Runs before the
-	// quiet-path early return so the reset-to-0 still happens at zero fleet.
-	reconcileWarmCapacity(cfg, inv)
-
 	// Self-heal a dangling worker-AMI pointer (#79): if the compute env is wired
 	// to an AMI that no longer exists, clear it → pull-on-boot, so a deleted AMI
 	// degrades to a slow cold start instead of breaking every cloud encode. No-op
@@ -247,57 +226,6 @@ func runCheck(cfg Config) {
 	// (from outside the region) as egress.
 	maybeGCFailedStaging(cfg)
 	maybeGCTelemetryQueues(cfg)
-}
-
-// reconcileWarmCapacity sets the compute environment's min_vcpus to WarmMinVCPUs
-// while a run is active and to 0 when idle, calling Batch only on a change.
-func reconcileWarmCapacity(cfg Config, inv *inventoryDoc) {
-	if cfg.WarmMinVCPUs <= 0 {
-		return // feature disabled
-	}
-	// Hold the warm floor while the app's own job queue has work (covers the gap
-	// between sequential jobs) OR AWS still shows a live run. Drops to 0 only when
-	// the app queue is empty AND no execution/Batch job is active.
-	appQueued := cfg.ActiveJobs != nil && cfg.ActiveJobs() > 0
-	active := appQueued || inv.Summary.RunningExecutions > 0 || inv.Summary.ActiveBatchJobs > 0
-	desired := 0
-	if active {
-		desired = cfg.WarmMinVCPUs
-	}
-	if desired == lastSetMinVCPUs {
-		return
-	}
-	if err := setMinVCPUs(desired); err != nil {
-		log.Printf("awswatch: set min_vcpus=%d failed: %v", desired, err)
-		return
-	}
-	reason := "idle, draining to zero"
-	if active {
-		reason = "run active, keeping a box warm"
-	}
-	log.Printf("awswatch: min_vcpus -> %d (%s)", desired, reason)
-	lastSetMinVCPUs = desired
-}
-
-func setMinVCPUs(n int) error {
-	cmd := exec.Command("python3", "-m", "infinite_streaming_encoder.cloud.compute_env",
-		"--set-min-vcpus", strconv.Itoa(n))
-	cmd.Env = os.Environ()
-	out, err := cmd.Output()
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return &pyError{module: "compute_env", code: ee.ExitCode(),
-				stderr: strings.TrimSpace(string(ee.Stderr))}
-		}
-		return err
-	}
-	var doc struct {
-		Error string `json:"error"`
-	}
-	if json.Unmarshal(out, &doc) == nil && doc.Error != "" {
-		return &pyError{module: "compute_env", stderr: doc.Error}
-	}
-	return nil
 }
 
 // healDanglingAMI clears the compute env's image_id_override when it points at a

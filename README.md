@@ -578,7 +578,7 @@ required; everything else has a working default. See
 - **Distributed-local:** `MASTER_IP`, `DIST_WORKERS`, `ENCODE_SLOTS`, plus
   Temporal/MinIO vars (defaults match `make farm-up`; master vs. worker box is a
   `docker compose` profile choice).
-- **Cloud:** `AWS_REGION`, `S3_BUCKET`, `STATE_MACHINE_ARN`, `WARM_MIN_VCPUS`.
+- **Cloud:** `AWS_REGION`, `S3_BUCKET`, `STATE_MACHINE_ARN`.
 - **Image/registry:** `GHCR_PAT`, `DOCKER_IMAGE`.
 
 ## Programmatic use (HTTP API)
@@ -672,7 +672,7 @@ cmd/server/          Go entrypoint
 internal/encode/     control plane: Job/Manager, targets, scheduling, promote
 internal/api/        HTTP + SSE, dist worker toggle, static file servers
 internal/watcher/    source-directory auto-submit
-internal/awswatch/   cloud inventory watchdog + Batch keep-warm
+internal/awswatch/   cloud inventory watchdog + staging GC
 scripts/infinite_streaming_encoder/     the Python encoder package
   cli_local_dist.py    distributed-local orchestrator (Temporal backend)
   temporal_worker.py   the per-box worker (activities + workflow DAG)
