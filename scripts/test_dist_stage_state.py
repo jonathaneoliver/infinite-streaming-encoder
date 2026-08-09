@@ -174,7 +174,6 @@ def test_promotion_is_emitted_once_not_every_poll() -> None:
         def from_payloads(self, p):
             return []
 
-    client = FakeAttr(data_converter=FakeAttr(payload_converter=PCV()))
     h, c = Handle(), FakeAttr(data_converter=FakeAttr(payload_converter=PCV()))
     first = _capture(lambda: asyncio.run(D._emit_fleet_cpu(h, c)))
     again = _capture(lambda: asyncio.run(D._emit_fleet_cpu(h, c)))

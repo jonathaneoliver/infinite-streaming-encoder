@@ -243,7 +243,6 @@ def main() -> int:
         print("\n=== chunk plans (start_s, frames) — do the paths cut the clip alike?")
         for rung in sorted(plans):
             kinds = plans[rung]
-            starts = {k: sorted(float(a) for a, _ in v) for k, v in kinds.items()}
             # dist:local and dist:ubuntu are the SAME plan split across boxes.
             merged: dict[str, set] = defaultdict(set)
             for k, v in kinds.items():

@@ -80,6 +80,14 @@ var maxResHeight = map[string]int{
 	"1080p": 1080, "1440p": 1440, "2160p": 2160,
 }
 
+// ResHeight is resHeight for callers outside the package (the API's min/max
+// band validation).
+//
+// The paragraph below used to sit here with no blank line before it, so it read
+// as ResHeight's doc comment while describing resHeight — which is what
+// staticcheck's ST1020 flagged.
+func ResHeight(name string) (int, bool) { return resHeight(name) }
+
 // resHeight parses a --min-res/--max-res tier name: "1080p" -> 1080, true.
 // An empty or unparseable name means "no bound" (0, false).
 //
@@ -87,10 +95,6 @@ var maxResHeight = map[string]int{
 // the SELECTED LADDER's actual rung heights, and the Apple-uniq ladders carry
 // non-standard ones (954p, 1800p, 594p...). A fixed table silently ignored
 // every tier it didn't know about. Mirrors ladder.res_height.
-// ResHeight is resHeight for callers outside the package (the API's min/max
-// band validation).
-func ResHeight(name string) (int, bool) { return resHeight(name) }
-
 func resHeight(name string) (int, bool) {
 	n := strings.TrimSpace(name)
 	if n == "" {

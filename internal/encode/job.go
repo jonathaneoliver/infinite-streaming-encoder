@@ -1,3 +1,14 @@
+// Package encode is the control plane: it owns the job set, the concurrency
+// semaphore, the SSE subscriber list, and the contracts the Python encoder is
+// held to across a Docker socket.
+//
+// Most of what reads as incidental detail here is a contract with something
+// that cannot be refactored alongside it — output directory naming
+// (OutputStem), the worker container name that makes reattach-after-restart
+// possible, the MinIO staging key shared with the staging GC, and the
+// .remote.json sidecar whose mere presence means the media is still in S3.
+// Change one of those and the matching Python, or the page, has to move with
+// it in the same commit.
 package encode
 
 import (
@@ -1146,7 +1157,7 @@ type JobConfig struct {
 	// CPU architecture for cloud encodes: "intel" | "amd" | "graviton".
 	// Empty defaults to intel. Ignored for local encodes (which always
 	// run on the host's native architecture).
-	CpuArch string `json:"cpu_arch,omitempty"`
+	CPUArch string `json:"cpu_arch,omitempty"`
 	// UseSpot controls EC2 purchasing mode for cloud encodes. Pointer
 	// so `omitempty` works and an unset value lets cli_cloud.py apply
 	// its env-var default (USE_SPOT=true). Ignored for local encodes.
@@ -2273,7 +2284,7 @@ func (m *Manager) run(job *Job, startIdx int) {
 // says so in its own narration — so an overlapping sample reads high for a
 // reason that has nothing to do with how the fleet packs one run.
 type RunSample struct {
-	Ts          int64   `json:"ts"`
+	TS          int64   `json:"ts"`
 	LostS       float64 `json:"lost_s"`
 	TotalS      float64 `json:"total_s"`
 	SpotUSD     float64 `json:"spot_usd"`
@@ -2327,7 +2338,7 @@ func (m *Manager) persistSpotSample(job *Job) {
 		ended = job.EndedAt.Unix()
 	}
 	samples := append(m.readRunSamples(), RunSample{
-		Ts: time.Now().Unix(), LostS: job.ReclaimLostS, TotalS: job.EncodeTotalS,
+		TS: time.Now().Unix(), LostS: job.ReclaimLostS, TotalS: job.EncodeTotalS,
 		SpotUSD: job.SpotUSD, OnDemandUSD: job.OnDemandUSD, SavedUSD: job.SavedUSD,
 		IdlePct: job.IdlePct, MachineVCPUHours: job.MachineVCPUHours,
 		AllocatedVCPUHours: job.AllocatedVCPUHours,

@@ -1,3 +1,14 @@
+// Package api is the HTTP surface: the JSON API, the SSE job stream, and the
+// static/media file servers. It owns no encoding state of its own — every route
+// reads or drives an encode.Manager — so a handler that needs to know something
+// about a job asks the manager rather than keeping a copy.
+//
+// Two rules this package exists to enforce, both learned the hard way.
+// mediaFileServer sets Content-Type for .m3u8/.mpd/.m4s/.ts because Go's MIME
+// database does not know them and hls.js will not play without them. And no S3
+// call belongs on the outputs-listing path: it already costs ~0.8s over 30
+// directories, so a HEAD per remote output every poll would be far worse than
+// the problem it solved.
 package api
 
 import (

@@ -11,7 +11,8 @@ specific broke — but it is no longer thin: 127 Go tests plus ten Python test
 scripts. Do not invent commands beyond these four:
 
 - `make check` — the static gate: gofmt/vet/build, `go test -race ./...`,
-  staticcheck, govulncheck, tofu fmt, the Step Functions checks, `ruff` F821,
+  `staticcheck -checks all`, govulncheck, tofu fmt, the Step Functions checks,
+  `ruff --select F`,
   python compile, page JS. staticcheck/govulncheck **skip when not installed**
   (like tofu and ruff) so the pre-push hook stays fast and offline; CI runs both
   unconditionally via `go run …@latest`, so CI is the authority. Install locally

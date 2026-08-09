@@ -63,8 +63,8 @@ def build_packager_cmd(spec: PackageSpec) -> list[str]:
         )
 
     cmd += [
-        f"--segment_duration", str(spec.segment_duration_s),
-        f"--fragment_duration", str(spec.partial_duration_s),
+        "--segment_duration", str(spec.segment_duration_s),
+        "--fragment_duration", str(spec.partial_duration_s),
         "--fragment_sap_aligned=false",
         "--mpd_output", "manifest.mpd",
         "--generate_static_live_mpd",

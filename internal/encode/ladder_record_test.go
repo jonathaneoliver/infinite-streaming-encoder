@@ -156,7 +156,7 @@ func TestConfigBlockPreservesExplicitValues(t *testing.T) {
 		MaxRes:        "2160p",
 		Burnin:        &off,
 		MeasureVmaf:   true,
-		CpuArch:       "graviton",
+		CPUArch:       "graviton",
 		ForceReencode: true,
 	}
 	m := configJSON(t, writeConfigToTemp(t, cfg))
@@ -189,7 +189,7 @@ func TestConfigBlockCoversEveryConfiguredField(t *testing.T) {
 		GopDuration: "1.0", OutputTag: "6s", HlsFormat: "ts", Padding: "black",
 		KeepMezzanine: true, ForceReencode: true, PromoteAfter: true,
 		HevcSinglePass: true, MeasureVmaf: true, VmafPrescale: true,
-		CpuArch: "graviton", UseSpot: &spot,
+		CPUArch: "graviton", UseSpot: &spot,
 	}
 	m := configJSON(t, writeConfigToTemp(t, cfg))
 

@@ -369,7 +369,6 @@ def _extract_segments(seg_list: ET.Element) -> list[dict[str, Any]]:
     timeline = seg_list.find("mpd:SegmentTimeline", _NS)
     if timeline is not None:
         for s in timeline.findall("mpd:S", _NS):
-            t = int(s.get("t", 0))
             d = int(s.get("d", 0))
             r = int(s.get("r", 0))
             duration_s = d / timescale
