@@ -5012,10 +5012,23 @@ function _fleetLanesHtml(opts) {
     // capacity that arrived after the queue had already drained.
     rental.forEach((r, id) => {
         if (byInst.has(id) || !r.launched_at) return;
+        // The rental record is a SNAPSHOT taken when the run ended, and at that
+        // moment every box is still alive — so it says alive:true and carries no
+        // termination, forever. Reading it alone left this lane billing to `now`
+        // long after EC2 had reclaimed the instance: the box that ran nothing was
+        // the one lane that never showed its meter stopping, which is precisely
+        // the lane where that matters, since its whole life is the waste.
+        //
+        // The live inventory is the authority on termination and the stage-built
+        // lanes above already prefer it. This is the same rule, applied to the
+        // one lane shape that was missing it.
+        const rseen = _fleetSeen.get(id) || {};
+        const goneAt = (r.ended_at && !r.alive) ? r.ended_at * 1000
+                     : (rseen.gone || null);
         lanes.push({
             id, merged: [], vcpus: r.vcpus || 0, type: r.type || '',
             launch: r.launched_at * 1000,
-            gone: (r.ended_at && !r.alive) ? r.ended_at * 1000 : null,
+            gone: goneAt,
             // Same SHAPE as a lane built from stages, even though every work
             // field is empty. The per-chunk block work added these, and an
             // injected lane without them threw on L.packed.map — which does not
@@ -5023,7 +5036,9 @@ function _fleetLanesHtml(opts) {
             // That is why the never-ran machine still did not appear after the
             // rental data was fixed to include it.
             rawMerged: [], work: [], packed: [], nrows: 1,
-            alive: !!r.alive,
+            // Gone wins outright; otherwise the inventory if it has seen this
+            // box at all, and only then the run-end snapshot.
+            alive: goneAt ? false : (rseen.launch ? !rseen.gone : !!r.alive),
         });
     });
     // ...and the same again from the LIVE inventory, for a box with no stages and
