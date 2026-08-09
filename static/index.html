@@ -468,6 +468,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                  there is no egress to avoid and the box would be a no-op. -->
             <div class="control-group" id="skip-media-group" style="display:none;align-self:center;padding-top:16px">
                 <label title="Bring back manifests and metadata only (~4 MB instead of ~2.6 GB), leaving the segments in S3. Egress is billed per GB and is roughly 3× the compute for a run. Download any output you want to keep from the Outputs tab — but within 7 days, after which S3 staging expires and the media is gone."><input type="checkbox" id="skip-media" style="width:auto;min-width:auto"> Leave media in S3 (fetch on demand)</label>
+                <label title="Do not package at all. The run finishes when the last chunk lands — no packaging job, no sync-back — and the chunks stay in S3 until you press Package in the Outputs tab. Removes the whole post-encode tail (measured at 4m18s, 37-39% of a run) and holds half as much in S3, because the packaged copy is never made. WARNING: the chunks are then the ONLY copy. When staging expires the run is gone and must be re-encoded from the source."><input type="checkbox" id="defer-packaging" style="width:auto;min-width:auto"> Don't package yet (package on demand)</label>
             </div>
             <div class="control-group">
                 <label>Codec</label>
@@ -2133,8 +2134,46 @@ function onTargetChange() {
     // egress to skip, so offering the choice there would be misleading.
     const skipGroup = document.getElementById('skip-media-group');
     if (skipGroup) skipGroup.style.display = isAnyCloud ? 'flex' : 'none';
+    // #272 shares that group, and the same reasoning: local targets package to
+    // disk directly, so there is nothing to defer.
+    _syncDeferPackaging();
     scheduleCostEstimate();
 }
+
+// #272 supersedes #214 rather than combining with it: both keep bytes in S3
+// until wanted, and deferring keeps strictly more, because the packaged output
+// is never made. Ticking both would ask the server to leave media in S3 for an
+// output that has no media — and the server resolves that by ignoring
+// skip-media, so the form must not imply otherwise.
+//
+// Disabled and explained rather than silently unchecked: a control that clears
+// itself when you touch a different one reads as a bug.
+function _syncDeferPackaging() {
+    const defer = document.getElementById('defer-packaging');
+    const skip = document.getElementById('skip-media');
+    if (!defer || !skip) return;
+    const lbl = skip.closest('label');
+    if (defer.checked) {
+        skip.disabled = true;
+        if (lbl) {
+            lbl.style.opacity = '0.5';
+            lbl.title = 'Not applicable while packaging is deferred: nothing is '
+                + 'packaged, so there is no media to leave in S3. The chunks stay '
+                + 'there instead.';
+        }
+    } else {
+        skip.disabled = false;
+        if (lbl) { lbl.style.opacity = ''; lbl.title = _skipMediaTitle; }
+    }
+}
+// Captured once so the title can be restored; it is long and lives in the HTML.
+let _skipMediaTitle = '';
+document.addEventListener('DOMContentLoaded', () => {
+    const skip = document.getElementById('skip-media');
+    if (skip && skip.closest('label')) _skipMediaTitle = skip.closest('label').title;
+    const defer = document.getElementById('defer-packaging');
+    if (defer) defer.addEventListener('change', _syncDeferPackaging);
+});
 
 // Before submitting a cloud encode, peek at the AWS inventory. If
 // something's already billing, make the user explicitly confirm they
@@ -2228,6 +2267,7 @@ async function startEncode(force = false) {
     // apply there.
     if (isAnyCloudTarget(target)) {
         body.skip_media_download = document.getElementById('skip-media').checked;
+        body.defer_packaging = document.getElementById('defer-packaging').checked;
     }
 
     try {
@@ -2277,7 +2317,10 @@ async function loadOutputs() {
 // only re-arms while something is in flight, so an idle Outputs tab is silent.
 let _fetchPollTimer = null;
 function _scheduleFetchPoll() {
-    const busy = outputDirs.some(d => d.fetch && d.fetch.state === 'fetching');
+    // 'packaging' counts too (#272), or a packaging row would sit at 0%
+    // until something else happened to reload the list.
+    const busy = outputDirs.some(d => d.fetch &&
+        (d.fetch.state === 'fetching' || d.fetch.state === 'packaging'));
     if (_fetchPollTimer) { clearTimeout(_fetchPollTimer); _fetchPollTimer = null; }
     if (busy) _fetchPollTimer = setTimeout(loadOutputs, 2000);
 }
@@ -2292,6 +2335,25 @@ async function fetchOutput(name, el) {
         if (!r.ok) { showToast(`Download of ${name} failed: ${await r.text()}`, 'error'); }
     } catch (e) {
         showToast(`Download of ${name} failed: ${e}`, 'error');
+    }
+    loadOutputs();
+}
+
+// #272 — package an output whose chunks were left in S3. Same shape as
+// fetchOutput and safe to click twice for the same reason: the server treats a
+// second request as a no-op and returns the running state.
+//
+// A separate endpoint rather than reusing /fetch: the two fail differently, and
+// "the media is gone" and "the chunks are gone and nothing was ever packaged"
+// are not the same message to show someone.
+async function packageOutput(name, el) {
+    if (el) { el.classList.add('busy'); el.innerHTML = '&#8987;'; }
+    try {
+        const r = await fetch(`/api/outputs/${encodeURIComponent(name)}/package`,
+                              { method: 'POST' });
+        if (!r.ok) { showToast(`Packaging of ${name} failed: ${await r.text()}`, 'error'); }
+    } catch (e) {
+        showToast(`Packaging of ${name} failed: ${e}`, 'error');
     }
     loadOutputs();
 }
@@ -2413,6 +2475,19 @@ function _remoteBadge(d) {
     if (f && f.state === 'failed') {
         return `<span class="badge-remote failed" title="${escapeAttr(f.error || '')}">download failed</span>`;
     }
+    // #272 — encoded but never packaged. Checked BEFORE d.remote and before the
+    // no-badge fallback: a pending dir holds one JSON file, so with no badge it
+    // renders as an ordinary finished output that happens to be empty. That is
+    // the #225 failure repeated with a worse starting position.
+    if (d.pending) {
+        if (d.pending.gone) {
+            return `<span class="badge-remote gone" title="The chunks are no longer in S3 — ${escapeAttr(d.pending.gone_reason || 'the staging prefix was found empty')}${d.pending.gone_detected_at ? ' (detected ' + escapeAttr(d.pending.gone_detected_at) + ')' : ''}. This was never packaged, so there is nothing to recover; re-encode.">chunks deleted</span>`;
+        }
+        if (d.pending_unrecoverable) {
+            return `<span class="badge-remote expired" title="Chunk staging expired ${escapeAttr(d.pending.expires_at)}. This was never packaged, so nothing survives; re-encode to recreate it.">expired unpackaged</span>`;
+        }
+        return `<span class="badge-remote" title="Encoded but not packaged — the chunks are in S3 and packaging runs on demand. Chunks expire ${escapeAttr(d.pending.expires_at)}, and they are the ONLY copy: after that this must be re-encoded.">not packaged</span>`;
+    }
     if (!d.remote) return '';
     // Gone before expired: an output can be both, and "deleted" is the more
     // specific and more actionable of the two. Expiry is the clock running out;
@@ -2431,6 +2506,21 @@ function _outputActions(d) {
     const f = d.fetch;
     if (f && f.state === 'fetching') {
         return `<span class="btn-fetch busy" title="Downloading ${(f.percent || 0).toFixed(0)}% — this row updates itself">&#8987;</span>`;
+    }
+    if (f && f.state === 'packaging') {
+        return `<span class="btn-fetch busy" title="Packaging ${(f.percent || 0).toFixed(0)}% — fetching chunks, joining, running Shaka. This row updates itself">&#8987;</span>`;
+    }
+    // #272 — pending outputs before remote ones. Play must not be offered: there
+    // are no manifests at all, so it would 404 before it even reached a segment.
+    if (d.pending) {
+        if (d.pending_unrecoverable) {
+            const why = d.pending.gone
+                ? `The chunks are no longer in S3 — ${escapeAttr(d.pending.gone_reason || 'the staging prefix was found empty')}.`
+                : `Chunk staging expired ${escapeAttr(d.pending.expires_at)}.`;
+            return `<span class="btn-fetch disabled" title="${why} This was never packaged, so nothing survives; re-encode to recreate it.">&#10007;</span>`;
+        }
+        return `<span class="btn-fetch" onclick="event.stopPropagation(); packageOutput('${n}', this)"
+                      title="Package now — fetches the chunks from S3, joins them, runs Shaka and writes the playlists. Chunks expire ${escapeAttr(d.pending.expires_at)} and are the only copy.">&#9881;</span>`;
     }
     if (d.remote && d.remote_gone) {
         return `<span class="btn-fetch disabled" title="The media is no longer in S3 — ${escapeAttr(d.remote.gone_reason || 'the staging prefix was found empty')}. Nothing to download; re-encode to recreate it.">&#10007;</span>`;
@@ -3147,6 +3237,7 @@ async function refreshCostEstimate() {
     };
     if (isAnyCloudTarget(target)) {
         body.skip_media_download = document.getElementById('skip-media').checked;
+        body.defer_packaging = document.getElementById('defer-packaging').checked;
     }
     try {
         const r = await fetch('/api/encode/estimate', {
@@ -3272,7 +3363,8 @@ function _jobConfigHtml(c) {
     // #214 — worth surfacing on the RUNNING job, not just afterwards on the
     // output: this is the difference between a finished encode you can play and
     // one whose media is still in S3 on a 7-day clock.
-    if (c.skip_media_download) chips.push(chip('media', 'stays in S3', '#e9c46a'));
+    if (c.defer_packaging) chips.push(chip('packaging', 'on demand', '#e9c46a'));
+    else if (c.skip_media_download) chips.push(chip('media', 'stays in S3', '#e9c46a'));
     if (c.padding) chips.push(chip('padding', c.padding));
     if (c.time) chips.push(chip('time', c.time));
     if (c.force_reencode) chips.push(chip('force', 're-encode', '#d0883a'));

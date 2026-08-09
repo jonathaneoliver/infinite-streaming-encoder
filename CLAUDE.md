@@ -371,6 +371,61 @@ deliberate — minutes of local CPU on a machine already up, versus an hour of
 spot-reclaimable encoding — and the error says the chunks are still in S3, since
 re-running with `PACKAGE_ON_HOST=0` packages them without re-encoding anything.
 
+### Deferred packaging, and the FOUR states an output can be in
+
+`DEFER_PACKAGING` / `defer_packaging` (#272) does not package at encode time at
+all. The run is done when the last chunk lands — no package, no fragments, no
+hls, no sync-back — and the chunks stay in S3 until someone presses Package.
+The post-encode tail does not shrink, it disappears.
+
+It reuses the #197 worker wholesale: `cli_batch package --dir <output>` reads the
+sidecar and calls the same `_package_on_host`. That is why this is a scheduling
+change rather than a second packaging implementation.
+
+**Deferring supersedes skip-media-download; they are not combinable.** Both keep
+bytes in S3 until wanted, and deferring keeps strictly more — the packaged output
+is never made, so there is nothing to leave behind. Honouring both would write a
+`.remote.json` describing media that does not exist.
+
+An output directory now carries one of four states, and **each is a distinct
+file rather than a field**, because #225's finding was that these collapse:
+
+| on disk | means | offer |
+| --- | --- | --- |
+| (neither sidecar) | complete | Play |
+| `.remote.json` | packaged; SEGMENTS in S3 | Download |
+| `.pending.json` | encoded, never packaged; CHUNKS in S3 | Package |
+| either, `gone: true` / expired | unrecoverable | nothing, and say why |
+
+A pending directory is the **furthest from complete** — no manifests, no rung
+subdirs, one JSON file. So `parseOutputMeta` cannot distinguish it from an empty
+finished encode, and the UI checks `pending` *before* `remote` and before the
+no-badge fallback. Get that order wrong and a deferred run renders as a finished
+one with nothing in it.
+
+**The chunks are the ONLY copy.** Under `.remote.json` an expiry costs the media
+but the manifests survive; here it costs the run, which must be re-encoded from
+source. Two consequences: `staging_retention_days` is now a decision rather than
+an inherited default, and `cmd_package` spends one `list_objects_v2` up front so
+"this can never work" is reported as `EXIT_STAGING_GONE` rather than as
+phase_package_all's accurate but useless "no h264 variants found".
+
+`gone` is SET, never signalled by deleting the sidecar — deleting it reclassifies
+the output as complete, which is the one wrong answer available.
+
+Two ordering rules that fail silently:
+
+- **The sidecar is removed LAST**, after the media is moved in. Its absence is
+  what reclassifies the output as finished, so removing it first makes the
+  directory read as complete for the minutes packaging takes.
+- **Packaging stages into a sibling `.packaging-<name>/`**, never in place, for
+  the same reason.
+
+`do_h264` / `do_hevc` / `do_av1` and `host_package` are both empty on a deferred
+run, so **`encoded_codecs` is carried separately** — it is the only thing left
+saying which codecs the run produced, and `cmd_poll` builds the run plan and one
+marker directory per entry from it.
+
 ### Batch state, event-driven (cloud)
 
 Chunk state comes from **EventBridge → a per-execution SQS queue**, not from

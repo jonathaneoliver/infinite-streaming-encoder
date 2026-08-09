@@ -152,6 +152,7 @@ _BOOL_FIELDS = {
 _TRISTATE_FIELDS = {
     "burnin": "burnin",
     "skip_media_download": "skip_media_download",
+    "defer_packaging": "defer_packaging",
     "use_spot": "use_spot",
 }
 
@@ -238,6 +239,14 @@ def build_parser() -> argparse.ArgumentParser:
                    default=None,
                    help="cloud only: leave segments in S3, fetch later "
                         "(unset: server default SKIP_OUTPUT_MEDIA)")
+    g.add_argument("--defer-packaging", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="cloud only: do not package at all — leave the CHUNKS in "
+                        "S3 and package on demand from the Outputs tab. Removes "
+                        "the whole post-encode tail. Supersedes "
+                        "--skip-media-download; the chunks become the only copy, "
+                        "so an expired run must be re-encoded "
+                        "(unset: server default DEFER_PACKAGING)")
     g.add_argument("--force-reencode", action="store_true",
                    help="re-encode even where output exists; the old output is "
                         "archived, not deleted")

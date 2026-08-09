@@ -117,6 +117,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("GET /api/outputs/{name}/logs", s.outputLogs)
 	s.Mux.HandleFunc("POST /api/outputs/{name}/promote", s.promoteOutput)
 	s.Mux.HandleFunc("POST /api/outputs/{name}/fetch", s.fetchOutput)
+	s.Mux.HandleFunc("POST /api/outputs/{name}/package", s.packageOutput)
 	s.Mux.HandleFunc("GET /api/promote", s.getPromote)
 	s.Mux.HandleFunc("POST /api/encode", s.startEncode)
 	s.Mux.HandleFunc("POST /api/encode/estimate", s.estimateEncode)
@@ -642,6 +643,18 @@ type outputDir struct {
 	// RemoteExpired because the two have different explanations and only one
 	// of them is anybody's fault.
 	RemoteGone bool `json:"remote_gone,omitempty"`
+	// Pending is set when this output was ENCODED but never PACKAGED (#272) —
+	// its chunks are in S3 and there is nothing local but this sidecar. A
+	// FOURTH state, and the one furthest from complete: Remote at least has
+	// manifests, rung subdirs and a duration. This has none of them, so the UI
+	// must not fall through to the ordinary "output with no resolutions"
+	// rendering, which would show an empty but apparently finished encode.
+	Pending *encode.PendingInfo `json:"pending,omitempty"`
+	// PendingUnrecoverable folds gone+expired into the one question the UI
+	// actually asks: is there any point offering the Package button? The chunks
+	// are the only copy, so unlike a remote output there is no partial result to
+	// fall back on — the answer is re-encode.
+	PendingUnrecoverable bool `json:"pending_unrecoverable,omitempty"`
 	// Fetch is the in-flight (or last failed) on-demand download. An output
 	// mid-fetch is neither remote nor complete; Play stays disabled until it
 	// clears.
@@ -761,6 +774,25 @@ func (s *Server) fetchOutput(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.Manager.FetchStateFor(name))
 }
 
+// packageOutput starts on-demand packaging of an output whose chunks were left
+// in S3 by a deferred run (#272). The twin of fetchOutput, and idempotent for
+// the same reason: the button must be safe to press twice.
+//
+// Separate route rather than folding into fetchOutput on sidecar type. They fail
+// differently and say different things — "the media is gone" versus "the chunks
+// are gone, and nothing was ever packaged" — and a single endpoint that guesses
+// which it is would have to be right about a distinction #225 shows is easy to
+// collapse.
+func (s *Server) packageOutput(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	err := s.Manager.PackageOutput(name)
+	if err != nil && err != encode.ErrPackageInFlight {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, s.Manager.FetchStateFor(name))
+}
+
 // estimateEncode projects what a config would cost BEFORE it is submitted, so
 // the encode form can show it while options are being chosen rather than only
 // in the finished job.
@@ -824,13 +856,18 @@ func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {
 		size, count := dirStats(dirPath)
 		meta := parseOutputMeta(e.Name(), dirPath)
 		remote := encode.ReadRemote(dirPath)
+		// Read from the directory, not from an S3 call: /api/outputs already
+		// costs ~0.8s over 30 dirs, and this path must stay free of network I/O.
+		pending := encode.ReadPending(dirPath)
 		dirs = append(dirs, outputDir{
 			Name: e.Name(), Size: size, NumFiles: count, ModTime: info.ModTime().UnixMilli(),
 			Codec: meta.codec, Resolutions: meta.resolutions, HlsFormat: meta.hlsFormat,
 			Partial: meta.partial, Padding: meta.padding,
 			Remote: remote, RemoteExpired: remote.Expired(),
-			RemoteGone: remote != nil && remote.Gone,
-			Fetch:      s.Manager.FetchStateFor(e.Name()),
+			RemoteGone:           remote != nil && remote.Gone,
+			Pending:              pending,
+			PendingUnrecoverable: pending.Unrecoverable(),
+			Fetch:                s.Manager.FetchStateFor(e.Name()),
 		})
 	}
 	writeJSON(w, dirs)

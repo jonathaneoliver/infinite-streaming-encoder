@@ -2495,6 +2495,51 @@ def _iso(epoch: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
 
+# Marks an output that was ENCODED but never PACKAGED — its chunks are in S3 and
+# the join/Shaka/HLS chain has not run (#272). A separate file from
+# REMOTE_SIDECAR rather than a flag in it, because the two offer different
+# actions: .remote.json means "packaged, segments in S3" -> Download, this means
+# "not packaged, chunks in S3" -> Package. Contract with encode.PendingSidecar.
+PENDING_SIDECAR = ".pending.json"
+
+
+def _write_pending_sidecar(dst_dir: Path, s3_prefix: str, codec: str,
+                           segment_duration: str, partial_duration: str,
+                           bucket: str) -> None:
+    """Record that this output's chunks are in S3 and it has not been packaged.
+
+    The segment/partial durations are written down rather than looked up later,
+    because they must OUTLIVE the Step Functions execution: cmd_poll reads them
+    from describe_execution, history ages out, and this output may be packaged
+    months afterwards. The chunks were encoded to this segment duration, and
+    packaging to a different one yields playlists whose boundaries do not land on
+    the media's keyframes — a break nothing would report.
+
+    Field names are a contract with encode.PendingInfo.
+    """
+    days = _staging_expiry_days(_s3(), bucket)
+    now = time.time()
+    payload = {
+        "s3_prefix": s3_prefix,
+        "codec": codec,
+        "segment_duration": segment_duration,
+        "partial_duration": partial_duration,
+        "recorded_at": _iso(now),
+        # A floor, not a guarantee — the lifecycle clock runs from each object's
+        # own creation. It matters MORE here than on .remote.json: there, expiry
+        # costs the media but the manifests survive; here the chunks are the only
+        # copy, so expiry means re-encoding from source.
+        "expires_at": _iso(now + days * 86400),
+        "expiry_days": days,
+    }
+    try:
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        (dst_dir / PENDING_SIDECAR).write_text(json.dumps(payload, indent=2))
+    except OSError as e:
+        print(f"    warn: could not write {PENDING_SIDECAR} in {dst_dir}: {e}",
+              flush=True)
+
+
 # cmd_fetch's "the prefix is empty, there is nothing to download and there never
 # will be" exit. A distinct code because the caller has to tell it apart from a
 # transfer that died halfway — one is worth retrying and the other is not, and
@@ -2535,6 +2580,105 @@ def _local_media_count(out_dir: Path) -> int:
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def cmd_package(args) -> int:
+    """Package an output whose chunks were left in S3 (#272), in place.
+
+    The on-demand half of deferred packaging. Reads .pending.json, runs the SAME
+    _package_on_host the encode path runs, moves the result into the existing
+    directory, and removes the sidecar. The directory keeps its identity — its
+    name is what the Outputs tab and every /content/ URL use — so the result is
+    indistinguishable from a run packaged at encode time, which is the acceptance
+    criterion.
+
+    Idempotent in the same shape as cmd_fetch: no sidecar means already packaged,
+    exit 0, so a second click is a no-op.
+    """
+    out_dir = Path(args.dir)
+    sidecar = out_dir / PENDING_SIDECAR
+    if not sidecar.exists():
+        print(f"    nothing pending: no {PENDING_SIDECAR} in {out_dir}", flush=True)
+        return 0
+    try:
+        meta = json.loads(sidecar.read_text())
+    except (OSError, ValueError) as e:
+        print(f"!!! unreadable {sidecar}: {e}", file=sys.stderr)
+        return 1
+
+    s3_prefix = meta.get("s3_prefix", "")
+    codec = meta.get("codec", "")
+    if not s3_prefix.startswith("s3://") or codec not in ("h264", "hevc", "av1"):
+        print(f"!!! {sidecar} has no usable s3_prefix/codec", file=sys.stderr)
+        return 1
+
+    # Known gone already (a clear-time invalidation got here first) — say so
+    # without paying for a listing that will come back empty again. Same exit
+    # code as the fetch path so the control plane needs one rule, not two.
+    if meta.get("gone"):
+        print(f"!!! chunks no longer in S3: {s3_prefix} was emptied "
+              f"({meta.get('gone_reason', 'reason not recorded')}, detected "
+              f"{meta.get('gone_detected_at', '?')}). Re-encode to recreate it.",
+              file=sys.stderr, flush=True)
+        return EXIT_STAGING_GONE
+
+    # Is anything still there? One LIST, and it buys the difference between "this
+    # failed" and "this can never work". Without it an expired run reaches
+    # phase_package_all and dies with "no h264 variants found" — accurate, and
+    # useless to someone deciding whether clicking again will help. #225's rule
+    # is that the terminal state must be reported as terminal, and the exit code
+    # is what the control plane keys off to write gone: true.
+    bucket, _, base_key = s3_prefix[len("s3://"):].rstrip("/").partition("/")
+    try:
+        page = _s3().list_objects_v2(Bucket=bucket,
+                                     Prefix=f"{base_key}/{codec}_", MaxKeys=1)
+        if not page.get("Contents"):
+            print(f"!!! chunks no longer in S3: nothing under "
+                  f"{s3_prefix}/{codec}_ — the staging expired or was cleared. "
+                  f"Re-encode to recreate it.", file=sys.stderr, flush=True)
+            return EXIT_STAGING_GONE
+    except ClientError as e:
+        print(f"!!! could not list {s3_prefix}: {e}", file=sys.stderr)
+        return 1
+
+    # Package into a sibling scratch, then move the contents in. Packaging
+    # straight into out_dir would leave a half-populated directory looking like a
+    # complete output for the minutes the job runs — and #225's whole finding is
+    # that nothing downstream can tell a partial output from a finished one.
+    work = out_dir.parent / f".packaging-{out_dir.name}"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        # output_stem empty: _package_on_host's rename step is for laying codecs
+        # down side by side under a stem, and here the destination directory
+        # already exists and already has its name.
+        res = _package_on_host([codec], s3_prefix, work, "", "",
+                               str(meta.get("segment_duration") or ""),
+                               str(meta.get("partial_duration") or ""))
+    except RuntimeError as e:
+        shutil.rmtree(work, ignore_errors=True)
+        print(f"!!! {e}", file=sys.stderr, flush=True)
+        return 1
+
+    src = work / f"output_{codec}"
+    if not src.is_dir():
+        shutil.rmtree(work, ignore_errors=True)
+        print(f"!!! packaging produced no {src.name}", file=sys.stderr)
+        return 1
+    for entry in src.iterdir():
+        dst = out_dir / entry.name
+        if dst.exists():
+            shutil.rmtree(dst) if dst.is_dir() else dst.unlink()
+        shutil.move(str(entry), str(dst))
+    shutil.rmtree(work, ignore_errors=True)
+
+    # Last: the sidecar's ABSENCE is what reclassifies this as a finished output,
+    # so it must not be removed until the media is in place. Removed rather than
+    # flagged, matching cmd_fetch — the output is now genuinely complete.
+    sidecar.unlink(missing_ok=True)
+    print(f"    packaged {out_dir.name} ({res.files} objects, "
+          f"{res.bytes / 1e6:.0f} MB fetched)", flush=True)
+    return 0
 
 
 def cmd_fetch(args) -> int:
@@ -3009,6 +3153,11 @@ def cmd_poll(args: argparse.Namespace) -> int:
     # is the only thing the ASL reads them for — so the two sets are disjoint and
     # the plan is their union. Empty list = the old behaviour, packaging in Batch.
     host_package: list[str] = []
+    # #272: nobody packages at encode time. encoded_codecs is carried separately
+    # because deferring empties do_* AND host_package, so without it there would
+    # be nothing left saying which codecs the run even produced.
+    defer_packaging = False
+    encoded_codecs: list[str] = []
     seg_dur = part_dur = ""
     try:
         inp = json.loads(sfn.describe_execution(
@@ -3021,15 +3170,30 @@ def cmd_poll(args: argparse.Namespace) -> int:
                         if c in ("h264", "hevc", "av1")]
         seg_dur = str(inp.get("segment_duration") or "")
         part_dur = str(inp.get("partial_duration") or "")
+        defer_packaging = bool(inp.get("defer_packaging", False))
+        encoded_codecs = [c for c in (inp.get("encoded_codecs") or [])
+                          if c in ("h264", "hevc", "av1")]
     except (ClientError, ValueError, TypeError):
         pass
+    # Older executions predate encoded_codecs; recover it the way it used to be
+    # recoverable, so re-attaching to a run submitted by an earlier server still
+    # plans correctly.
+    if not encoded_codecs:
+        encoded_codecs = sorted({c for c, on in
+                                 (("h264", do_h264), ("hevc", do_hevc), ("av1", do_av1))
+                                 if on} | set(host_package))
     # The plan must list what is being ENCODED, which is not what the state
     # machine packages once packaging moves here.
-    _emit_plan(variants, do_h264 or "h264" in host_package,
-               do_hevc or "hevc" in host_package,
+    # The package/fragments/hls rows are declared only if something will actually
+    # package this run — from Batch or from the host. A deferred run packages
+    # nothing, and a declared row that never fires sits pending forever, which is
+    # the same defect as the download:outputs row #197 fixed.
+    _emit_plan(variants,
+               "h264" in encoded_codecs and not defer_packaging,
+               "hevc" in encoded_codecs and not defer_packaging,
                # The sync-back only has work if the STATE MACHINE packaged
                # something; do_av1 counts here even though it has no plan row.
-               sync_back=do_h264 or do_hevc or do_av1)
+               sync_back=not defer_packaging and (do_h264 or do_hevc or do_av1))
     # Flag chunks left over from a prior (cancelled/failed) run as reused, so a
     # resume shows them distinctly instead of as fresh encodes.
     _emit_reused_chunks(args.s3_prefix)
@@ -3184,6 +3348,28 @@ def cmd_poll(args: argparse.Namespace) -> int:
                 # Package here, before the sync-back — these codecs have no
                 # packaged output in S3 for _download_outputs to find, because
                 # the state machine skipped their PerCodec branch entirely.
+                # Deferred (#272): nothing packaged this run, so there is nothing
+                # in S3 to sync back and nothing on disk yet. Write one marker
+                # directory per encoded codec instead. It travels through
+                # moveTmpToOutput exactly like a packaged dir, which is what makes
+                # the run appear in the Outputs tab at all — without it a deferred
+                # run leaves no trace on disk and is indistinguishable from one
+                # that never happened.
+                if defer_packaging and encoded_codecs:
+                    bucket = args.s3_prefix[len("s3://"):].partition("/")[0]
+                    stem = getattr(args, "output_stem", "")
+                    tag = getattr(args, "output_tag", "")
+                    for codec in encoded_codecs:
+                        name = (_local_codec_dir(stem, codec, tag) if stem
+                                else f"output_{codec}")
+                        _write_pending_sidecar(Path(args.local_dir) / name,
+                                               args.s3_prefix, codec,
+                                               seg_dur, part_dur, bucket)
+                    print(f"    deferred packaging: {len(encoded_codecs)} output(s) "
+                          f"marked pending; chunks stay in {args.s3_prefix}",
+                          flush=True)
+                    return 0
+
                 pkg = DownloadResult(0, 0, 0, 0)
                 if host_package:
                     pkg = _package_on_host(host_package, args.s3_prefix,
@@ -3294,6 +3480,11 @@ def main(argv: list[str] | None = None) -> int:
     pf.add_argument("--dry-run", action="store_true", dest="dry_run",
                     help="report what would be fetched, then exit")
     pf.set_defaults(fn=cmd_fetch)
+
+    pp2 = sub.add_parser("package")
+    pp2.add_argument("--dir", required=True, dest="dir",
+                     help="output directory holding a " + PENDING_SIDECAR)
+    pp2.set_defaults(fn=cmd_package)
 
     ps = sub.add_parser("submit")
     ps.add_argument("--state-machine-arn", required=True, dest="state_machine_arn")

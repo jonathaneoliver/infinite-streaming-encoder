@@ -1095,6 +1095,16 @@ type JobConfig struct {
 	// explicit true/false from the client wins. Cloud-batch only — the local and
 	// local-dist paths write straight to disk with no egress to avoid.
 	SkipMediaDownload *bool `json:"skip_media_download,omitempty"`
+	// DeferPackaging leaves the CHUNKS in S3 and does not package at all (#272).
+	// The run is done when the last chunk lands: no package, no fragments, no
+	// hls, no sync-back, so the post-encode tail does not shrink, it disappears.
+	// Packaging runs later, as its own job, when someone asks for the content.
+	//
+	// Supersedes SkipMediaDownload rather than combining with it — both keep
+	// bytes in S3 until wanted, and this keeps strictly more. Same pointer
+	// convention (nil = the DEFER_PACKAGING server default), same cloud-batch
+	// -only scope.
+	DeferPackaging *bool `json:"defer_packaging,omitempty"`
 	// Burnin toggles the per-variant burnt-in text overlay (timecode / rate /
 	// codec+res / encoder / watermark labels, plus the PADDING label). On by
 	// default — a pointer so nil (older persisted jobs, or a client that omits
@@ -3903,7 +3913,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// Source fps: keys the speed model (encode time ∝ frame count), so chunk
 		// sizes/priorities match the graviton keys learned at the same rate.
 		srcFps := probeSourceFps(localSrc)
-		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), m.packageOnHost(job.Config), srcWidth, srcFps, durationS, timeLimitS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), m.vmafEstimates(job.Config), job.AppendLog)
+		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), m.packageOnHost(job.Config), m.deferPackaging(job.Config), srcWidth, srcFps, durationS, timeLimitS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), m.vmafEstimates(job.Config), job.AppendLog)
 		expectedEncodes = expEnc
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
@@ -4196,7 +4206,7 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin, packageOnHost bool, sourceWidth, sourceFps int, clipDurationS, timeLimitS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int) {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin, packageOnHost, deferPackaging bool, sourceWidth, sourceFps int, clipDurationS, timeLimitS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int) {
 	if ladderName == "" {
 		ladderName = DefaultLadderName
 	}
@@ -4372,7 +4382,11 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	// Always a list, never null: cmd_poll reads it with `or []`, and an explicit
 	// empty list is also the honest encoding of "Batch packages everything".
 	hostPackage := []string{}
-	if packageOnHost {
+	// deferPackaging (#272) means nobody packages at encode time — not the state
+	// machine, not the host. It has to zero BOTH lists, and encodedCodecs below
+	// is what stops that erasing the run plan: with all three sets empty there
+	// would be nothing left saying which codecs were even encoded.
+	if packageOnHost && !deferPackaging {
 		for _, c := range []struct {
 			name string
 			on   bool
@@ -4380,6 +4394,19 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			if c.on {
 				hostPackage = append(hostPackage, c.name)
 			}
+		}
+	}
+	// The codecs this run ENCODES, independent of who packages them or whether
+	// anyone does. Before #272 this was recoverable as do_* OR host_package;
+	// deferring empties both, so it is now stated outright. cmd_poll builds the
+	// run plan from it and writes one pending sidecar per entry.
+	encodedCodecs := []string{}
+	for _, c := range []struct {
+		name string
+		on   bool
+	}{{"h264", doH264}, {"hevc", doHevc}, {"av1", doAV1}} {
+		if c.on {
+			encodedCodecs = append(encodedCodecs, c.name)
 		}
 	}
 	doc := map[string]any{
@@ -4401,15 +4428,21 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		// the PerCodec branch falls through to its Succeed and no pkgall job is
 		// ever submitted, with no change to infra/ and no deploy. Same trick
 		// #266 used to skip Mezzanine through the existing MezzCheck.
-		"do_h264": doH264 && !packageOnHost,
-		"do_hevc": doHevc && !packageOnHost,
-		"do_av1":  doAV1 && !packageOnHost,
+		"do_h264": doH264 && !packageOnHost && !deferPackaging,
+		"do_hevc": doHevc && !packageOnHost && !deferPackaging,
+		"do_av1":  doAV1 && !packageOnHost && !deferPackaging,
 		// ...and the codecs the ORCHESTRATOR packages instead. Disjoint from the
 		// three above by construction. Carried separately rather than inferred
 		// from them because the two sets answer different questions, and the run
 		// plan needs their union: a viewer must still be told h264 is being
 		// encoded when nothing in Batch will package it.
 		"host_package": hostPackage,
+		// Which codecs were encoded, regardless of who packages them. See
+		// encodedCodecs above.
+		"encoded_codecs": encodedCodecs,
+		// Nobody packages at encode time; the orchestrator writes a pending
+		// sidecar per encoded codec instead, and packaging runs on demand (#272).
+		"defer_packaging": deferPackaging,
 		// Ladder-level VBV shaping, applied to every variant's encode (the
 		// worker reads these as MAXRATE_PERCENT / BUFSIZE_MULT env). Threaded
 		// so a custom ladder's VBV is honored in the cloud, not just locally.
