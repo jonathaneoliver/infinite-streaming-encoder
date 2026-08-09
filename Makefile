@@ -1388,19 +1388,32 @@ smoke-cloud: require-paths require-s3-bucket  ## end-to-end CLOUD smoke against 
 	@[ -f "$(SMOKE_SRC)" ] || docker run --rm -v "$(SOURCE_DIR):/src" --entrypoint ffmpeg $(IMAGE_NAME) \
 	  -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 \
 	  -t 20 -pix_fmt yuv420p -c:v libx264 -c:a aac -shortest -y /src/smoke.mp4
-	@# Force a mezzanine cache MISS, or this target silently stops testing the
-	@# mezzanine at all. The cache is keyed on name|size|mtime and this file is
-	@# reused across runs, so every run after the first hit the cache and skipped
-	@# straight to fan-out — the mezzanine phase has not been exercised on the
-	@# cloud path since whenever smoke.mp4 was first created. It looked like a
-	@# pass: no mezz Batch job, straight to chunk encodes, exactly what a working
-	@# skip-the-job change would produce. The same shape for the opposite reason.
+	@# The mezzanine cache is keyed on name|size|mtime, and this file is reused
+	@# across runs — so by DEFAULT this smoke gets a cache hit and does not
+	@# exercise the mezzanine phase at all.
 	@#
-	@# touch, not delete: bumping the mtime moves the key, so the stale entry is
-	@# simply orphaned and ages out on the bucket's existing lifecycle rule. No
-	@# S3 deletion from a test target.
-	@echo ">>> [smoke-cloud] touching $(SMOKE_SRC) to force a mezzanine cache miss..."
-	@touch "$(SMOKE_SRC)"
+	@# That used to be forced to a miss on every run (an unconditional touch),
+	@# because a cache-hit run is INDISTINGUISHABLE from a working
+	@# skip-the-mezzanine-job change: both show no mezz Batch job and go straight
+	@# to chunk encodes. Verifying #266 against it, the prediction and the
+	@# observation matched perfectly and the code under test had not run.
+	@#
+	@# But forcing a miss every time also re-uploads a mezzanine and orphans the
+	@# previous one under mezz/<key>/ until the lifecycle rule collects it, which
+	@# is a lot of garbage for a target run several times a day. So the miss is
+	@# now OPT-IN, and the run REPORTS which path it took instead — the actual
+	@# lesson was not "always force a miss", it was "never let a pass claim
+	@# coverage it does not have".
+	@#
+	@# FORCE_MEZZ=1 to exercise the mezzanine (touch, never delete: bumping the
+	@# mtime moves the key, so the stale entry ages out on the bucket's existing
+	@# lifecycle rule — no S3 deletion from a test target).
+	@if [ -n "$(FORCE_MEZZ)" ]; then \
+	  echo ">>> [smoke-cloud] FORCE_MEZZ=1 — touching $(SMOKE_SRC) to force a mezzanine cache miss..."; \
+	  touch "$(SMOKE_SRC)"; \
+	else \
+	  echo ">>> [smoke-cloud] mezzanine will likely CACHE-HIT (FORCE_MEZZ=1 to exercise it)."; \
+	fi
 	@echo ">>> [smoke-cloud] clearing any prior smoke output..."
 	@rm -rf $(OUTPUT_DIR)/smoke_p200* 2>/dev/null || true
 	@echo ">>> [smoke-cloud] submitting (h264, 720p, 12s chunks, media forced home);"
@@ -1430,7 +1443,18 @@ smoke-cloud-assert:
 	 if [ "$$segs" -eq 0 ]; then \
 	   echo ">>> SMOKE-CLOUD FAIL: $$d has playlists but ZERO segments — the manifest"; \
 	   echo "    describes media that is not on disk."; exit 1; fi; \
-	 echo ">>> SMOKE-CLOUD PASS: $$d ($$segs segments, playlists present, no remote sidecar)"
+	 mz="not determined"; \
+	 jl=$$(ls -t $(TMP_DIR)/logs/*.log 2>/dev/null | head -1); \
+	 if [ -n "$$jl" ]; then \
+	   if grep -q 'building mezzanine on the host' "$$jl" 2>/dev/null; then \
+	     mz="mezzanine BUILT"; else mz="mezzanine CACHE-HIT (not exercised)"; fi; \
+	 fi; \
+	 echo ">>> SMOKE-CLOUD PASS: $$d ($$segs segments, playlists present, no remote sidecar)"; \
+	 case "$$mz" in \
+	   *CACHE-HIT*) echo "    $$mz — this run did NOT test the mezzanine path."; \
+	                echo "    Re-run with FORCE_MEZZ=1 if you changed anything upstream of the chunk plan.";; \
+	   *)           echo "    $$mz — the mezzanine path was exercised.";; \
+	 esac
 
 # ---- OOBE (out-of-box experience) test ---------------------------------------
 # Runs a fully ISOLATED instance — its own dirs, ports, container names, and a

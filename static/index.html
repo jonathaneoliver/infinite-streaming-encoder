@@ -1053,12 +1053,16 @@ let outputsView = 'list'; // 'list' or 'detail'
 const _POLL_FRESH_MS = 2000;
 const _pollers = [];
 
-function registerPoller(name, fn, intervalMs, when) {
-    _pollers.push({ name, fn, intervalMs, when, timer: null, lastRun: 0 });
+// holdOpen (optional): a predicate that earns this poller the LONG idle grace
+// even with no encode running. Per-poller on purpose — the grace is a cost
+// decision and they do not cost the same. /api/outputs walks 108k files, so it
+// must keep the short one whatever else is going on (#228).
+function registerPoller(name, fn, intervalMs, when, holdOpen) {
+    _pollers.push({ name, fn, intervalMs, when, holdOpen, timer: null, lastRun: 0 });
 }
 
 function _pollerWanted(p) {
-    return document.visibilityState !== 'hidden' && !pollingIdle() && p.when();
+    return document.visibilityState !== 'hidden' && !pollingIdle(p) && p.when();
 }
 
 // args are forwarded to the poller's fn — used by pollNow to run a poller in a
@@ -1118,7 +1122,7 @@ registerPoller('dist-workers', pollDistWorkers, 5000, () => activeTab() === 'job
 registerPoller('aws-inventory', refreshAws, 10000, () => {
     const chk = document.getElementById('aws-auto-refresh');
     return !!(chk && chk.checked) && (activeTab() === 'aws' || activeTab() === 'jobs');
-});
+}, machinesStillBilling);
 
 // ---------------------------------------------------------------------------
 // Idle: stop polling, and hand the page back to Originals (#227, #228)
@@ -1165,9 +1169,27 @@ function anyEncodeRunning() {
 // seconds, and watching a progress bar is not an activity that generates
 // pointer events — so polling gets the same hour the view does, and stops at
 // the same moment. It is the idle tail AFTER a run that this is really about.
-function pollingIdle() {
-    const limit = anyEncodeRunning() ? _IDLE_RETURN_MS : _IDLE_POLL_MS;
+function pollingIdle(p) {
+    // A poller may declare its own reason to stay awake. Called with no
+    // argument (the idle tick, _noteInteraction) this is exactly as before.
+    const live = anyEncodeRunning() || !!(p && p.holdOpen && p.holdOpen());
+    const limit = live ? _IDLE_RETURN_MS : _IDLE_POLL_MS;
     return Date.now() - _lastInteraction >= limit;
+}
+
+// Machines still up are still being BILLED, so the machine timeline still has
+// something to say — and what it has to say is the scale-down tail, which is
+// the largest single cost on a short run. anyEncodeRunning() alone treats "the
+// encode finished" as "nothing is happening", and the chart froze exactly while
+// the money was still accruing.
+//
+// Self-limiting, which is what makes it safe next to #228: boxes scale down
+// within minutes and _recordFleetLanes stamps `gone`, after which this goes
+// false on its own. A forgotten tab cannot hold it open, because a forgotten
+// tab is either hidden or on another tab and its when() gate has already shut.
+function machinesStillBilling() {
+    for (const rec of _fleetSeen.values()) if (!rec.gone) return true;
+    return false;
 }
 
 function viewExpired() {
@@ -4899,7 +4921,10 @@ function _fleetLanesHtml(opts) {
         if (isNaN(a)) return;
         const b = s.ended_at ? Date.parse(s.ended_at) : now;
         if (!byInst.has(s.instance)) byInst.set(s.instance, []);
-        byInst.get(s.instance).push([a, Math.max(b, a)]);
+        // key is carried so each block can name itself, and so the lane can
+        // count CHUNKS specifically — a box's work also includes audio, which
+        // is a Batch job on an instance but is not a chunk.
+        byInst.get(s.instance).push([a, Math.max(b, a), s.key || '']);
     });
 
     // Per-instance rental rows from the job itself, keyed by id.
@@ -4923,6 +4948,10 @@ function _fleetLanesHtml(opts) {
         // termination to stop a meter, so its lane is simply the window in which
         // it had work. Rental and inventory data belong to EC2 — on the local
         // path they would be stale ids from an earlier cloud run.
+        // Snapshot the union BEFORE the Batch stretch below. The band is only
+        // worth drawing where it covers something the blocks do not; drawn
+        // underneath them it reads as a box inside a box.
+        const rawMerged = merged.map(([a, b]) => [a, b]);
         const r = local ? null : rental.get(id);
         const seen = local ? {} : (_fleetSeen.get(id) || {});
         // Stages close before their Batch job does. pkgall's stages total 73s
@@ -4942,8 +4971,37 @@ function _fleetLanesHtml(opts) {
         }
         return {
             id, merged,
+            // The UNMERGED per-stage intervals, kept so the lane can show one
+            // block per unit of work. merged[] deliberately loses them — it
+            // answers "did this box have ANY work", which is the right input for
+            // the billing arithmetic and the wrong one for "how many chunks did
+            // it get through". Both questions, one pass.
+            work: iv, rawMerged,
+            // Greedy first-fit packing into sub-rows. Chunks OVERLAP on a box —
+            // that is the point of an 8-vCPU instance — so they cannot share one
+            // line without hiding each other. Done HERE rather than at render
+            // time so the deepest concurrency across all lanes is known before
+            // the first lane is drawn, and every lane can share one height.
+            ...(() => {
+                const packed = [], rowEnds = [];
+                iv.forEach(([a, b, key]) => {
+                    let r = rowEnds.findIndex(end => a >= end);
+                    if (r < 0) { r = rowEnds.length; rowEnds.push(0); }
+                    rowEnds[r] = b;
+                    packed.push({ a, b, key, row: r });
+                });
+                return { packed, nrows: Math.max(1, rowEnds.length) };
+            })(),
             launch: (r && r.launched_at) ? r.launched_at * 1000 : (seen.launch || null),
             gone: (r && r.ended_at && !r.alive) ? r.ended_at * 1000 : (seen.gone || null),
+            // Known to be STILL UP. Distinct from "no termination timestamp",
+            // which also covers "we lost track of it" — the difference decides
+            // whether the post-encode idle can be drawn as fact or has to be
+            // left as unknown. The rental record is authoritative (it is what
+            // the orchestrator recorded); the live inventory is the fallback,
+            // and terminated boxes are filtered out of it, so appearing there
+            // at all means up as of the last poll.
+            alive: r ? !!r.alive : !!(seen.launch && !seen.gone),
             vcpus: (r && r.vcpus) || seen.vcpus || 0,
             type: (r && r.type) || seen.type || '',
         };
@@ -4954,12 +5012,68 @@ function _fleetLanesHtml(opts) {
     // capacity that arrived after the queue had already drained.
     rental.forEach((r, id) => {
         if (byInst.has(id) || !r.launched_at) return;
+        // The rental record is a SNAPSHOT taken when the run ended, and at that
+        // moment every box is still alive — so it says alive:true and carries no
+        // termination, forever. Reading it alone left this lane billing to `now`
+        // long after EC2 had reclaimed the instance: the box that ran nothing was
+        // the one lane that never showed its meter stopping, which is precisely
+        // the lane where that matters, since its whole life is the waste.
+        //
+        // The live inventory is the authority on termination and the stage-built
+        // lanes above already prefer it. This is the same rule, applied to the
+        // one lane shape that was missing it.
+        const rseen = _fleetSeen.get(id) || {};
+        const goneAt = (r.ended_at && !r.alive) ? r.ended_at * 1000
+                     : (rseen.gone || null);
         lanes.push({
             id, merged: [], vcpus: r.vcpus || 0, type: r.type || '',
             launch: r.launched_at * 1000,
-            gone: (r.ended_at && !r.alive) ? r.ended_at * 1000 : null,
+            gone: goneAt,
+            // Same SHAPE as a lane built from stages, even though every work
+            // field is empty. The per-chunk block work added these, and an
+            // injected lane without them threw on L.packed.map — which does not
+            // just drop this lane, it takes the whole panel's render with it.
+            // That is why the never-ran machine still did not appear after the
+            // rental data was fixed to include it.
+            rawMerged: [], work: [], packed: [], nrows: 1,
+            // Gone wins outright; otherwise the inventory if it has seen this
+            // box at all, and only then the run-end snapshot.
+            alive: goneAt ? false : (rseen.launch ? !rseen.gone : !!r.alive),
         });
     });
+    // ...and the same again from the LIVE inventory, for a box with no stages and
+    // no rental row.
+    //
+    // The rental record only exists once a run has FINISHED — _emit_machine_rental
+    // runs in the SUCCEEDED branch — so during a live run there are no rentals at
+    // all and the injection above cannot fire. A machine that booted and never
+    // got work is therefore invisible for the entire time it is running, which is
+    // exactly when seeing it would let you act. _fleetSeen already has it: the
+    // lane builder was using it as a fallback for launch/vcpus but never to
+    // create a lane.
+    //
+    // Scoped the same way as the server-side rental fix, and for the same reason:
+    // an app-tagged instance carries no execution id, so attribution is by the
+    // scale-out window. Launch, not work time — a box boots BEFORE work lands on
+    // it, so bracketing on work would exclude precisely the machines being looked
+    // for. Without a known launch to bracket against, nothing is injected at all:
+    // inventing a machine is worse than omitting one.
+    if (!local) {
+        const knownLaunch = lanes.map(L => L.launch).filter(Boolean);
+        const from = knownLaunch.length ? Math.min(...knownLaunch) - 120000 : null;
+        if (from !== null) {
+            const have = new Set(lanes.map(L => L.id));
+            _fleetSeen.forEach((rec, id) => {
+                if (have.has(id) || !rec.launch || rec.launch < from) return;
+                lanes.push({
+                    id, merged: [], rawMerged: [], work: [], packed: [], nrows: 1,
+                    vcpus: rec.vcpus || 0, type: rec.type || '',
+                    launch: rec.launch, gone: rec.gone || null,
+                    alive: !rec.gone,
+                });
+            });
+        }
+    }
     if (!lanes.length) return '';
 
     // A lane's own start: its launch if known, else its first piece of work.
@@ -4998,9 +5112,27 @@ function _fleetLanesHtml(opts) {
     // keep drawing; a farm machine is not, so extending the axis to now would
     // just widen an empty right-hand margin every poll — the timeline growing
     // while nothing happens.
+    // Extend to `now` only while something is still BILLING. The reason a cloud
+    // chart keeps drawing after the last job is that a live box costs money
+    // every second, and hiding that would defeat the point of the idle band —
+    // but once every box is terminated there is nothing left to accrue, and
+    // growing the axis on every poll just squashes the run into a shrinking
+    // sliver on the left. jobLive was already computed for exactly this
+    // distinction and the axis was the one place not consulting it.
+    //
+    // `!L.gone` covers the box we never saw terminate as well as the one still
+    // running: both are "we cannot say the meter stopped", and the lane already
+    // says so in words ("freed time unknown").
+    // L.alive, not !L.gone. A lane with no termination timestamp is either
+    // still up or lost track of, and only the first is a reason to keep drawing:
+    // the lost one already stops at its last job and says "freed time unknown",
+    // so extending the axis for it just adds empty width. Seen on a real run —
+    // every box terminated at 1m49s and the chart drew to 3m38s because one lane
+    // had no timestamp, squeezing the whole run into the left half.
+    const stillBilling = jobLive || lanes.some(L => L.alive);
     const t1 = local
         ? Math.max(runEnd, ...lanes.map(laneEnd), t0 + 1)
-        : Math.max(now, ...lanes.map(laneEnd));
+        : Math.max(stillBilling ? now : 0, ...lanes.map(laneEnd), t0 + 1);
     const span = Math.max(1, t1 - t0);
     const pos = t => (t - t0) / span * 100;
 
@@ -5021,6 +5153,11 @@ function _fleetLanesHtml(opts) {
         : `${Math.floor(ms / 60000)}m${String(Math.round(ms % 60000 / 1000)).padStart(2, '0')}s`;
 
     let coldMs = 0, gapMs = 0, gapN = 0, tailMs = 0, freed = [], billedMs = 0, workMs = 0;
+    // Deepest concurrency on any lane, so all lanes share one height. Varying
+    // it per lane would read as a difference that means something. 5px per
+    // sub-row, floored at the original 15px so a single-row chart is unchanged.
+    const laneRows = Math.max(1, ...lanes.map(l => l.nrows || 1));
+    const LANE_H = Math.min(30, Math.max(15, laneRows * 5));
     const rows = lanes.map(L => {
         const host = (typeof instanceColor === 'function') ? instanceColor(L.id) : '#4a90d9';
         // Weight by vCPU on cloud (you rent vCPU-hours) and by 1 on the farm
@@ -5039,7 +5176,23 @@ function _fleetLanesHtml(opts) {
             if (d > 1500) segs.push({ a: L.launch, b: L.merged[0][0], s: 'boot' });
         }
         L.merged.forEach(([a, b], k) => {
-            segs.push({ a, b, s: 'busy' });
+            // Busy is drawn only where the per-chunk blocks do NOT already cover
+            // it. What is left is the stretch to Batch's own
+            // first_job_at/last_job_at — real work on the box with no stage open
+            // (pkgall's stages totalled 73s against a 177s job). That must keep
+            // being drawn or the tail reads longer than it was; but drawing it
+            // UNDER the blocks made every chunk look like a box inside a box.
+            let cuts = [[a, b]];
+            (L.rawMerged || []).forEach(([ca, cb]) => {
+                const next = [];
+                cuts.forEach(([x, y]) => {
+                    if (cb <= x || ca >= y) { next.push([x, y]); return; }
+                    if (ca > x) next.push([x, ca]);
+                    if (cb < y) next.push([cb, y]);
+                });
+                cuts = next;
+            });
+            cuts.forEach(([x, y]) => segs.push({ a: x, b: y, s: 'busy' }));
             const next = L.merged[k + 1];
             if (next && next[0] > b) {
                 const d = next[0] - b;
@@ -5069,7 +5222,22 @@ function _fleetLanesHtml(opts) {
         // from the one that carried it, which is the comparison this chart is
         // for. Cloud keeps per-instance bounds, because there a box really does
         // stop existing.
-        const tailTo = local ? runEnd : (L.gone || (jobLive ? now : null));
+        // A box still UP is still billing, whether or not the job is over. That
+        // window — last chunk done, machine not yet released — is the scale-down
+        // tail, and on a short run it is the single largest block of waste: the
+        // last smoke billed 0.78 of 0.83 vCPU-h with no job on the box.
+        //
+        // It was invisible. With the job terminal and no termination timestamp
+        // yet, this went null, and the whole tail block below is skipped: no
+        // band drawn, nothing added to tailMs, and billMs falling back to the
+        // last job's end. The chart stopped counting exactly where the waste
+        // starts, and the axis kept extending, so the costliest part of the run
+        // rendered as unbilled background.
+        //
+        // L.alive is what makes this provable rather than assumed — see the lane
+        // build. A box we have genuinely lost track of still yields null and
+        // still reads "freed time unknown", which is the honest answer there.
+        const tailTo = local ? runEnd : (L.gone || ((jobLive || L.alive) ? now : null));
         if (tailTo && tailTo > lastEnd) {
             const d = tailTo - lastEnd;
             tailMs += d * v;
@@ -5095,9 +5263,44 @@ function _fleetLanesHtml(opts) {
             if (w <= 0) return '';
             const bg = g.s === 'busy' ? host : g.s === 'boot' ? BOOT : IDLE;
             const what = g.s === 'busy' ? 'encoding' : g.s === 'boot' ? 'booting / pulling image' : 'RENTED, NO JOB';
+            const fade = g.s === 'busy' ? 'opacity:.34;' : '';
             return `<div style="position:absolute;left:${pos(g.a)}%;width:${w}%;top:0;bottom:0;`
-                + `background:${bg};${g.s === 'boot' ? stripes : ''}" `
+                + `background:${bg};${fade}${g.s === 'boot' ? stripes : ''}" `
                 + `title="${escapeHtml(`${what} · ${fmt(g.b - g.a)} · ${(((g.b - g.a) * v) / 3600000).toFixed(3)} vCPU-h`)}"></div>`;
+        }).join('');
+
+        // One block per unit of work, so the number of chunks a machine got
+        // through is readable off the lane instead of inferred from its length.
+        //
+        // Chunks OVERLAP on a box — that is the whole point of an 8-vCPU
+        // instance — so they cannot all sit on one line without hiding each
+        // other. Greedy first-fit packing into sub-rows, which is also why the
+        // lane now shows concurrency for free: a box running four at once draws
+        // four rows deep.
+        // Divided by the GLOBAL max, not this lane's own row count, so a block is
+        // the same height on every lane and one block means one chunk wherever
+        // it appears. Dividing per-lane made the machine running FEWER chunks at
+        // once draw FATTER blocks — the less-busy box rendering heavier, which is
+        // backwards for a chart whose job is showing where the work went.
+        //
+        // The alternative — uniform block height via ragged lane heights — was
+        // rejected: it would give the red idle band different visual weight per
+        // machine for a reason unrelated to cost, and idle is deliberately the
+        // loudest thing here because it is the only part you can act on.
+        //
+        // A lane with less concurrency leaves its lower rows empty, which reads
+        // correctly as exactly that.
+        const blocks = (L.packed || []).map(k => {
+            const w = (k.b - k.a) / span * 100;
+            if (w <= 0) return '';
+            const h = 100 / laneRows;
+            // A 1px inset on every side is what makes adjacent blocks
+            // countable; min-width keeps a very short chunk from vanishing
+            // entirely, which would undercount the thing this exists to show.
+            return `<div style="position:absolute;left:${pos(k.a)}%;width:${w}%;min-width:2px;`
+                + `top:${k.row * h}%;height:${h}%;background:${host};`
+                + `box-shadow:inset 0 0 0 1px rgba(9,12,16,.85);border-radius:1px" `
+                + `title="${escapeHtml(`${k.key || 'job'} · ${fmt(k.b - k.a)}`)}"></div>`;
         }).join('');
         // Where the meter stops. Without this the eye cannot tell a box that was
         // released from one that is still running off the right-hand edge.
@@ -5109,6 +5312,18 @@ function _fleetLanesHtml(opts) {
         // idle while another was the tail.
         const localTail = `<span style="color:${busyMs / Math.max(1, billMs) < 0.6 ? IDLE : '#8a94a2'}">`
             + `${fmt(busyMs)} working · <b>${Math.round(busyMs / Math.max(1, billMs) * 100)}%</b> of its window</span>`;
+        // Counted, not just drawn. On a 336-chunk run across 16 boxes each block
+        // is about a pixel wide, so the eye cannot count them — the visual shows
+        // the SHAPE (how work clustered, how deep the concurrency went) and the
+        // number answers "how many". Chunks specifically: a lane's work can also
+        // include audio, which is a Batch job on an instance but is not a chunk.
+        const nChunks = (L.work || []).filter(([, , k]) => (k || '').includes(':chunk')).length;
+        const nOther = (L.work || []).length - nChunks;
+        const countTxt = (L.work || []).length
+            ? `<span style="color:#7f8899" title="${escapeHtml(nChunks + ' chunk(s)'
+                + (nOther ? ' + ' + nOther + ' other job(s)' : '') + ' on this machine')}">`
+              + `${nChunks || L.work.length}&times;</span> `
+            : '';
         const tail = local ? localTail : never
             ? `<span style="color:${IDLE}"><b>${fmt(billMs)} billed, never ran a job</b></span>`
             : L.gone
@@ -5119,8 +5334,8 @@ function _fleetLanesHtml(opts) {
         return `<div style="display:flex;align-items:center;gap:8px">
             <div style="width:184px;flex:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:#9aa3b0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(L.id + ' ' + L.type)}">${escapeHtml(L.id)}</div>
             <div style="width:62px;flex:none;font-size:10.5px;color:#6f7887;font-variant-numeric:tabular-nums">${local ? '' : (v || '?') + ' vCPU'}</div>
-            <div style="position:relative;flex:1;height:15px;background:${TRACK};border-radius:3px;overflow:visible">${bars}${cap}</div>
-            <div style="width:196px;flex:none;font-size:10.5px;text-align:right;font-variant-numeric:tabular-nums">${tail}</div>
+            <div style="position:relative;flex:1;height:${LANE_H}px;background:${TRACK};border-radius:3px;overflow:visible">${bars}${blocks}${cap}</div>
+            <div style="width:196px;flex:none;font-size:10.5px;text-align:right;font-variant-numeric:tabular-nums">${countTxt}${tail}</div>
         </div>`;
     }).join('');
 

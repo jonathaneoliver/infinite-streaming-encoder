@@ -2887,61 +2887,111 @@ def _emit_machine_rental(exec_name: str, jobs: list) -> tuple | None:
     if not by_inst:
         return None
     try:
-        from infinite_streaming_encoder.cloud.inventory import _vcpus_for_type
+        from infinite_streaming_encoder.cloud.inventory import (
+            _describe_app_instances, _vcpus_for_type,
+        )
         ec2 = _ec2()
-        desc = ec2.describe_instances(InstanceIds=list(by_inst))
+        # App-tagged instances, NOT just the ones that ran a job.
+        #
+        # by_inst comes from Batch jobs, so a box that booted and never got work
+        # cannot appear in it — and that box is the purest waste this function
+        # exists to measure: rented, billed, never used. It was invisible three
+        # times over: no row in the table, no lane in the UI timeline (which
+        # reads these rows), and — worst — excluded from machine_vcpu_s, so the
+        # headline "vCPU-h billed" under-reported the very cost being reported.
+        # Usually it means capacity that arrived after the queue had drained.
+        #
+        # _describe_app_instances includes terminated instances, which is what
+        # makes a box that already scaled down still countable.
+        all_inst = _describe_app_instances(ec2)
     except Exception:  # noqa: BLE001 — reporting is best-effort
         return None
     import datetime
     now = time.time()
+
+    def _life(i):
+        """(launch, end, alive) in epoch seconds, or None if unusable."""
+        lt = i.get("LaunchTime")
+        lt = lt.timestamp() if hasattr(lt, "timestamp") else None
+        if lt is None:
+            return None
+        end, alive = None, i.get("State", {}).get("Name") not in ("terminated", "shutting-down")
+        tr = i.get("StateTransitionReason", "")
+        if "(" in tr and ")" in tr:
+            try:
+                end = datetime.datetime.strptime(
+                    tr[tr.index("(") + 1:tr.index(")")],
+                    "%Y-%m-%d %H:%M:%S %Z").replace(
+                    tzinfo=datetime.timezone.utc).timestamp()
+            except ValueError:
+                end = None
+        if end is None:
+            end, alive = now, True
+        return lt, end, alive
+
+    # The window this run's scale-out lives in, taken from the boxes we KNOW are
+    # ours (they ran our jobs). An unused box is attributed to this run only if
+    # it came up inside that window.
+    #
+    # Launch, not job time: a box boots BEFORE the first job lands on it, so
+    # bracketing on first-job would exclude exactly the machines being looked
+    # for. The 120s grace covers a straggler in the same scale-out.
+    #
+    # This is attribution, not proof — an app-tagged box is not stamped with an
+    # execution id, so a CONCURRENT run's idle machine can land here. That is the
+    # same limitation the (*) note below already documents for shared instances,
+    # and the honest trade: counting a box that might be someone else's beats
+    # silently dropping one that is definitely ours.
+    known_launch = [l[0] for l in (_life(i) for i in all_inst
+                                   if i.get("InstanceId") in by_inst) if l]
+    win_from = (min(known_launch) - 120.0) if known_launch else None
+    win_to = max(a["last"] for a in by_inst.values()) / 1000.0 + 120.0
+
     rows = []
-    for r in desc.get("Reservations", []):
-        for i in r.get("Instances", []):
-            iid = i["InstanceId"]
-            a = by_inst.get(iid)
-            if not a:
+    for i in all_inst:
+        iid = i.get("InstanceId")
+        if not iid:
+            continue
+        a = by_inst.get(iid)
+        if not a:
+            lf = _life(i)
+            if lf is None or win_from is None:
                 continue
-            launch = i.get("LaunchTime")
-            launch = launch.timestamp() if hasattr(launch, "timestamp") else None
-            if launch is None:
+            if not (win_from <= lf[0] <= win_to and lf[1] >= win_from):
                 continue
-            # A terminated instance carries its end time inside the human-readable
-            # reason string; there is no structured field for it.
-            end, alive = None, i.get("State", {}).get("Name") not in ("terminated", "shutting-down")
-            tr = i.get("StateTransitionReason", "")
-            if "(" in tr and ")" in tr:
-                try:
-                    end = datetime.datetime.strptime(
-                        tr[tr.index("(") + 1:tr.index(")")],
-                        "%Y-%m-%d %H:%M:%S %Z").replace(
-                        tzinfo=datetime.timezone.utc).timestamp()
-                except ValueError:
-                    end = None
-            if end is None:
-                end, alive = now, True
-            rows.append({
-                "id": iid, "type": i.get("InstanceType", "?"),
-                "vcpu": _vcpus_for_type(i.get("InstanceType")),
-                # Absolute launch/end, not just the derived durations: the UI's
-                # machine timeline needs to place each box on a shared axis, and
-                # a lifetime alone cannot say WHEN a box appeared relative to the
-                # others. Without these the chart can only infer "first appeared"
-                # from when a chunk landed, which hides the boot entirely.
-                "launch": launch, "end": end,
-                # When Batch work actually began and ended on this box. NOT the
-                # same as the first/last STAGE: a job keeps running after its
-                # stage closes — pkgall's stages total 73s against a 177s job,
-                # the rest being the parallel fetch and the packaged-output
-                # upload. A timeline drawn from stages alone paints that ~104s
-                # as idle, which is how a 3m40s tail came to read as over five
-                # minutes. These are Batch's own startedAt/stoppedAt.
-                "first_job": a["first"] / 1000.0, "last_job": a["last"] / 1000.0,
-                "life": end - launch,
-                "before": max(0.0, a["first"] / 1000.0 - launch),
-                "after": max(0.0, end - a["last"] / 1000.0),
-                "busy": max(0.0, (a["last"] - a["first"]) / 1000.0),
-                "vcpu_s": a["vcpu_s"], "n": a["n"], "alive": alive,
-            })
+            # Rented, never used. first/last are set to the launch so every
+            # downstream consumer sees a zero-length busy window rather than
+            # a missing one, and the whole life lands in "idle pre" — which
+            # is what it was: waiting for work that never came.
+            a = {"first": lf[0] * 1000.0, "last": lf[0] * 1000.0,
+                 "vcpu_s": 0.0, "n": 0}
+        lf = _life(i)
+        if lf is None:
+            continue
+        launch, end, alive = lf
+        rows.append({
+            "id": iid, "type": i.get("InstanceType", "?"),
+            "vcpu": _vcpus_for_type(i.get("InstanceType")),
+            # Absolute launch/end, not just the derived durations: the UI's
+            # machine timeline needs to place each box on a shared axis, and
+            # a lifetime alone cannot say WHEN a box appeared relative to the
+            # others. Without these the chart can only infer "first appeared"
+            # from when a chunk landed, which hides the boot entirely.
+            "launch": launch, "end": end,
+            # When Batch work actually began and ended on this box. NOT the
+            # same as the first/last STAGE: a job keeps running after its
+            # stage closes — pkgall's stages total 73s against a 177s job,
+            # the rest being the parallel fetch and the packaged-output
+            # upload. A timeline drawn from stages alone paints that ~104s
+            # as idle, which is how a 3m40s tail came to read as over five
+            # minutes. These are Batch's own startedAt/stoppedAt.
+            "first_job": a["first"] / 1000.0, "last_job": a["last"] / 1000.0,
+            "life": end - launch,
+            "before": max(0.0, a["first"] / 1000.0 - launch),
+            "after": max(0.0, end - a["last"] / 1000.0),
+            "busy": max(0.0, (a["last"] - a["first"]) / 1000.0),
+            "vcpu_s": a["vcpu_s"], "n": a["n"], "alive": alive,
+        })
     if not rows:
         return None
     rows.sort(key=lambda r: -r["life"])
