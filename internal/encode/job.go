@@ -431,42 +431,6 @@ func (j *Job) upsertStage(key, label, status string, percent float64) {
 	j.Stages = append(j.Stages, st)
 }
 
-// awsCpProgressRe matches an `aws s3 cp` progress line, e.g.
-// "Completed 256.0 MiB/1.2 GiB (50.0 MiB/s) with 1 file(s) remaining".
-var awsCpProgressRe = regexp.MustCompile(`Completed ([\d.]+) (\w+)/([\d.]+) (\w+)`)
-
-// parseAwsCpProgress extracts an overall percent from an aws-cli progress line.
-func parseAwsCpProgress(line string) (float64, bool) {
-	m := awsCpProgressRe.FindStringSubmatch(line)
-	if m == nil {
-		return 0, false
-	}
-	done := sizeToBytes(m[1], m[2])
-	total := sizeToBytes(m[3], m[4])
-	if total <= 0 {
-		return 0, false
-	}
-	return math.Min(100, done/total*100), true
-}
-
-func sizeToBytes(num, unit string) float64 {
-	f, err := strconv.ParseFloat(num, 64)
-	if err != nil {
-		return 0
-	}
-	switch unit {
-	case "KiB":
-		f *= 1 << 10
-	case "MiB":
-		f *= 1 << 20
-	case "GiB":
-		f *= 1 << 30
-	case "TiB":
-		f *= 1 << 40
-	}
-	return f
-}
-
 // parseMarker returns true when the line was a recognised progress marker
 // (and was applied to the job), so the caller can skip appending it to
 // the raw log buffer.
@@ -2092,6 +2056,111 @@ func (j *Job) isLaunchComplete() bool {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.launchComplete
+}
+
+// mezzanineEnv builds the environment for a host-side mezzanine run.
+//
+// Extracted so the handoff is testable. Skipping the Mezzanine state takes its
+// ContainerOverrides with it, so TIME_LIMIT_S has to be supplied HERE or the
+// cloud half of the duration limit is silently dead — and silently is the
+// operative word: the chunk plan is clamped to the limit independently, so the
+// output still comes out the right length. What breaks is the invariant that a
+// limited cache key holds limited media, and no smoke run can see that.
+//
+// ENCODER_WORK_DIR gets a dedicated scratch dir because cli_phase rmtree's it on
+// entry, so it must not be shared. Under TmpDir rather than the container's /tmp
+// because the mezzanine is source-sized.
+func mezzanineEnv(base []string, work string, timeLimitS float64) []string {
+	env := append(append([]string{}, base...), "ENCODER_WORK_DIR="+work)
+	if timeLimitS > 0 {
+		env = append(env, "TIME_LIMIT_S="+strconv.FormatFloat(timeLimitS, 'f', -1, 64))
+	}
+	return env
+}
+
+// buildMezzanineOnHost runs the mezzanine phase locally and uploads the result
+// to s3Mezz, so the cloud pipeline can skip both the source upload and the
+// mezzanine Batch job (#266).
+//
+// It shells out to the SAME `cli_phase mezzanine` the Batch job runs, given a
+// local path instead of an s3:// URI. Reimplementing the stream copy here would
+// be a second thing to keep in step with the chunk plan, whose drift guard
+// refuses when the mezzanine's duration disagrees with the plan built from it —
+// exactly the class of divergence this repo keeps paying for.
+//
+// timeLimitS > 0 applies a #184 duration limit, passed the same way the state
+// machine passes it (TIME_LIMIT_S). It is already folded into the cache key by
+// sourceMezzKey, so a limited mezzanine can never be served to a full run.
+func (m *Manager) buildMezzanineOnHost(job *Job, localSrc, s3Mezz, tmpDir string, timeLimitS float64) error {
+	job.AppendLog(fmt.Sprintf("[cloud-batch] building mezzanine on the host → %s (no source upload)", s3Mezz))
+	job.upsertStage("mezzanine", "mezzanine", "running", 0)
+	m.notify(job)
+
+	cmd := exec.Command("python3", "-m", "infinite_streaming_encoder.cli_phase",
+		"mezzanine", "--s3-in", localSrc, "--s3-out", s3Mezz)
+	work := filepath.Join(tmpDir, "mezz-work")
+	cmd.Env = mezzanineEnv(os.Environ(), work, timeLimitS)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("mezzanine stdout pipe: %w", err)
+	}
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Start(); err != nil {
+		job.upsertStage("mezzanine", "mezzanine", "failed", 0)
+		m.notify(job)
+		return fmt.Errorf("mezzanine start: %w", err)
+	}
+
+	// Cancel watcher, same as the upload this replaces: a bare subprocess with
+	// no worker container, so Manager.Cancel can only set the flag.
+	stop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				if job.IsCancelled() && cmd.Process != nil {
+					cmd.Process.Kill()
+					return
+				}
+			}
+		}
+	}()
+
+	// cli_phase emits its own ENCODER-STAGE markers, so the live mezzanine bar
+	// comes through the normal marker path rather than a bespoke parser.
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := stripANSI(sc.Text())
+		if job.parseMarker(line) {
+			m.notify(job)
+			continue
+		}
+		job.AppendLog(line)
+	}
+	close(stop)
+
+	if err := cmd.Wait(); err != nil {
+		if job.IsCancelled() {
+			job.upsertStage("mezzanine", "mezzanine", "cancelled", 0)
+			m.notify(job)
+			return err
+		}
+		job.upsertStage("mezzanine", "mezzanine", "failed", 0)
+		m.notify(job)
+		return fmt.Errorf("mezzanine: %w: %s", err, strings.TrimSpace(stderrBuf.String()))
+	}
+	// Belt and braces: the phase reports done itself, but a stage left running
+	// because a marker was missed would show as a stuck bar for the whole run.
+	job.upsertStage("mezzanine", "mezzanine", "done", 100)
+	m.notify(job)
+	os.RemoveAll(work)
+	return nil
 }
 
 func (m *Manager) jobPriorityBase(job *Job) int {
@@ -3770,88 +3839,43 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 			m.notify(job)
 		}
 		if !cacheHit {
-			// Upload the clip. Stream the aws-cli progress into an `upload:inputs`
-			// stage so the UI shows a live bar for the local->S3 copy — the mirror
-			// of the download:outputs bar on the sync-back.
-			job.AppendLog(fmt.Sprintf("[cloud-batch] uploading %s → %s", filename, s3Input))
-			job.upsertStage("upload:inputs", "upload inputs", "running", 0)
-			m.notify(job)
-			upload := exec.Command("aws", "s3", "cp", localSrc, s3Input) // no --only-show-errors: we want the progress lines
-			upload.Env = os.Environ()
-			// aws s3 cp writes its "Completed X/Y" progress to STDOUT (errors go
-			// to stderr). Scan stdout for the progress bar; buffer stderr for the
-			// failure message.
-			stdoutPipe, pipeErr := upload.StdoutPipe()
-			if pipeErr != nil {
-				return fmt.Errorf("aws s3 cp stdout pipe: %w", pipeErr)
-			}
-			var stderrBuf bytes.Buffer
-			upload.Stderr = &stderrBuf
-			if err := upload.Start(); err != nil {
-				job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
-				m.notify(job)
-				return fmt.Errorf("aws s3 cp start: %w", err)
-			}
-			// Cancel watcher: this upload is a bare subprocess with no worker
-			// container for Manager.Cancel to stop, so it watches the cancel flag
-			// and kills the copy. A multi-GB UHD source can upload for minutes;
-			// without this, Cancel is silently ignored until the copy finishes.
-			upStop := make(chan struct{})
-			go func() {
-				t := time.NewTicker(time.Second)
-				defer t.Stop()
-				for {
-					select {
-					case <-upStop:
-						return
-					case <-t.C:
-						if job.IsCancelled() && upload.Process != nil {
-							upload.Process.Kill()
-							return
-						}
-					}
-				}
-			}()
-			// aws s3 cp updates its progress in place with '\r'; split on both \r and \n
-			// so intermediate updates are seen, not just the final \n-terminated line.
-			upScanner := bufio.NewScanner(stdoutPipe)
-			upScanner.Buffer(make([]byte, 64*1024), 1<<20)
-			upScanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
-				if atEOF && len(data) == 0 {
-					return 0, nil, nil
-				}
-				if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
-					return i + 1, data[:i], nil
-				}
-				if atEOF {
-					return len(data), data, nil
-				}
-				return 0, nil, nil
-			})
-			for upScanner.Scan() {
-				line := strings.TrimSpace(upScanner.Text())
-				if pct, ok := parseAwsCpProgress(line); ok {
-					job.upsertStage("upload:inputs", "upload inputs", "running", pct)
-					m.notify(job)
-				}
-			}
-			close(upStop) // scan drained → stop the watcher before Wait
-			if err := upload.Wait(); err != nil {
-				// A cancel that killed the copy isn't a real failure — return
-				// clean so run() finalizes the job as cancelled (its deferred
-				// markLaunched still unblocks the queue).
+			// Build the mezzanine HERE, on the host, straight into the cache
+			// prefix — and do NOT upload the source at all (#266).
+			//
+			// The source is already on this machine's disk; it is the file the
+			// encode was submitted against. The old path uploaded it so that a
+			// Batch job could download it back, stream-copy it, and upload the
+			// result — a full round trip over the home link, plus a job's queue
+			// wait and container start, to run `ffmpeg -c copy`. Doing the copy
+			// locally costs no network at all and uploads a comparable number of
+			// bytes (the mezzanine keeps every stream, so it tracks the source).
+			//
+			// This works with NO state-machine change because it lands in the same
+			// place a cache hit would: writing mezz/<key>/mezzanine.mp4 + .done and
+			// setting cacheHit makes buildSFNInput emit mezz_cached, and MezzCheck
+			// already routes straight to FanOut on that. The mezzanine job is
+			// skipped rather than reimplemented, and the artifact is cached for
+			// every later run of the same source exactly as before.
+			//
+			// s3_input is referenced by precisely one state (Mezzanine), so with
+			// that state skipped the source is never needed in S3.
+			//
+			// Resilience is unchanged from the upload it replaces: both are bare
+			// subprocesses of the server with a cancel watcher, neither survives a
+			// server restart. This is not a new exposure, it is the same one.
+			if err := m.buildMezzanineOnHost(job, localSrc, s3Mezz, tmpDir, timeLimitS); err != nil {
 				if job.IsCancelled() {
-					job.upsertStage("upload:inputs", "upload inputs", "cancelled", 0)
-					m.notify(job)
+					// A cancel that killed the build isn't a failure — return clean
+					// so run() finalizes as cancelled (deferred markLaunched still
+					// unblocks the queue).
 					return nil
 				}
-				job.upsertStage("upload:inputs", "upload inputs", "failed", 0)
-				m.notify(job)
-				return fmt.Errorf("aws s3 cp: %w: %s", err, strings.TrimSpace(stderrBuf.String()))
+				return err
 			}
-			job.upsertStage("upload:inputs", "upload inputs", "done", 100)
-			m.notify(job)
-		} // end if !cacheHit (upload)
+			// The mezzanine is now where a cache hit would have found it, so every
+			// downstream decision treats this as one.
+			cacheHit = true
+		} // end if !cacheHit (host mezzanine)
 
 		// Build the state-machine input document.
 		// Probe the source duration so each variant can size its own chunks
