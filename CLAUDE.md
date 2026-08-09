@@ -315,6 +315,62 @@ of `cli_batch`'s drop decisions, which each used to carry their own literal list
 marker and every consumer forwards it already. Getting it wrong that way costs
 bandwidth; getting it wrong the other way is #141.
 
+### Which phases run on the HOST (cloud path)
+
+Two of the cloud pipeline's phases no longer run in Batch. Both moved for the
+same reason — the Batch job spent most of its life moving bytes to and from a
+machine that did not need to be involved — and both work the same way: shell out
+to the SAME `cli_phase` subcommand the job ran, with one flag pointing at a local
+path instead of S3. Neither reimplements anything.
+
+| phase | flag that goes local | what it removes |
+| --- | --- | --- |
+| mezzanine (#266) | `--s3-in` | the source upload, and the Mezzanine job |
+| package-all (#197) | `--s3-out` | the pkgall job, its queue wait, and `download:outputs` |
+
+**Neither needed a state machine change**, and that is not luck — it is the rule
+to follow if a third phase moves. Each reuses a Choice the ASL already had:
+`mezz_cached` routes past Mezzanine, and `do_h264` / `do_hevc` / `do_av1` gate
+nothing but the per-codec packaging branch, so setting them false skips
+`PerCodec` entirely. `buildSFNInput` computes them as `doX && !packageOnHost`
+and emits the complementary `host_package` list for the orchestrator. Nothing in
+`infra/` changes; rebuild the server and it takes effect.
+
+The consequence is that **`do_h264` means "the STATE MACHINE packages h264"**,
+not "h264 was encoded". `cmd_poll` needs the union of the two sets to build the
+run plan, or a host-packaged run reports itself as encoding no codecs.
+
+Host packaging is **forced off when the run is leaving its media in S3**
+(`skipMediaDownload`). The two features want opposite things: one exists so
+segments never come home, the other cannot package without pulling every chunk.
+Honouring both would fetch the whole ladder and then upload the packaged result
+back — strictly more transfer than either alone.
+
+Two things that fail silently and so are pinned by tests:
+
+- **Egress accounting.** With packaging here, the bytes billed as egress are the
+  CHUNKS this pulls, not the packaged output the sync-back no longer fetches.
+  `cli_batch` recovers that number by scanning `cli_phase`'s own printed fetch
+  measurement as it relays it — a regex against a print. Reword either and the
+  run reports zero egress, making host packaging look like a saving rather than
+  the trade it is (see CLAUDE.md's rule on the estimate and cost staying on one
+  basis). `scripts/test_host_package.py` pins the two together.
+- **The run plan.** `download:outputs` is declared up front, so on an all-host
+  run it would sit pending forever. `_emit_plan` takes `sync_back` and omits it
+  when the state machine packaged nothing.
+
+Each codec gets its own `ENCODER_WORK_DIR` — `cli_phase` rmtree's it on entry, so
+a shared scratch would delete a sibling codec's inputs, and only ever on a
+multi-codec run. `ENCODER_TELEMETRY_EXEC` is explicitly unset: on the host stdout
+IS the channel to the server, and the orchestrator is the telemetry queue's
+consumer, so leaving it set would have it drain its own output back.
+
+**No Batch retry.** Named as a risk in #197 and real: a packaging failure fails
+the job rather than being resubmitted onto fresh spot capacity. The trade is
+deliberate — minutes of local CPU on a machine already up, versus an hour of
+spot-reclaimable encoding — and the error says the chunks are still in S3, since
+re-running with `PACKAGE_ON_HOST=0` packages them without re-encoding anything.
+
 ### Batch state, event-driven (cloud)
 
 Chunk state comes from **EventBridge → a per-execution SQS queue**, not from

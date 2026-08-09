@@ -184,6 +184,17 @@ services:
       DEFAULT_MIN_RES: ${DEFAULT_MIN_RES:-}
       MAX_CONCURRENT: ${MAX_CONCURRENT:-1}
       WARM_MIN_VCPUS: ${WARM_MIN_VCPUS:-}
+      # Cloud packaging location (#197). Unset = on the host, which removes the
+      # pkgall Batch job, its queue wait and the sync-back that re-fetches what
+      # it just uploaded. Set 0/false to package in Batch as before.
+      PACKAGE_ON_HOST: ${PACKAGE_ON_HOST:-}
+      # SkipMediaDownloadDefault was reading this and this file did not pass it,
+      # so the server default was unreachable under compose — the failure mode
+      # the note above describes, sitting in the block that describes it. It
+      # matters more now: PACKAGE_ON_HOST defers to it, so an inert
+      # SKIP_OUTPUT_MEDIA=1 would leave host packaging enabled and pull the whole
+      # ladder home, which is the exact opposite of what was asked for.
+      SKIP_OUTPUT_MEDIA: ${SKIP_OUTPUT_MEDIA:-}
       PROMOTE_DESTS: ${PROMOTE_DESTS:-}
       # Staging reclaim knobs (MinIO via internal/diststage, TMP_DIR via
       # internal/tmpstage). Passed through EMPTY rather than with a default

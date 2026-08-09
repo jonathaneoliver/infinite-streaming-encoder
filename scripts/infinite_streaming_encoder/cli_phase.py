@@ -1417,7 +1417,7 @@ def phase_package_all(args: argparse.Namespace) -> int:
     _pkg_timer.mark("hls")
     emit_stage(f"hls:{args.codec}", "done", 100.0)
 
-    _upload_dir(pkg_dir, args.s3_out.rstrip("/") + f"/{stem}")
+    _deliver_dir(pkg_dir, args.s3_out, stem)
     _pkg_timer.mark("upload")
     _ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     _cpu = ((_ru1.ru_utime - _pkg_ru0.ru_utime)
@@ -1431,6 +1431,42 @@ def phase_package_all(args: argparse.Namespace) -> int:
 # Bulk dir transfer helpers — used by phases that produce or consume
 # a whole directory tree (package, hls, byteranges).
 # ---------------------------------------------------------------------------
+
+def _deliver_dir(local: Path, dest: str, stem: str) -> Path | str:
+    """Put a finished phase directory where the caller asked for it.
+
+    `dest` is an s3:// URI when a Batch job runs the phase, and a LOCAL
+    directory when the HOST runs it (#197). That is the same asymmetry
+    `--s3-in` already carries for the mezzanine (#266), in the other direction:
+    the flags are named for the deployment that came first, not for the only
+    thing they accept.
+
+    Delivering locally is the whole point of host packaging, not a convenience.
+    Uploading the packaged ladder so the orchestrator can immediately download
+    it again is the second of the two serial transfers #197 exists to remove —
+    on a measured run, 26s of `download:outputs` plus the ~1m55s of state
+    machine and poll latency around it.
+
+    A move, not a copy: the packaged dir is the ladder, and copying it would
+    reintroduce a full-size pass over the slowest disk in the system. shutil.move
+    degrades to copy+unlink across devices, which is exactly what TMP_DIR ->
+    OUTPUT_DIR needs on this setup (moveTmpToOutput has the same fallback).
+    """
+    if dest.startswith("s3://"):
+        target = dest.rstrip("/") + f"/{stem}"
+        _upload_dir(local, target)
+        return target
+    out = Path(dest) / stem
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # Replace rather than merge. A retry that landed a partial tree would
+    # otherwise leave stale segments beside the new ones, and both sets are
+    # named by the packager, so nothing downstream could tell them apart.
+    if out.exists():
+        shutil.rmtree(out)
+    shutil.move(str(local), str(out))
+    print(f"[phase package-all] delivered {stem} -> {out} (no upload)", flush=True)
+    return out
+
 
 def _upload_dir(local: Path, s3_prefix: str) -> None:
     bucket, base_key = _parse(s3_prefix)

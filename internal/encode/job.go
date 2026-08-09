@@ -3903,7 +3903,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// Source fps: keys the speed model (encode time ∝ frame count), so chunk
 		// sizes/priorities match the graviton keys learned at the same rate.
 		srcFps := probeSourceFps(localSrc)
-		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), srcWidth, srcFps, durationS, timeLimitS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), m.vmafEstimates(job.Config), job.AppendLog)
+		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), m.packageOnHost(job.Config), srcWidth, srcFps, durationS, timeLimitS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), m.vmafEstimates(job.Config), job.AppendLog)
 		expectedEncodes = expEnc
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
@@ -4196,7 +4196,7 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin bool, sourceWidth, sourceFps int, clipDurationS, timeLimitS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int) {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin, packageOnHost bool, sourceWidth, sourceFps int, clipDurationS, timeLimitS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int) {
 	if ladderName == "" {
 		ladderName = DefaultLadderName
 	}
@@ -4369,6 +4369,19 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	// SFN Map reads them off the item, not a shared top-level value. A variant
 	// that resolves to a single chunk flows through the whole-variant path
 	// (chunk_index=-1, no concat) via its own "chunked":"false".
+	// Always a list, never null: cmd_poll reads it with `or []`, and an explicit
+	// empty list is also the honest encoding of "Batch packages everything".
+	hostPackage := []string{}
+	if packageOnHost {
+		for _, c := range []struct {
+			name string
+			on   bool
+		}{{"h264", doH264}, {"hevc", doHevc}, {"av1", doAV1}} {
+			if c.on {
+				hostPackage = append(hostPackage, c.name)
+			}
+		}
+	}
 	doc := map[string]any{
 		"s3_input":  s3Input,
 		"s3_prefix": s3Prefix,
@@ -4382,9 +4395,21 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		// it straight from the cache.
 		"mezz_cached": mezzCached,
 		"variants":    variants,
-		"do_h264":     doH264,
-		"do_hevc":     doHevc,
-		"do_av1":      doAV1,
+		// do_h264 / do_hevc / do_av1 mean "the STATE MACHINE packages this
+		// codec" — the only thing the ASL reads them for is the per-codec
+		// packaging Choice. So turning them off is the whole of the #197 switch:
+		// the PerCodec branch falls through to its Succeed and no pkgall job is
+		// ever submitted, with no change to infra/ and no deploy. Same trick
+		// #266 used to skip Mezzanine through the existing MezzCheck.
+		"do_h264": doH264 && !packageOnHost,
+		"do_hevc": doHevc && !packageOnHost,
+		"do_av1":  doAV1 && !packageOnHost,
+		// ...and the codecs the ORCHESTRATOR packages instead. Disjoint from the
+		// three above by construction. Carried separately rather than inferred
+		// from them because the two sets answer different questions, and the run
+		// plan needs their union: a viewer must still be told h264 is being
+		// encoded when nothing in Batch will package it.
+		"host_package": hostPackage,
 		// Ladder-level VBV shaping, applied to every variant's encode (the
 		// worker reads these as MAXRATE_PERCENT / BUFSIZE_MULT env). Threaded
 		// so a custom ladder's VBV is honored in the cloud, not just locally.
