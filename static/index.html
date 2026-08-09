@@ -5170,11 +5170,23 @@ function _fleetLanesHtml(opts) {
         // other. Greedy first-fit packing into sub-rows, which is also why the
         // lane now shows concurrency for free: a box running four at once draws
         // four rows deep.
-        const nrows = L.nrows;
+        // Divided by the GLOBAL max, not this lane's own row count, so a block is
+        // the same height on every lane and one block means one chunk wherever
+        // it appears. Dividing per-lane made the machine running FEWER chunks at
+        // once draw FATTER blocks — the less-busy box rendering heavier, which is
+        // backwards for a chart whose job is showing where the work went.
+        //
+        // The alternative — uniform block height via ragged lane heights — was
+        // rejected: it would give the red idle band different visual weight per
+        // machine for a reason unrelated to cost, and idle is deliberately the
+        // loudest thing here because it is the only part you can act on.
+        //
+        // A lane with less concurrency leaves its lower rows empty, which reads
+        // correctly as exactly that.
         const blocks = L.packed.map(k => {
             const w = (k.b - k.a) / span * 100;
             if (w <= 0) return '';
-            const h = 100 / nrows;
+            const h = 100 / laneRows;
             // A 1px inset on every side is what makes adjacent blocks
             // countable; min-width keeps a very short chunk from vanishing
             // entirely, which would undercount the thing this exists to show.
