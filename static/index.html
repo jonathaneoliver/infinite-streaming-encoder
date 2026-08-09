@@ -5045,7 +5045,13 @@ function _fleetLanesHtml(opts) {
     // `!L.gone` covers the box we never saw terminate as well as the one still
     // running: both are "we cannot say the meter stopped", and the lane already
     // says so in words ("freed time unknown").
-    const stillBilling = jobLive || lanes.some(L => !L.gone);
+    // L.alive, not !L.gone. A lane with no termination timestamp is either
+    // still up or lost track of, and only the first is a reason to keep drawing:
+    // the lost one already stops at its last job and says "freed time unknown",
+    // so extending the axis for it just adds empty width. Seen on a real run —
+    // every box terminated at 1m49s and the chart drew to 3m38s because one lane
+    // had no timestamp, squeezing the whole run into the left half.
+    const stillBilling = jobLive || lanes.some(L => L.alive);
     const t1 = local
         ? Math.max(runEnd, ...lanes.map(laneEnd), t0 + 1)
         : Math.max(stillBilling ? now : 0, ...lanes.map(laneEnd), t0 + 1);
