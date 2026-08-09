@@ -4926,6 +4926,10 @@ function _fleetLanesHtml(opts) {
         // termination to stop a meter, so its lane is simply the window in which
         // it had work. Rental and inventory data belong to EC2 — on the local
         // path they would be stale ids from an earlier cloud run.
+        // Snapshot the union BEFORE the Batch stretch below. The band is only
+        // worth drawing where it covers something the blocks do not; drawn
+        // underneath them it reads as a box inside a box.
+        const rawMerged = merged.map(([a, b]) => [a, b]);
         const r = local ? null : rental.get(id);
         const seen = local ? {} : (_fleetSeen.get(id) || {});
         // Stages close before their Batch job does. pkgall's stages total 73s
@@ -4950,7 +4954,7 @@ function _fleetLanesHtml(opts) {
             // answers "did this box have ANY work", which is the right input for
             // the billing arithmetic and the wrong one for "how many chunks did
             // it get through". Both questions, one pass.
-            work: iv,
+            work: iv, rawMerged,
             // Greedy first-fit packing into sub-rows. Chunks OVERLAP on a box —
             // that is the point of an 8-vCPU instance — so they cannot share one
             // line without hiding each other. Done HERE rather than at render
@@ -5080,7 +5084,23 @@ function _fleetLanesHtml(opts) {
             if (d > 1500) segs.push({ a: L.launch, b: L.merged[0][0], s: 'boot' });
         }
         L.merged.forEach(([a, b], k) => {
-            segs.push({ a, b, s: 'busy' });
+            // Busy is drawn only where the per-chunk blocks do NOT already cover
+            // it. What is left is the stretch to Batch's own
+            // first_job_at/last_job_at — real work on the box with no stage open
+            // (pkgall's stages totalled 73s against a 177s job). That must keep
+            // being drawn or the tail reads longer than it was; but drawing it
+            // UNDER the blocks made every chunk look like a box inside a box.
+            let cuts = [[a, b]];
+            (L.rawMerged || []).forEach(([ca, cb]) => {
+                const next = [];
+                cuts.forEach(([x, y]) => {
+                    if (cb <= x || ca >= y) { next.push([x, y]); return; }
+                    if (ca > x) next.push([x, ca]);
+                    if (cb < y) next.push([cb, y]);
+                });
+                cuts = next;
+            });
+            cuts.forEach(([x, y]) => segs.push({ a: x, b: y, s: 'busy' }));
             const next = L.merged[k + 1];
             if (next && next[0] > b) {
                 const d = next[0] - b;
@@ -5136,12 +5156,6 @@ function _fleetLanesHtml(opts) {
             if (w <= 0) return '';
             const bg = g.s === 'busy' ? host : g.s === 'boot' ? BOOT : IDLE;
             const what = g.s === 'busy' ? 'encoding' : g.s === 'boot' ? 'booting / pulling image' : 'RENTED, NO JOB';
-            // The busy band is drawn FAINT and the individual jobs go on top at
-            // full strength. It cannot simply be replaced by the blocks: it also
-            // covers the stretch to Batch's own first_job_at/last_job_at, which
-            // is real work on the box with no stage open (pkgall's stages total
-            // 73s against a 177s job). Dropping the band would redraw that as a
-            // hole and reintroduce the tail-looks-longer-than-it-is bug.
             const fade = g.s === 'busy' ? 'opacity:.34;' : '';
             return `<div style="position:absolute;left:${pos(g.a)}%;width:${w}%;top:0;bottom:0;`
                 + `background:${bg};${fade}${g.s === 'boot' ? stripes : ''}" `
