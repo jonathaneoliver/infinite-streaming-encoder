@@ -27,10 +27,18 @@ except ModuleNotFoundError as e:  # pragma: no cover — dependency absent
     raise
 
 
-def _stub_inventory(vcpu_by_type):
-    """Stand in for cloud.inventory, which needs botocore."""
+def _stub_inventory(vcpu_by_type, instances):
+    """Stand in for cloud.inventory, which needs botocore.
+
+    _describe_app_instances now stands in for the old
+    describe_instances(InstanceIds=...): the rental report enumerates every
+    APP-TAGGED instance rather than only the ones that ran a Batch job, because
+    a box that ran nothing has no job to be found by (#197 follow-up). The stub
+    returns them all and lets the function do its own scoping.
+    """
     mod = types.ModuleType("infinite_streaming_encoder.cloud.inventory")
     mod._vcpus_for_type = lambda t: vcpu_by_type.get(t, 0)
+    mod._describe_app_instances = lambda ec2: list(instances)
     sys.modules["infinite_streaming_encoder.cloud.inventory"] = mod
 
 
@@ -38,13 +46,9 @@ class FakeEC2:
     def __init__(self, instances):
         self._instances = instances
 
-    def describe_instances(self, InstanceIds):
-        return {"Reservations": [{"Instances": [
-            i for i in self._instances if i["InstanceId"] in InstanceIds]}]}
-
 
 def run_report(jobs, instances, vcpu_by_type, job_vcpu=2.0):
-    _stub_inventory(vcpu_by_type)
+    _stub_inventory(vcpu_by_type, instances)
     orig = (cli_batch._ec2, cli_batch._ec2_for_container_instance,
             cli_batch._job_vcpu)
     cli_batch._ec2 = lambda: FakeEC2(instances)
@@ -145,11 +149,11 @@ def test_the_idle_share_is_returned_for_the_efficiency_line():
     while half the rented time ran nothing (high idle). Returning the number is
     what lets the two sit together.
     """
-    _stub_inventory({"c7g.2xlarge": 8})
+    insts = [inst("i-ccc", "c7g.2xlarge", launch_s=900, term_s=1200)]
+    _stub_inventory({"c7g.2xlarge": 8}, insts)
     orig = (cli_batch._ec2, cli_batch._ec2_for_container_instance,
             cli_batch._job_vcpu)
-    cli_batch._ec2 = lambda: FakeEC2(
-        [inst("i-ccc", "c7g.2xlarge", launch_s=900, term_s=1200)])
+    cli_batch._ec2 = lambda: FakeEC2(insts)
     cli_batch._ec2_for_container_instance = lambda arn: arn.rsplit("/", 1)[-1]
     cli_batch._job_vcpu = lambda j: 2.0
     try:
@@ -168,9 +172,82 @@ def test_the_idle_share_is_returned_for_the_efficiency_line():
         f"rather than allocation is the whole point")
 
 
+def test_a_box_that_ran_nothing_is_still_counted():
+    """The purest waste was invisible three times over.
+
+    A machine that booted and never got work has no Batch job pointing at it, so
+    it could not appear in a set derived from jobs. That meant: no row in the
+    table, no lane in the UI timeline (which is drawn from these rows), and —
+    worst — no contribution to machine_vcpu_h, so the headline "vCPU-h billed"
+    omitted the machine that wasted the most. A waste report that cannot see the
+    purest waste.
+
+    It is usually capacity that arrived after the queue had already drained,
+    which is exactly the thing worth acting on.
+    """
+    used = inst("i-used", "c7g.2xlarge", launch_s=1000, term_s=1300)
+    idle_box = inst("i-idle", "c7g.2xlarge", launch_s=1010, term_s=1300)
+    insts = [used, idle_box]
+    _stub_inventory({"c7g.2xlarge": 8}, insts)
+    orig = (cli_batch._ec2, cli_batch._ec2_for_container_instance,
+            cli_batch._job_vcpu)
+    cli_batch._ec2 = lambda: FakeEC2(insts)
+    cli_batch._ec2_for_container_instance = lambda arn: arn.rsplit("/", 1)[-1]
+    cli_batch._job_vcpu = lambda j: 2.0
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            # Only i-used ran anything.
+            res = cli_batch._emit_machine_rental("e", [job("i-used", 1100, 1200)])
+    finally:
+        (cli_batch._ec2, cli_batch._ec2_for_container_instance,
+         cli_batch._job_vcpu) = orig
+    out = buf.getvalue()
+
+    assert "i-idle" in out, (
+        "the box that ran nothing is absent — it is billed and unreported")
+    # Both boxes: 300s + 290s at 8 vCPU = 4720 vCPU-s = 1.311 h. Counting only
+    # the used one gives 0.667 — a 49% under-report of what was actually paid.
+    idle_pct, machine_vh = res
+    assert 1.30 < machine_vh < 1.32, (
+        f"machine vCPU-hours {machine_vh}; expected ~1.311 covering BOTH boxes. "
+        f"~0.667 means the unused machine is still being dropped")
+    # ...and it must be reported with zero chunks, not invented work.
+    assert "chunks=0" in out, "the unused box was not marked as having run nothing"
+    assert "id=i-idle" in out, "no ENCODER-RENTAL row, so the UI still gets no lane"
+
+
+def test_an_unrelated_box_is_not_attributed_to_this_run():
+    """Attribution must not become invention.
+
+    App-tagged instances are not stamped with an execution id, so scoping is by
+    the scale-out window. A box from an earlier run that is still lingering must
+    not be billed to this one — that would be the opposite error, and a louder
+    one, since it inflates every efficiency figure downwards.
+    """
+    used = inst("i-used", "c7g.2xlarge", launch_s=10000, term_s=10300)
+    stale = inst("i-old", "c7g.2xlarge", launch_s=100, term_s=400)
+    insts = [used, stale]
+    _stub_inventory({"c7g.2xlarge": 8}, insts)
+    orig = (cli_batch._ec2, cli_batch._ec2_for_container_instance,
+            cli_batch._job_vcpu)
+    cli_batch._ec2 = lambda: FakeEC2(insts)
+    cli_batch._ec2_for_container_instance = lambda arn: arn.rsplit("/", 1)[-1]
+    cli_batch._job_vcpu = lambda j: 2.0
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            cli_batch._emit_machine_rental("e", [job("i-used", 10100, 10200)])
+    finally:
+        (cli_batch._ec2, cli_batch._ec2_for_container_instance,
+         cli_batch._job_vcpu) = orig
+    assert "i-old" not in buf.getvalue(), (
+        "a box that lived and died long before this run was billed to it")
+
+
 def test_no_instances_returns_none_not_zero():
     """None means "unknown"; 0.0 would claim a perfectly-utilised fleet."""
-    _stub_inventory({})
+    _stub_inventory({}, [])
     orig = cli_batch._ec2
     cli_batch._ec2 = lambda: FakeEC2([])
     try:
