@@ -3207,11 +3207,33 @@ def cmd_poll(args: argparse.Namespace) -> int:
                     # host packaging TRADES one for the other rather than
                     # avoiding it — counting only res would price the trade as a
                     # saving it is not.
+                    # staged_bytes must include pkg.bytes as well. It drives BOTH
+                    # s3_storage_usd and the fitted s3_put_estimate_usd, and with
+                    # packaging here _download_outputs finds nothing and returns
+                    # zeros — so a host-packaged run would price its storage and
+                    # its Tier1 PUTs at zero while the chunks sit in S3 costing
+                    # both. Host packaging removes the PACKAGED OUTPUT's staging
+                    # (~1486 objects PUT then GET back on a full run, roughly
+                    # doubled by the per-segment .byteranges sidecars), not the
+                    # chunks'. pkg.bytes measures exactly the chunk staging, the
+                    # same way res.bytes measured the packaged staging before.
+                    #
+                    # Known miscalibration, stated rather than silently carried:
+                    # s3_put_estimate_usd is FITTED from staged bytes
+                    # (S3_TIER1_PER_GB_STAGED = 1897/GB), and that fit was taken
+                    # on runs that PUT the packaged output as well as the chunks.
+                    # A host-packaged run stages a similar number of bytes while
+                    # doing ~1488 fewer PUTs per codec, so the estimate now runs
+                    # HIGH for these runs — by roughly a third. Erring high is
+                    # the safe direction for a cost figure and refitting needs
+                    # bill data from runs that do not exist yet, but nobody
+                    # should read the Tier1 line as measured. It is labelled est.
                     _emit_cost_summary(exec_name, log_state,
                                        egress_bytes=res.bytes + pkg.bytes,
                                        egress_avoided_bytes=res.skipped_bytes,
                                        egress_files=res.files + pkg.files,
-                                       staged_bytes=res.bytes + res.skipped_bytes)
+                                       staged_bytes=res.bytes + res.skipped_bytes
+                                       + pkg.bytes)
                 except Exception:  # noqa: BLE001 — cost summary is best-effort
                     pass
                 return 0

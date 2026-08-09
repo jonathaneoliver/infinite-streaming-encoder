@@ -126,6 +126,29 @@ def test_fetch_regex_matches_what_cli_phase_actually_prints() -> None:
         "must change with it or egress silently reads zero")
 
 
+def test_cost_summary_counts_the_chunk_staging_when_packaging_is_local() -> None:
+    """staged_bytes drives storage AND the fitted Tier1 estimate.
+
+    With packaging on the host, _download_outputs finds no output_* objects and
+    returns all zeros. Feeding only that to _emit_cost_summary prices a run's
+    storage and its PUTs at zero while its chunks sit in S3 costing both — the
+    same "a trade looks like a saving" failure the egress term above exists to
+    stop, one argument over.
+
+    Host packaging removes the PACKAGED OUTPUT's staging (~1486 objects PUT and
+    then GET back on a full run, roughly doubled by the per-segment .byteranges
+    sidecars). It does not remove the chunks.
+    """
+    poll = inspect.getsource(cli_batch.cmd_poll)
+    assert "staged_bytes=res.bytes + res.skipped_bytes" in poll
+    assert "+ pkg.bytes)" in poll, (
+        "staged_bytes omits the chunk staging — a host-packaged run reports "
+        "zero S3 storage and zero Tier1 cost")
+    # ...and egress must count it too, for the same reason.
+    assert "egress_bytes=res.bytes + pkg.bytes" in poll
+    assert "egress_files=res.files + pkg.files" in poll
+
+
 def test_host_packaging_gives_each_codec_its_own_scratch() -> None:
     """cli_phase rmtree's ENCODER_WORK_DIR on entry.
 
