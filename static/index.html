@@ -199,22 +199,18 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .codec-checks { display: flex; gap: 16px; align-items: center; padding: 6px 0; }
 .codec-checks label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; font-weight: 400; }
 .codec-checks input { width: auto; min-width: 0; margin: 0; vertical-align: middle; }
-        /* Ladder picker: one row per profile, showing the DELIVERY SHAPE that
-           distinguishes it — segment / parts / GOP — plus the peak-over-average
-           multiplier at its own segment length, coloured to Apple's guidance
-           (<=1.25x live, <=2x VOD). Choosing between bare names would hide the
-           only thing that differs between four ladders over the same rungs. */
+        /* Ladder picker: one checkbox per profile. Name only — the delivery
+           shape (segment / parts / GOP / VBV / peak / output tag) is on hover,
+           because it is reference detail you need when choosing rather than
+           while scanning a four-item list. */
         .ladder-checks { display:flex; flex-direction:column; gap:2px; max-height:132px;
                          overflow-y:auto; border:1px solid #2a2a3a; border-radius:4px; padding:4px; }
-        .ladder-row { display:grid; grid-template-columns:auto 1fr auto auto auto; gap:8px;
-                      align-items:center; padding:2px 4px; border-radius:3px; cursor:pointer;
-                      font-size:12px; white-space:nowrap; }
+        .ladder-row { display:flex; align-items:center; gap:6px; padding:2px 4px;
+                      border-radius:3px; cursor:pointer; font-size:12px;
+                      font-weight:400; white-space:nowrap; }
         .ladder-row:hover { background:#232838; }
         .ladder-row input { width:auto; min-width:auto; margin:0; }
         .ladder-name i { color:#7f8899; font-style:normal; }
-        .ladder-shape { color:#8a94a2; font-size:11px; }
-        .ladder-peak { font-variant-numeric:tabular-nums; font-size:11px; }
-        .ladder-tag { color:#6f7887; font-size:11px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
 /* End-of-run efficiency stats, shown under the stages once ENCODER-STATS lands. */
 .job-stats { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; padding: 9px 12px; background: #141b2b; border-radius: 6px; font-size: 12px; }
 .job-stat { color: #8a9bb5; white-space: nowrap; }
@@ -1299,19 +1295,26 @@ async function loadLadders() {
             // worst case is the shortest chop go-live will make, which is 1s.
             const T = (seg && seg > 0) ? seg : 1;
             const mult = pct + buf / T;
-            const shape = [
-                (seg && seg > 0) ? `${seg}s seg` : 'flexible',
-                (parseFloat(d.partial_duration) > 0) ? `${parseFloat(d.partial_duration)}s parts` : 'no parts',
-                d.gop_duration ? `gop ${parseFloat(d.gop_duration)}` : '',
-            ].filter(Boolean).join(' · ');
             const tag = _ladderSuffix(d);
-            return `<label class="ladder-row" title="${escapeAttr(n)} — peak ${mult.toFixed(2)}× avg at ${T}s">
+            // Everything that distinguishes one ladder from another, on hover.
+            // Peak is at this ladder's own segment length (1s for a flexible
+            // base — its worst case, not its nominal one), against Apple's
+            // guidance of <=1.25x for live and <=2x for VOD.
+            const tip = [
+                `output: <stem>_<codec>${tag ? '_' + tag : ''}`,
+                (seg && seg > 0) ? `segment ${seg}s` : 'segment: flexible (go-live repackages into 1/2/6s)',
+                (parseFloat(d.partial_duration) > 0)
+                    ? `parts ${parseFloat(d.partial_duration)}s (independent every ${parseFloat(d.gop_duration) || '?'}s)`
+                    : 'no LL parts',
+                `gop ${parseFloat(d.gop_duration) || '?'}s`,
+                `VBV ${d.maxrate_percent || 124}% / ${buf}x`,
+                `peak ${mult.toFixed(2)}x avg at ${T}s`,
+                d.description || '',
+            ].filter(Boolean).join('\n');
+            return `<label class="ladder-row" title="${escapeAttr(tip)}">
                 <input type="checkbox" class="ladder-cb" value="${escapeAttr(n)}"${want.includes(n) ? ' checked' : ''}
                        onchange="syncResTiers();syncLadderMultiNote()">
                 <span class="ladder-name">${escapeHtml(n)}${d.seed ? '' : ' <i>(custom)</i>'}</span>
-                <span class="ladder-shape">${escapeHtml(shape)}</span>
-                <span class="ladder-peak" style="color:${_peakColor(mult)}">${mult.toFixed(2)}×</span>
-                <span class="ladder-tag">${tag ? '_' + escapeHtml(tag) : ''}</span>
             </label>`;
         }).join('');
     }
