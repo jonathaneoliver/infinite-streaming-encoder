@@ -1605,6 +1605,12 @@ type Manager struct {
 	mu   sync.Mutex
 	jobs []*Job
 
+	// Priority rank assigned to each launched local-dist job, keyed by job ID.
+	// Guarded by mu. Held HERE rather than on Job because a Job is marshalled
+	// for the SSE stream outside this lock (#196), and a field written under mu
+	// but read by json.Marshal is the shape of race that cost us once already.
+	distRanks map[string]int
+
 	// In-flight on-demand media fetches, keyed by output dir name (#214). Its
 	// own lock because a fetch runs for minutes and must not block job
 	// bookkeeping. See remote.go.
@@ -2181,32 +2187,90 @@ func (m *Manager) jobPriorityBase(job *Job) int {
 	return 9000 - older*1000
 }
 
+// Chunk-priority geometry. These MIRROR values that live in two other files and
+// there is no build-time check that they agree:
+//
+//	matching.priorityLevels   infra/local-cluster/dynamicconfig/encode.yaml
+//	PRIORITY_BANDS/_LEVELS    scripts/infinite_streaming_encoder/temporal_worker.py
+//
+// The worker turns a rank into priority_key = rank*BANDS + costBand, clamped to
+// LEVELS. So this cap is the BINDING constraint on how many jobs can be ordered
+// against each other: raising the other two without raising this one changes
+// nothing at all. Going the other way — a rank high enough to exceed the
+// server's ceiling — is caught by the worker's own clamp, so drift degrades to
+// ties rather than to a rejected activity.
+const (
+	chunkPriorityBands  = 5
+	chunkPriorityLevels = 250
+	maxLocalJobRank     = chunkPriorityLevels/chunkPriorityBands - 1 // 49
+)
+
 // localJobRank returns this local-dist job's arrival rank among currently-active
 // local-dist jobs — 0 for the oldest, 1 for the next, and so on. The Temporal
 // orchestrator folds it into every chunk's priority_key (rank*bands + costBand)
 // so ALL of an older job's chunks outrank any younger job's: the oldest job runs
 // to completion and a younger one only backfills spare slots. This is the local
 // mirror of jobPriorityBase's Batch bands. Job IDs are ascending timestamps, so a
-// smaller ID is older. Capped at 9 so rank*5+5 stays within matching.priorityLevels
-// (50); beyond 10 concurrent local jobs the extras share the lowest band.
+// smaller ID is older. Capped at maxLocalJobRank so rank*BANDS+BANDS stays within
+// matching.priorityLevels; beyond that the extras share the lowest band.
+//
+// The rank is assigned ONCE, when the job launches, and must therefore be
+// STRICTLY GREATER than the rank of any older job still running — counting
+// active older jobs is not enough. A job launches exactly when a slot frees,
+// which is exactly when one older job has just finished, so the count is very
+// nearly always 1 and consecutive jobs collide:
+//
+//	job  older active at ITS launch      count   assigned
+//	172  —                               0       0
+//	176  172                             1       1
+//	180  176        (172 already done)   1       1  <- ties with 176's successor
+//	183  180        (172, 176 done)      1       1  <- ties with 180
+//
+// Observed on the first multi-ladder run: -6s (73% done, four rungs complete)
+// and -xs (47%, still on its second rung) both carried rank 1, so the job term
+// cancelled out and the intra-job cost band decided. -xs was working its 954p
+// chunks (band 1) while -6s needed 540p (band ~4), so the NEWEST job took all
+// eight slots and the one about to finish was starved — the exact inversion the
+// rank exists to prevent.
+//
+// Taking the max against running older jobs makes each launch land strictly
+// behind its predecessor (0, 1, 2, 3), and the chain resets to 0 whenever the
+// farm drains, so ranks cannot creep to the cap during ordinary use.
 func (m *Manager) localJobRank(job *Job) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	older := 0
+	older, behind := 0, -1
 	for _, j := range m.jobs {
-		if j == job {
+		if j == job || j.Config.Target != TargetLocalDist || j.ID >= job.ID {
 			continue
 		}
-		if (j.Status == StatusQueued || j.Status == StatusRunning) &&
-			j.Config.Target == TargetLocalDist &&
-			j.ID < job.ID {
-			older++
+		if j.Status != StatusQueued && j.Status != StatusRunning {
+			continue
+		}
+		older++
+		// Only a RUNNING job has been assigned a rank; a queued one has not
+		// launched yet and will be ranked behind this job when it does.
+		if r, ok := m.distRanks[j.ID]; ok && j.Status == StatusRunning && r > behind {
+			behind = r
 		}
 	}
-	if older > 9 {
-		older = 9
+	rank := min(max(older, behind+1), maxLocalJobRank)
+	if m.distRanks == nil {
+		m.distRanks = map[string]int{}
 	}
-	return older
+	// Drop ranks for jobs that have left the working set, so a long-lived server
+	// does not accumulate one entry per encode it has ever run.
+	live := make(map[string]bool, len(m.jobs))
+	for _, j := range m.jobs {
+		live[j.ID] = true
+	}
+	for id := range m.distRanks {
+		if !live[id] {
+			delete(m.distRanks, id)
+		}
+	}
+	m.distRanks[job.ID] = rank
+	return rank
 }
 
 func (m *Manager) GetJob(id string) *Job {
