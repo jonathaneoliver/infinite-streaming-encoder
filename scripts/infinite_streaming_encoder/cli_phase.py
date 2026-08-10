@@ -560,16 +560,24 @@ _REF_BPS_AT_1080 = 30_000_000  # ~30 Mbps near-lossless 1080p, for the size gate
 
 
 def _build_prescaled_ref(mezz_path: Path, ref_path: Path, cw: int, ch: int,
-                         fps: str, crf: int, keyint: int) -> None:
+                         fps: str, crf: int, keyint: int,
+                         duration_s: float | None = None) -> None:
     """Downscale the mezzanine to (cw x ch) as NEAR-LOSSLESS H.264 (#109), with the
     SAME filter chain measure_vmaf applies to the reference (fps -> bicubic scale
     -> yuv420p -> setsar). Near-lossless (crf~8) shifts VMAF <~0.4 vs lossless but
     is far smaller and fast to decode. `keyint` aligns keyframes to chunk
     boundaries so per-chunk -ss seeks land clean (minimal pre-roll). Video-only;
-    CFR timestamps preserved so window seeks stay aligned."""
+    CFR timestamps preserved so window seeks stay aligned.
+
+    `duration_s` bounds the build. The encode path leaves it None (the mezzanine
+    IS the content), but an audit of a time-limited output compares 60s of
+    rendition against a 334s master, and libvmaf stops at the shorter stream —
+    so without this the build spends 5x its time on frames nothing will ever
+    look at. Placed before -i so it bounds the DECODE, not just the output."""
     vf = f"fps={fps},scale={cw}:{ch}:flags=bicubic,format=yuv420p,setsar=1"
     subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+         *(["-t", f"{duration_s:.3f}"] if duration_s and duration_s > 0 else []),
          "-i", str(mezz_path), "-map", "0:v:0", "-vf", vf,
          "-c:v", "libx264", "-crf", str(crf), "-preset", "ultrafast",
          "-g", str(max(1, keyint)), "-keyint_min", str(max(1, keyint)),

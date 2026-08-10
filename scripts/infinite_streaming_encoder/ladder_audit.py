@@ -25,11 +25,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from infinite_streaming_encoder.ffprobe import ProbeError, probe
+# #109's pre-scaled reference, built for the in-encode audit and reused here.
+# Importing rather than reimplementing: the ref must be produced with the SAME
+# filter chain measure_vmaf applies, and two copies of that chain drifting apart
+# would move every score without anything failing.
+from infinite_streaming_encoder.cli_phase import (
+    _build_prescaled_ref, _source_slower_than_ref,
+)
 from infinite_streaming_encoder.vmaf_audit import (
     VmafError, common_dimensions, measure_vmaf, pick_model,
 )
@@ -74,6 +86,20 @@ def _label_height(label: str) -> int:
     if head.endswith("p") and head[:-1].isdigit():
         return int(head[:-1])
     return 0
+
+
+def _rendition_seconds(variant_dir: Path) -> float:
+    """Playing time of one rendition, summed from its playlist's EXTINF.
+
+    Read from the playlist rather than the source because the two differ
+    whenever the encode carried a time limit — which is the case this exists
+    for. 0.0 when unreadable, which the caller treats as "no bound".
+    """
+    try:
+        pl = (variant_dir / "playlist.m3u8").read_text()
+    except OSError:
+        return 0.0
+    return sum(float(m) for m in re.findall(r"#EXTINF:([\d.]+),", pl))
 
 
 def _delivered_kbps(variant_dir: Path, duration_s: float) -> int:
@@ -126,10 +152,42 @@ def discover_rungs(output_dir: Path) -> tuple[str, list[tuple[str, Path]]]:
     return codec, profile, rungs
 
 
+def _safe(fn, *a):
+    """(True, value) or (False, error). Keeps one rung's failure from aborting
+    the pool — a single unreadable rendition should cost that rung, not the
+    other eleven and the hours already spent on them."""
+    try:
+        return True, fn(*a)
+    except VmafError as e:
+        return False, e
+
+
 def audit_output(output_dir: Path, source: Path, reference: int,
                  n_subsample: int = 5, limit_s: float | None = None,
-                 clip: str | None = None, progress=print) -> list[dict]:
-    """Measure every rung of `output_dir` against `source`. Returns curve points."""
+                 clip: str | None = None, progress=print,
+                 jobs: int = 1, n_threads: int = 0,
+                 prescale: bool = True) -> list[dict]:
+    """Measure every rung of `output_dir` against `source`. Returns curve points.
+
+    `jobs` rungs are measured concurrently and `n_threads` is handed to libvmaf.
+    Both default to the serial, library-default behaviour.
+
+    Measured on a 10-core box (4 performance), 4K reference, one rung: a single
+    libvmaf held ~148% CPU — about 1.5 cores of 10, with the rest idle for the
+    ~6 minutes it took. Twelve rungs across six outputs at that rate is seven
+    hours of a mostly-idle machine.
+
+    Rungs are independent — each is one subprocess reading the source and one
+    rendition — so the parallelism is safe. What it is NOT is free: each 4K
+    libvmaf holds ~1.5-2 GB, and each job decodes the 4K source again, so
+    `jobs` is bounded by RAM and source-decode bandwidth long before it is
+    bounded by cores. Left at 1 by default for that reason.
+
+    Ordering is preserved regardless of completion order: futures are consumed
+    in ladder order, so each rung prints as soon as IT is ready and a parallel
+    run reads exactly like a serial one — just with gaps where a later rung
+    finished first and is waiting its turn to be printed.
+    """
     codec, profile, rungs = discover_rungs(output_dir)
     info = probe(source)
     fps = f"{info.fps.numerator}/{info.fps.denominator}" if info.fps else None
@@ -145,21 +203,87 @@ def audit_output(output_dir: Path, source: Path, reference: int,
     progress(f"[audit] {output_dir.name} codec={codec} rungs={len(rungs)} "
              f"reference={reference}p common={common_w}x{common_h} model={model}")
 
-    points = []
-    for label, vdir in rungs:
-        # ALWAYS the full content duration: the byte total covers the whole
-        # rendition, so dividing by a shortened --limit-s window would inflate
-        # the bitrate by the ratio between them.
-        kbps = _delivered_kbps(vdir, info.duration_s)
+    # ---- pre-scaled reference (#109) ------------------------------------
+    # Every rung otherwise re-decodes the SOURCE and downscales it to the
+    # comparison resolution. With a 4K AV1 master that is the whole cost of the
+    # audit: twelve rungs, twelve identical 4K AV1 decodes, and AV1 is rated 2.5x
+    # H.264 to decode. Parallelising them just runs the redundant work at once
+    # and contends for memory bandwidth.
+    #
+    # So decode it ONCE into a near-lossless H.264 file at the comparison
+    # resolution, and point every rung at that. Same gate as the encode path —
+    # skipped when the source is not actually more expensive than the ref would
+    # be (an already-1080p H.264 master has nothing to gain) and when there are
+    # too few rungs to amortise the build.
+    ref_for_rungs = source
+    tmpdir = None
+    if prescale and len(rungs) >= 2 and _source_slower_than_ref(info, common_w, common_h):
+        # Only as long as the renditions: the master here is 334s while the
+        # outputs under test are 60s, and libvmaf stops at the shorter stream,
+        # so building the full master would spend 5x the time on frames nothing
+        # ever compares against.
+        span = limit_s or _rendition_seconds(rungs[0][1]) or info.duration_s
+        tmpdir = tempfile.mkdtemp(prefix="ladder-audit-ref-")
+        ref = Path(tmpdir) / "ref.mp4"
+        t0 = time.monotonic()
+        progress(f"[audit] building pre-scaled reference "
+                 f"{common_w}x{common_h} over {span:.0f}s "
+                 f"(source is {info.width}x{info.height} "
+                 f"{getattr(info, 'video_codec', '?')})")
         try:
-            r = measure_vmaf(
-                distorted=vdir / "playlist.m3u8", reference=source,
-                common_w=common_w, common_h=common_h, model=model,
-                ref_duration_s=limit_s, dist_duration_s=limit_s,
-                n_subsample=n_subsample, fps=fps)
-        except VmafError as e:
-            progress(f"[audit]   {label}: FAILED — {e}")
+            _build_prescaled_ref(source, ref, common_w, common_h, fps or "30",
+                                 crf=8, keyint=120, duration_s=span)
+            ref_for_rungs = ref
+            progress(f"[audit] reference built in {time.monotonic()-t0:.0f}s "
+                     f"({ref.stat().st_size/1e6:.0f} MB) — "
+                     f"{len(rungs)} rungs now decode THIS instead of the master")
+        except Exception as e:  # noqa: BLE001 - fall back to the master
+            progress(f"[audit] pre-scale failed ({e}); using the master directly")
+
+    def one(label, vdir):
+        """Measure one rung. Returns (kbps, result) or raises."""
+        # The RENDITION's own playing time, which is neither the source's nor
+        # --limit-s. The byte total covers the whole rendition, so scoring only
+        # a --limit-s window must NOT divide by that window. But the source is
+        # not the answer either: a time-limited encode (--time 60) produces a
+        # 60s rendition from a 334s master, and dividing its bytes by 334
+        # understated every bitrate by 5.57x — the exact ratio — turning a
+        # 5287 kbps rung into "949 kbps" on the curve.
+        #
+        # It fails silently and in the worst possible place: the numbers stay
+        # plausible and monotonic, and the curve store is what the Ladders tab
+        # uses to estimate quality per rung, so a poisoned curve misinforms
+        # every future ladder decision rather than erroring.
+        kbps = _delivered_kbps(vdir, _rendition_seconds(vdir) or info.duration_s)
+        return kbps, measure_vmaf(
+            distorted=vdir / "playlist.m3u8", reference=ref_for_rungs,
+            common_w=common_w, common_h=common_h, model=model,
+            ref_duration_s=limit_s, dist_duration_s=limit_s,
+            n_subsample=n_subsample, fps=fps, n_threads=n_threads)
+
+    # Results are consumed IN LADDER ORDER as each becomes ready, so a rung
+    # prints the moment it is done rather than at the end of the run. The first
+    # cut collected every result before printing anything, which on a 15-minute
+    # run looked identical to a hang — and did so on the serial path too, which
+    # had been printing incrementally for its whole life. A long job with no
+    # output is indistinguishable from a stuck one, and this job is long by
+    # nature.
+    if jobs > 1:
+        progress(f"[audit] {jobs} rungs at a time"
+                 + (f", libvmaf n_threads={n_threads}" if n_threads else ""))
+        pool = ThreadPoolExecutor(max_workers=jobs)
+        pending = [pool.submit(_safe, one, label, vdir) for label, vdir in rungs]
+        results = (f.result() for f in pending)
+    else:
+        pool = None
+        results = (_safe(one, label, vdir) for label, vdir in rungs)
+
+    points = []
+    for (label, vdir), (ok, val) in zip(rungs, results):
+        if not ok:
+            progress(f"[audit]   {label}: FAILED — {val}")
             continue
+        kbps, r = val
         height = _label_height(label)
         if height == 0:
             progress(f"[audit]   {label}: skipped — can't read a height from the label")
@@ -188,11 +312,16 @@ def audit_output(output_dir: Path, source: Path, reference: int,
             f"worst {r['min']:6.2f} @frame {r.get('min_frame', -1)}  "
             f"<10 {r.get('pct_lt10', 0):5.1f}%  <50 {r.get('pct_lt50', 0):5.1f}%  "
             f"std {r.get('std', 0):5.2f}  ({r['frames']} frames)")
+    if pool is not None:
+        pool.shutdown()
+    if tmpdir:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     return points
 
 
 def audit_tree(root: Path, source_dir: Path, reference: int,
                n_subsample: int = 5, limit_s: float | None = None,
+               jobs: int = 1, n_threads: int = 0, prescale: bool = True,
                match: str | None = None, latest: bool = False,
                progress=print) -> list[dict]:
     """Audit every eligible output under `root`, SKIPPING the rest with a reason.
@@ -261,6 +390,7 @@ def audit_tree(root: Path, source_dir: Path, reference: int,
     for d, src in chosen:
         try:
             got = audit_output(d, src, reference, n_subsample=n_subsample,
+                               jobs=jobs, n_threads=n_threads, prescale=prescale,
                                limit_s=limit_s, progress=progress)
         except (AuditError, ProbeError) as e:
             skipped += 1
@@ -341,6 +471,23 @@ def _main(argv=None) -> int:
                     help="score every Nth frame (default 5)")
     ap.add_argument("--limit-s", type=float, default=None, dest="limit_s",
                     help="only score the first N seconds — for a quick check")
+    ap.add_argument("--prescale", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="decode the source ONCE into a near-lossless file at "
+                         "the comparison resolution and score every rung "
+                         "against that (#109). On by default; gated off "
+                         "automatically when the source is no more expensive "
+                         "than the reference would be.")
+    ap.add_argument("--jobs", type=int, default=1, metavar="N",
+                    help="measure N rungs concurrently (default 1). Rungs are "
+                         "independent, but each 4K libvmaf holds ~1.5-2 GB and "
+                         "re-decodes the source, so RAM and source-decode "
+                         "bandwidth bound this well before core count does.")
+    ap.add_argument("--n-threads", type=int, default=0, dest="n_threads",
+                    metavar="N",
+                    help="threads for libvmaf itself (default: its own). "
+                         "Complements --jobs rather than replacing it: one "
+                         "measurement was observed using ~1.5 of 10 cores.")
     ap.add_argument("--json", action="store_true", help="emit the points as JSON")
     args = ap.parse_args(argv)
 
@@ -364,10 +511,14 @@ def _main(argv=None) -> int:
     try:
         if args.all:
             points = audit_tree(args.all, args.source_dir, args.reference,
+                                jobs=args.jobs, n_threads=args.n_threads,
+                                prescale=args.prescale,
                                 n_subsample=args.n_subsample, limit_s=args.limit_s,
                                 match=args.match, latest=args.latest, progress=progress)
         else:
             points = audit_output(args.output_dir, args.source, args.reference,
+                                  jobs=args.jobs, n_threads=args.n_threads,
+                                  prescale=args.prescale,
                                   n_subsample=args.n_subsample, limit_s=args.limit_s,
                                   clip=args.clip, progress=progress)
     except (AuditError, ProbeError) as e:
