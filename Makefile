@@ -211,6 +211,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  py threads     '; \
 	if out=$$(python3 scripts/test_encode_threads.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py vmafperiod  '; \
+	if out=$$(python3 scripts/test_vmaf_periodicity.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py diststate   '; \
 	if out=$$(python3 scripts/test_dist_stage_state.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \

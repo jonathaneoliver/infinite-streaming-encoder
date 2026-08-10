@@ -72,7 +72,8 @@ def measure_vmaf(distorted: Path, reference: Path, common_w: int, common_h: int,
                  ref_duration_s: float | None = None,
                  n_subsample: int = 5, n_threads: int = 0,
                  fps: str | None = None, n_frames: int | None = None,
-                 dist_duration_s: float | None = None) -> dict:
+                 dist_duration_s: float | None = None,
+                 keep_frames: bool = False) -> dict:
     """Score `distorted` against a [ref_start_s, +ref_duration_s) window of
     `reference`, both bicubic-scaled to (common_w x common_h). Returns
     {mean, harmonic_mean, min, frames, inv_sum} — inv_sum = sum(1/frame_vmaf),
@@ -85,6 +86,15 @@ def measure_vmaf(distorted: Path, reference: Path, common_w: int, common_h: int,
     desyncs them and craters the score (VMAF is unforgiving of a 1-frame slip on
     high-motion content). Regenerating a common CFR clock from decode order
     sidesteps that — pass the source fps whenever it's known.
+
+    `keep_frames` adds the raw per-frame score list as `frame_scores`. OFF by
+    default, and it must stay that way on the encode path: a rung is thousands
+    of floats per chunk, and the telemetry markers exist precisely to keep that
+    volume off the queue. This is for OFFLINE callers holding both files, where
+    the analysis is a filesystem away — see analyze_vmaf_periodicity.py, which
+    needs the series to fold quality against position-in-GOP. Pair it with
+    `n_subsample=1`; the default 5 aliases anything faster than ~6 samples per
+    second and a 1s GOP at 30fps is exactly that fast.
 
     `n_frames` clamps BOTH streams to exactly that many frames after the CFR
     re-time. Per-chunk audits seek the reference window with `-ss`/`-t`, whose
@@ -130,12 +140,12 @@ def measure_vmaf(distorted: Path, reference: Path, common_w: int, common_h: int,
         if proc.returncode != 0:
             raise VmafError(f"libvmaf failed (exit {proc.returncode}): "
                             f"{proc.stderr.strip()[-300:]}")
-        return _parse_vmaf_log(Path(log_path))
+        return _parse_vmaf_log(Path(log_path), keep_frames=keep_frames)
     finally:
         Path(log_path).unlink(missing_ok=True)
 
 
-def _parse_vmaf_log(log_path: Path) -> dict:
+def _parse_vmaf_log(log_path: Path, keep_frames: bool = False) -> dict:
     data = json.loads(log_path.read_text())
     frames = [f.get("metrics", {}).get("vmaf")
               for f in data.get("frames", [])]
@@ -165,6 +175,10 @@ def _parse_vmaf_log(log_path: Path) -> dict:
             "std": std,
             "pct_lt10": pct_lt10,
             "pct_lt50": pct_lt50,
+            # Only when asked: the series is the whole point for periodicity
+            # analysis and pure weight for everyone else. The default keeps the
+            # returned dict identical to what every existing caller reads.
+            **({"frame_scores": frames} if keep_frames else {}),
             "frames": n,
             "inv_sum": inv_sum,
         }
