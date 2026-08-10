@@ -195,8 +195,9 @@ func variantResourcesFor(codec string, height int) (vcpu, memory string) {
 // before it emits a marker, so the true peak is above what we can see. h264
 // 2160p read 2271 and still OOM'd at 3072.
 //
-// A flat 3072 was safe only because apple-uniq-live stops h264 at 1080p. The
-// first apple-uniq-live-full run put x264 on 3840x2160 at 27 Mbps and Batch
+// A flat 3072 was safe only while the default ladder stopped h264 at 1080p —
+// which the base no longer does. The first apple-uniq-live-xs run (h264 to
+// 2160p) put x264 on 3840x2160 at 27 Mbps and Batch
 // killed every 2160p chunk twice. hevc 2160p was already within ~20% of the
 // same cliff without having crossed it.
 //

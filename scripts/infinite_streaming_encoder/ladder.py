@@ -205,19 +205,8 @@ _SEED_APPLE_H264_UNIQ_FULL = _SEED_APPLE_H264_UNIQ + [
 ]
 
 SEED_LADDERS: dict[str, dict] = {
-    "legacy": {
-        "description": "Default distinct-height geometric ladder "
-                       "(one rung per resolution per codec).",
-        "seed": True,
-        "codecs": {
-            "h264": _SEED_LEGACY_H264,
-            "hevc": _SEED_LEGACY_HEVC,
-            "av1":  _SEED_LEGACY_HEVC,
-        },
-    },
     "apple": {
-        "description": "Apple HLS Authoring Spec bitrates — per-codec, "
-                       "multi-rung (some resolutions repeat at higher bitrate).",
+        "description": "Apple HLS Authoring Spec bitrates — per-codec, multi-rung.",
         "seed": True,
         "codecs": {
             "h264": _SEED_APPLE_H264,
@@ -226,8 +215,7 @@ SEED_LADDERS: dict[str, dict] = {
         },
     },
     "apple-uniq": {
-        "description": "Apple bitrates with every rung given a unique 16:9 "
-                       "resolution (distinguishable by decoded frame size).",
+        "description": "Apple bitrates with every rung given a unique 16:9 resolution.",
         "seed": True,
         "codecs": {
             "h264": _SEED_APPLE_H264_UNIQ,
@@ -235,35 +223,22 @@ SEED_LADDERS: dict[str, dict] = {
             "av1":  _SEED_APPLE_HEVC_UNIQ,
         },
     },
-    "apple-uniq-live": {
-        "description": "apple-uniq bitrates under Apple's live/linear VBV: "
-                       "peak <= 1.25x avg. maxrate 110% + tight 0.10x buffer "
-                       "keep delivered peak <=~1.20x even at 1s segments; "
-                       "unique resolutions keep the bands distinct.",
+    "apple-uniq-live-xs": {
+        "description": "The FLEXIBLE base: no pinned segment length, so go-live "
+                       "repackages one encode into 1s/2s/6s. Apple's live/linear VBV "
+                       "(peak <= 1.25x avg) with maxrate 110% and a tight 0.10x "
+                       "buffer, which keeps the delivered peak <=~1.20x EVEN AT 1s — "
+                       "that is what makes it safe to re-chop, and why the buffer is "
+                       "smaller than any apple-uniq-live-Ns ladder can afford to give "
+                       "itself. H.264 climbs to 4K (1440p/1800p/2160p): Apple caps "
+                       "H.264 at 1080p and puts HEVC above, so this trades "
+                       "spec-compliance for max-compatibility high-bitrate 4K H.264, "
+                       "matching the rung set of the fixed-segment ladders it is "
+                       "compared against.",
         "seed": True,
         "maxrate_percent": 110,
         "bufsize_multiplier": 0.10,
-        # No pinned segment_duration: the flexible base (tight VBV is safe to
-        # repackage into 1s/2s/6s); partial/gop are its LL-HLS live settings.
-        "partial_duration": "0.2",
-        "gop_duration": "1.0",
-        "codecs": {
-            "h264": _SEED_APPLE_H264_UNIQ,
-            "hevc": _SEED_APPLE_HEVC_UNIQ,
-            "av1":  _SEED_APPLE_HEVC_UNIQ,
-        },
-    },
-    "apple-uniq-live-full": {
-        "description": "apple-uniq-live, but H.264 climbs all the way to 4K "
-                       "(1440p/1800p/2160p) at high bitrates. Apple caps H.264 "
-                       "at 1080p (HEVC above), so this trades spec-compliance "
-                       "for max-compatibility high-bitrate 4K H.264. Same "
-                       "live/linear VBV (110%/0.10x, 0.2s parts, 1s GOP) and "
-                       "flexible _xs base as apple-uniq-live.",
-        "seed": True,
-        "maxrate_percent": 110,
-        "bufsize_multiplier": 0.10,
-        # Flexible base (no pinned segment_duration → _xs), same as apple-uniq-live.
+        # Flexible base: no pinned segment_duration → suffix derives to _xs.
         "partial_duration": "0.2",
         "gop_duration": "1.0",
         "codecs": {
@@ -273,19 +248,19 @@ SEED_LADDERS: dict[str, dict] = {
         },
     },
     "apple-uniq-live-1s": {
-        "description": "apple-uniq bitrates encoded NATIVELY for 1s segments."
-                       "Delivered peak (maxrate + bufsize/T) is held at 1.25x avg —"
-                       "Apple's live/linear guidance — the SAME as the other apple-"
-                       "uniq-live-Ns ladders, so a comparison between them is not"
-                       "confounded by peak. Committing to 1s is what buys the bigger"
-                       "buffer: 0.15x here versus 0.10x on the flexible base (apple-"
-                       "uniq-live), which must survive re-chopping to 1s and so pays"
-                       "the 1s price at every length — that difference IS the cost of"
-                       "re-choppability. GOP matched to the segment (1s), which is"
-                       "what makes this a different ENCODE rather than a repackaging."
-                       "NOTE gop == segment means LL-HLS parts are INDEPENDENT only at"
-                       "segment boundaries, so a player cannot join mid-segment: the"
-                       "low-latency cost of a long GOP.",
+        "description": "apple-uniq bitrates encoded NATIVELY for 1s segments. "
+                       "Delivered peak (maxrate + bufsize/T) is held at 1.25x avg — "
+                       "Apple's live/linear guidance — the SAME as the other "
+                       "apple-uniq-live-Ns ladders, so a comparison between them is "
+                       "not confounded by peak. Committing to 1s is what buys the "
+                       "bigger buffer: 0.15x here versus 0.10x on the flexible base "
+                       "(apple-uniq-live-xs), which must survive re-chopping to 1s and "
+                       "so pays the 1s price at every length — that difference IS the "
+                       "cost of re-choppability. GOP matched to the segment (1s), "
+                       "which is what makes this a different ENCODE rather than a "
+                       "repackaging. NOTE gop == segment means LL-HLS parts are "
+                       "INDEPENDENT only at segment boundaries, so a player cannot "
+                       "join mid-segment: the low-latency cost of a long GOP.",
         "seed": True,
         "maxrate_percent": 110,
         "bufsize_multiplier": 0.15,
@@ -293,25 +268,25 @@ SEED_LADDERS: dict[str, dict] = {
         "partial_duration": "0.2",
         "gop_duration": "1",
         "codecs": {
-            "h264": _SEED_APPLE_H264_UNIQ,
+            "h264": _SEED_APPLE_H264_UNIQ_FULL,
             "hevc": _SEED_APPLE_HEVC_UNIQ,
             "av1":  _SEED_APPLE_HEVC_UNIQ,
         },
     },
     "apple-uniq-live-2s": {
-        "description": "apple-uniq bitrates encoded NATIVELY for 2s segments."
-                       "Delivered peak (maxrate + bufsize/T) is held at 1.25x avg —"
-                       "Apple's live/linear guidance — the SAME as the other apple-"
-                       "uniq-live-Ns ladders, so a comparison between them is not"
-                       "confounded by peak. Committing to 2s is what buys the bigger"
-                       "buffer: 0.3x here versus 0.10x on the flexible base (apple-"
-                       "uniq-live), which must survive re-chopping to 1s and so pays"
-                       "the 1s price at every length — that difference IS the cost of"
-                       "re-choppability. GOP matched to the segment (2s), which is"
-                       "what makes this a different ENCODE rather than a repackaging."
-                       "NOTE gop == segment means LL-HLS parts are INDEPENDENT only at"
-                       "segment boundaries, so a player cannot join mid-segment: the"
-                       "low-latency cost of a long GOP.",
+        "description": "apple-uniq bitrates encoded NATIVELY for 2s segments. "
+                       "Delivered peak (maxrate + bufsize/T) is held at 1.25x avg — "
+                       "Apple's live/linear guidance — the SAME as the other "
+                       "apple-uniq-live-Ns ladders, so a comparison between them is "
+                       "not confounded by peak. Committing to 2s is what buys the "
+                       "bigger buffer: 0.3x here versus 0.10x on the flexible base "
+                       "(apple-uniq-live-xs), which must survive re-chopping to 1s and "
+                       "so pays the 1s price at every length — that difference IS the "
+                       "cost of re-choppability. GOP matched to the segment (2s), "
+                       "which is what makes this a different ENCODE rather than a "
+                       "repackaging. NOTE gop == segment means LL-HLS parts are "
+                       "INDEPENDENT only at segment boundaries, so a player cannot "
+                       "join mid-segment: the low-latency cost of a long GOP.",
         "seed": True,
         "maxrate_percent": 110,
         "bufsize_multiplier": 0.3,
@@ -319,25 +294,25 @@ SEED_LADDERS: dict[str, dict] = {
         "partial_duration": "0.2",
         "gop_duration": "2",
         "codecs": {
-            "h264": _SEED_APPLE_H264_UNIQ,
+            "h264": _SEED_APPLE_H264_UNIQ_FULL,
             "hevc": _SEED_APPLE_HEVC_UNIQ,
             "av1":  _SEED_APPLE_HEVC_UNIQ,
         },
     },
     "apple-uniq-live-6s": {
-        "description": "apple-uniq bitrates encoded NATIVELY for 6s segments."
-                       "Delivered peak (maxrate + bufsize/T) is held at 1.25x avg —"
-                       "Apple's live/linear guidance — the SAME as the other apple-"
-                       "uniq-live-Ns ladders, so a comparison between them is not"
-                       "confounded by peak. Committing to 6s is what buys the bigger"
-                       "buffer: 0.9x here versus 0.10x on the flexible base (apple-"
-                       "uniq-live), which must survive re-chopping to 1s and so pays"
-                       "the 1s price at every length — that difference IS the cost of"
-                       "re-choppability. GOP matched to the segment (6s), which is"
-                       "what makes this a different ENCODE rather than a repackaging."
-                       "NOTE gop == segment means LL-HLS parts are INDEPENDENT only at"
-                       "segment boundaries, so a player cannot join mid-segment: the"
-                       "low-latency cost of a long GOP.",
+        "description": "apple-uniq bitrates encoded NATIVELY for 6s segments. "
+                       "Delivered peak (maxrate + bufsize/T) is held at 1.25x avg — "
+                       "Apple's live/linear guidance — the SAME as the other "
+                       "apple-uniq-live-Ns ladders, so a comparison between them is "
+                       "not confounded by peak. Committing to 6s is what buys the "
+                       "bigger buffer: 0.9x here versus 0.10x on the flexible base "
+                       "(apple-uniq-live-xs), which must survive re-chopping to 1s and "
+                       "so pays the 1s price at every length — that difference IS the "
+                       "cost of re-choppability. GOP matched to the segment (6s), "
+                       "which is what makes this a different ENCODE rather than a "
+                       "repackaging. NOTE gop == segment means LL-HLS parts are "
+                       "INDEPENDENT only at segment boundaries, so a player cannot "
+                       "join mid-segment: the low-latency cost of a long GOP.",
         "seed": True,
         "maxrate_percent": 110,
         "bufsize_multiplier": 0.9,
@@ -345,17 +320,17 @@ SEED_LADDERS: dict[str, dict] = {
         "partial_duration": "0.2",
         "gop_duration": "6",
         "codecs": {
-            "h264": _SEED_APPLE_H264_UNIQ,
+            "h264": _SEED_APPLE_H264_UNIQ_FULL,
             "hevc": _SEED_APPLE_HEVC_UNIQ,
             "av1":  _SEED_APPLE_HEVC_UNIQ,
         },
     },
     "apple-uniq-vod": {
-        "description": "apple-uniq bitrates tuned for VOD: 6s segments, NO "
-                       "LL-HLS parts, long 6s GOP (fewer keyframes -> better "
-                       "efficiency), relaxed VBV (peak <= 2x avg per Apple's "
-                       "VOD guidance, 2.0x buffer). Bits redistribute toward "
-                       "complex scenes; average bitrate + size unchanged.",
+        "description": "apple-uniq bitrates tuned for VOD: 6s segments, NO LL-HLS "
+                       "parts, long 6s GOP (fewer keyframes -> better efficiency), and "
+                       "a relaxed VBV (peak <= 2x avg per Apple's VOD guidance, 2.0x "
+                       "buffer). Bits redistribute toward complex scenes; average "
+                       "bitrate and size are unchanged.",
         "seed": True,
         "maxrate_percent": 200,
         "bufsize_multiplier": 2.0,
@@ -375,7 +350,7 @@ SEED_LADDERS: dict[str, dict] = {
     },
 }
 
-DEFAULT_LADDER = "apple-uniq-live"
+DEFAULT_LADDER = "apple-uniq-live-xs"
 
 
 class LadderError(ValueError):

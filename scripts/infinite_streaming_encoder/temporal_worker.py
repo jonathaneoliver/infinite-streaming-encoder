@@ -464,7 +464,7 @@ class EncodeWorkflow:
             #
             # MAXRATE_PERCENT / BUFSIZE_MULT come from the ladder via the plan.
             # Omitting them let cli_phase fall back to its module defaults
-            # (124% / 0.25x), so local-dist encoded apple-uniq-live with a 2.5x
+            # (124% / 0.25x), so local-dist encoded apple-uniq-live-xs with a 2.5x
             # looser buffer than the profile specifies and delivered ~25% more
             # bits than the same rung on cloud (#167).
             env = {"CHUNK_DURATION_S": str(cd),
@@ -502,7 +502,7 @@ class EncodeWorkflow:
             # Packaging reads PARTIAL_DURATION (LL-HLS part length; 0 turns
             # parts off for VOD) and SEGMENT_DURATION. These dispatches passed
             # an empty env, so both silently defaulted to 0.2 / 6.0 — harmless
-            # for apple-uniq-live, wrong for apple-uniq-vod, which asks for
+            # for apple-uniq-live-xs, wrong for apple-uniq-vod, which asks for
             # partial=0 and would still have got LL-HLS parts (#172).
             pkg_env = {k: v for k, v in (
                 ("PARTIAL_DURATION", str(plan.get("partial_duration", ""))),

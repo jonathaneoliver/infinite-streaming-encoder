@@ -1278,7 +1278,7 @@ async function loadLadders() {
     // Populate the encode-options dropdown, preserving the current choice.
     const sel = document.getElementById('ladder-list');
     if (sel) {
-        const DEFAULT = 'apple-uniq-live';
+        const DEFAULT = 'apple-uniq-live-xs';
         // Preserve the whole SELECTION, not just one value — reloading the
         // ladder list must not silently drop profiles someone ticked.
         const cur = selectedLadders();
@@ -3434,7 +3434,7 @@ function _saasCompare(e, prefix) {
 
 // The encoder never upscales: select_rungs / resolveRungs drop every ladder rung
 // wider than the source, for all codecs. So on a sub-ladder-height source the
-// ladder's taller rungs are INERT — switching apple-uniq-live → -full, or nudging
+// ladder's taller rungs are INERT — switching to a ladder with taller rungs, or nudging
 // Max/Min-Res above the source, does nothing for them, and the cost doesn't move.
 // THAT silent no-op is the surprise to state; a Max-Res cap the user set is not
 // (that's a deliberate reduction). Name the rungs the SOURCE caps away and the
@@ -3554,7 +3554,7 @@ function _jobConfigHtml(c) {
         `<span style="background:#232a36;border-radius:3px;padding:1px 7px;font-size:11px;color:#bbb">`
         + `<span style="color:${hl || '#7a8'}">${label}</span> ${escapeHtml(String(val))}</span>`;
     const chips = [
-        chip('profile', c.ladder || 'apple-uniq-live', '#e0883a'),
+        chip('profile', c.ladder || 'apple-uniq-live-xs', '#e0883a'),
         chip('codec', c.codec || 'both'),
         chip('target', c.target || 'local'),
     ];
@@ -3644,7 +3644,7 @@ function jobRowHtml(j) {
             <div class="job-header">
                 <div>
                     <span class="job-files">${escapeHtml((j.config.files || []).join(', '))}</span>
-                    <span class="job-meta"> — ${j.config.target} / ${j.config.codec} / ${j.config.ladder || 'apple-uniq-live'}${j.config.max_res ? ' / \u2264' + j.config.max_res : ''}${j.config.min_res ? ' / \u2265' + j.config.min_res : ''}</span>
+                    <span class="job-meta"> — ${j.config.target} / ${j.config.codec} / ${j.config.ladder || 'apple-uniq-live-xs'}${j.config.max_res ? ' / \u2264' + j.config.max_res : ''}${j.config.min_res ? ' / \u2265' + j.config.min_res : ''}</span>
                     ${cloudBadge}
                     <span class="job-ami-badge" style="display:none"></span>
                     <span class="job-reclaim-badge" style="display:none"></span>

@@ -10,15 +10,15 @@ import (
 
 // The ladder a run used has to be recoverable from history.md (#202). A rerun
 // built from history silently used the default ladder instead of
-// apple-uniq-live-full — 9 rungs capped at 1080p rather than 12 up to 2160p,
+// apple-uniq-live-xs — 9 rungs capped at 1080p rather than 12 up to 2160p,
 // 252 chunks instead of 336 — and nothing in the permanent record said so.
 //
 // These pin the two halves of the fix: the fallback name is resolved the same
 // way the encoder resolves it, and the recorded rungs are the ones that ran.
 
 func TestEffectiveLadderResolvesTheDefault(t *testing.T) {
-	if got := EffectiveLadder(JobConfig{Ladder: "apple-uniq-live-full"}); got != "apple-uniq-live-full" {
-		t.Errorf("named ladder = %q, want apple-uniq-live-full", got)
+	if got := EffectiveLadder(JobConfig{Ladder: "apple-uniq-live-xs"}); got != "apple-uniq-live-xs" {
+		t.Errorf("named ladder = %q, want apple-uniq-live-xs", got)
 	}
 	// An unnamed ladder must record what actually ran, not "". Recording the
 	// empty string is what made "ran with the default" and "ran with X"
@@ -150,7 +150,7 @@ func TestConfigBlockPreservesExplicitValues(t *testing.T) {
 	cfg := JobConfig{
 		Files:         []string{"clip.mp4"},
 		Codec:         "h264",
-		Ladder:        "apple-uniq-live-full",
+		Ladder:        "apple-uniq-live-xs",
 		ChunkDuration: "12", // the field whose absence produced 41 chunks not 336
 		Target:        TargetCloudBatch,
 		MaxRes:        "2160p",
@@ -163,7 +163,7 @@ func TestConfigBlockPreservesExplicitValues(t *testing.T) {
 
 	for field, want := range map[string]any{
 		"chunk_duration": "12",
-		"ladder":         "apple-uniq-live-full",
+		"ladder":         "apple-uniq-live-xs",
 		"codec":          "h264",
 		"max_res":        "2160p",
 		"burnin":         false,

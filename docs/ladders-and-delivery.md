@@ -59,15 +59,26 @@ peak / avg  =  maxrate_percent/100  +  bufsize_multiplier / T
 A **large** buffer lets a **short** segment burst. This is the whole reason a
 tight VBV is needed if one encode is to be cut at several segment durations:
 
-| ladder | 1s | 2s | 6s |
-| --- | --- | --- | --- |
-| `apple-uniq-live` / `-full` (110% / 0.1x) | 1.20x | 1.15x | 1.12x |
-| `apple-uniq-live-6s` (150% / 1x) | 2.50x | 2.00x | 1.67x |
-| `apple-uniq-vod` (200% / 2x) | 3.00x | 2.50x | 2.33x |
-
 Apple's guidance, which the chart colours against: **<=1.25x avg for live,
-<=2x for VOD**. So the tight ladder is within live guidance at *every* chop
-length; the loose ones are only sane at the duration they were built for.
+<=2x for VOD**.
+
+The live ladders are deliberately **peak-matched** at that 1.25x cap, so a
+comparison between them is not confounded by peak. What differs is the BUFFER
+each can afford, which is what committing to a segment length buys:
+
+| ladder | maxrate | bufsize | at its own T | at 1s |
+| --- | --- | --- | --- | --- |
+| `apple-uniq-live-xs` (flexible) | 110% | **0.10** | 1.12x at 6s | **1.20x** |
+| `apple-uniq-live-1s` | 110% | **0.15** | 1.25x | 1.25x |
+| `apple-uniq-live-2s` | 110% | **0.30** | 1.25x | (n/a) |
+| `apple-uniq-live-6s` | 110% | **0.90** | 1.25x | (n/a) |
+| `apple-uniq-vod` | 200% | 2.00 | 2.33x at 6s | — |
+
+The flexible base gets the **smallest** buffer of the set, and that is the whole
+point: it must survive being re-chopped to 1s, so it pays the 1s price at every
+length. A 6s ladder can hold 9x more buffer for the same delivered peak. That
+gap — 0.10x vs 0.90x — is the cost of re-choppability, and it is what the
+experiment below measures.
 
 The default `bufsize_multiplier` is **0.25x**. It was **2x** until July 2026,
 which was the pre-#829 value from smashing's `create_abr_ladder.sh`; the port
@@ -90,14 +101,25 @@ Observable in the output: `EXT-X-PART ... INDEPENDENT=YES` appears every 5th
 part in a `gop 1.0` / `partial 0.2` profile — 5 x 0.2s = **1.0s**, exactly the
 GOP. A player can join every second instead of every six.
 
-**A consequence worth stating plainly:** `apple-uniq-live-6s` uses `gop 1.0`, so
-it is *not* a "native 6s encode" in the efficiency sense — it is an LL encode
-that happens to use 6s segments. A genuinely native 6s encode would use `gop 6`.
+`apple-uniq-live-6s` **used** to use `gop 1.0`, making it an LL encode that
+happened to use 6s segments rather than a native 6s one. It is now `gop 6`, and
+`-1s` / `-2s` match their segments too — which is what makes each of them a
+distinct ENCODE. With VBV and GOP identical they would have been one encode
+packaged three ways, and there would be nothing to compare.
+
+The trade is visible in the same place: `gop = segment` means parts are
+`INDEPENDENT` only at segment boundaries, so a player can no longer join
+mid-segment. That is the low-latency cost of a long GOP.
 
 **Short GOP is the price of choppability**, and it is a real cost: six times the
 keyframes at `gop 1.0` versus `gop 6`. How large that cost is has not been
-measured; VMAF per rung is already computed, so it is cheap to find out, and it
-bounds the value of the whole one-encode-serves-all idea.
+measured, and it bounds the value of the whole one-encode-serves-all idea.
+
+It is NOT cheap to find out from the Ladders tab as it stands: those VMAF
+estimates are keyed by `(codec, height, bitrate, clip)` and ignore VBV and GOP
+entirely, so every ladder here reports the same numbers — including the GOP
+difference this paragraph is about. Measuring it means a real audit run, and
+recording which encode settings the resulting curve belongs to. See #288.
 
 ### Constraints
 
@@ -128,38 +150,53 @@ go last so the `_p200_<codec>` shape that `OutputStem`, `resolveCodec`,
 `_ladderSuffix`:
 
 ```
-explicit tag set          -> use it
+explicit tag set           -> use it
 no pinned segment_duration -> "xs"     (flexible; go-live repackages into 1/2/6s)
-pinned segment_duration    -> ""       (fixed-segment, served as-is)
+pinned segment_duration    -> "<n>s"   (6 -> "6s"; served as-is)
 ```
+
+Equivalent spellings collapse (`6` and `6.0` are one profile, not two
+directories), and a zero, negative or unparseable segment derives no tag at all
+rather than inventing `0s`.
 
 It can be set three ways, in increasing precedence: the derivation above, the
 ladder's own `output_tag`, and a per-encode override (the encode form's tag box,
 `--output-tag` on the CLI).
 
-### The gap
+### The gap this closed
 
-**Every pinned-segment ladder derives the same empty tag.** So `_1s`, `_2s` and
-`_6s` ladders would all produce `<stem>_<codec>` and overwrite each other. That
-is why a `_6s` output had to be tagged by hand — and why it landed as
-`..._h264__6s`, with a doubled underscore, because the typed value already had
-the separator.
+Pinned-segment ladders used to derive `""`. That held while there was ONE of
+them; with 6s, 2s and 1s ladders all three produced `<stem>_<codec>` and
+silently overwrote each other. It is also why a `_6s` output once had to be
+tagged by hand, and why it landed as `..._h264__6s` — the typed value carried
+its own separator.
 
-Deriving from the segment duration instead (`6 -> "6s"`) would make the four
-names automatic and collision-free. It changes existing output names, so it
-touches the naming contract above. Tracked in #286.
+Deriving from the segment length fixed that, but it does NOT make the tag
+unique and cannot: two profiles can pin the same length and differ in
+everything else (see `apple-uniq-vod` above). Explicit tags remain necessary;
+the submit-time collision check is what makes their absence loud rather than
+destructive.
 
 ## The ladders as they stand
 
-| ladder | maxrate% | bufsize x | seg | part | gop | derives tag |
+| ladder | maxrate% | bufsize x | seg | part | gop | tag |
 | --- | --- | --- | --- | --- | --- | --- |
-| `apple` | — | — | — | — | — | `xs` |
-| `apple-uniq` | — | — | — | — | — | `xs` |
-| `apple-uniq-live` | 110 | 0.1 | — | 0.2 | 1.0 | `xs` |
-| `apple-uniq-live-full` | 110 | 0.1 | — | 0.2 | 1.0 | `xs` |
-| `apple-uniq-live-6s` | 150 | 1 | 6 | 0.2 | 1.0 | `""` |
-| `apple-uniq-vod` | 200 | 2 | 6 | 0 | 6 | `""` |
-| `legacy` | — | — | — | — | — | `xs` |
+| `apple` | — | — | — | — | — | `xs` (derived) |
+| `apple-uniq` | — | — | — | — | — | `xs` (derived) |
+| `apple-uniq-live-xs` | 110 | 0.10 | — | 0.2 | 1.0 | `xs` (derived) |
+| `apple-uniq-live-1s` | 110 | 0.15 | 1 | 0.2 | 1 | `1s` (derived) |
+| `apple-uniq-live-2s` | 110 | 0.30 | 2 | 0.2 | 2 | `2s` (derived) |
+| `apple-uniq-live-6s` | 110 | 0.90 | 6 | 0.2 | 6 | `6s` (derived) |
+| `apple-uniq-vod` | 200 | 2.00 | 6 | 0 | 6 | **`vod` (explicit)** |
+
+`apple-uniq-vod` carries an EXPLICIT tag because it pins 6s and would otherwise
+derive `6s` — the same as `apple-uniq-live-6s`, which is a different encode
+entirely. Two encodes, one output directory, second overwrites first. Segment
+duration is a good default name, not a unique one; the encode form refuses a
+selection whose derived tags collide.
+
+The four `apple-uniq-live-*` ladders share one 12-rung h264 set (to 2160p) so a
+comparison between them is like-for-like at every rung.
 
 No stored ladder sets `output_tag`; every tag seen on disk is either derived
 (`xs`) or was typed per encode.
@@ -171,6 +208,10 @@ dynamically from one tight-VBV encode against content encoded natively for each
 duration with looser live-TV VBV.** If the tight arm holds up, one encode can
 serve all three durations instead of three.
 
-Status: the tight arm's encode exists (`apple-uniq-live-full` -> `_xs`). The
-native arm has only its 6s point, and that point uses `gop 1.0` rather than
-`gop 6`, so it may not be measuring what it appears to. See #286.
+Status: all four ladders exist as built-ins and are peak-matched, so the
+comparison can be run. Nothing has been encoded through them yet.
+
+One caveat before reading results: **VMAF estimates in the Ladders tab are keyed
+by (codec, height, bitrate, clip) and ignore VBV and GOP**, so all four ladders
+report identical numbers — including the GOP difference the experiment exists to
+measure. See #288.

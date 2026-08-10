@@ -190,7 +190,7 @@ func TestDeferPackagingSupersedesSkipMediaDownload(t *testing.T) {
 func sfnInputForDefer(t *testing.T, codecSel string, packageOnHost, deferPkg bool) map[string]any {
 	t.Helper()
 	in, _ := buildSFNInput(LoadLadderStore(""), LoadEncodeSpeedStore(""),
-		"s3://in/x.mp4", "s3://p", "s3://m", "apple-uniq-live-full", codecSel,
+		"s3://in/x.mp4", "s3://p", "s3://m", "apple-uniq-live-xs", codecSel,
 		"", "", false, false, true, packageOnHost, deferPkg, 3840, 30, 334.4, 0,
 		"12", "6", "0.2", "1.0", 9000, nil, nil)
 	var doc map[string]any

@@ -13,7 +13,7 @@ import (
 func sfnInputFor(t *testing.T, codecSel string, packageOnHost bool) map[string]any {
 	t.Helper()
 	in, _ := buildSFNInput(LoadLadderStore(""), LoadEncodeSpeedStore(""),
-		"s3://in/x.mp4", "s3://p", "s3://m", "apple-uniq-live-full", codecSel,
+		"s3://in/x.mp4", "s3://p", "s3://m", "apple-uniq-live-xs", codecSel,
 		"", "", false, false, true, packageOnHost, false, 3840, 30, 334.4, 0,
 		"12", "6", "0.2", "1.0", 9000, nil, nil)
 	var doc map[string]any
@@ -86,7 +86,7 @@ func TestHostPackagingCoversOnlyEncodedCodecs(t *testing.T) {
 // JSON null is what a nil Go slice marshals to.
 func TestHostPackageIsAlwaysAList(t *testing.T) {
 	in, _ := buildSFNInput(LoadLadderStore(""), LoadEncodeSpeedStore(""),
-		"s3://in/x.mp4", "s3://p", "s3://m", "apple-uniq-live-full", "both",
+		"s3://in/x.mp4", "s3://p", "s3://m", "apple-uniq-live-xs", "both",
 		"", "", false, false, true, false, false, 3840, 30, 334.4, 0,
 		"12", "6", "0.2", "1.0", 9000, nil, nil)
 	var raw map[string]json.RawMessage
