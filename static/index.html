@@ -479,10 +479,11 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 </div>
             </div>
             <div class="control-group">
-                <label title="Bitrate ladder (resolutions + target bitrates) AND its output timing (segment / partial / GOP). Manage ladders in the Ladders tab.">Ladder / Profile</label>
-                <select id="ladder" onchange="syncResTiers()">
+                <label title="Bitrate ladder (resolutions + target bitrates) AND its output timing (segment / partial / GOP / VBV). Select SEVERAL to encode the same source as several delivery profiles — one job each. Manage ladders in the Ladders tab.">Ladder / Profile</label>
+                <select id="ladder" multiple size="4" onchange="syncResTiers();syncLadderMultiNote()" style="height:auto;min-height:76px">
                     <option value="apple-uniq-live">apple-uniq-live</option>
                 </select>
+                <div id="ladder-multi-note" style="display:none;font-size:11px;color:#e9c46a;margin-top:3px"></div>
             </div>
             <!-- Options are rebuilt from the SELECTED LADDER's real rung heights
                  by syncResTiers() — these placeholders only cover the moment
@@ -1268,14 +1269,55 @@ async function loadLadders() {
     const sel = document.getElementById('ladder');
     if (sel) {
         const DEFAULT = 'apple-uniq-live';
-        const cur = sel.value || DEFAULT;
+        // Preserve the whole SELECTION, not just one value — this is a
+        // multi-select now and reloading the ladder list must not silently
+        // drop the profiles someone ticked.
+        const cur = selectedLadders();
         const names = Object.keys(laddersCache).sort();
         sel.innerHTML = names.map(n =>
             `<option value="${n}">${n}${laddersCache[n].seed ? '' : ' (custom)'}</option>`).join('');
-        sel.value = names.includes(cur) ? cur : (names.includes(DEFAULT) ? DEFAULT : names[0] || '');
+        const keep = cur.filter(n => names.includes(n));
+        const want = keep.length ? keep
+            : (names.includes(DEFAULT) ? [DEFAULT] : names.slice(0, 1));
+        Array.from(sel.options).forEach(o => { o.selected = want.includes(o.value); });
     }
     syncResTiers();
     loadLadderEstimates();
+    syncLadderMultiNote();
+}
+
+// Say how many jobs the button will start, and which ladder the single-ladder
+// views below are describing. Without this the second, third and fourth job are
+// invisible until they appear in the Jobs tab — and each one costs money.
+function syncLadderMultiNote() {
+    const el = document.getElementById('ladder-multi-note');
+    if (!el) return;
+    const sel = selectedLadders();
+    if (sel.length <= 1) { el.style.display = 'none'; return; }
+    el.style.display = '';
+    el.textContent = `${sel.length} ladders selected → ${sel.length} separate jobs, `
+        + `one output each. Charts and the estimate below show ${sel[0]}.`;
+}
+
+// Every ladder selected in the encode form, in list order. A multi-select with
+// nothing selected is possible (click into empty space), so this never returns
+// an empty array — an encode with no ladder is not a thing.
+function selectedLadders() {
+    const sel = document.getElementById('ladder');
+    if (!sel) return [];
+    const on = Array.from(sel.selectedOptions || []).map(o => o.value);
+    if (on.length) return on;
+    const first = sel.options[0];
+    return first ? [first.value] : [];
+}
+
+// The one ladder that the single-ladder views describe: the res-tier list, the
+// band charts, the cost estimate. Deliberately NOT an average or a union —
+// those views are about a specific (rungs + VBV + T) triple and there is no
+// meaningful way to draw several at once. The multi-select note tells the user
+// which one they are looking at.
+function primaryLadder() {
+    return selectedLadders()[0] || '';
 }
 
 // The codecs whose checkboxes are ticked, in canonical order. Falls back to all
@@ -1311,7 +1353,7 @@ function onCodecsChanged() {
 // the min list and vice versa, so an inverted band (which would encode nothing)
 // can't be selected. The server rejects it too — this just stops it earlier.
 function syncResTiers() {
-    const d = laddersCache[document.getElementById('ladder')?.value];
+    const d = laddersCache[primaryLadder()];
     const maxSel = document.getElementById('max-res');
     const minSel = document.getElementById('min-res');
     if (!maxSel || !minSel) return;
@@ -1355,7 +1397,7 @@ function syncResTiers() {
 // first place, but a mixed selection (e.g. H.264 + HEVC with a 1800p floor) can
 // still leave H.264 empty while HEVC is fine — this catches that before submit.
 function resBandError() {
-    const d = laddersCache[document.getElementById('ladder')?.value];
+    const d = laddersCache[primaryLadder()];
     if (!d || !d.codecs) return '';
     const minV = document.getElementById('min-res').value;
     const maxV = document.getElementById('max-res').value;
@@ -2270,7 +2312,7 @@ async function startEncode(force = false) {
         time: document.getElementById('time-limit').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
-        ladder: document.getElementById('ladder').value,
+        ladder: primaryLadder(),
         output_tag: document.getElementById('output-tag').value.trim(),
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,
@@ -2288,22 +2330,51 @@ async function startEncode(force = false) {
         body.defer_packaging = document.getElementById('defer-packaging').checked;
     }
 
-    try {
-        const res = await fetch('/api/encode', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        });
-        if (!res.ok) {
-            const text = await res.text();
-            showToast('Encode failed: ' + text, 'error');
-            return;
+    // One job per selected ladder. A ladder carries its own rungs, VBV, timing
+    // and output tag, so N ladders is N independent encodes producing N output
+    // directories — there is no server-side concept to add, just N submissions.
+    // They queue behind MAX_CONCURRENT like any other jobs.
+    const ladders = selectedLadders();
+    if (!ladders.length) { showToast('Select at least one ladder', 'error'); return; }
+
+    // An explicit tag applies to EVERY job, so with more than one ladder it
+    // would point them all at the same output directory and they would
+    // overwrite each other. Refuse rather than silently drop one of the two
+    // things the user asked for.
+    if (ladders.length > 1 && body.output_tag) {
+        showToast(`Output tag "${body.output_tag}" would apply to all ${ladders.length} ladders `
+            + `and they would overwrite each other. Clear it and let each ladder derive its own.`, 'error');
+        return;
+    }
+
+    const started = [];
+    const failed = [];
+    for (const name of ladders) {
+        try {
+            const res = await fetch('/api/encode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...body, ladder: name })
+            });
+            if (res.ok) { started.push(name); }
+            else { failed.push(`${name}: ${await res.text()}`); }
+        } catch (e) {
+            failed.push(`${name}: ${e.message}`);
         }
+    }
+
+    // Report BOTH — a partial submission is the likely failure here (one ladder
+    // rejected, the rest fine), and saying only "started" would hide it while
+    // saying only "failed" would hide the jobs that are now running.
+    if (started.length) {
         selectNone();
-        showToast(force ? 'Re-encode started — previous output archived' : 'Encode started', 'success');
+        const what = started.length === 1 ? `Encode started (${started[0]})`
+            : `${started.length} encodes started: ${started.join(', ')}`;
+        showToast(force ? `${what} — previous output archived` : what, 'success');
         switchTab('jobs');
-    } catch (e) {
-        showToast('Error: ' + e.message, 'error');
+    }
+    if (failed.length) {
+        showToast(`${failed.length} of ${ladders.length} failed — ${failed.join(' | ')}`, 'error');
     }
 }
 
@@ -3250,7 +3321,7 @@ async function refreshCostEstimate() {
         max_res: document.getElementById('max-res').value,
         min_res: document.getElementById('min-res').value,
         time: document.getElementById('time-limit').value,
-        ladder: document.getElementById('ladder').value,
+        ladder: primaryLadder(),
         hevc_single_pass: false,
     };
     if (isAnyCloudTarget(target)) {
@@ -3296,7 +3367,7 @@ function _saasCompare(e, prefix) {
 // from the ladder def + the estimate's probed width; empty when the source can
 // produce the whole ladder (or the width is unknown).
 function _excludedRungsNote(e) {
-    const d = laddersCache[document.getElementById('ladder')?.value];
+    const d = laddersCache[primaryLadder()];
     if (!d || !d.codecs) return '';
     const srcW = e.width || 0;
     if (srcW <= 0) return ''; // probe failed — no honest statement to make
@@ -6289,7 +6360,7 @@ async function forceReencode(fileName, _clickAt) {
         time: document.getElementById('time-limit').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
-        ladder: document.getElementById('ladder').value,
+        ladder: primaryLadder(),
         output_tag: document.getElementById('output-tag').value.trim(),
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,

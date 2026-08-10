@@ -3612,10 +3612,10 @@ func (m *Manager) resolveTimings(cfg *JobConfig) {
 	cfg.SegmentDuration = effectiveTiming(cfg.SegmentDuration, def.SegmentDuration, "6")
 	cfg.PartialDuration = effectiveTiming(cfg.PartialDuration, def.PartialDuration, "0.2")
 	cfg.GopDuration = effectiveTiming(cfg.GopDuration, def.GopDuration, "1.0")
-	// Output suffix: explicit (job or ladder output_tag) wins; otherwise only the
-	// FLEXIBLE base (no pinned segment) is tagged "xs" — that's the master go-live
-	// repackages into 1s/2s/6s. A fixed-segment profile is served as-is, so it
-	// gets NO suffix (go-live doesn't repackage it or need its segment length).
+	// Output suffix: explicit (job or ladder output_tag) wins; otherwise the
+	// FLEXIBLE base (no pinned segment) is tagged "xs" — that's the master
+	// go-live repackages into 1s/2s/6s — and a pinned-segment profile is tagged
+	// with its own segment length ("6s", "2s", "1s").
 	tag := cfg.OutputTag
 	if tag == "" {
 		tag = def.OutputTag
@@ -3625,7 +3625,20 @@ func (m *Manager) resolveTimings(cfg *JobConfig) {
 
 // deriveOutputTag returns the explicit tag if set; else "xs" for the flexible
 // base (no pinned segment — the repackage-into-1/2/6s master go-live treats
-// specially), or "" for a fixed-segment profile (served as-is, no marker needed).
+// specially), else the pinned segment length ("6" -> "6s").
+//
+// Pinned-segment ladders used to derive "" on the reasoning that a fixed-segment
+// profile is served as-is and needs no marker. That only held while there was
+// ONE of them: give a run 6s, 2s and 1s ladders — the whole point of #286 — and
+// all three produce <stem>_<codec> and silently overwrite each other. The
+// segment length is what distinguishes them, so it IS the tag.
+//
+// This is why a _6s output had to be tagged by hand, and why it landed as
+// "..._h264__6s": the typed value carried its own separator.
+//
+// A non-positive or unparseable segment keeps the old empty tag. "0" is not a
+// segmentation anyone can be served, so naming an output after it would assert
+// something false.
 func deriveOutputTag(explicit, ladderSegment string) string {
 	if explicit != "" {
 		return explicit
@@ -3633,7 +3646,24 @@ func deriveOutputTag(explicit, ladderSegment string) string {
 	if ladderSegment == "" {
 		return "xs"
 	}
-	return ""
+	return segmentTag(ladderSegment)
+}
+
+// segmentTag renders a segment duration as a path-safe suffix: "6" -> "6s",
+// "6.0" -> "6s", "1.5" -> "1.5s". Trailing zeros are trimmed so a ladder written
+// "6.0" and one written "6" cannot produce two directories for one profile.
+func segmentTag(seg string) string {
+	f, err := strconv.ParseFloat(strings.TrimSpace(seg), 64)
+	if err != nil || f <= 0 {
+		return ""
+	}
+	s := strconv.FormatFloat(f, 'f', -1, 64) + "s"
+	// The tag becomes a path segment; anything ValidPathSegment would reject is
+	// not worth naming a directory after.
+	if ValidPathSegment("output tag", s) != nil {
+		return ""
+	}
+	return s
 }
 
 func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int) error {
