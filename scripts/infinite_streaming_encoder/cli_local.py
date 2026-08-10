@@ -33,7 +33,7 @@ from infinite_streaming_encoder.encode_variants import (
 )
 from infinite_streaming_encoder.ffprobe import ProbeError, probe
 from infinite_streaming_encoder.hls import (
-    TsHlsSpec, generate_byteranges_sidecars, generate_fmp4_hls, generate_ts_hls,
+    TsHlsSpec, generate_fmp4_hls, generate_ts_hls,
 )
 from infinite_streaming_encoder import pricing
 from infinite_streaming_encoder.manifests import write_fragmented_mpd
@@ -460,12 +460,12 @@ def run_full(args: argparse.Namespace) -> int:
             emit_stage(f"package:{codec}", "done", 100.0)
 
             if want_fmp4:
-                print(f"[phase 6] fragment sidecars for {codec}...", flush=True)
+                print(f"[fragments] expanding manifest.mpd for {codec}...", flush=True)
                 emit_stage(f"fragments:{codec}", "running", 0.0)
-                count = generate_byteranges_sidecars(pkg_dir)
-                write_fragmented_mpd(pkg_dir)
+                n = write_fragmented_mpd(pkg_dir)
                 emit_stage(f"fragments:{codec}", "done", 100.0)
-                print(f"[phase 6] wrote {count} byteranges sidecars", flush=True)
+                print(f"[fragments] {n} representation(s) at fragment granularity",
+                      flush=True)
 
                 print(f"[phase 7] fMP4 HLS playlists for {codec}...", flush=True)
                 emit_stage(f"hls:{codec}", "running", 0.0)
@@ -650,8 +650,7 @@ def run_resume(args: argparse.Namespace) -> int:
         ))
 
         if want_fmp4:
-            generate_byteranges_sidecars(pkg_dir)
-            # Self-contained DASH: expand fragment byte-ranges into manifest_fragmented.mpd
+            # Self-contained DASH: manifest.mpd carries per-fragment mediaRange.
             write_fragmented_mpd(pkg_dir)
             generate_fmp4_hls(pkg_dir)
 

@@ -48,7 +48,7 @@ from infinite_streaming_encoder.encode_variants import (
 )
 from infinite_streaming_encoder.ffprobe import probe
 from infinite_streaming_encoder.hls import (
-    generate_byteranges_sidecars, generate_fmp4_hls,
+    generate_fmp4_hls,
 )
 from infinite_streaming_encoder.manifests import write_fragmented_mpd
 from infinite_streaming_encoder.ladder import (
@@ -1207,7 +1207,9 @@ def phase_hls(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# byteranges — fMP4 fragment byterange sidecars for EXT-X-PART.
+# byteranges — expand manifest.mpd to per-fragment mediaRange. Kept under the
+# old phase name (a Batch job definition references it); it no longer writes the
+# `.byteranges` sidecars the name came from (#282).
 # ---------------------------------------------------------------------------
 
 def phase_byteranges(args: argparse.Namespace) -> int:
@@ -1219,8 +1221,7 @@ def phase_byteranges(args: argparse.Namespace) -> int:
     _download_dir(args.s3_package.rstrip("/") + f"/{stem}", pkg_dir)
 
     emit_stage(f"fragments:{args.codec}", "running", 0.0)
-    generate_byteranges_sidecars(pkg_dir)
-    # Self-contained DASH: expand fragment byte-ranges into manifest_fragmented.mpd
+    # Self-contained DASH: manifest.mpd carries per-fragment mediaRange (#282).
     write_fragmented_mpd(pkg_dir)
     emit_stage(f"fragments:{args.codec}", "done", 100.0)
 
@@ -1229,14 +1230,18 @@ def phase_byteranges(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# package-all — combined package + byteranges + fMP4 HLS for one codec in a
-# single job. Downloads the variants + audio ONCE, then packages, writes the
-# byterange sidecars, and generates the LL-HLS playlists all from the local
-# package dir (no re-download between steps), and uploads once. Replaces the
-# old package -> hls -> byteranges chain of three separate Batch jobs — which
-# each cold-started, re-downloaded the whole ladder, and (a latent bug) ran
-# HLS before the byteranges it embeds. Correct order is package -> byteranges
-# -> hls (hls_from_dash reads the .byteranges sidecars).
+# package-all — combined package + fragment expansion + fMP4 HLS for one codec
+# in a single job. Downloads the variants + audio ONCE, then packages, expands
+# manifest.mpd to fragment granularity, and generates the LL-HLS playlists all
+# from the local package dir (no re-download between steps), and uploads once.
+# Replaces the old package -> hls -> byteranges chain of three separate Batch
+# jobs, which each cold-started and re-downloaded the whole ladder.
+#
+# That chain also had an ordering bug — HLS ran before the byteranges it
+# embedded — and the fix was to pin the order. Since #282 the order is no longer
+# load-bearing: both steps read the fragment offsets from the .m4s boxes, and
+# _extract_segments collapses either manifest granularity back to whole
+# segments, so neither can be corrupted by the other having run first.
 # ---------------------------------------------------------------------------
 
 def phase_package_all(args: argparse.Namespace) -> int:
@@ -1404,10 +1409,11 @@ def phase_package_all(args: argparse.Namespace) -> int:
     _pkg_timer.mark("shaka")
     emit_stage(f"package:{args.codec}", "done", 100.0)
 
-    # Byteranges BEFORE HLS — the playlists embed the fragment byte ranges.
+    # Self-contained DASH: manifest.mpd carries per-fragment mediaRange (#282).
+    # Order no longer matters here — _extract_segments collapses either
+    # granularity back to whole segments — but the fragment ranges are read from
+    # the media by both this and the HLS phase, so neither waits on the other.
     emit_stage(f"fragments:{args.codec}", "running", 0.0)
-    generate_byteranges_sidecars(pkg_dir)
-    # Self-contained DASH: expand fragment byte-ranges into manifest_fragmented.mpd
     write_fragmented_mpd(pkg_dir)
     _pkg_timer.mark("fragments")
     emit_stage(f"fragments:{args.codec}", "done", 100.0)

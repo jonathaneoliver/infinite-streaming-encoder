@@ -550,8 +550,8 @@ Supporting modules (all stdlib-only except `cloud/*` which uses boto3):
 - `padding.py` — LCM-based segment-boundary padding; 0.5s skip-threshold.
 - `burnin.py` — 5-layer drawtext filter (timecode, rate, codec+res+fps, encoder, watermark) + optional PADDING label on padded frames only.
 - `vmaf.py` — CSV lookup with linear interpolation; no-op when CSV absent.
-- `manifests.py` — folds the former `convert_to_segmentlist.py` (DASH SegmentTemplate → SegmentList) and an HLS master/variant generator.
-- `fragments.py` — fMP4 box walker producing `.byteranges` sidecars for EXT-X-PART. Reimplementation of the external `parse_fmp4_fragments.py` (not in the original repo) using stdlib `struct` only.
+- `manifests.py` — folds the former `convert_to_segmentlist.py` (DASH SegmentTemplate → SegmentList), the fragment-granularity expansion of `manifest.mpd`, and an HLS master/variant generator.
+- `fragments.py` — fMP4 box walker yielding each fragment's offset/length/independent. Reimplementation of the external `parse_fmp4_fragments.py` (not in the original repo) using stdlib `struct` only.
 - `resume.py` — scans a temp dir for `{codec}_{res}.mp4` files, used by `--resume-package-from` to skip phases 1-4.
 - `cloud/` — boto3-backed subpackage: `aws.py` (client factory + STS preflight), `launch.py` (spot run-instances + fallback), `userdata.py` (remote bash template, shlex-quoted), `poll.py` (S3 marker polling), `sync.py` (idempotent upload + paginated download).
 
@@ -626,7 +626,40 @@ not free — each pass is a LIST plus a `head_object` per job prefix.
 - Emit new markers via `telemetry.emit()`, and remember `cli_batch` is the queue's consumer — it must keep using `print`.
 - **`.remote.json` is the media-is-still-in-S3 flag** (`encode.RemoteSidecar`, written by `_write_remote_sidecar` in `cli_batch.py`, read by `encode.ReadRemote`). Its **presence** is the state — written by a `--no-media` sync-back, deleted by a completed `cli_batch.py fetch` — so the two languages agree on a filename and nothing else. Field names in `encode.RemoteInfo` are a contract with the Python writer. A metadata-only output dir is indistinguishable from a complete one by every other signal: right name, right rung subdirs, manifests present, `parseOutputMeta` happy. Miss the sidecar and the UI offers Play, hls.js loads the playlist, and every segment 404s.
 - **The sidecar has three states, not two** (#225). `expires_at` says when the lifecycle rule will remove the media; it does **not** say the media is still there. Everything else that removes objects — a staging clear, a console delete, the lifecycle firing early off each object's own creation time — leaves an output that looks available and fails on the click. So `gone: true` is set (never the file deleted — deleting it reclassifies the output as *complete*, the one wrong answer available) by two paths: `cmd_fetch` when the listing comes back **empty**, exiting `EXIT_STAGING_GONE` (4, mirrored as `encode.exitStagingGone`); and `Manager.MarkGoneUnderPrefix`, called from every cloud-clear handler with the prefixes out of `cleanup.py`'s own report. Ask `RemoteInfo.Fetchable()` rather than re-deriving from `Expired()`. **No S3 call belongs on the `/api/outputs` path** — it already costs ~0.8s over 30 dirs, and a HEAD per remote output every poll would be far worse than the problem.
-- Media exclusion is stated as `_MEDIA_SUFFIXES` (`.m4s`, `.byteranges`) — an **exclusion, not an allow-list**, so a new metadata file the packager starts writing ships by default instead of being silently dropped. Measured on a real ladder: metadata is 3.99 MB of 2.64 GB (0.151%).
+- Media exclusion is stated as `_MEDIA_SUFFIXES` (`.m4s`, `.byteranges`) — an **exclusion, not an allow-list**, so a new metadata file the packager starts writing ships by default instead of being silently dropped. Measured on a real ladder: metadata is 3.99 MB of 2.64 GB (0.151%). `.byteranges` is retained there for library content only; nothing writes sidecars since #282, but old outputs still have them and every path that reads or classifies them must keep tolerating both shapes.
+
+### One DASH manifest, at fragment granularity (#282)
+
+`manifest.mpd` is written **in place** at fragment granularity: one
+`<SegmentURL @media @mediaRange>` per fragment, with a fragment-level
+`<SegmentTimeline>`. There is no `manifest_fragmented.mpd` and no
+`<segment>.byteranges` sidecar — one file replaces three-plus-728-per-rung.
+
+The fragment form is a strict **superset**: segment membership regroups by
+`@media`, and a segment's duration is the sum of its fragments'. `@mediaRange` is
+inclusive, so length is `last-first+1`, and the first fragment starts at **432** —
+bytes 0-431 are the segment's own `styp`/`sidx` header and belong to no fragment.
+go-live relies on that offset, and detects granularity from the presence of
+`@mediaRange` rather than from the filename, so old content keeps working and this
+needed no flag day.
+
+Three rules hold this together:
+
+- **`write_fragmented_mpd` is idempotent.** `@mediaRange` anywhere means "already
+  expanded, stop". Phases retry and resume, so it runs twice on the same directory
+  routinely, and re-expanding would split each *fragment* into sub-fragments.
+- **`_extract_segments` collapses either granularity** back to whole segments, so
+  HLS generation cannot be corrupted by the expansion having run first. That
+  replaced an ordering rule (`package → byteranges → hls`) which had already been
+  got wrong once.
+- **HLS reads the media, not the manifest,** for its parts:  `@mediaRange` carries
+  no independence bit, and `#EXT-X-PART` needs `INDEPENDENT`. That is the one
+  thing the sidecars held which the manifest cannot — a deliberate, one-way loss
+  for the DASH side, where nothing reads it.
+
+`manifests._segment_fragments` prefers a `.byteranges` sidecar when one exists so
+a pre-#282 package repackages identically, and otherwise walks the `.m4s`. Both
+branches call the same `fragments.parse_segment`, so they cannot disagree.
 - **`version` (worker, fleet view, `run.json`) means ENCODER PAYLOAD, not build** (#248). It is `IMAGE_TAG`, which the Makefile derives as `git log -1 --format=%h -- Dockerfile requirements.txt scripts static` — excluding `internal/` and `cmd/`, while the Dockerfile still copies the Go server binary into the image. Two consequences, both deliberate: a **Go-only change does not move the tag**, so it publishes different image content under the same tag and is invisible to `make fleet-check` by construction; and **rollback is asymmetric** — `make infra-plan IMAGE_TAG=<prev>` restores the encoder payload, not the server binary that shipped in that image (nothing expects it to, since the server is not deployed from the pinned tag). This is the right identity for the question being asked — a chunk's encode behaviour lives in `scripts/`, so two chunks agreeing on `version` ran identical encoder code — but "version" invites a stronger reading than it can support, and someone will eventually chase a server-side skew the tag is correctly refusing to show.
 - **The pre-flight estimate and the finished run's cost must stay on one basis.** AWS bills the INSTANCE — launch to termination, boot, image pull and the scale-down tail — not the vCPU-time jobs allocate. `_emit_cost_summary` prices the rental; `projectCloudCost` predicts allocation and converts with the one term that reconciles them, `machine = allocated / (1 - idle)`, from `fleetIdleFraction`. Before that term existed the same app quoted ~60% of what it then reported (#237). Two rules keep it honest: the allowance is **shown, never folded in** (an invisible 1.7x next to the Encode button is how the gap survived), and `variantResourcesFor`'s **reservation** must stay on both sides — `unallocated_pct` is defined against reserved vCPU, so pricing measured busy-cores instead would break the calibration and restore the undercount.
 - `$TMP_DIR/spot_samples.json` (`encode.RunSample`) is a **cross-language contract**: Go writes it at every terminal job, `inventory.py`'s `_spot_and_reclaim_stats` reads it **by field name and ignores what it doesn't know**. Adding fields is safe; renaming one silently zeroes the AWS view's spot savings with no error on either side. `idle_pct` there is a lower bound — boxes still alive at run end have their lifetime measured to now — and samples whose `started_at`/`ended_at` overlap another run are excluded from the allowance, because `_emit_machine_rental` counts a concurrent run's time on a shared instance as this run's idle.
