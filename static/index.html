@@ -5060,15 +5060,56 @@ function _isLocalDistJob(j) {
     return t.includes('local') || t.includes('dist');
 }
 
-function _laneJob(local) {
+// A short name for a job on a shared chart. The ladder tag is what distinguishes
+// four ladders of one source, which is the case this exists for; the ladder name
+// is the fallback while a job is early enough not to have resolved one.
+function _laneJobLabel(j) {
+    const c = (j || {}).config || {};
+    return String(c.output_tag || c.ladder || (j || {}).id || '?')
+        .replace(/^apple-uniq-/, '');
+}
+
+// The job(s) to chart, newest first.
+//
+// On the FARM every job shares one worker pool, so charting a single job asks
+// the wrong question. A machine flat out on job B draws as IDLE on job A's lane,
+// and the panel's headline — "% of the run each machine was working" — stops
+// describing the farm and starts describing job A's queue position. The two
+// halves of the panel then contradict each other in a way neither can explain:
+// the rows above are farm-wide and read 100% busy while the lanes below read
+// 16%, both correct, nothing saying why.
+//
+// #286 made that the NORMAL case rather than a curiosity: ticking four ladders
+// submits four jobs against one set of machines, they start milliseconds apart,
+// and Temporal's task queue is roughly FIFO — so the later ones sit behind the
+// first with no work at all, for minutes. Observed on the first real multi-ladder
+// run: -1s had 234 chunks done and 6 running while -2s had 9 done and 246 queued.
+//
+// So local charts every running job at once, and idle recovers its meaning: no
+// job of ANY kind on that machine.
+//
+// Cloud charts ONE job, because there the premise is reversed — each execution
+// rents its own instances, so two runs never share a lane and summing them would
+// add unrelated bills together.
+function _laneJobs(local) {
     const all = Object.values((typeof jobs === 'object' && jobs) ? jobs : {})
         .filter(j => _laneStages(j).length)
         .filter(j => local === undefined || _isLocalDistJob(j) === !!local);
-    if (!all.length) return null;
+    if (!all.length) return [];
+    const newestFirst = (a, b) =>
+        Date.parse(b.started_at || 0) - Date.parse(a.started_at || 0);
     const run = all.filter(j => typeof _jobRunning === 'function' ? _jobRunning(j) : false);
-    const pick = (run.length ? run : all);
-    return pick.sort((a, b) =>
-        Date.parse(b.started_at || 0) - Date.parse(a.started_at || 0))[0];
+    // Nothing running: the most recent finished run is still worth reading, and
+    // that is exactly when someone looks at it.
+    if (!run.length) return [all.sort(newestFirst)[0]];
+    if (local) return run.sort(newestFirst);
+    // Cloud picks one, and prefers a job with work OPEN right now. Sorting by
+    // start alone chose the job LEAST likely to be doing anything: submissions
+    // land milliseconds apart, so "newest" is a coin toss that resolves to
+    // whichever went to the back of the queue, and a job with no open stage is
+    // the worst possible subject for a chart about who is busy.
+    const busy = run.filter(j => _laneStages(j).some(s => !s.ended_at));
+    return [(busy.length ? busy : run).sort(newestFirst)[0]];
 }
 
 function _laneStages(job) {
@@ -5085,9 +5126,21 @@ function _laneStages(job) {
 // stage data, different headline.
 function _fleetLanesHtml(opts) {
     const local = !!(opts && opts.local);
-    const job = _laneJob(local);
-    const stages = _laneStages(job);
+    const chartJobs = _laneJobs(local);
+    if (!chartJobs.length) return '';
+    const multi = chartJobs.length > 1;
+    // The key names the block in its tooltip and is what counts chunks, so with
+    // several jobs on one machine it has to say WHICH job — `chunk9` appears in
+    // all four ladders of a source. Prefixed rather than replaced: the `:chunk`
+    // the count keys off has to survive.
+    const stages = chartJobs.flatMap(j => {
+        if (!multi) return _laneStages(j);
+        const tag = _laneJobLabel(j);
+        return _laneStages(j).map(s => ({ ...s, key: tag + ' · ' + (s.key || '') }));
+    });
     if (!stages.length) return '';
+    // Rentals are per-execution and cloud-only, and cloud charts exactly one job.
+    const job = chartJobs[0];
     const now = Date.now();
 
     // Merge each instance's stage intervals — chunks overlap on a box, and the
@@ -5257,9 +5310,20 @@ function _fleetLanesHtml(opts) {
     const laneStart = L => L.launch || (L.merged.length ? L.merged[0][0] : now);
     const laneEnd = L => Math.max(L.gone || 0, L.merged.length ? L.merged[L.merged.length - 1][1] : 0, laneStart(L));
 
+    // Sorted and t0 taken HERE, above runEnd, because runEnd's last fallback
+    // reads t0 — and a `const` read before its declaration is a ReferenceError
+    // that takes the whole panel down, not a quiet undefined. It needs a
+    // finished job with no ended_at to fire, which is why it has never been
+    // seen; it is still one branch away.
+    lanes.sort((a, b) => laneStart(a) - laneStart(b) || a.id.localeCompare(b.id));
+    const t0 = Math.min(...lanes.map(laneStart));
+
     // Is the run still going? Decides whether an unterminated box is still
     // billing or simply unobserved — see the tailTo comment below.
-    const jobLive = (typeof _jobRunning === 'function') ? _jobRunning(job) : false;
+    // ANY charted job still going. On the farm the machines are shared, so one
+    // live job is enough for the fleet to still be in use.
+    const jobLive = chartJobs.some(j =>
+        (typeof _jobRunning === 'function') ? _jobRunning(j) : false);
     // The horizon local lanes are measured against: the whole JOB, ending when
     // the job does.
     //
@@ -5272,7 +5336,11 @@ function _fleetLanesHtml(opts) {
     // It stops at the job's own end, so once the job is done the chart is
     // static: a finished run reads the same an hour later as it did on
     // completion.
-    const jobEnd = Date.parse((job || {}).ended_at || '');
+    // The LAST of them to finish — the farm is only free once every charted job
+    // is done, so anything earlier would crop the tail off the others.
+    const jobEnds = chartJobs
+        .map(j => Date.parse((j || {}).ended_at || '')).filter(t => !isNaN(t));
+    const jobEnd = jobEnds.length ? Math.max(...jobEnds) : NaN;
     const runEnd = jobLive ? now
         : (!isNaN(jobEnd) ? jobEnd
            : Math.max(...lanes.map(L =>
@@ -5282,8 +5350,6 @@ function _fleetLanesHtml(opts) {
     // (the tail after the last job: the fan-in barrier plus scale-down) as an
     // unexplained remainder the reader had to compute by subtraction.
 
-    lanes.sort((a, b) => laneStart(a) - laneStart(b) || a.id.localeCompare(b.id));
-    const t0 = Math.min(...lanes.map(laneStart));
     // The axis stops where the work does on local, and at `now` on cloud. A
     // cloud box is still costing money after its last job, so the chart must
     // keep drawing; a farm machine is not, so extending the axis to now would
@@ -5545,11 +5611,16 @@ function _fleetLanesHtml(opts) {
     return `<div style="margin-top:16px;border-top:1px solid #2a303c;padding-top:12px">
       <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px">
         <div style="font-size:12px;color:#ccc;font-weight:600">Machine timeline</div>
-        <div style="font-size:11px;color:#7f8899">${local ? "when each machine was working, and where the run waited on one of them" : "you pay from launch to termination — colour is billed, track is not. Idle here means NO job on the box; the rental table\u0027s figure is stricter (it counts partly-allocated boxes too)."}</div>
+        <div style="font-size:11px;color:#7f8899">${local
+          ? (multi
+             ? "every running job at once — these machines are shared, so idle means no job of any kind on the box"
+             : "when each machine was working, and where the run waited on one of them")
+          : "you pay from launch to termination — colour is billed, track is not. Idle here means NO job on the box; the rental table\u0027s figure is stricter (it counts partly-allocated boxes too)."}</div>
+        ${multi ? `<div style="font-size:11px;color:#6f7887" title="one worker pool, so these queue behind each other rather than running side by side">${chartJobs.length} jobs sharing the farm: ${escapeHtml(chartJobs.map(_laneJobLabel).join(', '))}</div>` : ''}
       </div>
       <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:10px;font-variant-numeric:tabular-nums">
         ${local
-          ? `<div style="font-size:19px;color:#e6e9ef;font-weight:600">${Math.round(workMs / Math.max(1, billedMs) * 100)}% <span style="font-size:12px;font-weight:400;color:#8a94a2">of the run each machine was working</span></div>`
+          ? `<div style="font-size:19px;color:#e6e9ef;font-weight:600">${Math.round(workMs / Math.max(1, billedMs) * 100)}% <span style="font-size:12px;font-weight:400;color:#8a94a2">of the window each machine was working</span></div>`
           : `<div style="font-size:19px;color:#e6e9ef;font-weight:600">${(billedMs / 3600000).toFixed(2)} <span style="font-size:12px;font-weight:400;color:#8a94a2">vCPU-h billed</span></div>`}
         ${(!local && cpuS > 0) ? `<div style="font-size:13px;color:#e6e9ef" title="CPU seconds actually burned by ffmpeg, over vCPU-seconds rented. Containers run at ~99% of their reserved vCPU, so the shortfall is fleet idle — boot, image pull, the fan-in wait and the scale-down tail — not slack inside a job.">${effPct.toFixed(0)}% <span style="color:#8a94a2">efficient</span> <span style="color:#6f7887">(${(cpuS / 3600).toFixed(2)} vCPU-h of real CPU)</span></div>` : ''}
         <div style="font-size:13px;color:${IDLE}">${local
