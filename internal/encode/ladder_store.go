@@ -55,8 +55,10 @@ type LadderDef struct {
 	SegmentDuration string `json:"segment_duration,omitempty"`
 	PartialDuration string `json:"partial_duration,omitempty"`
 	GopDuration     string `json:"gop_duration,omitempty"`
-	// OutputTag, when set, is appended to the output directory name (e.g. "6s" →
-	// "<stem>_6s_<codec>"). It marks the profile in the filename so a downstream
+	// OutputTag, when set, is appended to the output directory name AFTER the
+	// codec (e.g. "6s" → "<stem>_<codec>_6s") — last, so the `_p200_<codec>`
+	// shape that OutputStem / resolveCodec / parseOutputMeta / the watcher all
+	// key off stays intact. It marks the profile in the filename so a downstream
 	// consumer (e.g. go-live) can tell a repackage-once profile from the default
 	// repackage-into-1s/2s/6s one. Empty = no tag (dir names unchanged).
 	OutputTag string `json:"output_tag,omitempty"`
