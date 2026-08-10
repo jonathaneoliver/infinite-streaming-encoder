@@ -1313,7 +1313,7 @@ async function loadLadders() {
             ].filter(Boolean).join('\n');
             return `<label class="ladder-row" title="${escapeAttr(tip)}">
                 <input type="checkbox" class="ladder-cb" value="${escapeAttr(n)}"${want.includes(n) ? ' checked' : ''}
-                       onchange="syncResTiers();syncLadderMultiNote()">
+                       onchange="syncResTiers();syncLadderMultiNote();scheduleCostEstimate()">
                 <span class="ladder-name">${escapeHtml(n)}${d.seed ? '' : ' <i>(custom)</i>'}</span>
             </label>`;
         }).join('');
@@ -1777,7 +1777,15 @@ function renderLaddersTab() {
             (fixed && fixed > 0) ? `segment ${d.segment_duration}s (fixed)` : `segment 1/2/6s`,
             partOff ? `no parts` : `partial ${d.partial_duration || '0.2'}s`,
             `gop ${d.gop_duration || '1.0'}s`,
-            _ladderSuffix(d) ? `suffix _${_ladderSuffix(d)} (go-live → 1/2/6s)` : `no suffix (served as-is)`,
+            (() => {
+                const t = _ladderSuffix(d);
+                if (!t) return `no suffix (served as-is)`;
+                // Only the FLEXIBLE base is re-chopped. A pinned profile now
+                // derives its own segment length as the suffix, and go-live
+                // serves it unchanged.
+                return t === 'xs' ? `suffix _xs (go-live → 1/2/6s)`
+                                  : `suffix _${t} (served as-is)`;
+            })(),
         ];
         const actions = d.seed
             ? `<span class="job-ami-badge" title="Built-in, read-only">built-in</span>`
@@ -1992,7 +2000,7 @@ function _renderLadderEditor() {
           <input type="text" value="${_escAttr(e.partial_duration)}" placeholder="0.2" style="width:80px" oninput="_edSet('partial_duration',this.value)"></div>
         <div class="control-group"><label title="GOP / keyframe interval (s). VOD can use a long GOP (=segment) for efficiency; live keeps ~1s. Blank inherits 1.0.">GOP (s)</label>
           <input type="text" value="${_escAttr(e.gop_duration)}" placeholder="1.0" style="width:80px" oninput="_edSet('gop_duration',this.value)"></div>
-        <div class="control-group"><label title="Suffix appended to the output dir name. '_xs' tells go-live to generate 1s/2s/6s segments from this master; anything else (no suffix) is served as-is. Blank = auto: the flexible base (no pinned segment) → 'xs', a fixed-segment profile → none.">Output suffix</label>
+        <div class="control-group"><label title="Suffix appended to the output dir name, after the codec. '_xs' tells go-live this is the master to generate 1s/2s/6s from; any other suffix is served as-is. Blank = auto: a flexible ladder (no pinned segment) derives 'xs', a pinned one derives its own segment length ('6s', '2s', '1s'). Set one explicitly when two ladders pin the SAME length — they would otherwise derive the same suffix and overwrite each other.">Output suffix</label>
           <input type="text" value="${_escAttr(e.output_tag)}" placeholder="auto: ${_ladderSuffix({ segment_duration: e.segment_duration }) || 'none'}" style="width:110px" oninput="_edSet('output_tag',this.value)"></div>
       </div>
       <div class="control-group" style="margin-top:8px"><label>Description</label>
@@ -3384,14 +3392,26 @@ async function refreshCostEstimate() {
         body.defer_packaging = document.getElementById('defer-packaging').checked;
     }
     try {
-        const r = await fetch('/api/encode/estimate', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        });
-        if (!r.ok) { el.style.display = 'none'; return; }
-        const d = await r.json();
-        if (!d.ok) { el.style.display = 'none'; return; }
-        el.innerHTML = _estimateHtml(d.estimate, files.length);
+        // One request per selected ladder. They are priced SEPARATELY rather
+        // than one-times-N because ladders differ in rungs and VBV, so their
+        // costs differ — and the rung count is what dominates. In flight
+        // together; the endpoint probes per file, so this is N x that, which is
+        // why the 400ms debounce above matters more now than it did.
+        const ladders = selectedLadders();
+        const rs = await Promise.all(ladders.map(name =>
+            fetch('/api/encode/estimate', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...body, ladder: name }),
+            }).then(r => r.ok ? r.json() : null).catch(() => null)));
+
+        const got = [];
+        rs.forEach((d, i) => { if (d && d.ok) got.push({ name: ladders[i], est: d.estimate }); });
+        if (!got.length) { el.style.display = 'none'; return; }
+
+        const d = { ok: true, estimate: got[0].est };
+        el.innerHTML = got.length === 1
+            ? _estimateHtml(got[0].est, files.length)
+            : _estimateHtmlMulti(got, files.length, ladders.length);
         el.style.display = '';
         // Now that we know the source width, prune the Min/Max-Res tiers to what
         // this source can produce (no upscale). Only re-sync on a real change to
@@ -3440,6 +3460,45 @@ function _excludedRungsNote(e) {
     const cap = ceiling ? `${ceiling}p` : `${srcW}px wide`;
     return `<div style="color:#e9c46a;font-size:11px;margin-top:3px">`
          + `⚠ Source tops out at ${cap} — this ladder's taller rungs (${list}) can't be produced (no upscale), so switching to a ladder that adds them won't change the output.</div>`;
+}
+
+// Several ladders selected: N encodes, N outputs, one bill. The headline is the
+// SUM, because that is what gets charged; the per-ladder split follows so a
+// costly ladder can be identified instead of hiding inside the total.
+//
+// `asked` is how many were selected: when a ladder fails to price (unprobeable
+// source, a rejected config) it is dropped from the sum, and a total quietly
+// covering fewer encodes than the button will start is exactly the kind of
+// under-statement this function exists to prevent — so it is said out loud.
+function _estimateHtmlMulti(got, nFiles, asked) {
+    const local = got[0].est.local;
+    const sum = k => got.reduce((n, g) => n + (g.est[k] || 0), 0);
+    const mins = (got[0].est.duration_s || 0) / 60;
+    const src = `${nFiles} file${nFiles > 1 ? 's' : ''} · ${mins.toFixed(1)} min`;
+    const missing = asked - got.length;
+    const note = missing > 0
+        ? ` <span style="color:#e9c46a">(${missing} ladder${missing > 1 ? 's' : ''} could not be priced — total covers ${got.length} of ${asked})</span>`
+        : '';
+
+    const split = got.map(g => {
+        const usd = local ? 0 : (g.est.total_usd || 0);
+        return `${escapeHtml(g.name)} <b>$${usd.toFixed(2)}</b>`;
+    }).join(' · ');
+
+    if (local) {
+        return `<b>Estimated cost</b> ${src} → <b style="color:#6ab04c">$0.00</b> `
+             + `<span style="color:#889">${got.length} local encodes, nothing billed</span>${note}`
+             + `<div style="color:#889;font-size:11px;margin-top:2px">${split}</div>`
+             + _excludedRungsNote(got[0].est);
+    }
+    const eg = sum('egress_usd');
+    const parts = [`$${sum('spot_usd').toFixed(2)} compute${_idleNote(got[0].est)}`];
+    if (eg > 0) parts.push(`$${eg.toFixed(2)} egress (${sum('egress_gb').toFixed(2)} GB)`);
+    else parts.push(`<span style="color:#6ab04c">no egress — media stays in S3</span>`);
+    return `<b>Estimated cost</b> ${src} → <b>$${sum('total_usd').toFixed(2)}</b> `
+         + `<span style="color:#889">${got.length} encodes · ${parts.join(' · ')}</span>${note}`
+         + `<div style="color:#889;font-size:11px;margin-top:2px">${split}</div>`
+         + _excludedRungsNote(got[0].est);
 }
 
 function _estimateHtml(e, nFiles) {

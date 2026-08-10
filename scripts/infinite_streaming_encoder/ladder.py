@@ -272,20 +272,78 @@ SEED_LADDERS: dict[str, dict] = {
             "av1":  _SEED_APPLE_HEVC_UNIQ,
         },
     },
-    "apple-uniq-live-6s": {
-        "description": "apple-uniq LL-HLS for 6s segments ONLY. The tight "
-                       "110%/0.10x VBV on apple-uniq-live kept the delivered "
-                       "per-segment peak reasonable even at 1s (peak ~= maxrate "
-                       "+ bufsize/T); fixed at 6s the bufsize/T term is 6x "
-                       "smaller, so relax to 150%/1.0x for better quality while "
-                       "the delivered peak stays ~1.67x avg. Keeps 0.2s parts + "
-                       "1s GOP. Outputs tagged _6s so go-live only makes 6s.",
+    "apple-uniq-live-1s": {
+        "description": "apple-uniq bitrates encoded NATIVELY for 1s segments."
+                       "Delivered peak (maxrate + bufsize/T) is held at 1.25x avg —"
+                       "Apple's live/linear guidance — the SAME as the other apple-"
+                       "uniq-live-Ns ladders, so a comparison between them is not"
+                       "confounded by peak. Committing to 1s is what buys the bigger"
+                       "buffer: 0.15x here versus 0.10x on the flexible base (apple-"
+                       "uniq-live), which must survive re-chopping to 1s and so pays"
+                       "the 1s price at every length — that difference IS the cost of"
+                       "re-choppability. GOP matched to the segment (1s), which is"
+                       "what makes this a different ENCODE rather than a repackaging."
+                       "NOTE gop == segment means LL-HLS parts are INDEPENDENT only at"
+                       "segment boundaries, so a player cannot join mid-segment: the"
+                       "low-latency cost of a long GOP.",
         "seed": True,
-        "maxrate_percent": 150,
-        "bufsize_multiplier": 1.0,
+        "maxrate_percent": 110,
+        "bufsize_multiplier": 0.15,
+        "segment_duration": "1",
+        "partial_duration": "0.2",
+        "gop_duration": "1",
+        "codecs": {
+            "h264": _SEED_APPLE_H264_UNIQ,
+            "hevc": _SEED_APPLE_HEVC_UNIQ,
+            "av1":  _SEED_APPLE_HEVC_UNIQ,
+        },
+    },
+    "apple-uniq-live-2s": {
+        "description": "apple-uniq bitrates encoded NATIVELY for 2s segments."
+                       "Delivered peak (maxrate + bufsize/T) is held at 1.25x avg —"
+                       "Apple's live/linear guidance — the SAME as the other apple-"
+                       "uniq-live-Ns ladders, so a comparison between them is not"
+                       "confounded by peak. Committing to 2s is what buys the bigger"
+                       "buffer: 0.3x here versus 0.10x on the flexible base (apple-"
+                       "uniq-live), which must survive re-chopping to 1s and so pays"
+                       "the 1s price at every length — that difference IS the cost of"
+                       "re-choppability. GOP matched to the segment (2s), which is"
+                       "what makes this a different ENCODE rather than a repackaging."
+                       "NOTE gop == segment means LL-HLS parts are INDEPENDENT only at"
+                       "segment boundaries, so a player cannot join mid-segment: the"
+                       "low-latency cost of a long GOP.",
+        "seed": True,
+        "maxrate_percent": 110,
+        "bufsize_multiplier": 0.3,
+        "segment_duration": "2",
+        "partial_duration": "0.2",
+        "gop_duration": "2",
+        "codecs": {
+            "h264": _SEED_APPLE_H264_UNIQ,
+            "hevc": _SEED_APPLE_HEVC_UNIQ,
+            "av1":  _SEED_APPLE_HEVC_UNIQ,
+        },
+    },
+    "apple-uniq-live-6s": {
+        "description": "apple-uniq bitrates encoded NATIVELY for 6s segments."
+                       "Delivered peak (maxrate + bufsize/T) is held at 1.25x avg —"
+                       "Apple's live/linear guidance — the SAME as the other apple-"
+                       "uniq-live-Ns ladders, so a comparison between them is not"
+                       "confounded by peak. Committing to 6s is what buys the bigger"
+                       "buffer: 0.9x here versus 0.10x on the flexible base (apple-"
+                       "uniq-live), which must survive re-chopping to 1s and so pays"
+                       "the 1s price at every length — that difference IS the cost of"
+                       "re-choppability. GOP matched to the segment (6s), which is"
+                       "what makes this a different ENCODE rather than a repackaging."
+                       "NOTE gop == segment means LL-HLS parts are INDEPENDENT only at"
+                       "segment boundaries, so a player cannot join mid-segment: the"
+                       "low-latency cost of a long GOP.",
+        "seed": True,
+        "maxrate_percent": 110,
+        "bufsize_multiplier": 0.9,
         "segment_duration": "6",
         "partial_duration": "0.2",
-        "gop_duration": "1.0",
+        "gop_duration": "6",
         "codecs": {
             "h264": _SEED_APPLE_H264_UNIQ,
             "hevc": _SEED_APPLE_HEVC_UNIQ,
@@ -304,6 +362,11 @@ SEED_LADDERS: dict[str, dict] = {
         "segment_duration": "6",
         "partial_duration": "0",
         "gop_duration": "6",
+        # Explicit: the derived tag would be "6s", colliding with
+        # apple-uniq-live-6s, which is a different encode (gop 6 vs 1.0, no
+        # parts vs 0.2s, 200%/2x vs 150%/1x). Segment duration is a good
+        # default name, not a unique one.
+        "output_tag": "vod",
         "codecs": {
             "h264": _SEED_APPLE_H264_UNIQ,
             "hevc": _SEED_APPLE_HEVC_UNIQ,

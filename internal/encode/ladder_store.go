@@ -162,14 +162,42 @@ func defaultSeedLadders() map[string]LadderDef {
 				"av1":  appleUniqHEVC,
 			},
 		},
-		"apple-uniq-live-6s": {
-			Description:       "apple-uniq LL-HLS for 6s segments ONLY. The tight 110%/0.10x VBV on apple-uniq-live existed to keep the delivered per-segment peak reasonable even at 1s (delivered peak ~= maxrate + bufsize/T). Fixed at 6s the bufsize/T term is 6x smaller, so relax to 150%/1.0x for better quality on complex scenes while the delivered peak stays ~1.67x avg. Keeps LL-HLS parts (0.2s) + 1s GOP.",
+		"apple-uniq-live-1s": {
+			Description:       "apple-uniq bitrates encoded NATIVELY for 1s segments. Delivered peak (maxrate + bufsize/T) is held at 1.25x avg — Apple's live/linear guidance — the SAME as the other apple-uniq-live-Ns ladders, so a comparison between them is not confounded by peak. Committing to 1s is what buys the bigger buffer: 0.15x here versus 0.10x on the flexible base (apple-uniq-live), which must survive re-chopping to 1s and so pays the 1s price at every length — that difference IS the cost of re-choppability. GOP matched to the segment (1s), which is what makes this a different ENCODE rather than a repackaging. NOTE gop == segment means LL-HLS parts are INDEPENDENT only at segment boundaries, so a player cannot join mid-segment: the low-latency cost of a long GOP.",
 			Seed:              true,
-			MaxratePercent:    150,
-			BufsizeMultiplier: 1.0,
+			MaxratePercent:    110,
+			BufsizeMultiplier: 0.15,
+			SegmentDuration:   "1", // fixed → suffix auto-derives to "_1s"
+			PartialDuration:   "0.2",
+			GopDuration:       "1",
+			Codecs: map[string][][]int{
+				"h264": appleUniqH264,
+				"hevc": appleUniqHEVC,
+				"av1":  appleUniqHEVC,
+			},
+		},
+		"apple-uniq-live-2s": {
+			Description:       "apple-uniq bitrates encoded NATIVELY for 2s segments. Delivered peak (maxrate + bufsize/T) is held at 1.25x avg — Apple's live/linear guidance — the SAME as the other apple-uniq-live-Ns ladders, so a comparison between them is not confounded by peak. Committing to 2s is what buys the bigger buffer: 0.3x here versus 0.10x on the flexible base (apple-uniq-live), which must survive re-chopping to 1s and so pays the 1s price at every length — that difference IS the cost of re-choppability. GOP matched to the segment (2s), which is what makes this a different ENCODE rather than a repackaging. NOTE gop == segment means LL-HLS parts are INDEPENDENT only at segment boundaries, so a player cannot join mid-segment: the low-latency cost of a long GOP.",
+			Seed:              true,
+			MaxratePercent:    110,
+			BufsizeMultiplier: 0.3,
+			SegmentDuration:   "2", // fixed → suffix auto-derives to "_2s"
+			PartialDuration:   "0.2",
+			GopDuration:       "2",
+			Codecs: map[string][][]int{
+				"h264": appleUniqH264,
+				"hevc": appleUniqHEVC,
+				"av1":  appleUniqHEVC,
+			},
+		},
+		"apple-uniq-live-6s": {
+			Description:       "apple-uniq bitrates encoded NATIVELY for 6s segments. Delivered peak (maxrate + bufsize/T) is held at 1.25x avg — Apple's live/linear guidance — the SAME as the other apple-uniq-live-Ns ladders, so a comparison between them is not confounded by peak. Committing to 6s is what buys the bigger buffer: 0.9x here versus 0.10x on the flexible base (apple-uniq-live), which must survive re-chopping to 1s and so pays the 1s price at every length — that difference IS the cost of re-choppability. GOP matched to the segment (6s), which is what makes this a different ENCODE rather than a repackaging. NOTE gop == segment means LL-HLS parts are INDEPENDENT only at segment boundaries, so a player cannot join mid-segment: the low-latency cost of a long GOP.",
+			Seed:              true,
+			MaxratePercent:    110,
+			BufsizeMultiplier: 0.9,
 			SegmentDuration:   "6", // fixed → suffix auto-derives to "_6s"
 			PartialDuration:   "0.2",
-			GopDuration:       "1.0",
+			GopDuration:       "6",
 			Codecs: map[string][][]int{
 				"h264": appleUniqH264,
 				"hevc": appleUniqHEVC,
@@ -184,6 +212,12 @@ func defaultSeedLadders() map[string]LadderDef {
 			SegmentDuration:   "6",
 			PartialDuration:   "0",
 			GopDuration:       "6",
+			// Explicit, because the derived tag would be "6s" — the same as
+			// apple-uniq-live-6s, which is a different encode entirely (gop 6 vs
+			// 1.0, no parts vs 0.2s, 200%/2x vs 150%/1x). Two encodes into one
+			// output directory, second overwrites first. Segment duration is a
+			// good DEFAULT name, not a unique one.
+			OutputTag: "vod",
 			Codecs: map[string][][]int{
 				"h264": appleUniqH264,
 				"hevc": appleUniqHEVC,
