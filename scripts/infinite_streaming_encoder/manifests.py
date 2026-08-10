@@ -31,6 +31,18 @@ _DASH_NS = "urn:mpeg:dash:schema:mpd:2011"
 _NS = {"mpd": _DASH_NS}
 
 
+def _clean_xml_bytes(data: bytes) -> bytes:
+    """Drop any stray bytes before the XML declaration. The pure half of
+    _strip_leading_junk, for readers that must NOT write to the file they are
+    reading — manifest.mpd is a shared name that several steps rewrite in place,
+    and a reader that also writes it is one more way for the file to change
+    underneath whoever reads it next."""
+    idx = data.find(b"<?xml")
+    if idx < 0:
+        idx = data.find(b"<MPD")  # no declaration but starts at the root element
+    return data[idx:] if idx > 0 else data
+
+
 def _strip_leading_junk(path: Path) -> bool:
     """Remove any stray bytes before the XML declaration in an .mpd and rewrite.
     A stray log line can leak into the file (we've seen "Make manifest.mpd"
@@ -86,9 +98,10 @@ def write_fragmented_mpd(package_dir: Path) -> int:
 
     ET.register_namespace("", _DASH_NS)
     ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
-    _strip_leading_junk(src)
-    tree = ET.parse(src)
-    root = tree.getroot()
+    # Parsed from memory: this function's docstring promises it "leaves
+    # manifest.mpd untouched", and _strip_leading_junk would have broken that
+    # promise on any manifest that needed healing.
+    root = ET.fromstring(_clean_xml_bytes(src.read_bytes()))
 
     # Already expanded — @mediaRange is the marker, the same signal go-live uses
     # to tell the two shapes apart. Re-expanding would split each FRAGMENT into
@@ -332,6 +345,8 @@ def hls_from_dash(package_dir: Path) -> bool:
     dash_info = _parse_dash(manifest_path)
     print(f"  Found {len(dash_info['representations'])} representations")
 
+    _fold_fragments_to_segments(dash_info, manifest_path)
+
     master_path = _write_master(dash_info, package_dir)
     print(f"  Created: {master_path.name}")
 
@@ -526,6 +541,75 @@ def _write_variant_playlist(rep: dict[str, Any], output_path: Path, package_dir:
     output_path.write_text("\n".join(lines) + "\n")
 
 
+def _fragment_granularity(rep: dict[str, Any]) -> tuple[int, int]:
+    """(entries, distinct files) for one representation's segment list."""
+    urls = [s.get("url") for s in rep.get("segments", []) if s.get("url")]
+    return len(urls), len(set(urls))
+
+
+def _fold_fragments_to_segments(dash_info: dict[str, Any], manifest_path: Path) -> int:
+    """Group a per-fragment SegmentList by file, for the HLS media lines.
+
+    A fragment-granular manifest.mpd is DELIBERATE and is the master format:
+    every live ladder sets partial_duration (only apple-uniq-vod turns it off),
+    and write_fragmented_mpd expands each segment into per-fragment SegmentURLs
+    with mediaRange so a player needs no .byteranges sidecar at serve time.
+
+    But DASH and HLS express those fragments in DIFFERENT PLACES. DASH addresses
+    each fragment as its own SegmentURL. HLS keeps whole segments on the
+    #EXTINF media lines and describes the fragments as #EXT-X-PART with
+    BYTERANGE. So the fragments are preserved either way — this only decides
+    which granularity the MEDIA lines carry, and for HLS that must be the
+    segment.
+
+    Reading fragment entries straight onto the media lines produced output that
+    still parsed and was wrong everywhere:
+
+      - each EXTINF named a whole 6s .m4s but claimed one FRAGMENT's duration,
+        with no BYTERANGE — so a player fetches 6s of data told it is 0.2s, 30
+        times over
+      - EXT-X-PART subdivided an already-subdivided entry (0.0067s parts
+        instead of 0.2s)
+      - EXT-X-TARGETDURATION collapsed to 1
+      - AVERAGE-BANDWIDTH counted each file once per fragment: 30x on a 6s/0.2s
+        ladder, 5x on a 1s one, 232 Mbps advertised for a 7.8 Mbps rung
+
+    Measured on a real four-ladder run, and nothing downstream noticed: the
+    manifests are valid, every segment present, file lists and byte totals
+    reconcile. Only a player walking down every rendition and stalling shows it.
+
+    The fold is exact rather than a guess: the entries carry their file names
+    and their durations sum back to the segment's, so grouping by file inverts
+    the expansion. EXT-X-PART is unaffected — it comes from the .byteranges
+    sidecars, and gets its duration from the folded segment, which is what puts
+    it back at 0.2s.
+    """
+    folded = 0
+    for rep in dash_info.get("representations", []):
+        n, distinct = _fragment_granularity(rep)
+        if not n or distinct == n:
+            continue
+        merged: dict[str, dict[str, Any]] = {}
+        for seg in rep["segments"]:
+            url = seg.get("url")
+            if not url:
+                continue
+            if url in merged:
+                merged[url]["duration"] += float(seg.get("duration", 0.0) or 0.0)
+            else:
+                s = dict(seg)
+                s["duration"] = float(seg.get("duration", 0.0) or 0.0)
+                merged[url] = s
+        rep["segments"] = list(merged.values())
+        folded += 1
+    if folded:
+        print(f"  {manifest_path.name} is fragment-granular (expected: parts are "
+              f"on); folded {folded} representation(s) onto whole-segment media "
+              f"lines. Fragments are carried as EXT-X-PART BYTERANGE, as HLS "
+              f"expects.")
+    return folded
+
+
 def _average_bandwidth(rep: dict[str, Any], package_dir: Path) -> int:
     total_duration = 0.0
     total_bytes = 0
@@ -534,14 +618,22 @@ def _average_bandwidth(rep: dict[str, Any], package_dir: Path) -> int:
     if init_segment and (package_dir / init_segment).exists():
         total_bytes += (package_dir / init_segment).stat().st_size
 
+    # Each FILE contributes its bytes once. _reject_fragment_granular should
+    # have stopped a per-fragment manifest reaching this, but the two guards are
+    # independent on purpose: this one is what makes the arithmetic correct
+    # rather than merely typical, and it is cheap.
+    counted: set[str] = set()
     for seg in rep.get("segments", []):
         duration = float(seg.get("duration", 0.0) or 0.0)
         url = seg.get("url")
         if duration <= 0 or not url:
             continue
         seg_path = package_dir / url
-        if seg_path.exists():
-            total_duration += duration
+        if not seg_path.exists():
+            continue
+        total_duration += duration
+        if url not in counted:
+            counted.add(url)
             total_bytes += seg_path.stat().st_size
 
     if total_duration <= 0 or total_bytes <= 0:

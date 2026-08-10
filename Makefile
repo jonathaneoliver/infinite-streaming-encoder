@@ -169,6 +169,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  py hostmezz    '; \
 	if out=$$(python3 scripts/test_host_mezzanine.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py hlsgran     '; \
+	if out=$$(python3 scripts/test_hls_granularity.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py hostpkg     '; \
 	if out=$$(python3 scripts/test_host_package.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
