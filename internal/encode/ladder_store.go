@@ -422,18 +422,33 @@ func (d LadderDef) extraArgsFor(codec string) string {
 }
 
 // passesFor returns the encode pass count for a codec on this ladder, falling
-// back to the per-codec default when the ladder doesn't pin it: h264 → 1,
-// hevc → 2, av1 → 2 (two-pass gives AV1 an accurate target average, same as
-// HEVC). Single source of truth for the two-pass decision (was
-// JobConfig.HevcSinglePass).
+// back to TWO for every codec when the ladder doesn't pin it. Single source of
+// truth for the two-pass decision (was JobConfig.HevcSinglePass).
+//
+// h264 defaulted to 1 on the stated grounds that "x264's single-pass VBV
+// already lands the target average, so two-passing H264 just doubles encode
+// time for no measurable gain". That holds at a loose VBV and fails badly at a
+// tight one. Measured on one source, two encodes differing ONLY in pass count,
+// delivered bitrate as a fraction of the rung target:
+//
+//	rung    1-pass  2-pass
+//	1080p      68%     85%
+//	 540p      66%     80%
+//	 234p      64%     76%
+//
+// +12 to +18 points at every rung on a 0.10x buffer, and the peak/avg ratio
+// steadies with it — 1.16-1.50 wandering under single-pass, 1.19-1.29 under
+// two-pass, back under Apple's 1.25x live cap at the top rungs.
+//
+// The cost is real: h264 encode time roughly doubles. A ladder with a loose
+// buffer gains little (0.90x already delivers 97-100% single-pass) and can pin
+// `passes: {"h264": 1}` to buy the time back. Defaulting the other way was the
+// error — it made the ladders that need it most the ones that did not get it.
 func (d LadderDef) passesFor(codec string) int {
 	if d.Passes != nil {
 		if n, ok := d.Passes[codec]; ok && n > 0 {
 			return n
 		}
-	}
-	if codec == "h264" {
-		return 1
 	}
 	return 2
 }

@@ -239,12 +239,16 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 	}
 	// Effective pass count = the profile's, with the per-encode HevcSinglePass
 	// override forcing HEVC to 1. Record only when it DEVIATES from the
-	// codec default (h264:1, hevc/av1:2) so a plain ladder's encode.json stays
+	// codec default (2 for every codec) so a plain ladder's encode.json stays
 	// unchanged; 0 is omitted by omitempty.
+	//
+	// NOTE the default moved: h264 was 1. An encode.json written before that
+	// change records nothing for a single-pass h264 rung, so absence means 1
+	// there and 2 here. Anything reading `passes` back for reproduction has to
+	// date the file — which is an argument for recording it unconditionally,
+	// not for keeping the omission. Left as-is for now because nothing reads it
+	// yet; #287 is where that changes.
 	defaultPasses := 2
-	if codec == "h264" {
-		defaultPasses = 1
-	}
 	effectivePasses := def.passesFor(codec)
 	if cfg.HevcSinglePass && codec == "hevc" {
 		effectivePasses = 1

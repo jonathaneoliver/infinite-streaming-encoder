@@ -4375,11 +4375,15 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		}
 		for _, r := range rungs {
 			vcpu, mem := variantResourcesFor(c, r.Height)
-			// Two-pass is now owned by the ladder profile's per-codec pass count
-			// (LadderDef.Passes → passesFor: hevc defaults to 2, h264/av1 to 1;
-			// h264:2/av1:2 are rejected at save time). The per-encode
-			// hevcSinglePass flag is kept as an OVERRIDE to force a single-pass
-			// HEVC comparison run without cloning the ladder.
+			// Two-pass is owned by the ladder profile's per-codec pass count
+			// (LadderDef.Passes → passesFor), which now defaults to 2 for EVERY
+			// codec — see passesFor for the measurement that moved h264. The
+			// per-encode hevcSinglePass flag is kept as an OVERRIDE to force a
+			// single-pass HEVC comparison run without cloning the ladder.
+			//
+			// This comment used to say "h264:2/av1:2 are rejected at save time".
+			// They are not, and never were: validateLadder only checks the codec
+			// name and that the count is 1 or 2.
 			twoPass := ladderDef.passesFor(c) == 2
 			if hevcSinglePass && c == "hevc" {
 				twoPass = false
