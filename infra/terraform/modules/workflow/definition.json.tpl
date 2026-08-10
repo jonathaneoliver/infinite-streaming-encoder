@@ -13,6 +13,7 @@
     },
 
     "Mezzanine": {
+      "Comment": "Duration limit (#184) is applied HERE and ONLY here, by truncating the mezzanine — every variant, chunk and the audio are cut from it. buildSFNInput ALWAYS supplies time_limit (\"0\" when unset) because Value.$ on a key the input omits fails the state at runtime. The TIME_LIMIT_S env below carries it; note a Comment cannot live inside an Environment entry — Step Functions validates those against the Batch API shape and rejects anything but Name/Value.",
       "Type": "Task",
       "Resource": "arn:aws:states:::batch:submitJob.sync",
       "Parameters": {
@@ -29,8 +30,7 @@
           "Environment": [
             { "Name": "ENCODER_TELEMETRY_EXEC", "Value.$": "$$.Execution.Name" },
             { "Name": "JOB_ID", "Value.$": "$$.Execution.Name" },
-            { "Comment": "Duration limit (#184), applied by truncating the mezzanine — every variant, chunk and the audio are cut from it, so this is the only state that needs it. buildSFNInput ALWAYS supplies time_limit (\"0\" when unset): Value.$ on a key the input omits fails the state at runtime.",
-              "Name": "TIME_LIMIT_S", "Value.$": "$.time_limit" }
+            { "Name": "TIME_LIMIT_S", "Value.$": "$.time_limit" }
           ]
         }
       },
@@ -134,6 +134,7 @@
                     "Default": "EncodeWhole"
                   },
                   "EncodeWhole": {
+                    "Comment": "TIME_LIMIT_S is passed below but NOT applied here — the mezzanine is already truncated. It tells cli_phase\u2019s plan-vs-media check that the chunk plan is a deliberate PREFIX of the mezzanine, because -t on a stream copy overshoots by a frame or two (#184).",
                     "Type": "Task",
                     "Resource": "arn:aws:states:::batch:submitJob.sync",
                     "Parameters": {
@@ -166,8 +167,7 @@
                           { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" },
                           { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
                           { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" },
-                          { "Comment": "Not applied here — the mezzanine is already truncated. This tells the plan-vs-media check that the chunk plan is a deliberate PREFIX of the mezzanine, because -t on a stream copy overshoots the limit by a frame or two (#184).",
-                            "Name": "TIME_LIMIT_S", "Value.$": "$.time_limit" },
+                          { "Name": "TIME_LIMIT_S", "Value.$": "$.time_limit" },
                           { "Name": "BURNIN", "Value.$": "$.burnin" },
                           { "Name": "EST_VMAF", "Value.$": "$.est_vmaf" },
                           { "Name": "EST_VMAF_CLAMPED", "Value.$": "$.est_vmaf_clamped" },
@@ -218,6 +218,7 @@
                       "StartAt": "EncodeChunk",
                       "States": {
                         "EncodeChunk": {
+                          "Comment": "TIME_LIMIT_S is passed below but NOT applied here — the mezzanine is already truncated. It tells cli_phase\u2019s plan-vs-media check that the chunk plan is a deliberate PREFIX of the mezzanine, because -t on a stream copy overshoots by a frame or two (#184).",
                           "Type": "Task",
                           "Resource": "arn:aws:states:::batch:submitJob.sync",
                           "Parameters": {
@@ -250,8 +251,7 @@
                                 { "Name": "BUFSIZE_MULT", "Value.$": "$.bufsize_multiplier" },
                                 { "Name": "SEGMENT_DURATION", "Value.$": "$.segment_duration" },
                                 { "Name": "GOP_DURATION", "Value.$": "$.gop_duration" },
-                                { "Comment": "Not applied here — the mezzanine is already truncated. This tells the plan-vs-media check that the chunk plan is a deliberate PREFIX of the mezzanine, because -t on a stream copy overshoots the limit by a frame or two (#184).",
-                                  "Name": "TIME_LIMIT_S", "Value.$": "$.time_limit" },
+                                { "Name": "TIME_LIMIT_S", "Value.$": "$.time_limit" },
                                 { "Name": "BURNIN", "Value.$": "$.burnin" },
                                 { "Name": "EST_VMAF", "Value.$": "$.est_vmaf" },
                                 { "Name": "EST_VMAF_CLAMPED", "Value.$": "$.est_vmaf_clamped" },
