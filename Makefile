@@ -175,6 +175,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  py passes      '; \
 	if out=$$(python3 scripts/test_ladder_passes.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py mezzlock    '; \
+	if out=$$(python3 scripts/test_mezz_lock.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py hostpkg     '; \
 	if out=$$(python3 scripts/test_host_package.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \

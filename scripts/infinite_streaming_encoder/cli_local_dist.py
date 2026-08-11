@@ -49,6 +49,8 @@ the same duration.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import math
 import os
@@ -57,6 +59,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import replace as dc_replace
 from pathlib import Path
@@ -357,6 +360,49 @@ def _object_exists(bucket: str, key: str) -> bool:
 # per-worker /tmp/mezz-cache is keyed off this URI too, so a box that already
 # encoded this source skips the MinIO download entirely (symlinks its copy).
 MEZZ_CACHE_PREFIX = "mezz-cache"
+
+
+@contextlib.contextmanager
+def _mezz_build_lock(rel: str):
+    """Serialise the mezzanine check-then-build across ORCHESTRATOR PROCESSES.
+
+    The Go half of #291 is an in-process mutex, which is right for cloud-batch —
+    one server builds every cloud mezzanine. It cannot reach here: on local-dist
+    each job runs in its own orchestrator container, so two jobs on one source
+    are two processes and a mutex in either is invisible to the other.
+
+    What they DO share is $TMP_DIR, mounted into every orchestrator from the same
+    host directory. So an flock on a file there is the cheapest thing that spans
+    them. Advisory and process-scoped: the kernel drops it when the container
+    dies, so a killed orchestrator cannot wedge the key — which a claim OBJECT in
+    MinIO would, and is why this is not that.
+
+    The key is deliberately ladder-independent (a mezzanine is a stream copy, so
+    the ladder cannot change it), which means all four apple-uniq-live-* ladders
+    of one source map to ONE lock — and #286 made submitting those four a single
+    click. Best-effort: any failure to lock proceeds unserialised, because a
+    duplicate build wastes work while a hard failure here would lose the encode.
+    """
+    lock_dir = Path(os.environ.get("TMP_DIR") or tempfile.gettempdir())
+    fh = None
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_dir / f".mezz-{rel.replace('/', '_')}.lock", "w")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    except OSError as e:
+        print(f"[dist] mezzanine lock unavailable ({e}) — proceeding unserialised; "
+              f"a concurrent job on this source may build it twice", flush=True)
+        if fh:
+            fh.close()
+        fh = None
+    try:
+        yield
+    finally:
+        if fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            finally:
+                fh.close()
 
 
 def _mezz_cache_rel(input_path: Path, time_limit_s: float | None = None) -> str:
@@ -1041,16 +1087,20 @@ def run_temporal(args: argparse.Namespace) -> int:
     # and the shared cache is populated for the next job either way.
     mezz_rel = _mezz_cache_rel(input_path, time_limit_s)
     mezz_prefix = f"s3://{bucket}/{mezz_rel}"
-    if _object_exists(bucket, f"{mezz_rel}/mezzanine.mp4.done"):
-        print(f"[dist] mezzanine cache HIT {mezz_prefix} — skipping the "
-              f"mezzanine entirely (same source encoded before)", flush=True)
-        _touch_prefix(bucket, mezz_rel)  # keep it fresh while this job reuses it
-    else:
-        _ensure_bucket(bucket)
-        if not _build_mezzanine_on_host(
-                input_path, mezz_prefix,
-                Path(args.output_dir) / ".mezz-work", time_limit_s):
-            return 1
+    # The lock spans the CHECK and the BUILD (#291). Guarding only the build
+    # would leave both jobs having already missed, so both would still build.
+    # A job that waits here re-checks inside and finds it warm.
+    with _mezz_build_lock(mezz_rel):
+        if _object_exists(bucket, f"{mezz_rel}/mezzanine.mp4.done"):
+            print(f"[dist] mezzanine cache HIT {mezz_prefix} — skipping the "
+                  f"mezzanine entirely (same source encoded before)", flush=True)
+            _touch_prefix(bucket, mezz_rel)  # keep it fresh while this job reuses it
+        else:
+            _ensure_bucket(bucket)
+            if not _build_mezzanine_on_host(
+                    input_path, mezz_prefix,
+                    Path(args.output_dir) / ".mezz-work", time_limit_s):
+                return 1
 
     # Pass count + extra_args come from the ladder profile now; hevc_single_pass
     # remains a per-encode override forcing HEVC single-pass.
