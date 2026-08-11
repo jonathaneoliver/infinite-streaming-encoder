@@ -24,6 +24,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from infinite_streaming_encoder.audio import AAC_BITRATE, AAC_SAMPLE_RATE
 from infinite_streaming_encoder.manifests import hls_from_dash as _hls_from_dash
 
 
@@ -67,8 +68,11 @@ def _run_ffmpeg_hls(input_file: Path, out_dir: Path, segment_duration: float,
     cmd = ["ffmpeg", "-y", "-i", str(input_file)]
     if reencode_audio:
         # Re-encode audio to AAC so segment boundaries align exactly;
-        # -c copy can drift on fractional-frame sources.
-        cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+        # -c copy can drift on fractional-frame sources. Params come from
+        # `audio` rather than being restated here — this path fed the SAME
+        # ladder from a second literal, so tuning one format's audio and not
+        # the other's produced no error anywhere (#296).
+        cmd += ["-c:a", "aac", "-b:a", AAC_BITRATE, "-ar", AAC_SAMPLE_RATE]
     else:
         cmd += ["-c", "copy"]
     cmd += [
