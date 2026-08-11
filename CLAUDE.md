@@ -675,8 +675,16 @@ speaking unguarded.
 **`internal/watcher/watcher.go`** — polls `SourceDir` on `watch-interval` (default 30s). A file is auto-submitted when: (1) it's been seen before, (2) its size hasn't changed since last scan (ensures write is complete), (3) `alreadyEncoded` returns false. `alreadyEncoded` checks both in-memory jobs and `OutputDir` for any dir matching `<stem>_*` — so deleting an output dir triggers re-encode on next scan without needing a restart. First scan after startup only seeds `seen` and does not submit.
 
 **`scripts/infinite_streaming_encoder/`** — the real encoder, as a Python package. Edits here affect encode behavior without touching Go. Orchestrators:
-- `cli_local.py` — local pipeline entry. Runs input probe, mezzanine stream-copy, variant encodes (per codec × resolution), audio extract, Shaka Packager DASH, fragment byteranges, LL-HLS playlists, and optional TS HLS.
-- `cli_cloud.py` — cloud pipeline entry. Uploads inputs to S3, launches a spot EC2 instance (with AZ + instance-type fallback on InsufficientInstanceCapacity), polls for `_DONE`/`_FAILED` markers, syncs outputs back. Uses boto3.
+- `cli_local.py` — single-container local pipeline entry. Runs input probe, mezzanine stream-copy, variant encodes (per codec × resolution), audio extract, Shaka Packager DASH, the fragment-granularity manifest, LL-HLS playlists, and optional TS HLS.
+- `cli_batch.py` — cloud orchestrator. Submits the Step Functions execution, creates/drains/deletes the per-execution telemetry queue and EventBridge rule, relays state, packages on the host, syncs back, and prices the run. Also the CLI behind `fetch` / `package` / `gc`.
+- `cli_local_dist.py` — farm orchestrator, the Temporal twin of the above. Builds the mezzanine and packages on the host, starts the workflow, relays stage/host/fleet markers from its history and pending activities, and reclaims MinIO staging.
+- `cli_phase.py` — ONE phase, in a worker: mezzanine / variant (chunk) / audio / package-all. Both orchestrators shell out to it for the phases they run themselves, with `--s3-in` / `--s3-out` pointing at a local path — so a host phase is the same code as the worker phase, not a reimplementation.
+- `temporal_worker.py` — the farm worker: `WORKER_LABEL` identity, slot sizing, heartbeats carrying live % + CPU + build, and the `EncodeWorkflow` graph itself.
+
+There is no `cli_cloud.py`. The single-box EC2 target it drove was retired when
+cloud encoding moved to Step Functions + Batch, and it went with
+`cloud/launch.py`, `cloud/userdata.py` and `cloud/poll.py` (#15). A few comments
+in `internal/encode/job.go` still name it; they describe history, not a path.
 
 Supporting modules (all stdlib-only except `cloud/*` which uses boto3):
 - `ffprobe.py` — structured ffprobe wrapper; fps as `Fraction` for exact GOP math.
@@ -696,11 +704,22 @@ Supporting modules (all stdlib-only except `cloud/*` which uses boto3):
 - `manifests.py` — folds the former `convert_to_segmentlist.py` (DASH SegmentTemplate → SegmentList), the fragment-granularity expansion of `manifest.mpd`, and an HLS master/variant generator.
 - `fragments.py` — fMP4 box walker yielding each fragment's offset/length/independent. Reimplementation of the external `parse_fmp4_fragments.py` (not in the original repo) using stdlib `struct` only.
 - `resume.py` — scans a temp dir for `{codec}_{res}.mp4` files, used by `--resume-package-from` to skip phases 1-4.
-- `cloud/` — boto3-backed subpackage: `aws.py` (client factory + STS preflight), `launch.py` (spot run-instances + fallback), `userdata.py` (remote bash template, shlex-quoted), `poll.py` (S3 marker polling), `sync.py` (idempotent upload + paginated download).
+- `cloud/` — boto3-backed subpackage, and NOT legacy: everything here serves the
+  Batch path or the AWS tab. `aws.py` (client factory + STS preflight),
+  `sync.py` (idempotent upload + paginated download), `inventory.py`
+  (read-only "what is running and costing money", which the Go server shells
+  out to), `cleanup.py` (tear down what this tool created — its report is what
+  `MarkGoneUnderPrefix` reads), `batch_admin.py` (cancel: stopping an execution
+  does not stop its in-flight jobs), `compute_env.py` (live `maxvCpus` without a
+  redeploy), `image_state.py` (which tag Batch will actually pull, + the
+  awswatch self-heal), `timing.py` and `cpu_report.py` (per-execution
+  where-did-the-time-go, and per-tier CPU from the TIMING markers), and `arch.py`
+  (cpu-arch profiles, currently reachable only as data — one compute env means a
+  job cannot land on Intel or AMD; see `projectCloudCost`).
 
 Hardware encoding (VideoToolbox `--force-hardware`) was intentionally dropped in the rewrite — it only works on macOS hosts, not Linux workers.
 
-The EC2 user-data itself is still bash (it runs on the remote instance) — `cloud/userdata.py` renders it as a template string. The remote pulls the same `ghcr.io/jonathaneoliver/infinite-streaming-encoder:latest` image the local server builds from `Dockerfile`, so local and cloud encodes share the Python pipeline end-to-end. The image's default entrypoint (`python3 -m infinite_streaming_encoder.cli_local`) accepts the CLI surface the user-data passes, so no `--entrypoint` override is needed.
+Workers pull the same `ghcr.io/jonathaneoliver/infinite-streaming-encoder` image the local server builds from `Dockerfile`, so local and cloud encodes share the Python pipeline end-to-end. Batch job definitions pin a content-hash `IMAGE_TAG` rather than `:latest` (see the `version` note below); the farm's workers take `:latest` unless `make farm-test-up` gave them a throwaway tag.
 
 **`static/index.html`** — a single self-contained HTML file (vanilla JS, no build step). Served directly by the Go file server. It polls `/api/jobs/stream` for live updates and plays HLS via hls.js pointed at `/content/<dir>/<playlist>.m3u8`.
 
