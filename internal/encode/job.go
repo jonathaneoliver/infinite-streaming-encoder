@@ -3995,7 +3995,13 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// Source fps: keys the speed model (encode time ∝ frame count), so chunk
 		// sizes/priorities match the graviton keys learned at the same rate.
 		srcFps := probeSourceFps(localSrc)
-		inputJSON, expEnc := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), m.packageOnHost(job.Config), m.deferPackaging(job.Config), srcWidth, srcFps, durationS, timeLimitS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), m.vmafEstimates(job.Config), job.AppendLog)
+		inputJSON, expEnc, err := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), m.packageOnHost(job.Config), m.deferPackaging(job.Config), srcWidth, srcFps, durationS, timeLimitS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), m.vmafEstimates(job.Config), job.AppendLog)
+		if err != nil {
+			// Fail the job rather than submit. A replayed job whose ladder was
+			// renamed or deleted reaches here having passed submit validation
+			// under the old name (#289).
+			return fmt.Errorf("plan cloud encode for %s: %w", filename, err)
+		}
 		expectedEncodes = expEnc
 		inputPath := filepath.Join(tmpDir, fmt.Sprintf("sfn-input-%s.json", filename))
 		if err := os.WriteFile(inputPath, []byte(inputJSON), 0644); err != nil {
@@ -4288,9 +4294,16 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin, packageOnHost, deferPackaging bool, sourceWidth, sourceFps int, clipDurationS, timeLimitS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int) {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin, packageOnHost, deferPackaging bool, sourceWidth, sourceFps int, clipDurationS, timeLimitS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int, error) {
 	if ladderName == "" {
 		ladderName = DefaultLadderName
+	}
+	// Submit-time validation has already run by the time a job gets here — but a
+	// job REPLAYED by Reconcile after a ladder was renamed or deleted never sees
+	// it again, and that is exactly the case a dangling name arrives by (#289).
+	// So the check is repeated rather than assumed.
+	if err := store.validateName(ladderName); err != nil {
+		return "", 0, err
 	}
 	// A duration limit (#184) truncates the mezzanine, and every variant, chunk
 	// and the audio are cut from that — so the clip IS shorter, and the chunk
@@ -4435,6 +4448,33 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 				ContentDuration: formatSeconds(clipDurationS),
 			})
 		}
+	}
+	// Zero variants is never what anyone asked for (#289). Without this the run
+	// submits a Step Functions execution with an empty variants array, no chunks
+	// and encoded_codecs: [] — which costs money, takes time, and REPORTS
+	// SUCCESS having encoded nothing. Same failure shape as #225 and #284: an
+	// outcome that passes every check and is not the thing that was wanted.
+	//
+	// The ladder is known to exist by this point, so the cause is the filters:
+	// a codec the ladder has no column for, or a band/source width that emptied
+	// every column. Say which inputs produced it, since the whole point is that
+	// the caller cannot see the rungs.
+	if len(variants) == 0 {
+		detail := fmt.Sprintf("codec %s", codecSel)
+		if minRes != "" || maxRes != "" {
+			lo, hi := minRes, maxRes
+			if lo == "" {
+				lo = "any"
+			}
+			if hi == "" {
+				hi = "any"
+			}
+			detail += fmt.Sprintf(", band %s–%s", lo, hi)
+		}
+		if sourceWidth > 0 {
+			detail += fmt.Sprintf(", source %dpx wide", sourceWidth)
+		}
+		return "", 0, fmt.Errorf("ladder %q selects no rungs (%s) — refusing to submit an execution with no variants", ladderName, detail)
 	}
 	// Assign the banded SchedulingPriority by RANK of predicted encode wall: the
 	// heaviest variant gets 999 within this job's band, the next 998, and so on —
@@ -4583,7 +4623,7 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			expected++
 		}
 	}
-	return string(b), expected
+	return string(b), expected, nil
 }
 
 // resolveCodec checks which codecs are already encoded in OutputDir and returns
