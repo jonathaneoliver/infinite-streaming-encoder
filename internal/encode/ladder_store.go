@@ -123,10 +123,10 @@ func defaultSeedLadders() map[string]LadderDef {
 			},
 		},
 		"apple-uniq-live-xs": {
-			Description:       "The FLEXIBLE base: no pinned segment length, so go-live repackages one encode into 1s/2s/6s. Apple's live/linear VBV (peak <= 1.25x avg) with maxrate 110% and a tight 0.10x buffer, which keeps the delivered peak <=~1.20x EVEN AT 1s — that is what makes it safe to re-chop, and why the buffer is smaller than any apple-uniq-live-Ns ladder can afford to give itself. H.264 climbs to 4K (1440p/1800p/2160p): Apple caps H.264 at 1080p and puts HEVC above, so this trades spec-compliance for max-compatibility high-bitrate 4K H.264, matching the rung set of the fixed-segment ladders it is compared against.",
+			Description:       "The FLEXIBLE base: no pinned segment length, so go-live repackages one encode into 1s/2s/6s. Apple's live/linear VBV (peak <= 1.25x avg) split as maxrate 100% + a 0.25x buffer, so the bound holds EVEN AT 1s (1.00 + 0.25) — that is what makes it safe to re-chop. The split matters as much as the bound: at 110%/0.10x the same 1.25x ceiling left only 3 frames of buffer and the encoder delivered just 64-68% of target, because a 3-frame buffer cannot absorb a keyframe and x264 stays conservative rather than violate VBV. Measured, the peak never reached 86-92% of that maxrate at any rung, so the ceiling was never the constraint — trading it for buffer costs nothing and yields 94-99% of target with the 1s peak still inside the cap. H.264 climbs to 4K (1440p/1800p/2160p): Apple caps H.264 at 1080p and puts HEVC above, so this trades spec-compliance for max-compatibility high-bitrate 4K H.264, matching the rung set of the fixed-segment ladders it is compared against.",
 			Seed:              true,
-			MaxratePercent:    110,
-			BufsizeMultiplier: 0.10,
+			MaxratePercent:    100,
+			BufsizeMultiplier: 0.25,
 			// Flexible base: no pinned segment_duration → suffix derives to _xs.
 			PartialDuration: "0.2",
 			GopDuration:     "1.0",
@@ -137,10 +137,10 @@ func defaultSeedLadders() map[string]LadderDef {
 			},
 		},
 		"apple-uniq-live-1s": {
-			Description:       "apple-uniq bitrates encoded NATIVELY for 1s segments. Delivered peak (maxrate + bufsize/T) is held at 1.25x avg — Apple's live/linear guidance — the SAME as the other apple-uniq-live-Ns ladders, so a comparison between them is not confounded by peak. Committing to 1s is what buys the bigger buffer: 0.15x here versus 0.10x on the flexible base (apple-uniq-live-xs), which must survive re-chopping to 1s and so pays the 1s price at every length — that difference IS the cost of re-choppability. GOP matched to the segment (1s), which is what makes this a different ENCODE rather than a repackaging. NOTE gop == segment means LL-HLS parts are INDEPENDENT only at segment boundaries, so a player cannot join mid-segment: the low-latency cost of a long GOP.",
+			Description:       "apple-uniq bitrates encoded NATIVELY for 1s segments. Delivered peak (maxrate + bufsize/T) is held at 1.25x avg — Apple's live/linear guidance — the SAME as the other apple-uniq-live-Ns ladders, so a comparison between them is not confounded by peak. Split as maxrate 100% + 0.25x rather than 110% + 0.15x: both satisfy the bound at T=1s, but the first gives 7.5 frames of buffer instead of 4.5, which lifts delivery from 91% to 94-99% of target AND brings the measured 1s peak back under the cap (110%/0.15x breached it at 540p). GOP matched to the segment (1s), which is what makes this a different ENCODE rather than a repackaging. NOTE gop == segment means LL-HLS parts are INDEPENDENT only at segment boundaries, so a player cannot join mid-segment: the low-latency cost of a long GOP.",
 			Seed:              true,
-			MaxratePercent:    110,
-			BufsizeMultiplier: 0.15,
+			MaxratePercent:    100,
+			BufsizeMultiplier: 0.25,
 			SegmentDuration:   "1", // fixed → suffix auto-derives to "_1s"
 			PartialDuration:   "0.2",
 			GopDuration:       "1",

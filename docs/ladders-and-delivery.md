@@ -66,19 +66,43 @@ The live ladders are deliberately **peak-matched** at that 1.25x cap, so a
 comparison between them is not confounded by peak. What differs is the BUFFER
 each can afford, which is what committing to a segment length buys:
 
-| ladder | maxrate | bufsize | at its own T | at 1s |
-| --- | --- | --- | --- | --- |
-| `apple-uniq-live-xs` (flexible) | 110% | **0.10** | 1.12x at 6s | **1.20x** |
-| `apple-uniq-live-1s` | 110% | **0.15** | 1.25x | 1.25x |
-| `apple-uniq-live-2s` | 110% | **0.30** | 1.25x | (n/a) |
-| `apple-uniq-live-6s` | 110% | **0.90** | 1.25x | (n/a) |
-| `apple-uniq-vod` | 200% | 2.00 | 2.33x at 6s | — |
+| ladder | maxrate | bufsize | frames | at its own T | at 1s |
+| --- | --- | --- | --- | --- | --- |
+| `apple-uniq-live-xs` (flexible) | **100%** | **0.25** | 7.5 | 1.04x at 6s | **1.25x** |
+| `apple-uniq-live-1s` | **100%** | **0.25** | 7.5 | 1.25x | 1.25x |
+| `apple-uniq-live-2s` | 110% | 0.30 | 9.0 | 1.25x | (n/a) |
+| `apple-uniq-live-6s` | 110% | 0.90 | 27.0 | 1.25x | (n/a) |
+| `apple-uniq-vod` | 200% | 2.00 | 60.0 | 2.33x at 6s | — |
 
-The flexible base gets the **smallest** buffer of the set, and that is the whole
-point: it must survive being re-chopped to 1s, so it pays the 1s price at every
-length. A 6s ladder can hold 9x more buffer for the same delivered peak. That
-gap — 0.10x vs 0.90x — is the cost of re-choppability, and it is what the
-experiment below measures.
+The flexible base still pays the 1s price at every length — that has not
+changed, and it is the cost of re-choppability. What changed is HOW the 1.25x
+allowance is split between the two knobs.
+
+**The split matters as much as the bound.** `peak/avg = maxrate% + bufsize/T`,
+so at T=1s every point of maxrate given up buys 0.01x of buffer directly. The
+ladders originally spent that allowance on maxrate (110%) and left the buffer at
+0.10x — **three frames**. A three-frame buffer cannot absorb a keyframe, and
+x264 respects VBV strictly, so rather than risk violating it the rate control
+stays conservative everywhere and the average lands far below `-b:v`:
+
+| bufsize | frames | delivered, as % of target |
+| --- | --- | --- |
+| 0.10x | 3.0 | **64-68%** |
+| 0.15x | 4.5 | 91% |
+| 0.25x | 7.5 | **94-99%** |
+| 0.30x | 9.0 | 96-99% |
+| 0.90x | 27.0 | 99-104% |
+
+Two measurements made the trade obvious. First, the peak never reached more than
+**86-92% of its own maxrate at any rung** — the ceiling was never what
+constrained the encode, the buffer was. Second, `100%/0.25x` peaks *lower* over
+1s windows than `110%/0.15x` despite a 67% bigger buffer, because the reduced
+ceiling does the containing. See #292.
+
+Express the buffer in FRAMES (`bufsize_multiplier x fps`) rather than as a
+multiple of the bitrate and this stops being surprising: the number is
+rung-independent, and single-digit frames is not a burst allowance, it is a
+straitjacket.
 
 The default `bufsize_multiplier` is **0.25x**. It was **2x** until July 2026,
 which was the pre-#829 value from smashing's `create_abr_ladder.sh`; the port
@@ -183,8 +207,8 @@ destructive.
 | --- | --- | --- | --- | --- | --- | --- |
 | `apple` | — | — | — | — | — | `xs` (derived) |
 | `apple-uniq` | — | — | — | — | — | `xs` (derived) |
-| `apple-uniq-live-xs` | 110 | 0.10 | — | 0.2 | 1.0 | `xs` (derived) |
-| `apple-uniq-live-1s` | 110 | 0.15 | 1 | 0.2 | 1 | `1s` (derived) |
+| `apple-uniq-live-xs` | 100 | 0.25 | — | 0.2 | 1.0 | `xs` (derived) |
+| `apple-uniq-live-1s` | 100 | 0.25 | 1 | 0.2 | 1 | `1s` (derived) |
 | `apple-uniq-live-2s` | 110 | 0.30 | 2 | 0.2 | 2 | `2s` (derived) |
 | `apple-uniq-live-6s` | 110 | 0.90 | 6 | 0.2 | 6 | `6s` (derived) |
 | `apple-uniq-vod` | 200 | 2.00 | 6 | 0 | 6 | **`vod` (explicit)** |
