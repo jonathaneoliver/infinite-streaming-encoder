@@ -21,6 +21,7 @@ import glob
 import json
 import shutil
 import sys
+import tempfile
 import xml.dom.minidom as minidom
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -55,14 +56,25 @@ def _strip_leading_junk(path: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 def write_fragmented_mpd(package_dir: Path) -> int:
-    """Write manifest_fragmented.mpd beside manifest.mpd: expand each whole-segment
-    <SegmentURL> into one per-fragment <SegmentURL media mediaRange> (standard DASH
-    byte-range addressing into the same .m4s), with a matching per-fragment
-    SegmentTimeline — each segment's duration split evenly across its fragments,
-    the same way go-live derives them. This puts the fragment index IN the manifest
-    (mirroring how the HLS m3u8 already carries EXT-X-PART), so a player / go-live
-    needs no .byteranges sidecar at serve time. Leaves manifest.mpd untouched for
-    A/B. Requires the sidecars to already exist. Returns representations expanded.
+    """Rewrite manifest.mpd IN PLACE at fragment granularity: expand each
+    whole-segment <SegmentURL> into one per-fragment <SegmentURL media mediaRange>
+    (standard DASH byte-range addressing into the same .m4s), with a matching
+    per-fragment SegmentTimeline — each segment's duration split evenly across its
+    fragments, the same way go-live derives them. This puts the fragment index IN
+    the manifest, mirroring how the HLS m3u8 already carries EXT-X-PART, so nothing
+    needs a `.byteranges` sidecar at serve time.
+
+    One file, not two (#282). It used to write a second manifest_fragmented.mpd and
+    leave manifest.mpd alone for A/B; the fragment form is a strict superset —
+    segment membership regroups by @media, and a segment's duration is the sum of
+    its fragments' — so shipping only it loses nothing, and go-live opens
+    `manifest.mpd` and detects granularity from content rather than the filename.
+
+    IDEMPOTENT: a manifest already at fragment granularity is left alone. Phases
+    retry and resume, so this runs twice on the same directory routinely, and
+    expanding an expanded manifest would produce fragments of fragments.
+
+    Returns the number of representations expanded (0 if already fragmented).
     """
     package_dir = Path(package_dir)
     src = package_dir / "manifest.mpd"
@@ -77,6 +89,12 @@ def write_fragmented_mpd(package_dir: Path) -> int:
     _strip_leading_junk(src)
     tree = ET.parse(src)
     root = tree.getroot()
+
+    # Already expanded — @mediaRange is the marker, the same signal go-live uses
+    # to tell the two shapes apart. Re-expanding would split each FRAGMENT into
+    # sub-fragments and destroy the manifest.
+    if root.find(".//mpd:SegmentURL[@mediaRange]", _NS) is not None:
+        return 0
 
     n = 0
     for sl in root.findall(".//mpd:SegmentList", _NS):
@@ -100,7 +118,7 @@ def write_fragmented_mpd(package_dir: Path) -> int:
         for i, surl in enumerate(seg_urls):
             media = surl.get("media") or ""
             seg_dur = durs[i]
-            frags = _load_byteranges(package_dir / media) if media else None
+            frags = _segment_fragments(package_dir / media) if media else None
             if frags:
                 base, rem = divmod(seg_dur, len(frags))
                 for k, fr in enumerate(frags):
@@ -140,11 +158,16 @@ def write_fragmented_mpd(package_dir: Path) -> int:
 
     if n == 0:
         return 0
-    out = src.with_name("manifest_fragmented.mpd")
     dom = minidom.parseString(ET.tostring(root, encoding="UTF-8"))
     pretty = dom.toprettyxml(indent="  ", encoding="UTF-8").decode("UTF-8")
-    out.write_text("\n".join(l for l in pretty.split("\n") if l.strip()) + "\n", encoding="UTF-8")
-    print(f"Wrote {out.name}: {n} representation(s) expanded to per-fragment mediaRange")
+    body = "\n".join(l for l in pretty.split("\n") if l.strip()) + "\n"
+    # Write-then-rename: manifest.mpd is the file every consumer opens, and a
+    # crash mid-write would leave a truncated one that parses as "no segments"
+    # rather than as an error.
+    tmp = src.with_name(src.name + ".tmp")
+    tmp.write_text(body, encoding="UTF-8")
+    tmp.replace(src)
+    print(f"Wrote {src.name}: {n} representation(s) expanded to per-fragment mediaRange")
     return n
 
 
@@ -152,7 +175,20 @@ def write_fragmented_mpd(package_dir: Path) -> int:
 # SegmentTemplate → SegmentList
 # ---------------------------------------------------------------------------
 
-def convert_segmentlist(manifest_path: Path, backup: bool = True) -> None:
+def convert_segmentlist(manifest_path: Path, backup: bool = True,
+                        backup_dir: Path | None = None) -> None:
+    """Rewrite a SegmentTemplate MPD in place as SegmentList.
+
+    `backup` keeps Shaka's own output — the input to this rewrite — so a manifest
+    that looks wrong can be traced to the packager or to us. It is a debugging
+    artifact that nothing reads, so it goes to the TEMP dir, not beside the
+    manifest: it used to ship in every output directory, where it was a third
+    manifest-shaped file in a tree that is meant to hold one.
+
+    Named after the package directory, so concurrent codecs of the same title
+    don't overwrite each other's. Best-effort — failing to keep a debugging copy
+    must never fail a package.
+    """
     manifest_path = Path(manifest_path)
     output_dir = manifest_path.parent
 
@@ -161,10 +197,14 @@ def convert_segmentlist(manifest_path: Path, backup: bool = True) -> None:
         sys.exit(1)
 
     if backup:
-        backup_path = manifest_path.with_suffix(".mpd.template.bak")
-        manifest_path.replace(backup_path)
-        print(f"Backup created: {backup_path}")
-        shutil.copy(backup_path, manifest_path)
+        dest_dir = Path(backup_dir) if backup_dir else Path(tempfile.gettempdir())
+        backup_path = dest_dir / f"{output_dir.name}.mpd.template.bak"
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy(manifest_path, backup_path)
+            print(f"Backup created: {backup_path}")
+        except OSError as e:
+            print(f"Backup skipped ({e})")
 
     ET.register_namespace("", _DASH_NS)
     ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
@@ -363,34 +403,74 @@ def _parse_frame_rate(fr: str | None) -> float | None:
 
 
 def _extract_segments(seg_list: ET.Element) -> list[dict[str, Any]]:
+    """Whole SEGMENTS from a <SegmentList>, whichever granularity it is written at.
+
+    Since #282 manifest.mpd is written at FRAGMENT granularity — many
+    <SegmentURL @media @mediaRange> per .m4s — so entries are collapsed back by
+    @media, summing the members' timeline durations, exactly as go-live does at
+    load time. A segment-granularity manifest (library content, or this same run
+    before the expansion) has one entry per file and collapses to itself.
+
+    Doing it here rather than relying on phase order is deliberate: HLS
+    generation and the manifest rewrite both run over the same directory, phases
+    retry, and an ordering rule is a thing to get wrong later. This way neither
+    order can produce a playlist with one EXTINF per fragment.
+    """
     timescale = int(seg_list.get("timescale", 1))
-    segments: list[dict[str, Any]] = []
+    durations: list[int] = []
 
     timeline = seg_list.find("mpd:SegmentTimeline", _NS)
     if timeline is not None:
         for s in timeline.findall("mpd:S", _NS):
             d = int(s.get("d", 0))
-            r = int(s.get("r", 0))
-            duration_s = d / timescale
-            for _ in range(r + 1):
-                segments.append({"duration": duration_s, "timeline_duration": d})
+            durations.extend([d] * (int(s.get("r", 0)) + 1))
 
     urls = [u.get("media") for u in seg_list.findall("mpd:SegmentURL", _NS) if u.get("media")]
+
+    segments: list[dict[str, Any]] = []
+    by_url: dict[str, int] = {}
     for i, url in enumerate(urls):
-        if i < len(segments):
-            segments[i]["url"] = url
-        else:
-            segments.append({"url": url, "duration": 4.0})
+        d = durations[i] if i < len(durations) else 0
+        if url in by_url:                      # another fragment of the same file
+            seg = segments[by_url[url]]
+            seg["timeline_duration"] += d
+            seg["duration"] = seg["timeline_duration"] / timescale
+            continue
+        by_url[url] = len(segments)
+        segments.append({
+            "url": url,
+            "timeline_duration": d,
+            "duration": (d / timescale) if d else 4.0,
+        })
+    # A timeline with no URLs at all (shouldn't happen) still yields durations.
+    if not urls and durations:
+        segments = [{"duration": d / timescale, "timeline_duration": d} for d in durations]
     return segments
 
 
-def _load_byteranges(segment_path: Path) -> list[dict[str, Any]] | None:
+def _segment_fragments(segment_path: Path) -> list[dict[str, Any]] | None:
+    """This segment's fragments (offset/length/independent), or None.
+
+    Read from the `.byteranges` sidecar when one exists — library content
+    predating #282 still has them — and otherwise parsed straight out of the
+    .m4s. Since #282 the sidecars are no longer written, so the parse is the
+    normal path; the sidecar branch exists only so an old package still
+    repackages identically.
+
+    The fMP4 walk is the same one that produced the sidecars in the first place
+    (fragments.parse_segment), so the two branches cannot disagree.
+    """
     byteranges_path = Path(str(segment_path) + ".byteranges")
-    if not byteranges_path.exists():
-        return None
+    if byteranges_path.exists():
+        try:
+            return json.loads(byteranges_path.read_text()).get("fragments", [])
+        except (json.JSONDecodeError, OSError):
+            pass  # fall through to parsing the media
     try:
-        return json.loads(byteranges_path.read_text()).get("fragments", [])
-    except (json.JSONDecodeError, OSError):
+        from infinite_streaming_encoder.fragments import parse_segment
+        track_type = "audio" if "audio" in segment_path.parts else "video"
+        return parse_segment(segment_path, track_type) or None
+    except Exception:  # noqa: BLE001 — a corrupt segment must not fail the package
         return None
 
 
@@ -428,7 +508,7 @@ def _write_variant_playlist(rep: dict[str, Any], output_path: Path, package_dir:
         if not url:
             continue
         seg_filename = Path(url).name
-        fragments = _load_byteranges(package_dir / url)
+        fragments = _segment_fragments(package_dir / url)
 
         if fragments:
             fragment_duration = duration / len(fragments)

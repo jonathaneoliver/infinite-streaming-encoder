@@ -190,6 +190,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  py mezzcache   '; \
 	if out=$$(python3 scripts/test_mezz_cache.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py fragmpd     '; \
+	if out=$$(python3 scripts/test_fragment_manifest.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py timelimit   '; \
 	if out=$$(python3 scripts/test_time_limit.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \

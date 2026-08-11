@@ -104,7 +104,8 @@ def package(spec: PackageSpec) -> Path:
             f"(shaka packager succeeded but output is missing)"
         )
 
-    # Convert SegmentTemplate → SegmentList. `backup=True` keeps the
-    # original packager output as .mpd.template.bak for debugging.
+    # Convert SegmentTemplate → SegmentList. `backup=True` keeps Shaka's own
+    # output as <package-dir>.mpd.template.bak for debugging — in the TEMP dir,
+    # not here: nothing reads it, and the output tree should hold one manifest.
     convert_segmentlist(manifest_path, backup=True)
     return manifest_path
