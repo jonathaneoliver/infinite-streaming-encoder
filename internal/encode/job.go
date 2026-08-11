@@ -1611,6 +1611,12 @@ type Manager struct {
 	// but read by json.Marshal is the shape of race that cost us once already.
 	distRanks map[string]int
 
+	// One in-flight mezzanine build per cache key (#291). Its own lock because a
+	// build runs for minutes and must not block job bookkeeping — same reason
+	// fetchMu exists.
+	mezzMu    sync.Mutex
+	mezzBuild map[string]*mezzGate
+
 	// In-flight on-demand media fetches, keyed by output dir name (#214). Its
 	// own lock because a fetch runs for minutes and must not block job
 	// bookkeeping. See remote.go.
@@ -3918,56 +3924,78 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		if !limited {
 			timeLimitS = 0
 		}
-		if key, ok := sourceMezzKey(localSrc, timeLimitS); ok {
-			s3Mezz = fmt.Sprintf("s3://%s/mezz/%s", bucket, key)
-			if s3ObjectExists(s3Mezz+"/mezzanine.mp4") &&
-				s3ObjectExists(s3Mezz+"/mezzanine.mp4.done") {
-				cacheHit = true
-			}
-		}
-		if cacheHit {
-			job.AppendLog(fmt.Sprintf("[cloud-batch] %s: mezzanine cache hit — reusing %s, skipping upload + mezzanine", filename, s3Mezz))
-			job.upsertStage("upload:inputs", "upload inputs", "skipped", 100)
-			m.notify(job)
-		}
-		if !cacheHit {
-			// Build the mezzanine HERE, on the host, straight into the cache
-			// prefix — and do NOT upload the source at all (#266).
-			//
-			// The source is already on this machine's disk; it is the file the
-			// encode was submitted against. The old path uploaded it so that a
-			// Batch job could download it back, stream-copy it, and upload the
-			// result — a full round trip over the home link, plus a job's queue
-			// wait and container start, to run `ffmpeg -c copy`. Doing the copy
-			// locally costs no network at all and uploads a comparable number of
-			// bytes (the mezzanine keeps every stream, so it tracks the source).
-			//
-			// This works with NO state-machine change because it lands in the same
-			// place a cache hit would: writing mezz/<key>/mezzanine.mp4 + .done and
-			// setting cacheHit makes buildSFNInput emit mezz_cached, and MezzCheck
-			// already routes straight to FanOut on that. The mezzanine job is
-			// skipped rather than reimplemented, and the artifact is cached for
-			// every later run of the same source exactly as before.
-			//
-			// s3_input is referenced by precisely one state (Mezzanine), so with
-			// that state skipped the source is never needed in S3.
-			//
-			// Resilience is unchanged from the upload it replaces: both are bare
-			// subprocesses of the server with a cancel watcher, neither survives a
-			// server restart. This is not a new exposure, it is the same one.
-			if err := m.buildMezzanineOnHost(job, localSrc, s3Mezz, tmpDir, timeLimitS); err != nil {
-				if job.IsCancelled() {
-					// A cancel that killed the build isn't a failure — return clean
-					// so run() finalizes as cancelled (deferred markLaunched still
-					// unblocks the queue).
-					return nil
+		// Scoped to a closure so `defer unlock()` releases at the end of the
+		// MEZZANINE STEP. runOneCloudBatchSFN runs the whole execution — submit,
+		// then poll to completion — so a defer at function scope would hold the
+		// key for the entire job and serialise every job on one source end to
+		// end, which is far worse than the duplicate build it prevents.
+		cancelled, mezzErr := func() (bool, error) {
+			if key, ok := sourceMezzKey(localSrc, timeLimitS); ok {
+				s3Mezz = fmt.Sprintf("s3://%s/mezz/%s", bucket, key)
+				// Serialise on the key across the CHECK and the BUILD (#291), not
+				// just the build: two jobs that both check before either writes
+				// would both miss and both build. The second job blocks here for
+				// the length of the first build, then re-checks below and finds it
+				// warm — which is the whole point, since waiting costs it nothing
+				// it was not already going to spend.
+				unlock := m.lockMezz(key)
+				defer unlock()
+				if s3ObjectExists(s3Mezz+"/mezzanine.mp4") &&
+					s3ObjectExists(s3Mezz+"/mezzanine.mp4.done") {
+					cacheHit = true
 				}
-				return err
 			}
-			// The mezzanine is now where a cache hit would have found it, so every
-			// downstream decision treats this as one.
-			cacheHit = true
-		} // end if !cacheHit (host mezzanine)
+			if cacheHit {
+				job.AppendLog(fmt.Sprintf("[cloud-batch] %s: mezzanine cache hit — reusing %s, skipping upload + mezzanine", filename, s3Mezz))
+				job.upsertStage("upload:inputs", "upload inputs", "skipped", 100)
+				m.notify(job)
+			}
+			if !cacheHit {
+				// Build the mezzanine HERE, on the host, straight into the cache
+				// prefix — and do NOT upload the source at all (#266).
+				//
+				// The source is already on this machine's disk; it is the file the
+				// encode was submitted against. The old path uploaded it so that a
+				// Batch job could download it back, stream-copy it, and upload the
+				// result — a full round trip over the home link, plus a job's queue
+				// wait and container start, to run `ffmpeg -c copy`. Doing the copy
+				// locally costs no network at all and uploads a comparable number of
+				// bytes (the mezzanine keeps every stream, so it tracks the source).
+				//
+				// This works with NO state-machine change because it lands in the same
+				// place a cache hit would: writing mezz/<key>/mezzanine.mp4 + .done and
+				// setting cacheHit makes buildSFNInput emit mezz_cached, and MezzCheck
+				// already routes straight to FanOut on that. The mezzanine job is
+				// skipped rather than reimplemented, and the artifact is cached for
+				// every later run of the same source exactly as before.
+				//
+				// s3_input is referenced by precisely one state (Mezzanine), so with
+				// that state skipped the source is never needed in S3.
+				//
+				// Resilience is unchanged from the upload it replaces: both are bare
+				// subprocesses of the server with a cancel watcher, neither survives a
+				// server restart. This is not a new exposure, it is the same one.
+				if err := m.buildMezzanineOnHost(job, localSrc, s3Mezz, tmpDir, timeLimitS); err != nil {
+					if job.IsCancelled() {
+						// A cancel that killed the build isn't a failure — return clean
+						// so run() finalizes as cancelled (deferred markLaunched still
+						// unblocks the queue).
+						return true, nil
+					}
+					return false, err
+				}
+				// The mezzanine is now where a cache hit would have found it, so every
+				// downstream decision treats this as one.
+				cacheHit = true
+			} // end if !cacheHit (host mezzanine)
+			return false, nil
+		}()
+		if mezzErr != nil {
+			return mezzErr
+		}
+		if cancelled {
+			return nil
+		}
 
 		// Build the state-machine input document.
 		// Probe the source duration so each variant can size its own chunks
@@ -4237,6 +4265,62 @@ func chunkModeLabel(cfg string) string {
 // later full encode of that file — right name, right manifests, silently short
 // video. 0 = no limit, which reproduces the pre-#184 key exactly, so existing
 // cached mezzanines still hit.
+// mezzGate serialises the check-then-build of one mezzanine cache key.
+//
+// The mezz key is deliberately ladder-independent — a mezzanine is a stream
+// copy, so the ladder cannot change it, and sharing one artefact across every
+// ladder of a source is the point of the cache. Which means all four
+// apple-uniq-live-* ladders of one source map to ONE key, and #286 made
+// "select several ladders, get a job each" a single click. So the common way to
+// use that feature is also the way to have two jobs miss the cache together,
+// both run ffmpeg on the host, and both upload a source-sized file to the same
+// prefix.
+//
+// Nothing is corrupted when that happens: the mezzanine is deterministic for a
+// given (source, limit) so both writers produce identical bytes, and PutObject
+// is atomic. The cost is the waste — one redundant local encode and one
+// redundant upload of ~2.3 GB over the home link, per submission. That is
+// precisely the round trip #266 removed, reintroduced by parallelism.
+//
+// refs counts waiters so the map does not accumulate one entry per source
+// encoded for the life of the server.
+type mezzGate struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockMezz serialises on `key`, returning the unlock func. Callers MUST defer it.
+//
+// In-process only, which is the right scope for the cloud-batch path: one Go
+// server builds every cloud mezzanine, so a mutex is sufficient and introduces
+// no new failure mode. It does NOT cover local-dist, where each job builds in
+// its own orchestrator CONTAINER — see _mezz_build_lock in cli_local_dist.py for
+// the cross-process half.
+func (m *Manager) lockMezz(key string) func() {
+	m.mezzMu.Lock()
+	if m.mezzBuild == nil {
+		m.mezzBuild = map[string]*mezzGate{}
+	}
+	g := m.mezzBuild[key]
+	if g == nil {
+		g = &mezzGate{}
+		m.mezzBuild[key] = g
+	}
+	g.refs++
+	m.mezzMu.Unlock()
+
+	g.mu.Lock()
+	return func() {
+		g.mu.Unlock()
+		m.mezzMu.Lock()
+		g.refs--
+		if g.refs == 0 {
+			delete(m.mezzBuild, key)
+		}
+		m.mezzMu.Unlock()
+	}
+}
+
 func sourceMezzKey(path string, timeLimitS float64) (string, bool) {
 	fi, err := os.Stat(path)
 	if err != nil {
