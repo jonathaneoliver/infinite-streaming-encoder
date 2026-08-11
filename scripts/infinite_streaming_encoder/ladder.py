@@ -483,15 +483,27 @@ def ladder_extra_args(ladder_def: dict, codec: str) -> str:
     return str((ladder_def.get("extra_args") or {}).get(codec, "") or "")
 
 
+# Default pass count when a ladder does not pin one. MUST equal
+# LadderDef.passesFor's fallback in internal/encode/ladder_store.go.
+#
+# This is a MIRROR, not a reference, and the local-dist path uses THIS copy:
+# cli_local_dist resolves the ladder in Python, so Go's value never reaches it.
+# When h264 moved from 1 to 2 the Go side was changed alone, and four
+# full-length encodes came out single-pass while their output tags said "2p" —
+# nothing failed, the bitrates just stayed low. Only the worker's
+# `ENCODER-ARGV ... pass=0` markers gave it away.
+#
+# scripts/test_ladder_passes.py asserts the two agree.
+_DEFAULT_PASSES = 2
+
+
 def ladder_passes(ladder_def: dict, codec: str) -> int:
-    """Encode pass count for a codec on this ladder, falling back to the
-    per-codec default when unset: h264 → 1, hevc → 2, av1 → 2 (two-pass gives
-    AV1 an accurate target average, like HEVC). Mirrors LadderDef.passesFor on
-    the Go side — the single source of truth for the two-pass decision."""
+    """Encode pass count for a codec on this ladder, falling back to
+    _DEFAULT_PASSES when unset."""
     n = (ladder_def.get("passes") or {}).get(codec)
     if isinstance(n, int) and n > 0:
         return n
-    return 1 if codec == "h264" else 2
+    return _DEFAULT_PASSES
 
 
 def _normalize_rung_row(row) -> tuple[int, int, int, str]:
