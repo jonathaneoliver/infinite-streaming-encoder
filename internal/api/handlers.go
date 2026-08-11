@@ -85,6 +85,14 @@ type Server struct {
 	// feedback without waiting for the Temporal poller list to expire.
 	distMu       sync.Mutex
 	distDisabled map[string]bool
+	// lastPoll remembers when each worker identity was last seen polling.
+	// Temporal drops a vanished poller from the task-queue listing outright, so
+	// without this the only fact available about a box that stopped polling is
+	// that it is absent — which reads identically for asleep, crashed,
+	// unreachable and never-configured (#294). Process-lifetime memory is the
+	// right scope: a server restart genuinely does not know when a box was last
+	// here, and saying so beats persisting a stale claim.
+	lastPoll map[string]time.Time
 }
 
 func NewServer(mgr *encode.Manager) *Server {
@@ -96,6 +104,7 @@ func NewServer(mgr *encode.Manager) *Server {
 			os.Getenv("GHCR_PAT"),
 		),
 		distDisabled: map[string]bool{},
+		lastPoll:     map[string]time.Time{},
 	}
 	s.Mux.HandleFunc("GET /api/version", s.getVersion)
 	s.Mux.HandleFunc("GET /api/dist/workers", s.distWorkers)

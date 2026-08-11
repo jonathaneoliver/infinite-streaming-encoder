@@ -5890,11 +5890,31 @@ const _MAXVCPU_BASE = 48;
 // re-render each 10s tick is fine (radios re-check from live state, no text
 // input to lose focus on).
 // Distributed-local encoder machines — from /api/dist/workers, each
-// {name, on, local}. Rendered as colour-coded pills (same instanceColor() the
-// chunk plot uses). Remote pills are buttons: click to enable/disable a box
-// even mid-encode — disabling hard-stops its worker, so Temporal re-queues its
-// in-flight chunks onto the other machines. Best-effort; empty if cluster down.
+// {name, on, local, state, last_seen_ago_s}. Rendered as colour-coded pills
+// (same instanceColor() the chunk plot uses). Remote pills are buttons: click to
+// enable/disable a box even mid-encode — disabling hard-stops its worker, so
+// Temporal re-queues its in-flight chunks onto the other machines. Best-effort;
+// empty if cluster down.
+//
+// FOUR states, not two (#294). `on` alone said "not contributing" and left the
+// reason to guesswork, and the reasons want opposite responses: a DISABLED box
+// is doing what it was told, a STALE one is a fault to go and fix. A macmini
+// that slept through most of a run rendered exactly like one someone had
+// switched off — and reading the pill, the wrong conclusion was drawn.
+//
+// So the two are drawn as different KINDS of thing rather than shades of the
+// same one: disabled keeps the deliberate struck-through look, stale is amber
+// with a warning glyph, never-seen is grey with a question mark. Colour alone
+// would not carry it, hence the glyphs.
 let _distMachines = { count: 0, machines: [] };
+
+// Seconds-since-last-poll as words, for the pill tooltip. null means the box has
+// never been seen, which is a different sentence — not "0s ago".
+function lastSeenText(m) {
+    if (m.last_seen_ago_s === null || m.last_seen_ago_s === undefined) return 'never seen';
+    if (m.last_seen_ago_s < 15) return 'seen just now';
+    return `last seen ${formatDuration(m.last_seen_ago_s)} ago`;
+}
 
 function machinePillsHtml() {
     const ms = _distMachines.machines || [];
@@ -5902,16 +5922,43 @@ function machinePillsHtml() {
     return '<div class="machine-pills">' + ms.map(m => {
         const color = instanceColor(m.name) || '#4361ee';
         const clickable = !m.local;   // the master box is always on
-        const style = m.on
-            ? `background:${color};color:#0b1020;border:1px solid ${color}`
-            : `background:transparent;color:${color};border:1px dashed ${color};opacity:.5`;
-        const onclick = clickable ? ` onclick="toggleMachine('${m.name}', ${!m.on})"` : '';
-        const title = !clickable ? `${m.name} — master (always on)`
-            : (m.on ? `Disable ${m.name}: its in-flight chunks are dropped and re-queued to the other machines`
-                    : `Enable ${m.name}: rejoin the encode pool`);
-        const nameHtml = m.on ? m.name
-            : `<span style="text-decoration:line-through">${m.name}</span>`;
-        return `<span class="machine-pill${clickable ? ' toggle' : ''}" style="${style}"${onclick} title="${title}">${nameHtml}</span>`;
+        // Older servers send no `state`; fall back to the boolean they do send.
+        const state = m.state || (m.on ? 'polling' : 'disabled');
+        const seen = lastSeenText(m);
+
+        let style, glyph = '', nameHtml = escapeHtml(m.name), title;
+        if (state === 'polling') {
+            style = `background:${color};color:#0b1020;border:1px solid ${color}`;
+            // An older server sends no last-seen at all; saying "never seen"
+            // next to a live pill would just be wrong, so drop the clause.
+            const when = m.last_seen_ago_s === null || m.last_seen_ago_s === undefined ? '' : ` (${seen})`;
+            title = clickable
+                ? `${m.name} — polling${when}. Click to disable: its in-flight chunks are dropped and re-queued to the other machines`
+                : `${m.name} — master (always on)${when}`;
+        } else if (state === 'disabled') {
+            style = `background:transparent;color:${color};border:1px dashed ${color};opacity:.5`;
+            nameHtml = `<span style="text-decoration:line-through">${escapeHtml(m.name)}</span>`;
+            title = `${m.name} — disabled by you; its worker is stopped. Click to enable: rejoin the encode pool`;
+        } else if (state === 'stale') {
+            // Not disabled, not polling: asleep, crashed, unreachable, or its
+            // worker container is down. Amber because it is a fault, and the
+            // commonest cause on a Mac is sleep — see the hint in the tooltip.
+            style = 'background:transparent;color:#f0a13a;border:1px solid #f0a13a';
+            glyph = '⚠ ';
+            title = `${m.name} — NOT polling (${seen}). Asleep, unreachable, or its worker is down. `
+                  + `On a Mac, check sleep: sudo pmset -a sleep 0 disablesleep 1 powernap 0`;
+        } else {
+            style = 'background:transparent;color:#6b7280;border:1px dotted #6b7280';
+            glyph = '? ';
+            title = `${m.name} — configured but never seen polling. `
+                  + `Its worker has not started, or it cannot reach this box's Temporal`;
+        }
+        // Re-enabling is the only useful click on a box that is not polling; a
+        // stale one is already off as far as Temporal is concerned, and asking
+        // to disable it would write an intent nobody can act on.
+        const wantOn = state !== 'polling';
+        const onclick = clickable ? ` onclick="toggleMachine('${m.name}', ${wantOn})"` : '';
+        return `<span class="machine-pill${clickable ? ' toggle' : ''}" style="${style}"${onclick} title="${escapeHtml(title)}">${glyph}${nameHtml}</span>`;
     }).join('') + '</div>';
 }
 
@@ -6077,7 +6124,17 @@ function renderDistMachines() {
 
 async function toggleMachine(name, enabled) {
     const m = (_distMachines.machines || []).find(x => x.name === name);
-    if (m) m.on = enabled;                 // optimistic
+    if (m) {
+        // Optimistic, and deliberately NOT optimistic in both directions.
+        // Disabling is instant and certain — the flag is the state. Enabling
+        // only asks: the container has to start and register as a poller, which
+        // takes seconds, so claiming `polling` here would be a green pill for a
+        // box that may never come up. It goes to the honest not-polling-yet
+        // state and the next poll promotes it.
+        m.on = enabled;
+        m.state = !enabled ? 'disabled'
+            : (m.last_seen_ago_s === null || m.last_seen_ago_s === undefined) ? 'never' : 'stale';
+    }
     renderDistMachines();
     try {
         await fetch('/api/dist/workers/' + encodeURIComponent(name), {
