@@ -199,6 +199,18 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .codec-checks { display: flex; gap: 16px; align-items: center; padding: 6px 0; }
 .codec-checks label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; font-weight: 400; }
 .codec-checks input { width: auto; min-width: 0; margin: 0; vertical-align: middle; }
+        /* Ladder picker: one checkbox per profile. Name only — the delivery
+           shape (segment / parts / GOP / VBV / peak / output tag) is on hover,
+           because it is reference detail you need when choosing rather than
+           while scanning a four-item list. */
+        .ladder-checks { display:flex; flex-direction:column; gap:2px; max-height:132px;
+                         overflow-y:auto; border:1px solid #2a2a3a; border-radius:4px; padding:4px; }
+        .ladder-row { display:flex; align-items:center; gap:6px; padding:2px 4px;
+                      border-radius:3px; cursor:pointer; font-size:12px;
+                      font-weight:400; white-space:nowrap; }
+        .ladder-row:hover { background:#232838; }
+        .ladder-row input { width:auto; min-width:auto; margin:0; }
+        .ladder-name i { color:#7f8899; font-style:normal; }
 /* End-of-run efficiency stats, shown under the stages once ENCODER-STATS lands. */
 .job-stats { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; padding: 9px 12px; background: #141b2b; border-radius: 6px; font-size: 12px; }
 .job-stat { color: #8a9bb5; white-space: nowrap; }
@@ -479,10 +491,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 </div>
             </div>
             <div class="control-group">
-                <label title="Bitrate ladder (resolutions + target bitrates) AND its output timing (segment / partial / GOP). Manage ladders in the Ladders tab.">Ladder / Profile</label>
-                <select id="ladder" onchange="syncResTiers()">
-                    <option value="apple-uniq-live">apple-uniq-live</option>
-                </select>
+                <label title="Bitrate ladder (resolutions + target bitrates) AND its output timing (segment / partial / GOP / VBV). Select SEVERAL to encode the same source as several delivery profiles — one job each. Manage ladders in the Ladders tab.">Ladder / Profile</label>
+                <div id="ladder-list" class="ladder-checks"></div>
+                <div id="ladder-multi-note" style="display:none;font-size:11px;color:#e9c46a;margin-top:3px"></div>
             </div>
             <!-- Options are rebuilt from the SELECTED LADDER's real rung heights
                  by syncResTiers() — these placeholders only cover the moment
@@ -1265,17 +1276,83 @@ async function loadLadders() {
         laddersCache = (await res.json()) || {};
     } catch (e) { laddersCache = {}; }
     // Populate the encode-options dropdown, preserving the current choice.
-    const sel = document.getElementById('ladder');
+    const sel = document.getElementById('ladder-list');
     if (sel) {
-        const DEFAULT = 'apple-uniq-live';
-        const cur = sel.value || DEFAULT;
+        const DEFAULT = 'apple-uniq-live-xs';
+        // Preserve the whole SELECTION, not just one value — reloading the
+        // ladder list must not silently drop profiles someone ticked.
+        const cur = selectedLadders();
         const names = Object.keys(laddersCache).sort();
-        sel.innerHTML = names.map(n =>
-            `<option value="${n}">${n}${laddersCache[n].seed ? '' : ' (custom)'}</option>`).join('');
-        sel.value = names.includes(cur) ? cur : (names.includes(DEFAULT) ? DEFAULT : names[0] || '');
+        const keep = cur.filter(n => names.includes(n));
+        const want = keep.length ? keep
+            : (names.includes(DEFAULT) ? [DEFAULT] : names.slice(0, 1));
+        sel.innerHTML = names.map(n => {
+            const d = laddersCache[n] || {};
+            const seg = parseFloat(d.segment_duration);
+            const pct = (d.maxrate_percent || 124) / 100;
+            const buf = d.bufsize_multiplier != null ? d.bufsize_multiplier : 0.25;
+            // Peak at this ladder's OWN segment length; for a flexible base the
+            // worst case is the shortest chop go-live will make, which is 1s.
+            const T = (seg && seg > 0) ? seg : 1;
+            const mult = pct + buf / T;
+            const tag = _ladderSuffix(d);
+            // Everything that distinguishes one ladder from another, on hover.
+            // Peak is at this ladder's own segment length (1s for a flexible
+            // base — its worst case, not its nominal one), against Apple's
+            // guidance of <=1.25x for live and <=2x for VOD.
+            const tip = [
+                `output: <stem>_<codec>${tag ? '_' + tag : ''}`,
+                (seg && seg > 0) ? `segment ${seg}s` : 'segment: flexible (go-live repackages into 1/2/6s)',
+                (parseFloat(d.partial_duration) > 0)
+                    ? `parts ${parseFloat(d.partial_duration)}s (independent every ${parseFloat(d.gop_duration) || '?'}s)`
+                    : 'no LL parts',
+                `gop ${parseFloat(d.gop_duration) || '?'}s`,
+                `VBV ${d.maxrate_percent || 124}% / ${buf}x`,
+                `peak ${mult.toFixed(2)}x avg at ${T}s`,
+                d.description || '',
+            ].filter(Boolean).join('\n');
+            return `<label class="ladder-row" title="${escapeAttr(tip)}">
+                <input type="checkbox" class="ladder-cb" value="${escapeAttr(n)}"${want.includes(n) ? ' checked' : ''}
+                       onchange="syncResTiers();syncLadderMultiNote();scheduleCostEstimate()">
+                <span class="ladder-name">${escapeHtml(n)}${d.seed ? '' : ' <i>(custom)</i>'}</span>
+            </label>`;
+        }).join('');
     }
     syncResTiers();
     loadLadderEstimates();
+    syncLadderMultiNote();
+}
+
+// Say how many jobs the button will start, and which ladder the single-ladder
+// views below are describing. Without this the second, third and fourth job are
+// invisible until they appear in the Jobs tab — and each one costs money.
+function syncLadderMultiNote() {
+    const el = document.getElementById('ladder-multi-note');
+    if (!el) return;
+    const sel = selectedLadders();
+    if (sel.length <= 1) { el.style.display = 'none'; return; }
+    el.style.display = '';
+    el.textContent = `${sel.length} ladders selected → ${sel.length} separate jobs, `
+        + `one output each. Charts and the estimate below show ${sel[0]}.`;
+}
+
+// Every ladder selected in the encode form, in list order. A multi-select with
+// nothing selected is possible (click into empty space), so this never returns
+// an empty array — an encode with no ladder is not a thing.
+function selectedLadders() {
+    const boxes = Array.from(document.querySelectorAll('.ladder-cb'));
+    const on = boxes.filter(b => b.checked).map(b => b.value);
+    if (on.length) return on;
+    return boxes.length ? [boxes[0].value] : [];
+}
+
+// The one ladder that the single-ladder views describe: the res-tier list, the
+// band charts, the cost estimate. Deliberately NOT an average or a union —
+// those views are about a specific (rungs + VBV + T) triple and there is no
+// meaningful way to draw several at once. The multi-select note tells the user
+// which one they are looking at.
+function primaryLadder() {
+    return selectedLadders()[0] || '';
 }
 
 // The codecs whose checkboxes are ticked, in canonical order. Falls back to all
@@ -1311,7 +1388,7 @@ function onCodecsChanged() {
 // the min list and vice versa, so an inverted band (which would encode nothing)
 // can't be selected. The server rejects it too — this just stops it earlier.
 function syncResTiers() {
-    const d = laddersCache[document.getElementById('ladder')?.value];
+    const d = laddersCache[primaryLadder()];
     const maxSel = document.getElementById('max-res');
     const minSel = document.getElementById('min-res');
     if (!maxSel || !minSel) return;
@@ -1355,7 +1432,7 @@ function syncResTiers() {
 // first place, but a mixed selection (e.g. H.264 + HEVC with a 1800p floor) can
 // still leave H.264 empty while HEVC is fine — this catches that before submit.
 function resBandError() {
-    const d = laddersCache[document.getElementById('ladder')?.value];
+    const d = laddersCache[primaryLadder()];
     if (!d || !d.codecs) return '';
     const minV = document.getElementById('min-res').value;
     const maxV = document.getElementById('max-res').value;
@@ -1605,7 +1682,11 @@ function _peakColor(m) { return m <= 1.25 ? '#6ab04c' : (m <= 2.0 ? '#d0a24a' : 
 // deriveOutputTag.
 function _ladderSuffix(d) {
     if (d.output_tag) return d.output_tag;
-    return (parseFloat(d.segment_duration) > 0) ? '' : 'xs';
+    const seg = parseFloat(d.segment_duration);
+    if (!(seg > 0)) return 'xs';        // flexible base; go-live repackages it
+    // Mirrors Go's segmentTag: trailing zeros trimmed so "6" and "6.0" are one
+    // profile rather than two directories.
+    return String(seg) + 's';
 }
 
 // Design-time VMAF estimates per ladder, from GET /api/ladders/{name}/estimates.
@@ -1696,7 +1777,15 @@ function renderLaddersTab() {
             (fixed && fixed > 0) ? `segment ${d.segment_duration}s (fixed)` : `segment 1/2/6s`,
             partOff ? `no parts` : `partial ${d.partial_duration || '0.2'}s`,
             `gop ${d.gop_duration || '1.0'}s`,
-            _ladderSuffix(d) ? `suffix _${_ladderSuffix(d)} (go-live → 1/2/6s)` : `no suffix (served as-is)`,
+            (() => {
+                const t = _ladderSuffix(d);
+                if (!t) return `no suffix (served as-is)`;
+                // Only the FLEXIBLE base is re-chopped. A pinned profile now
+                // derives its own segment length as the suffix, and go-live
+                // serves it unchanged.
+                return t === 'xs' ? `suffix _xs (go-live → 1/2/6s)`
+                                  : `suffix _${t} (served as-is)`;
+            })(),
         ];
         const actions = d.seed
             ? `<span class="job-ami-badge" title="Built-in, read-only">built-in</span>`
@@ -1911,7 +2000,7 @@ function _renderLadderEditor() {
           <input type="text" value="${_escAttr(e.partial_duration)}" placeholder="0.2" style="width:80px" oninput="_edSet('partial_duration',this.value)"></div>
         <div class="control-group"><label title="GOP / keyframe interval (s). VOD can use a long GOP (=segment) for efficiency; live keeps ~1s. Blank inherits 1.0.">GOP (s)</label>
           <input type="text" value="${_escAttr(e.gop_duration)}" placeholder="1.0" style="width:80px" oninput="_edSet('gop_duration',this.value)"></div>
-        <div class="control-group"><label title="Suffix appended to the output dir name. '_xs' tells go-live to generate 1s/2s/6s segments from this master; anything else (no suffix) is served as-is. Blank = auto: the flexible base (no pinned segment) → 'xs', a fixed-segment profile → none.">Output suffix</label>
+        <div class="control-group"><label title="Suffix appended to the output dir name, after the codec. '_xs' tells go-live this is the master to generate 1s/2s/6s from; any other suffix is served as-is. Blank = auto: a flexible ladder (no pinned segment) derives 'xs', a pinned one derives its own segment length ('6s', '2s', '1s'). Set one explicitly when two ladders pin the SAME length — they would otherwise derive the same suffix and overwrite each other.">Output suffix</label>
           <input type="text" value="${_escAttr(e.output_tag)}" placeholder="auto: ${_ladderSuffix({ segment_duration: e.segment_duration }) || 'none'}" style="width:110px" oninput="_edSet('output_tag',this.value)"></div>
       </div>
       <div class="control-group" style="margin-top:8px"><label>Description</label>
@@ -2270,7 +2359,7 @@ async function startEncode(force = false) {
         time: document.getElementById('time-limit').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
-        ladder: document.getElementById('ladder').value,
+        ladder: primaryLadder(),
         output_tag: document.getElementById('output-tag').value.trim(),
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,
@@ -2288,22 +2377,67 @@ async function startEncode(force = false) {
         body.defer_packaging = document.getElementById('defer-packaging').checked;
     }
 
-    try {
-        const res = await fetch('/api/encode', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
+    // One job per selected ladder. A ladder carries its own rungs, VBV, timing
+    // and output tag, so N ladders is N independent encodes producing N output
+    // directories — there is no server-side concept to add, just N submissions.
+    // They queue behind MAX_CONCURRENT like any other jobs.
+    const ladders = selectedLadders();
+    if (!ladders.length) { showToast('Select at least one ladder', 'error'); return; }
+
+    // An explicit tag applies to EVERY job, so with more than one ladder it
+    // would point them all at the same output directory and they would
+    // overwrite each other. Refuse rather than silently drop one of the two
+    // things the user asked for.
+    // Same derived tag => same output directory => silent overwrite.
+    if (ladders.length > 1 && !body.output_tag) {
+        const byTag = {};
+        ladders.forEach(n => {
+            const t = _ladderSuffix(laddersCache[n] || {});
+            (byTag[t] = byTag[t] || []).push(n);
         });
-        if (!res.ok) {
-            const text = await res.text();
-            showToast('Encode failed: ' + text, 'error');
+        const clash = Object.entries(byTag).filter(([, ns]) => ns.length > 1);
+        if (clash.length) {
+            showToast(clash.map(([t, ns]) =>
+                `${ns.join(' and ')} both write _${t}`).join('; ')
+                + ' — they would overwrite each other. Give one an explicit '
+                + 'output tag in the Ladders tab.', 'error');
             return;
         }
+    }
+    if (ladders.length > 1 && body.output_tag) {
+        showToast(`Output tag "${body.output_tag}" would apply to all ${ladders.length} ladders `
+            + `and they would overwrite each other. Clear it and let each ladder derive its own.`, 'error');
+        return;
+    }
+
+    const started = [];
+    const failed = [];
+    for (const name of ladders) {
+        try {
+            const res = await fetch('/api/encode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...body, ladder: name })
+            });
+            if (res.ok) { started.push(name); }
+            else { failed.push(`${name}: ${await res.text()}`); }
+        } catch (e) {
+            failed.push(`${name}: ${e.message}`);
+        }
+    }
+
+    // Report BOTH — a partial submission is the likely failure here (one ladder
+    // rejected, the rest fine), and saying only "started" would hide it while
+    // saying only "failed" would hide the jobs that are now running.
+    if (started.length) {
         selectNone();
-        showToast(force ? 'Re-encode started — previous output archived' : 'Encode started', 'success');
+        const what = started.length === 1 ? `Encode started (${started[0]})`
+            : `${started.length} encodes started: ${started.join(', ')}`;
+        showToast(force ? `${what} — previous output archived` : what, 'success');
         switchTab('jobs');
-    } catch (e) {
-        showToast('Error: ' + e.message, 'error');
+    }
+    if (failed.length) {
+        showToast(`${failed.length} of ${ladders.length} failed — ${failed.join(' | ')}`, 'error');
     }
 }
 
@@ -3250,7 +3384,7 @@ async function refreshCostEstimate() {
         max_res: document.getElementById('max-res').value,
         min_res: document.getElementById('min-res').value,
         time: document.getElementById('time-limit').value,
-        ladder: document.getElementById('ladder').value,
+        ladder: primaryLadder(),
         hevc_single_pass: false,
     };
     if (isAnyCloudTarget(target)) {
@@ -3258,14 +3392,26 @@ async function refreshCostEstimate() {
         body.defer_packaging = document.getElementById('defer-packaging').checked;
     }
     try {
-        const r = await fetch('/api/encode/estimate', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        });
-        if (!r.ok) { el.style.display = 'none'; return; }
-        const d = await r.json();
-        if (!d.ok) { el.style.display = 'none'; return; }
-        el.innerHTML = _estimateHtml(d.estimate, files.length);
+        // One request per selected ladder. They are priced SEPARATELY rather
+        // than one-times-N because ladders differ in rungs and VBV, so their
+        // costs differ — and the rung count is what dominates. In flight
+        // together; the endpoint probes per file, so this is N x that, which is
+        // why the 400ms debounce above matters more now than it did.
+        const ladders = selectedLadders();
+        const rs = await Promise.all(ladders.map(name =>
+            fetch('/api/encode/estimate', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...body, ladder: name }),
+            }).then(r => r.ok ? r.json() : null).catch(() => null)));
+
+        const got = [];
+        rs.forEach((d, i) => { if (d && d.ok) got.push({ name: ladders[i], est: d.estimate }); });
+        if (!got.length) { el.style.display = 'none'; return; }
+
+        const d = { ok: true, estimate: got[0].est };
+        el.innerHTML = got.length === 1
+            ? _estimateHtml(got[0].est, files.length)
+            : _estimateHtmlMulti(got, files.length, ladders.length);
         el.style.display = '';
         // Now that we know the source width, prune the Min/Max-Res tiers to what
         // this source can produce (no upscale). Only re-sync on a real change to
@@ -3288,7 +3434,7 @@ function _saasCompare(e, prefix) {
 
 // The encoder never upscales: select_rungs / resolveRungs drop every ladder rung
 // wider than the source, for all codecs. So on a sub-ladder-height source the
-// ladder's taller rungs are INERT — switching apple-uniq-live → -full, or nudging
+// ladder's taller rungs are INERT — switching to a ladder with taller rungs, or nudging
 // Max/Min-Res above the source, does nothing for them, and the cost doesn't move.
 // THAT silent no-op is the surprise to state; a Max-Res cap the user set is not
 // (that's a deliberate reduction). Name the rungs the SOURCE caps away and the
@@ -3296,7 +3442,7 @@ function _saasCompare(e, prefix) {
 // from the ladder def + the estimate's probed width; empty when the source can
 // produce the whole ladder (or the width is unknown).
 function _excludedRungsNote(e) {
-    const d = laddersCache[document.getElementById('ladder')?.value];
+    const d = laddersCache[primaryLadder()];
     if (!d || !d.codecs) return '';
     const srcW = e.width || 0;
     if (srcW <= 0) return ''; // probe failed — no honest statement to make
@@ -3314,6 +3460,45 @@ function _excludedRungsNote(e) {
     const cap = ceiling ? `${ceiling}p` : `${srcW}px wide`;
     return `<div style="color:#e9c46a;font-size:11px;margin-top:3px">`
          + `⚠ Source tops out at ${cap} — this ladder's taller rungs (${list}) can't be produced (no upscale), so switching to a ladder that adds them won't change the output.</div>`;
+}
+
+// Several ladders selected: N encodes, N outputs, one bill. The headline is the
+// SUM, because that is what gets charged; the per-ladder split follows so a
+// costly ladder can be identified instead of hiding inside the total.
+//
+// `asked` is how many were selected: when a ladder fails to price (unprobeable
+// source, a rejected config) it is dropped from the sum, and a total quietly
+// covering fewer encodes than the button will start is exactly the kind of
+// under-statement this function exists to prevent — so it is said out loud.
+function _estimateHtmlMulti(got, nFiles, asked) {
+    const local = got[0].est.local;
+    const sum = k => got.reduce((n, g) => n + (g.est[k] || 0), 0);
+    const mins = (got[0].est.duration_s || 0) / 60;
+    const src = `${nFiles} file${nFiles > 1 ? 's' : ''} · ${mins.toFixed(1)} min`;
+    const missing = asked - got.length;
+    const note = missing > 0
+        ? ` <span style="color:#e9c46a">(${missing} ladder${missing > 1 ? 's' : ''} could not be priced — total covers ${got.length} of ${asked})</span>`
+        : '';
+
+    const split = got.map(g => {
+        const usd = local ? 0 : (g.est.total_usd || 0);
+        return `${escapeHtml(g.name)} <b>$${usd.toFixed(2)}</b>`;
+    }).join(' · ');
+
+    if (local) {
+        return `<b>Estimated cost</b> ${src} → <b style="color:#6ab04c">$0.00</b> `
+             + `<span style="color:#889">${got.length} local encodes, nothing billed</span>${note}`
+             + `<div style="color:#889;font-size:11px;margin-top:2px">${split}</div>`
+             + _excludedRungsNote(got[0].est);
+    }
+    const eg = sum('egress_usd');
+    const parts = [`$${sum('spot_usd').toFixed(2)} compute${_idleNote(got[0].est)}`];
+    if (eg > 0) parts.push(`$${eg.toFixed(2)} egress (${sum('egress_gb').toFixed(2)} GB)`);
+    else parts.push(`<span style="color:#6ab04c">no egress — media stays in S3</span>`);
+    return `<b>Estimated cost</b> ${src} → <b>$${sum('total_usd').toFixed(2)}</b> `
+         + `<span style="color:#889">${got.length} encodes · ${parts.join(' · ')}</span>${note}`
+         + `<div style="color:#889;font-size:11px;margin-top:2px">${split}</div>`
+         + _excludedRungsNote(got[0].est);
 }
 
 function _estimateHtml(e, nFiles) {
@@ -3369,7 +3554,7 @@ function _jobConfigHtml(c) {
         `<span style="background:#232a36;border-radius:3px;padding:1px 7px;font-size:11px;color:#bbb">`
         + `<span style="color:${hl || '#7a8'}">${label}</span> ${escapeHtml(String(val))}</span>`;
     const chips = [
-        chip('profile', c.ladder || 'apple-uniq-live', '#e0883a'),
+        chip('profile', c.ladder || 'apple-uniq-live-xs', '#e0883a'),
         chip('codec', c.codec || 'both'),
         chip('target', c.target || 'local'),
     ];
@@ -3459,7 +3644,7 @@ function jobRowHtml(j) {
             <div class="job-header">
                 <div>
                     <span class="job-files">${escapeHtml((j.config.files || []).join(', '))}</span>
-                    <span class="job-meta"> — ${j.config.target} / ${j.config.codec} / ${j.config.ladder || 'apple-uniq-live'}${j.config.max_res ? ' / \u2264' + j.config.max_res : ''}${j.config.min_res ? ' / \u2265' + j.config.min_res : ''}</span>
+                    <span class="job-meta"> — ${j.config.target} / ${j.config.codec} / ${j.config.ladder || 'apple-uniq-live-xs'}${j.config.max_res ? ' / \u2264' + j.config.max_res : ''}${j.config.min_res ? ' / \u2265' + j.config.min_res : ''}</span>
                     ${cloudBadge}
                     <span class="job-ami-badge" style="display:none"></span>
                     <span class="job-reclaim-badge" style="display:none"></span>
@@ -4875,15 +5060,56 @@ function _isLocalDistJob(j) {
     return t.includes('local') || t.includes('dist');
 }
 
-function _laneJob(local) {
+// A short name for a job on a shared chart. The ladder tag is what distinguishes
+// four ladders of one source, which is the case this exists for; the ladder name
+// is the fallback while a job is early enough not to have resolved one.
+function _laneJobLabel(j) {
+    const c = (j || {}).config || {};
+    return String(c.output_tag || c.ladder || (j || {}).id || '?')
+        .replace(/^apple-uniq-/, '');
+}
+
+// The job(s) to chart, newest first.
+//
+// On the FARM every job shares one worker pool, so charting a single job asks
+// the wrong question. A machine flat out on job B draws as IDLE on job A's lane,
+// and the panel's headline — "% of the run each machine was working" — stops
+// describing the farm and starts describing job A's queue position. The two
+// halves of the panel then contradict each other in a way neither can explain:
+// the rows above are farm-wide and read 100% busy while the lanes below read
+// 16%, both correct, nothing saying why.
+//
+// #286 made that the NORMAL case rather than a curiosity: ticking four ladders
+// submits four jobs against one set of machines, they start milliseconds apart,
+// and Temporal's task queue is roughly FIFO — so the later ones sit behind the
+// first with no work at all, for minutes. Observed on the first real multi-ladder
+// run: -1s had 234 chunks done and 6 running while -2s had 9 done and 246 queued.
+//
+// So local charts every running job at once, and idle recovers its meaning: no
+// job of ANY kind on that machine.
+//
+// Cloud charts ONE job, because there the premise is reversed — each execution
+// rents its own instances, so two runs never share a lane and summing them would
+// add unrelated bills together.
+function _laneJobs(local) {
     const all = Object.values((typeof jobs === 'object' && jobs) ? jobs : {})
         .filter(j => _laneStages(j).length)
         .filter(j => local === undefined || _isLocalDistJob(j) === !!local);
-    if (!all.length) return null;
+    if (!all.length) return [];
+    const newestFirst = (a, b) =>
+        Date.parse(b.started_at || 0) - Date.parse(a.started_at || 0);
     const run = all.filter(j => typeof _jobRunning === 'function' ? _jobRunning(j) : false);
-    const pick = (run.length ? run : all);
-    return pick.sort((a, b) =>
-        Date.parse(b.started_at || 0) - Date.parse(a.started_at || 0))[0];
+    // Nothing running: the most recent finished run is still worth reading, and
+    // that is exactly when someone looks at it.
+    if (!run.length) return [all.sort(newestFirst)[0]];
+    if (local) return run.sort(newestFirst);
+    // Cloud picks one, and prefers a job with work OPEN right now. Sorting by
+    // start alone chose the job LEAST likely to be doing anything: submissions
+    // land milliseconds apart, so "newest" is a coin toss that resolves to
+    // whichever went to the back of the queue, and a job with no open stage is
+    // the worst possible subject for a chart about who is busy.
+    const busy = run.filter(j => _laneStages(j).some(s => !s.ended_at));
+    return [(busy.length ? busy : run).sort(newestFirst)[0]];
 }
 
 function _laneStages(job) {
@@ -4900,9 +5126,21 @@ function _laneStages(job) {
 // stage data, different headline.
 function _fleetLanesHtml(opts) {
     const local = !!(opts && opts.local);
-    const job = _laneJob(local);
-    const stages = _laneStages(job);
+    const chartJobs = _laneJobs(local);
+    if (!chartJobs.length) return '';
+    const multi = chartJobs.length > 1;
+    // The key names the block in its tooltip and is what counts chunks, so with
+    // several jobs on one machine it has to say WHICH job — `chunk9` appears in
+    // all four ladders of a source. Prefixed rather than replaced: the `:chunk`
+    // the count keys off has to survive.
+    const stages = chartJobs.flatMap(j => {
+        if (!multi) return _laneStages(j);
+        const tag = _laneJobLabel(j);
+        return _laneStages(j).map(s => ({ ...s, key: tag + ' · ' + (s.key || '') }));
+    });
     if (!stages.length) return '';
+    // Rentals are per-execution and cloud-only, and cloud charts exactly one job.
+    const job = chartJobs[0];
     const now = Date.now();
 
     // Merge each instance's stage intervals — chunks overlap on a box, and the
@@ -5072,9 +5310,20 @@ function _fleetLanesHtml(opts) {
     const laneStart = L => L.launch || (L.merged.length ? L.merged[0][0] : now);
     const laneEnd = L => Math.max(L.gone || 0, L.merged.length ? L.merged[L.merged.length - 1][1] : 0, laneStart(L));
 
+    // Sorted and t0 taken HERE, above runEnd, because runEnd's last fallback
+    // reads t0 — and a `const` read before its declaration is a ReferenceError
+    // that takes the whole panel down, not a quiet undefined. It needs a
+    // finished job with no ended_at to fire, which is why it has never been
+    // seen; it is still one branch away.
+    lanes.sort((a, b) => laneStart(a) - laneStart(b) || a.id.localeCompare(b.id));
+    const t0 = Math.min(...lanes.map(laneStart));
+
     // Is the run still going? Decides whether an unterminated box is still
     // billing or simply unobserved — see the tailTo comment below.
-    const jobLive = (typeof _jobRunning === 'function') ? _jobRunning(job) : false;
+    // ANY charted job still going. On the farm the machines are shared, so one
+    // live job is enough for the fleet to still be in use.
+    const jobLive = chartJobs.some(j =>
+        (typeof _jobRunning === 'function') ? _jobRunning(j) : false);
     // The horizon local lanes are measured against: the whole JOB, ending when
     // the job does.
     //
@@ -5087,7 +5336,11 @@ function _fleetLanesHtml(opts) {
     // It stops at the job's own end, so once the job is done the chart is
     // static: a finished run reads the same an hour later as it did on
     // completion.
-    const jobEnd = Date.parse((job || {}).ended_at || '');
+    // The LAST of them to finish — the farm is only free once every charted job
+    // is done, so anything earlier would crop the tail off the others.
+    const jobEnds = chartJobs
+        .map(j => Date.parse((j || {}).ended_at || '')).filter(t => !isNaN(t));
+    const jobEnd = jobEnds.length ? Math.max(...jobEnds) : NaN;
     const runEnd = jobLive ? now
         : (!isNaN(jobEnd) ? jobEnd
            : Math.max(...lanes.map(L =>
@@ -5097,8 +5350,6 @@ function _fleetLanesHtml(opts) {
     // (the tail after the last job: the fan-in barrier plus scale-down) as an
     // unexplained remainder the reader had to compute by subtraction.
 
-    lanes.sort((a, b) => laneStart(a) - laneStart(b) || a.id.localeCompare(b.id));
-    const t0 = Math.min(...lanes.map(laneStart));
     // The axis stops where the work does on local, and at `now` on cloud. A
     // cloud box is still costing money after its last job, so the chart must
     // keep drawing; a farm machine is not, so extending the axis to now would
@@ -5360,11 +5611,16 @@ function _fleetLanesHtml(opts) {
     return `<div style="margin-top:16px;border-top:1px solid #2a303c;padding-top:12px">
       <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px">
         <div style="font-size:12px;color:#ccc;font-weight:600">Machine timeline</div>
-        <div style="font-size:11px;color:#7f8899">${local ? "when each machine was working, and where the run waited on one of them" : "you pay from launch to termination — colour is billed, track is not. Idle here means NO job on the box; the rental table\u0027s figure is stricter (it counts partly-allocated boxes too)."}</div>
+        <div style="font-size:11px;color:#7f8899">${local
+          ? (multi
+             ? "every running job at once — these machines are shared, so idle means no job of any kind on the box"
+             : "when each machine was working, and where the run waited on one of them")
+          : "you pay from launch to termination — colour is billed, track is not. Idle here means NO job on the box; the rental table\u0027s figure is stricter (it counts partly-allocated boxes too)."}</div>
+        ${multi ? `<div style="font-size:11px;color:#6f7887" title="one worker pool, so these queue behind each other rather than running side by side">${chartJobs.length} jobs sharing the farm: ${escapeHtml(chartJobs.map(_laneJobLabel).join(', '))}</div>` : ''}
       </div>
       <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:10px;font-variant-numeric:tabular-nums">
         ${local
-          ? `<div style="font-size:19px;color:#e6e9ef;font-weight:600">${Math.round(workMs / Math.max(1, billedMs) * 100)}% <span style="font-size:12px;font-weight:400;color:#8a94a2">of the run each machine was working</span></div>`
+          ? `<div style="font-size:19px;color:#e6e9ef;font-weight:600">${Math.round(workMs / Math.max(1, billedMs) * 100)}% <span style="font-size:12px;font-weight:400;color:#8a94a2">of the window each machine was working</span></div>`
           : `<div style="font-size:19px;color:#e6e9ef;font-weight:600">${(billedMs / 3600000).toFixed(2)} <span style="font-size:12px;font-weight:400;color:#8a94a2">vCPU-h billed</span></div>`}
         ${(!local && cpuS > 0) ? `<div style="font-size:13px;color:#e6e9ef" title="CPU seconds actually burned by ffmpeg, over vCPU-seconds rented. Containers run at ~99% of their reserved vCPU, so the shortfall is fleet idle — boot, image pull, the fan-in wait and the scale-down tail — not slack inside a job.">${effPct.toFixed(0)}% <span style="color:#8a94a2">efficient</span> <span style="color:#6f7887">(${(cpuS / 3600).toFixed(2)} vCPU-h of real CPU)</span></div>` : ''}
         <div style="font-size:13px;color:${IDLE}">${local
@@ -6289,7 +6545,7 @@ async function forceReencode(fileName, _clickAt) {
         time: document.getElementById('time-limit').value,
         hls_format: document.getElementById('hls-format').value,
         padding: document.getElementById('padding').value,
-        ladder: document.getElementById('ladder').value,
+        ladder: primaryLadder(),
         output_tag: document.getElementById('output-tag').value.trim(),
         cpu_arch: document.getElementById('cpu-arch').value,
         chunk_duration: document.getElementById('chunk-duration').value,

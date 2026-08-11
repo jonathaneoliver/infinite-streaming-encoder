@@ -20,7 +20,7 @@ import (
 // SEED DATA PROVENANCE — read this before trusting a number:
 //
 //   Source: insane_fpv_shots_hydrofoil_windsurfing.mkv — 3840x2160, 29.97fps,
-//   334s of EXTREME-MOTION FPV footage. Ladder apple-uniq-live-full, 12 rungs.
+//   334s of EXTREME-MOTION FPV footage. Ladder apple-uniq-live-xs, 12 rungs.
 //   Measured with libvmaf, n_subsample=5 (~2005 frames/rung), fps-paired,
 //   run natively. Extracted from docs/vmaf-audit/*.html (see that README).
 //
@@ -82,7 +82,7 @@ type CurvePoint struct {
 // say whose quality it is estimating.
 // The reference=2160 points were re-measured 2026-07-29 by `ladder_audit` on
 // ffmpeg 8.0.1 with vmaf_4k_v0.6.1 at common=3840x2160, and follow the CURRENT
-// apple-uniq-live rungs (594/954/1800 rather than the retired 684/1044/2124).
+// apple-uniq-live-* rungs (594/954/1800 rather than the retired 684/1044/2124).
 // The reference=1080 points are older and their provenance was not recorded —
 // see #163, which is why curve points now carry model/common_w/common_h.
 const SeedClip = "insane_fpv_shots_hydrofoil_windsurfing.mkv (4K, extreme motion)"

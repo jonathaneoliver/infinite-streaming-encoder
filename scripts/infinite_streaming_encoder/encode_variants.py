@@ -68,12 +68,20 @@ class EncodeContext:
     # a lookahead window, so on complex content the achieved average falls
     # short of the -b:v target — which drags the real bitrate below the
     # advertised AVERAGE-BANDWIDTH and packs the ladder rungs together.
-    # x265 overshoots/undershoots avg+peak noticeably; x264's single-pass
-    # VBV already lands the target average, so two-passing H264 just
-    # doubles encode time for no measurable gain. Two-pass fixes HEVC:
+    # x265 overshoots/undershoots avg+peak noticeably. Two-pass fixes it:
     # pass 1 profiles scene complexity into a stats file (output discarded
     # via the null muxer), pass 2 distributes bits to hit the average
     # accurately while the SAME maxrate/bufsize VBV keeps peaks flat.
+    #
+    # This block used to continue "x264's single-pass VBV already lands the
+    # target average, so two-passing H264 just doubles encode time for no
+    # measurable gain", and h264 defaulted to one pass on that basis. It is
+    # true at a loose VBV and false at a tight one — the same shortfall
+    # described above for x265, from the same cause. Measured on one source,
+    # two encodes differing ONLY in pass count, delivered as a fraction of the
+    # rung target: 1080p 68% -> 85%, 540p 66% -> 80%, 234p 64% -> 76% on a
+    # 0.10x buffer. h264 now defaults to two passes; see passesFor in
+    # internal/encode/ladder_store.go, which owns the decision.
     #
     # LEGACY fallback for the two-pass decision when `passes` (below) is unset —
     # only meaningful for HEVC. New code sets `passes` instead.

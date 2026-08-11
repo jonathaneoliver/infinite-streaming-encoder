@@ -822,7 +822,7 @@ def run_temporal(args: argparse.Namespace) -> int:
         # Ladder-level VBV. The workers read these as MAXRATE_PERCENT /
         # BUFSIZE_MULT; without them cli_phase falls back to the module defaults
         # (124% / 0.25x) and the ladder's shaping is silently discarded — which
-        # is what local-dist did until #167, encoding apple-uniq-live with a 2.5x
+        # is what local-dist did until #167, encoding apple-uniq-live-xs with a 2.5x
         # looser buffer than it specifies and delivering ~25% more bits than the
         # same rung on cloud.
         "maxrate_percent": ladder_maxrate_percent(ladder_def),
@@ -963,7 +963,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "<stem>_<codec>_xs); blank = none")
     p.add_argument("--output-dir", required=True, dest="output_dir")
     p.add_argument("--codec", default="hevc")
-    p.add_argument("--ladder", default="apple-uniq-live")
+    p.add_argument("--ladder", default="apple-uniq-live-xs")
     # Job-level overrides of the ladder's profile timing. Absent -> the ladder's
     # value. Strings, not floats, so "" and "0" stay distinguishable ("0" is a
     # real setting: PARTIAL_DURATION=0 disables LL-HLS parts).

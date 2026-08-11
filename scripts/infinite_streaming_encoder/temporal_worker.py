@@ -44,11 +44,18 @@ TASK_QUEUE = os.environ.get("TEMPORAL_TASK_QUEUE", "encode")
 #     priority_key = job_rank * PRIORITY_BANDS + cost_band     (both start at 0/1)
 # so ALL of an older job's chunks (rank 0) outrank ANY younger job's (rank 1+),
 # and within a job the heaviest tiers lead. PRIORITY_BANDS = cost bands per job;
-# PRIORITY_LEVELS = the server's matching.priorityLevels ceiling (raised to 50 in
-# the encode dynamic config) = max jobs (10) × bands (5). Keys are clamped to it.
+# PRIORITY_LEVELS = the server's matching.priorityLevels ceiling (raised to 250 in
+# the encode dynamic config) = max jobs (50) × bands (5). Keys are clamped to it.
 # See #99. Mirrors the cloud path's jobPriorityBase (1000-wide bands + 0-999 within).
+#
+# This default must not exceed matching.priorityLevels in
+# infra/local-cluster/dynamicconfig/encode.yaml — a key above the server's
+# ceiling is rejected when the activity is SCHEDULED, so the whole encode fails
+# rather than merely mis-ordering. Lower is safe (keys clamp early, ranks tie);
+# higher is not. It was 50, matching a ten-rank ceiling that a queue which never
+# drains reaches in ten jobs.
 PRIORITY_BANDS = int(os.environ.get("CHUNK_PRIORITY_BANDS", "5"))
-PRIORITY_LEVELS = int(os.environ.get("CHUNK_PRIORITY_LEVELS", "50"))
+PRIORITY_LEVELS = int(os.environ.get("CHUNK_PRIORITY_LEVELS", "250"))
 
 # Pulls the live % out of an ENCODER-STAGE marker so it can ride the heartbeat.
 _STAGE_PCT_RE = re.compile(r"percent=([0-9.]+)\]\]")
@@ -464,7 +471,7 @@ class EncodeWorkflow:
             #
             # MAXRATE_PERCENT / BUFSIZE_MULT come from the ladder via the plan.
             # Omitting them let cli_phase fall back to its module defaults
-            # (124% / 0.25x), so local-dist encoded apple-uniq-live with a 2.5x
+            # (124% / 0.25x), so local-dist encoded apple-uniq-live-xs with a 2.5x
             # looser buffer than the profile specifies and delivered ~25% more
             # bits than the same rung on cloud (#167).
             env = {"CHUNK_DURATION_S": str(cd),
@@ -502,7 +509,7 @@ class EncodeWorkflow:
             # Packaging reads PARTIAL_DURATION (LL-HLS part length; 0 turns
             # parts off for VOD) and SEGMENT_DURATION. These dispatches passed
             # an empty env, so both silently defaulted to 0.2 / 6.0 — harmless
-            # for apple-uniq-live, wrong for apple-uniq-vod, which asks for
+            # for apple-uniq-live-xs, wrong for apple-uniq-vod, which asks for
             # partial=0 and would still have got LL-HLS parts (#172).
             pkg_env = {k: v for k, v in (
                 ("PARTIAL_DURATION", str(plan.get("partial_duration", ""))),

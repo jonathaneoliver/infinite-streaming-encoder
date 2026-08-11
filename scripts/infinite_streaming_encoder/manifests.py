@@ -87,8 +87,7 @@ def write_fragmented_mpd(package_dir: Path) -> int:
     ET.register_namespace("", _DASH_NS)
     ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
     _strip_leading_junk(src)
-    tree = ET.parse(src)
-    root = tree.getroot()
+    root = ET.parse(src).getroot()
 
     # Already expanded — @mediaRange is the marker, the same signal go-live uses
     # to tell the two shapes apart. Re-expanding would split each FRAGMENT into
@@ -534,14 +533,22 @@ def _average_bandwidth(rep: dict[str, Any], package_dir: Path) -> int:
     if init_segment and (package_dir / init_segment).exists():
         total_bytes += (package_dir / init_segment).stat().st_size
 
+    # Each FILE contributes its bytes once. _reject_fragment_granular should
+    # have stopped a per-fragment manifest reaching this, but the two guards are
+    # independent on purpose: this one is what makes the arithmetic correct
+    # rather than merely typical, and it is cheap.
+    counted: set[str] = set()
     for seg in rep.get("segments", []):
         duration = float(seg.get("duration", 0.0) or 0.0)
         url = seg.get("url")
         if duration <= 0 or not url:
             continue
         seg_path = package_dir / url
-        if seg_path.exists():
-            total_duration += duration
+        if not seg_path.exists():
+            continue
+        total_duration += duration
+        if url not in counted:
+            counted.add(url)
             total_bytes += seg_path.stat().st_size
 
     if total_duration <= 0 or total_bytes <= 0:

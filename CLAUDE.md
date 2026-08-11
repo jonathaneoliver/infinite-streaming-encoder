@@ -193,7 +193,8 @@ keep-list.
 `$TMP_DIR` holds four kinds of thing and only one is garbage, so **eligibility
 is the `^[0-9]+$` job-ID directory shape, not age** — the `encode_<stem>/`
 mezzanine caches, the learned state that sizes every chunk plan
-(`encode_speeds.json`, `ladders.json`, `quality-curves.json`) and the permanent
+(`encode_speeds.json`, `quality-curves.json`), the ladder CONFIGURATION
+(`ladders.json` — user-authored, not learned) and the permanent
 record (`logs/`, `history.md`, `failed/`) are out of scope structurally rather
 than by a rule someone can forget. `MaxAge` of 0 means *disabled* at both the
 loop and the sweep, because read literally it puts the cutoff at now and takes
@@ -545,7 +546,14 @@ speaking unguarded.
 Supporting modules (all stdlib-only except `cloud/*` which uses boto3):
 - `ffprobe.py` — structured ffprobe wrapper; fps as `Fraction` for exact GOP math.
 - `mezzanine.py`, `audio.py`, `encode_variants.py`, `packager.py`, `hls.py` — one per phase; each exposes a pure builder for its ffmpeg/packager argv plus a function that runs the subprocess.
-- `ladder.py` — 6-tier bitrate table × 3 codecs + `--bitrate-override-*` parsing.
+- **`docs/ladders-and-delivery.md`** — what a ladder actually contains: rungs
+  AND the delivery profile (segment / partial / GOP / VBV) AND the output tag,
+  why they are one object, the `peak = maxrate% + bufsize/T` relation that
+  makes a tight VBV the price of re-choppability, the three competing drivers
+  of GOP, and the tag-derivation rule that gives every pinned-segment ladder
+  the SAME empty tag (so two of them overwrite each other).
+- `ladder.py` — rung selection + `--bitrate-override-*` parsing. The tables are
+  DATA now (`$TMP_DIR/ladders.json`), not a hardcoded 6-tier × 3-codec block.
 - `gop.py` — `KEYINT = round(fps × gop_s)`, min 1, on Fraction fps.
 - `padding.py` — LCM-based segment-boundary padding; 0.5s skip-threshold.
 - `burnin.py` — 5-layer drawtext filter (timecode, rate, codec+res+fps, encoder, watermark) + optional PADDING label on padded frames only.

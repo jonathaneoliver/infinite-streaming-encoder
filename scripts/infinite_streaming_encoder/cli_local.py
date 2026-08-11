@@ -83,8 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Ladder by name (legacy | apple | apple-uniq | any custom ladder). Not
     # restricted to `choices` so user-defined ladders work; validated via
     # get_ladder at run time.
-    p.add_argument("--ladder", default="apple-uniq-live", dest="ladder",
-                   help="encoding ladder name (default: apple-uniq-live)")
+    p.add_argument("--ladder", default="apple-uniq-live-xs", dest="ladder",
+                   help="encoding ladder name (default: apple-uniq-live-xs)")
     # No `choices=` on either bound: the UI derives its tier options from the
     # selected ladder's real rung heights, and the Apple-uniq ladders carry
     # non-standard ones (954p, 1800p, 594p...). Any "<height>p" is valid; an

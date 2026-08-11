@@ -29,7 +29,7 @@ import (
 // Note the server flag (-default-ladder / DEFAULT_LADDER) can override the
 // default for jobs it seeds; EffectiveLadder describes what a given JobConfig
 // resolves to, which is what history.md needs.
-const DefaultLadderName = "apple-uniq-live"
+const DefaultLadderName = "apple-uniq-live-xs"
 
 // EffectiveLadder is the ladder a config actually encodes with — the one it
 // names, or the default when it names none.
@@ -55,8 +55,10 @@ type LadderDef struct {
 	SegmentDuration string `json:"segment_duration,omitempty"`
 	PartialDuration string `json:"partial_duration,omitempty"`
 	GopDuration     string `json:"gop_duration,omitempty"`
-	// OutputTag, when set, is appended to the output directory name (e.g. "6s" →
-	// "<stem>_6s_<codec>"). It marks the profile in the filename so a downstream
+	// OutputTag, when set, is appended to the output directory name AFTER the
+	// codec (e.g. "6s" → "<stem>_<codec>_6s") — last, so the `_p200_<codec>`
+	// shape that OutputStem / resolveCodec / parseOutputMeta / the watcher all
+	// key off stays intact. It marks the profile in the filename so a downstream
 	// consumer (e.g. go-live) can tell a repackage-once profile from the default
 	// repackage-into-1s/2s/6s one. Empty = no tag (dir names unchanged).
 	OutputTag string `json:"output_tag,omitempty"`
@@ -93,7 +95,6 @@ type LadderStore struct {
 // scripts/infinite_streaming_encoder/ladder.py SEED_LADDERS (av1 == hevc). Kept in sync by hand;
 // the store persists a copy so both languages read the same file thereafter.
 func defaultSeedLadders() map[string]LadderDef {
-	legacyHEVC := [][]int{{640, 360, 300}, {960, 540, 1001}, {1280, 720, 1662}, {1920, 1080, 4273}, {2560, 1440, 10547}, {3840, 2160, 16458}}
 	appleH264 := [][]int{{416, 234, 145}, {640, 360, 365}, {768, 432, 730}, {768, 432, 1100}, {960, 540, 2000}, {1280, 720, 3000}, {1280, 720, 4500}, {1920, 1080, 6000}, {1920, 1080, 7800}}
 	appleHEVC := [][]int{{640, 360, 145}, {768, 432, 300}, {960, 540, 600}, {960, 540, 900}, {960, 540, 1600}, {1280, 720, 2400}, {1280, 720, 3400}, {1920, 1080, 4500}, {1920, 1080, 5800}, {2560, 1440, 8100}, {3840, 2160, 11600}, {3840, 2160, 16800}}
 	appleUniqH264 := [][]int{{416, 234, 145}, {640, 360, 365}, {704, 396, 730}, {768, 432, 1100}, {960, 540, 2000}, {1056, 594, 3000}, {1280, 720, 4500}, {1696, 954, 6000}, {1920, 1080, 7800}}
@@ -103,15 +104,6 @@ func defaultSeedLadders() map[string]LadderDef {
 	// H.264-appropriate (higher) bitrates. Keeps h264/hevc/av1 rung-parallel.
 	appleUniqH264Full := append(append([][]int{}, appleUniqH264...), []int{2560, 1440, 13500}, []int{3200, 1800, 19000}, []int{3840, 2160, 27000})
 	return map[string]LadderDef{
-		"legacy": {
-			Description: "Default distinct-height geometric ladder (one rung per resolution per codec).",
-			Seed:        true,
-			Codecs: map[string][][]int{
-				"h264": {{640, 360, 600}, {960, 540, 1722}, {1280, 720, 2779}, {1920, 1080, 6957}, {2560, 1440, 16995}, {3840, 2160, 26453}},
-				"hevc": legacyHEVC,
-				"av1":  legacyHEVC,
-			},
-		},
 		"apple": {
 			Description: "Apple HLS Authoring Spec bitrates — per-codec, multi-rung.",
 			Seed:        true,
@@ -130,28 +122,12 @@ func defaultSeedLadders() map[string]LadderDef {
 				"av1":  appleUniqHEVC,
 			},
 		},
-		"apple-uniq-live": {
-			Description:       "apple-uniq bitrates under Apple's live/linear VBV: peak <= 1.25x avg. maxrate 110% + tight 0.10x buffer keep delivered peak <=~1.20x even at 1s segments; unique resolutions keep the bands distinct.",
+		"apple-uniq-live-xs": {
+			Description:       "The FLEXIBLE base: no pinned segment length, so go-live repackages one encode into 1s/2s/6s. Apple's live/linear VBV (peak <= 1.25x avg) split as maxrate 100% + a 0.25x buffer, so the bound holds EVEN AT 1s (1.00 + 0.25) — that is what makes it safe to re-chop. The split matters as much as the bound: at 110%/0.10x the same 1.25x ceiling left only 3 frames of buffer and the encoder delivered just 64-68% of target, because a 3-frame buffer cannot absorb a keyframe and x264 stays conservative rather than violate VBV. Measured, the peak never reached 86-92% of that maxrate at any rung, so the ceiling was never the constraint — trading it for buffer costs nothing and yields 94-99% of target with the 1s peak still inside the cap. H.264 climbs to 4K (1440p/1800p/2160p): Apple caps H.264 at 1080p and puts HEVC above, so this trades spec-compliance for max-compatibility high-bitrate 4K H.264, matching the rung set of the fixed-segment ladders it is compared against.",
 			Seed:              true,
-			MaxratePercent:    110,
-			BufsizeMultiplier: 0.10,
-			// No pinned segment_duration: this is the FLEXIBLE base — the tight VBV
-			// is safe to repackage into 1s/2s/6s, so the ladder page shows all three
-			// segment charts. partial/gop are its LL-HLS live settings.
-			PartialDuration: "0.2",
-			GopDuration:     "1.0",
-			Codecs: map[string][][]int{
-				"h264": appleUniqH264,
-				"hevc": appleUniqHEVC,
-				"av1":  appleUniqHEVC,
-			},
-		},
-		"apple-uniq-live-full": {
-			Description:       "apple-uniq-live, but H.264 climbs all the way to 4K (1440p/1800p/2160p) at high bitrates. Apple caps H.264 at 1080p (HEVC above), so this trades spec-compliance for max-compatibility high-bitrate 4K H.264. Same live/linear VBV (110%/0.10x, 0.2s parts, 1s GOP) and flexible _xs base as apple-uniq-live.",
-			Seed:              true,
-			MaxratePercent:    110,
-			BufsizeMultiplier: 0.10,
-			// Flexible base (no pinned segment_duration → _xs), same as apple-uniq-live.
+			MaxratePercent:    100,
+			BufsizeMultiplier: 0.25,
+			// Flexible base: no pinned segment_duration → suffix derives to _xs.
 			PartialDuration: "0.2",
 			GopDuration:     "1.0",
 			Codecs: map[string][][]int{
@@ -160,16 +136,44 @@ func defaultSeedLadders() map[string]LadderDef {
 				"av1":  appleUniqHEVC,
 			},
 		},
-		"apple-uniq-live-6s": {
-			Description:       "apple-uniq LL-HLS for 6s segments ONLY. The tight 110%/0.10x VBV on apple-uniq-live existed to keep the delivered per-segment peak reasonable even at 1s (delivered peak ~= maxrate + bufsize/T). Fixed at 6s the bufsize/T term is 6x smaller, so relax to 150%/1.0x for better quality on complex scenes while the delivered peak stays ~1.67x avg. Keeps LL-HLS parts (0.2s) + 1s GOP.",
+		"apple-uniq-live-1s": {
+			Description:       "apple-uniq bitrates encoded NATIVELY for 1s segments. Delivered peak (maxrate + bufsize/T) is held at 1.25x avg — Apple's live/linear guidance — the SAME as the other apple-uniq-live-Ns ladders, so a comparison between them is not confounded by peak. Split as maxrate 100% + 0.25x rather than 110% + 0.15x: both satisfy the bound at T=1s, but the first gives 7.5 frames of buffer instead of 4.5, which lifts delivery from 91% to 94-99% of target AND brings the measured 1s peak back under the cap (110%/0.15x breached it at 540p). GOP matched to the segment (1s), which is what makes this a different ENCODE rather than a repackaging. NOTE gop == segment means LL-HLS parts are INDEPENDENT only at segment boundaries, so a player cannot join mid-segment: the low-latency cost of a long GOP.",
 			Seed:              true,
-			MaxratePercent:    150,
-			BufsizeMultiplier: 1.0,
+			MaxratePercent:    100,
+			BufsizeMultiplier: 0.25,
+			SegmentDuration:   "1", // fixed → suffix auto-derives to "_1s"
+			PartialDuration:   "0.2",
+			GopDuration:       "1",
+			Codecs: map[string][][]int{
+				"h264": appleUniqH264Full,
+				"hevc": appleUniqHEVC,
+				"av1":  appleUniqHEVC,
+			},
+		},
+		"apple-uniq-live-2s": {
+			Description:       "apple-uniq bitrates encoded NATIVELY for 2s segments. Delivered peak (maxrate + bufsize/T) is held at 1.25x avg — Apple's live/linear guidance — the SAME as the other apple-uniq-live-Ns ladders, so a comparison between them is not confounded by peak. Committing to 2s is what buys the bigger buffer: 0.3x here versus 0.10x on the flexible base (apple-uniq-live-xs), which must survive re-chopping to 1s and so pays the 1s price at every length — that difference IS the cost of re-choppability. GOP matched to the segment (2s), which is what makes this a different ENCODE rather than a repackaging. NOTE gop == segment means LL-HLS parts are INDEPENDENT only at segment boundaries, so a player cannot join mid-segment: the low-latency cost of a long GOP.",
+			Seed:              true,
+			MaxratePercent:    110,
+			BufsizeMultiplier: 0.3,
+			SegmentDuration:   "2", // fixed → suffix auto-derives to "_2s"
+			PartialDuration:   "0.2",
+			GopDuration:       "2",
+			Codecs: map[string][][]int{
+				"h264": appleUniqH264Full,
+				"hevc": appleUniqHEVC,
+				"av1":  appleUniqHEVC,
+			},
+		},
+		"apple-uniq-live-6s": {
+			Description:       "apple-uniq bitrates encoded NATIVELY for 6s segments. Delivered peak (maxrate + bufsize/T) is held at 1.25x avg — Apple's live/linear guidance — the SAME as the other apple-uniq-live-Ns ladders, so a comparison between them is not confounded by peak. Committing to 6s is what buys the bigger buffer: 0.9x here versus 0.10x on the flexible base (apple-uniq-live-xs), which must survive re-chopping to 1s and so pays the 1s price at every length — that difference IS the cost of re-choppability. GOP matched to the segment (6s), which is what makes this a different ENCODE rather than a repackaging. NOTE gop == segment means LL-HLS parts are INDEPENDENT only at segment boundaries, so a player cannot join mid-segment: the low-latency cost of a long GOP.",
+			Seed:              true,
+			MaxratePercent:    110,
+			BufsizeMultiplier: 0.9,
 			SegmentDuration:   "6", // fixed → suffix auto-derives to "_6s"
 			PartialDuration:   "0.2",
-			GopDuration:       "1.0",
+			GopDuration:       "6",
 			Codecs: map[string][][]int{
-				"h264": appleUniqH264,
+				"h264": appleUniqH264Full,
 				"hevc": appleUniqHEVC,
 				"av1":  appleUniqHEVC,
 			},
@@ -182,6 +186,12 @@ func defaultSeedLadders() map[string]LadderDef {
 			SegmentDuration:   "6",
 			PartialDuration:   "0",
 			GopDuration:       "6",
+			// Explicit, because the derived tag would be "6s" — the same as
+			// apple-uniq-live-6s, which is a different encode entirely (gop 6 vs
+			// 1.0, no parts vs 0.2s, 200%/2x vs 150%/1x). Two encodes into one
+			// output directory, second overwrites first. Segment duration is a
+			// good DEFAULT name, not a unique one.
+			OutputTag: "vod",
 			Codecs: map[string][][]int{
 				"h264": appleUniqH264,
 				"hevc": appleUniqHEVC,
@@ -412,18 +422,33 @@ func (d LadderDef) extraArgsFor(codec string) string {
 }
 
 // passesFor returns the encode pass count for a codec on this ladder, falling
-// back to the per-codec default when the ladder doesn't pin it: h264 → 1,
-// hevc → 2, av1 → 2 (two-pass gives AV1 an accurate target average, same as
-// HEVC). Single source of truth for the two-pass decision (was
-// JobConfig.HevcSinglePass).
+// back to TWO for every codec when the ladder doesn't pin it. Single source of
+// truth for the two-pass decision (was JobConfig.HevcSinglePass).
+//
+// h264 defaulted to 1 on the stated grounds that "x264's single-pass VBV
+// already lands the target average, so two-passing H264 just doubles encode
+// time for no measurable gain". That holds at a loose VBV and fails badly at a
+// tight one. Measured on one source, two encodes differing ONLY in pass count,
+// delivered bitrate as a fraction of the rung target:
+//
+//	rung    1-pass  2-pass
+//	1080p      68%     85%
+//	 540p      66%     80%
+//	 234p      64%     76%
+//
+// +12 to +18 points at every rung on a 0.10x buffer, and the peak/avg ratio
+// steadies with it — 1.16-1.50 wandering under single-pass, 1.19-1.29 under
+// two-pass, back under Apple's 1.25x live cap at the top rungs.
+//
+// The cost is real: h264 encode time roughly doubles. A ladder with a loose
+// buffer gains little (0.90x already delivers 97-100% single-pass) and can pin
+// `passes: {"h264": 1}` to buy the time back. Defaulting the other way was the
+// error — it made the ladders that need it most the ones that did not get it.
 func (d LadderDef) passesFor(codec string) int {
 	if d.Passes != nil {
 		if n, ok := d.Passes[codec]; ok && n > 0 {
 			return n
 		}
-	}
-	if codec == "h264" {
-		return 1
 	}
 	return 2
 }
@@ -514,8 +539,9 @@ func (s *LadderStore) codecHeightRange(ladderName, codec string) (lo, hi int, ok
 // rungs for any of the config's chosen codecs — the "no ladder rungs fit this
 // source" failure, caught at submit time instead of one second into a launched
 // worker (issue #115). Codec-specific because the ladder's columns differ in
-// reach: apple-uniq-live's h264 tops at 1080p while hevc/av1 reach 2160p, so a
-// [1800p,2160p] band is fine for hevc but empty for h264.
+// reach: apple-uniq / apple-uniq-vod stop h264 at 1080p while hevc/av1 reach
+// 2160p, so a [1800p,2160p] band is fine for hevc but empty for h264. (The
+// apple-uniq-live-* ladders carry h264 to 2160p, so they do not hit this.)
 //
 // Source-width (no-upscale) filtering is deliberately NOT applied here: the
 // probe isn't available at submit time, and a too-small source dropping a rung

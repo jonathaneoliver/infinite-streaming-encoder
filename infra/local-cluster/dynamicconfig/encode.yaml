@@ -27,11 +27,30 @@ matching.numTaskqueueWritePartitions:
 
 # Raise the priority ceiling from the default 5 so the workflow can encode a
 # COMPOSITE priority_key = job_rank*5 + cost_band on each chunk (see #99 /
-# temporal_worker.PRIORITY_LEVELS). 50 = up to 10 concurrent local jobs × 5 cost
-# bands: an older job's whole ladder (ranks 1-5) outranks a younger job's (6-10),
-# and within a job the heaviest tiers lead. priority_key: 1 = highest.
+# temporal_worker.PRIORITY_LEVELS). LEVELS/BANDS = how many jobs can be ordered
+# against each other: an older job's whole ladder outranks a younger job's, and
+# within a job the heaviest tiers lead. priority_key: 1 = highest.
+#
+# 250 = 50 job ranks × 5 cost bands. It was 50 (ten ranks), and ten is reachable
+# in ordinary use: a rank is assigned at launch and each launch lands one below
+# the job still running, so a queue that never drains climbs one rank per job
+# and saturates at the tenth. Everything past that shares the bottom band, ties,
+# and falls through to the cost-band tie-break — which favours the NEWEST job,
+# because it is the one still on its expensive top rungs. That is the exact
+# inversion the rank exists to prevent, and it returns silently.
+#
+# Raising this MOVES the saturation point, it does not remove it. The growth is
+# inherent: a new job must rank below the one still running, its key is fixed
+# when the activity is scheduled, and with a full queue there is never a moment
+# to renumber. 50 ranks is chosen to be past any plausible unbroken chain.
+#
+# THREE PLACES MUST AGREE, or raising this buys nothing:
+#   - this value                              (the server's ceiling)
+#   - temporal_worker.PRIORITY_LEVELS         (clamps the key it sends)
+#   - encode.maxLocalJobRank                  (clamps the rank Go assigns)
+# The Go cap is the binding one — it decides how many distinct ranks ever exist.
 matching.priorityLevels:
-  - value: 50
+  - value: 250
     constraints:
       taskQueueName: encode
 
