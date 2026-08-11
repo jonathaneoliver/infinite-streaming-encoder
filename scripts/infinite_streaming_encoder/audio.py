@@ -3,7 +3,7 @@
 Produces a fragmented MP4 at `<tmp>/audio.mp4`. Shaka Packager later
 reads this alongside the video variant MP4s to package them together.
 
-Audio is ALWAYS transcoded to AAC-LC 192k stereo (2-channel) 48kHz — a
+Audio is ALWAYS transcoded to AAC-LC stereo (2-channel) 48kHz — a
 single canonical output regardless of source (ports smashing dev
 #269/6398f299 + the #3e09a700 stereo fix). No codec/profile/channel
 gating:
@@ -29,12 +29,31 @@ from infinite_streaming_encoder.ffprobe import probe
 from infinite_streaming_encoder.progress import run_ffmpeg_with_progress
 
 
-# Canonical AAC encode params — match dev bash (AAC-LC 192k, stereo, 48kHz).
-# ffmpeg's native `aac` encoder emits AAC-LC (mp4a.40.2) by default, so no
-# explicit profile flag is needed. _AAC_CHANNELS="2" is the stereo downmix
-# that keeps multichannel sources playable in HLS.js et al.
-_AAC_BITRATE = "192k"
-_AAC_SAMPLE_RATE = "48000"
+# Canonical AAC encode params. ffmpeg's native `aac` encoder emits AAC-LC
+# (mp4a.40.2) by default, so no explicit profile flag is needed.
+# _AAC_CHANNELS="2" is the stereo downmix that keeps multichannel sources
+# playable in HLS.js et al.
+#
+# ONE flat track is shared by every rung of every ladder, so its cost is
+# charged in full to the cheapest rung as well as the dearest. At the 192k
+# this used to carry, that made audio 62% of the 234p rendition and 39% of
+# 360p — a 54x video ladder (145k..7800k) against a constant (#296). 96k
+# puts every rung from 360p up under a quarter of its total while costing
+# 1.4% at 1080p.
+#
+# It does NOT fix the bottom rung: 234p budgets 145k of video, so audio
+# would have to fit ~40k to stay a quarter of it, and AAC-LC is not
+# listenable there. That needs HE-AAC (SBR), which requires libfdk_aac —
+# not in the BtbN static build this image pulls, and not redistributable
+# in a public image once linked. Until that is resolved 234p carries 45%
+# audio and no number here changes it.
+#
+# AAC_BITRATE / AAC_SAMPLE_RATE are public because `hls.py`'s TS re-encode
+# path needs the same values; it carried its own literal 192k until #296,
+# which is how the two output formats would have silently disagreed about
+# audio the moment either was tuned.
+AAC_BITRATE = "96k"
+AAC_SAMPLE_RATE = "48000"
 _AAC_CHANNELS = "2"
 _FRAG_DURATION_US = 1_000_000
 
@@ -74,15 +93,15 @@ def detect_source_codec(mezzanine_path: Path) -> str:
 
 
 def build_ffmpeg_cmd(spec: AudioSpec) -> list[str]:
-    # Always transcode to AAC-LC 192k stereo 48kHz (no stream-copy path —
-    # see the module docstring for why the -ac 2 downmix rules it out).
+    # Always transcode to AAC-LC stereo 48kHz (no stream-copy path — see the
+    # module docstring for why the -ac 2 downmix rules it out).
     cmd = [
         "ffmpeg", "-y",
         "-i", str(spec.mezzanine_path),
         "-vn",
         "-c:a", "aac",
-        "-b:a", _AAC_BITRATE,
-        "-ar", _AAC_SAMPLE_RATE,
+        "-b:a", AAC_BITRATE,
+        "-ar", AAC_SAMPLE_RATE,
         "-ac", _AAC_CHANNELS,
     ]
     if spec.padding_s > 0:
@@ -114,7 +133,7 @@ def create_audio(spec: AudioSpec, stage_key: str = "audio",
     # codec no longer gates anything.
     source_codec = detect_source_codec(spec.mezzanine_path)
     print(f"[audio] transcoding {source_codec or '?'} → AAC-LC "
-          f"{_AAC_BITRATE} stereo {_AAC_SAMPLE_RATE}Hz", flush=True)
+          f"{AAC_BITRATE} stereo {AAC_SAMPLE_RATE}Hz", flush=True)
     cmd = build_ffmpeg_cmd(spec)
     try:
         if duration_s > 0:
