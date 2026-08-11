@@ -66,11 +66,16 @@ if [ -z "$JD" ]; then row "state" "${D}no AWS access${N}"; else
   printf '%s' "$JD" | python3 -c '
 import json,sys
 d=json.load(sys.stdin).get("jobDefinitions",[])
-tags=sorted({j["containerProperties"]["image"].rsplit(":",1)[-1] for j in d})
 revs=sorted({j["revision"] for j in d})
 print("  %-22s %s" % ("job definitions", "%d defs, rev %s" % (len(d), ",".join(map(str,revs)))))
-print("  %-22s %s" % ("pinned image tag", ",".join(tags) or "-"))
 ' 2>/dev/null || row "job definitions" "-"
+  # Tag extraction lives in scripts/cloud_payload.sh — `make fleet-check` needs
+  # the same value to compare against the farm's payload, and two copies of the
+  # parse is how they drift. Piped our already-fetched JSON so this stays one
+  # describe call. Note the "Farm workers" rows below are NOT comparable to this:
+  # they print each container's image reference (…:latest), which is identical
+  # whatever payload the box runs. `make fleet-check` does that comparison (#300).
+  row "pinned image tag" "$(printf '%s' "$JD" | bash scripts/cloud_payload.sh - | tr '\n' ',' | sed 's/,$//' || echo '-')"
   EX=$(aws stepfunctions list-executions --region "$REGION" \
     --state-machine-arn "$(cd infra/terraform 2>/dev/null && tofu output -no-color -raw state_machine_arn 2>/dev/null)" \
     --status-filter RUNNING --query 'length(executions)' --output text 2>/dev/null || echo '-')

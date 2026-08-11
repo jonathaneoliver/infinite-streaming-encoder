@@ -347,7 +347,7 @@ clean: stop
 # GHCR (+ ECR when used) and ensures the docker-container buildx builder exists.
 # Requires GHCR_PAT (write:packages). Supersedes the old GHCR-only publish and
 # the ECR-only ecr-publish (now a thin alias).
-publish: require-ghcr   ## build once (multi-arch) → GHCR always, ECR when cloud is configured
+publish: require-ghcr require-cloud-state ## build once (multi-arch) → GHCR always, ECR when cloud is configured
 	@: $${GHCR_PAT:?GHCR_PAT is not set — create a classic PAT with write:packages scope}
 	@echo "$$GHCR_PAT" | docker login ghcr.io -u $(GHCR_USERNAME) --password-stdin
 	@docker buildx inspect encoder-builder >/dev/null 2>&1 || \
@@ -361,7 +361,7 @@ publish: require-ghcr   ## build once (multi-arch) → GHCR always, ECR when clo
 	elif [ -n "$$(printf '%s' '$(ECR_REPO)' | tr -d '[:space:]')" ]; then \
 	  echo ">>> WARNING: ECR_REPO set but not a valid *.dkr.ecr.* URL — skipping ECR (GHCR only). Value: '$(ECR_REPO)'"; \
 	else \
-	  echo ">>> no cloud stack (ECR_REPO empty) — GHCR-only publish"; \
+	  echo ">>> no cloud configured (no TFSTATE_BUCKET, no ECR_REPO) — GHCR-only publish"; \
 	fi; \
 	docker buildx build --builder encoder-builder --platform $(PLATFORMS) \
 		--build-arg VERSION=$(VERSION) --build-arg GIT_SHA=$(GIT_SHA) --build-arg IMAGE_TAG=$(IMAGE_TAG) \
@@ -452,6 +452,54 @@ TFSTATE_TABLE  ?= terraform-lock
 # value (which then reach `docker login` as a garbage registry host).
 ECR_REPO ?= $(shell cd $(TF_DIR) && tofu output -no-color -raw ecr_repo_url 2>/dev/null)
 ECR_REGISTRY = $(firstword $(subst /, ,$(ECR_REPO)))
+
+# An EMPTY ECR_REPO has two causes, and they are opposites (#299):
+#
+#   TFSTATE_BUCKET unset -> this checkout is not configured for cloud at all.
+#                           "no cloud stack" is TRUE and a GHCR-only publish is
+#                           exactly right. A perfectly normal local-only setup.
+#   TFSTATE_BUCKET set   -> there IS a cloud stack and we cannot READ it.
+#                           Almost always an uninitialised checkout — a fresh
+#                           worktree, which this repo actively encourages — where
+#                           `tofu output` fails with "Backend initialization
+#                           required" and the 2>/dev/null above throws that away.
+#
+# The second used to print "no cloud stack (ECR_REPO empty) — GHCR-only publish"
+# and CONTINUE. That reads as "this machine isn't set up for cloud, that's
+# expected", so it gets ignored — and `publish` is step 1 of `deploy`, so the
+# deploy went on to push GHCR and roll the master and every DIST_WORKERS box onto
+# the new payload before `infra-plan` finally failed with the real reason. The
+# farm ended up on the new encoder with Batch still on the old one (#300), which
+# is the split `version` exists to make impossible (#248).
+#
+# So it FAILS here rather than degrading. Degrading is only honest once we have
+# established there is nothing to push to, and an unreadable state establishes
+# nothing. Failing costs one `make infra-init` and a re-run.
+#
+# TFSTATE_BUCKET is the entire discriminator and it costs nothing: no extra tofu
+# call, and no matching against tofu's error TEXT, which would rot the first time
+# they reword it. tofu's own message is still shown — by re-running the command
+# without the redirect, on the failure path only, so `make help` stays quiet.
+#
+# STATE_MACHINE_ARN below resolves from the same state the same way, so it is
+# empty under exactly these conditions and this guard covers it too.
+.PHONY: require-cloud-state
+require-cloud-state:
+	@if [ -z "$(TFSTATE_BUCKET)" ] || \
+	   [ -n "$$(printf '%s' '$(ECR_REPO)' | tr -d '[:space:]')" ]; then exit 0; fi; \
+	echo "!!! cannot read the cloud stack's state, but this repo is configured for cloud."; \
+	echo "    TFSTATE_BUCKET=$(TFSTATE_BUCKET) is set, so a stack EXISTS — the ECR repo,"; \
+	echo "    the Batch job definitions and the state machine are all still there. This"; \
+	echo "    checkout just cannot see them. tofu says:"; \
+	echo; \
+	cd $(TF_DIR) && tofu output -no-color -raw ecr_repo_url 2>&1 | sed 's/^/    /' || true; \
+	echo; \
+	echo "    Fix:  make infra-init        <- almost always this, in a fresh worktree"; \
+	echo "    Or:   set ECR_REPO in .env   <- skips the state lookup entirely"; \
+	echo; \
+	echo "    Refusing to continue: publishing now would push GHCR and roll the farm"; \
+	echo "    onto a payload the cloud is not getting."; \
+	exit 1
 
 # Worker-image tag: short-sha of the last commit that touched anything baked
 # INTO the image (the Dockerfile + the dirs it COPYs). Commits that only change
@@ -862,6 +910,15 @@ deploy: require-idle  ## push image + bring the whole farm up + plan + APPLY inf
 	else \
 		el=$$(( $$(date +%s) - start )); \
 		printf '\a\n\033[1;31m!!! DEPLOY FAILED after %dm %02ds - see output above\033[0m\n' $$((el/60)) $$((el%60)); \
+		printf '\033[1;31m    "failed" does NOT mean "nothing happened" (#300).\033[0m\n'; \
+		echo "    This chain stops at the first failure, but every step BEFORE it has"; \
+		echo "    already taken effect — and two of them are externally visible: publish"; \
+		echo "    pushes GHCR :latest, and farm-up restarts the master and every remote"; \
+		echo "    box on it. A failure at plan/apply therefore leaves the farm on the new"; \
+		echo "    payload and the cloud on the old one."; \
+		echo; \
+		echo "    Run 'make fleet-check' — it now reports both halves, so it answers what"; \
+		echo "    actually moved rather than this chain guessing where it died."; \
 		exit 1; \
 	fi
 	@$(if $(filter 1,$(USE_AMI)),true,$(MAKE) ami-check)
@@ -1259,18 +1316,67 @@ farm-dev-down: farm-down   ## take the dev farm down (identical to `make farm-do
 # quietly a subset, which reads as complete.
 fleet-check:            ## list the workers actually connected to the encode queue
 	@fleet=$$(curl -sf --max-time 5 http://localhost:$(PORT)/api/dist/workers 2>/dev/null); \
-	 if [ -z "$$fleet" ]; then echo ">>> [fleet] server not reachable on :$(PORT) — cannot tell who is connected"; exit 0; fi; \
-	 remote=$$(printf '%s' "$$fleet" | python3 -c \
-	   "import json,sys; print(' '.join(m.get('name','?') for m in json.load(sys.stdin).get('machines',[]) if not m.get('local')))" 2>/dev/null); \
-	 if [ -n "$$remote" ]; then \
-	   printf '\033[1;33m>>> [fleet] NOT master-only — remote worker(s) connected: %s\033[0m\n' "$$remote"; \
-	   echo "    They take chunks from the same queue on whatever image they last pulled, so a run"; \
-	   echo "    now can span code versions and drop the telemetry of whichever half is older."; \
-	   echo "    For a same-version fleet: 'make deploy' (updates every box), or stop those workers."; \
+	 if [ -z "$$fleet" ]; then \
+	   echo ">>> [fleet] server not reachable on :$(PORT) — cannot tell who is connected"; \
 	 else \
-	   echo ">>> [fleet] master only — no remote workers connected"; \
+	   remote=$$(printf '%s' "$$fleet" | python3 -c \
+	     "import json,sys; print(' '.join(m.get('name','?') for m in json.load(sys.stdin).get('machines',[]) if not m.get('local')))" 2>/dev/null); \
+	   if [ -n "$$remote" ]; then \
+	     printf '\033[1;33m>>> [fleet] NOT master-only — remote worker(s) connected: %s\033[0m\n' "$$remote"; \
+	     echo "    They take chunks from the same queue on whatever image they last pulled, so a run"; \
+	     echo "    now can span code versions and drop the telemetry of whichever half is older."; \
+	     echo "    For a same-version fleet: 'make deploy' (updates every box), or stop those workers."; \
+	   else \
+	     echo ">>> [fleet] master only — no remote workers connected"; \
+	   fi; \
+	   printf '%s' "$$fleet" | python3 -c "$$FLEET_VERSION_PY" 2>/dev/null || true; \
 	 fi; \
-	 printf '%s' "$$fleet" | python3 -c "$$FLEET_VERSION_PY" 2>/dev/null || true
+	 $(MAKE) --no-print-directory cloud-payload
+
+# The cloud half of the question fleet-check already asks about the LAN (#300).
+#
+# `version` means ENCODER PAYLOAD (#248), and its whole value is that two chunks
+# agreeing on it ran identical encoder code. A farm/cloud split breaks exactly
+# that guarantee — a local-dist run and a cloud run of the same source can be
+# different encoders — and it is the confound #167/#286-style comparisons cannot
+# absorb. Until now nothing compared the two: the split observed on 2026-08-11
+# (farm on 4ab3e12, job definitions on 459251f) only became visible by reading a
+# later `tofu plan` diff, and could otherwise have persisted indefinitely.
+#
+# Detection rather than prevention, deliberately. A deploy that fails half way is
+# only one way in; applying infra without publishing, a partial apply, or a
+# console edit all produce the same split and no deploy is involved.
+#
+# ACTIVE revisions only — a deploy leaves deregistered ones behind, and including
+# them would report every tag the stack has ever run. Job definitions are matched
+# by IMAGE rather than by name prefix, so this needs no naming convention to stay
+# true; ECR_REPO is the repo this stack actually deploys to, by definition.
+#
+# NOT folded into `cloud-check`: that one is a readiness GATE (creds, state
+# machine, bucket) that exits 1 and blocks cloud-up. This only reports, and a
+# payload difference is frequently not a fault.
+.PHONY: cloud-payload
+cloud-payload:          ## what encoder payload the CLOUD (Batch job definitions) is on
+	@if [ -z "$(TFSTATE_BUCKET)" ] && [ -z "$(ECR_REPO)" ]; then \
+	  echo ">>> [cloud] not configured — no TFSTATE_BUCKET, no ECR_REPO"; exit 0; fi; \
+	if [ -z "$$(printf '%s' '$(ECR_REPO)' | tr -d '[:space:]')" ]; then \
+	  echo ">>> [cloud] cannot read tofu state — run 'make infra-init' (see #299)"; exit 0; fi; \
+	tags=$$(AWS_REGION=$(AWS_REGION) ECR_REPO="$(ECR_REPO)" bash scripts/cloud_payload.sh); \
+	if [ -z "$$tags" ]; then \
+	  echo ">>> [cloud] no ACTIVE Batch job definitions on $(ECR_REPO) — has infra ever been applied?"; \
+	  exit 0; fi; \
+	n=$$(printf '%s\n' "$$tags" | wc -l | tr -d ' '); \
+	if [ "$$n" != "1" ]; then \
+	  printf '\033[1;31m>>> [cloud] job definitions DISAGREE: %s\033[0m\n' "$$(printf '%s' "$$tags" | tr '\n' ' ')"; \
+	  echo "    A partial apply left them split. 'make deploy' puts them back on one tag."; \
+	  exit 0; fi; \
+	echo ">>> [cloud] Batch job definitions: $$tags"; \
+	if [ "$$tags" != "$(IMAGE_TAG)" ]; then \
+	  printf '\033[1;33m    this checkout builds %s — a deploy WOULD move the cloud\033[0m\n' "$(IMAGE_TAG)"; \
+	  echo "    Not a fault on its own: it just means main has moved since the last deploy."; \
+	  echo "    It IS a fault if the farm above is already on $(IMAGE_TAG) — that is the"; \
+	  echo "    farm/cloud payload split, and a cloud-vs-local comparison is not valid."; \
+	fi
 
 # Reported builds per box, and whether they disagree (#248). Only workers that
 # have run a chunk since the server started have said — a box that has been idle
