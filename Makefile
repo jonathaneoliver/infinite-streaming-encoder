@@ -105,7 +105,7 @@ COMPOSE_DEV  := $(COMPOSE_BASE) -f docker-compose.dev.yml
 # compose as ENCODE_SLOTS (empty string is safe: compose ${ENCODE_SLOTS:-0}).
 FARM_ENCODE_SLOTS := $(shell P=$$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null); if [ -n "$$P" ] && [ "$$P" -gt 1 ]; then echo $$((P/2)); fi)
 
-.PHONY: require-paths require-ghcr require-s3-bucket require-idle build run run-remote down stop restart logs shell status clean publish version setup-hooks
+.PHONY: require-paths require-ghcr require-s3-bucket require-idle require-valid-sfn build run run-remote down stop restart logs shell status clean publish version setup-hooks
 
 # Point git at the committed hooks (scripts/git-hooks/) so the pre-push guard
 # that blocks direct pushes to main is active in this clone. Run once per clone.
@@ -141,6 +141,11 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	  echo "                 fix: tofu -chdir=infra/terraform fmt -recursive"; fail=1; fi; \
 	printf '  sfn scopes     '; \
 	if out=$$(python3 scripts/check_sfn_scopes.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  sfn schema     '; \
+	out=$$(python3 scripts/check_sfn_definition.py 2>&1); rc=$$?; \
+	if [ $$rc -eq 0 ]; then echo "ok"; \
+	elif [ $$rc -eq 2 ]; then echo "$$out"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  go test        '; \
 	if out=$$(go test -race ./... 2>&1); then echo "ok"; \
@@ -214,6 +219,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  py cli         '; \
 	if out=$$(python3 scripts/test_encoder_cli.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py sfnschema   '; \
+	if out=$$(python3 scripts/test_sfn_definition.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  python compile '; \
 	if out=$$(cd scripts && python3 -m compileall -q infinite_streaming_encoder 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
@@ -255,6 +263,23 @@ require-idle:
 	    echo "    out from under them. Wait, or cancel them in the UI."; \
 	    exit 1; \
 	  fi
+
+# The ASL schema gate, on the DEPLOY path (#284). Ask Step Functions whether it
+# would accept the definition before Terraform starts mutating anything.
+#
+# Unlike require-idle above, this one degrades CLOSED. That inversion is the
+# whole point: a rejected definition does not fail the apply cleanly. Terraform
+# applies job definitions FIRST, so it bumps and DEREGISTERS the live revisions,
+# then fails on the state machine and leaves it pinned to revisions that no
+# longer exist — cloud encoding broken, nothing rolled back, and every retry
+# re-breaking it. Refusing to deploy when the definition cannot be validated is
+# strictly cheaper than that, and you need credentials to deploy anyway.
+#
+# Costs one API call and creates nothing.
+require-valid-sfn:
+	@out=$$(python3 scripts/check_sfn_definition.py --require 2>&1) || { \
+	  echo "!!! $$out" | sed 's/^    /    /'; \
+	  echo "    NOTHING has been applied. Fix the ASL and re-run."; exit 1; }
 
 require-ghcr:
 	@: $${GHCR_ORG:?GHCR_ORG is not set — your GHCR namespace, e.g. ghcr.io/yourname (see .env.example)}
@@ -599,7 +624,7 @@ infra-init:           ## tofu init against the S3 backend (needs TFSTATE_BUCKET 
 		-backend-config="region=$(AWS_REGION)" \
 		-backend-config="dynamodb_table=$(TFSTATE_TABLE)"
 
-infra-plan: require-s3-bucket ## tofu plan -> tf.plan (review before infra-apply)
+infra-plan: require-s3-bucket require-valid-sfn ## tofu plan -> tf.plan (review before infra-apply)
 	@echo ">>> image_tag=$(IMAGE_TAG)  worker_ami_id=$(if $(WORKER_AMI),$(WORKER_AMI),<none, pull-on-boot>)"
 	cd $(TF_DIR) && AWS_REGION=$(AWS_REGION) tofu plan \
 		-var s3_bucket=$(S3_BUCKET) \
@@ -898,7 +923,7 @@ DEPLOY_AMI_BANNER := $(if $(filter 1,$(USE_AMI)),+AMI bake,)
 # a fresh sub-process, so the recipe genuinely re-runs rather than being skipped
 # as an already-satisfied target. Entry keeps its check too: failing before a
 # five-minute build beats failing after one.
-deploy: require-idle  ## push image + bring the whole farm up + plan + APPLY infra (one shot; USE_AMI=1 also bakes + wires the worker AMI)
+deploy: require-idle require-valid-sfn  ## push image + bring the whole farm up + plan + APPLY infra (one shot; USE_AMI=1 also bakes + wires the worker AMI)
 	@start=$$(date +%s); \
 	echo ">>> deploy started $$(date '+%H:%M:%S')  worker=$(IMAGE_TAG) $(DEPLOY_AMI_BANNER)"; \
 	if $(MAKE) publish && $(MAKE) require-idle && $(DEPLOY_AMI_STEP) $(MAKE) farm-up && $(MAKE) infra-plan && $(MAKE) require-idle && $(MAKE) infra-apply; then \
