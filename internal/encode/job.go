@@ -3948,6 +3948,21 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 			if cacheHit {
 				job.AppendLog(fmt.Sprintf("[cloud-batch] %s: mezzanine cache hit — reusing %s, skipping upload + mezzanine", filename, s3Mezz))
 				job.upsertStage("upload:inputs", "upload inputs", "skipped", 100)
+				// And say the same about the mezzanine itself (#189). Nothing
+				// announces this row on a hit: MezzCheck routes straight past the
+				// task so no container runs to emit a marker, the host build below
+				// is the branch not taken, and cli_batch's plan declares the key
+				// unconditionally — so it rendered `pending 0.0%` for the whole
+				// run and stayed there after the job was done, reading as a phase
+				// that hung rather than one that was never needed.
+				//
+				// `skipped`, not `done`: nothing ran. That is also what the row
+				// beside it says, for the upload the same cache hit avoided.
+				//
+				// Safe to set before the orchestrator starts because ENCODER-PLAN
+				// merges — an existing row keeps its status — which is the same
+				// thing that lets upload:inputs survive the plan.
+				job.upsertStage("mezzanine", "mezzanine", "skipped", 100)
 				m.notify(job)
 			}
 			if !cacheHit {
