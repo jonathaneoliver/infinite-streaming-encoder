@@ -322,6 +322,7 @@ def audit_output(output_dir: Path, source: Path, reference: int,
 def audit_tree(root: Path, source_dir: Path, reference: int,
                n_subsample: int = 5, limit_s: float | None = None,
                jobs: int = 1, n_threads: int = 0, prescale: bool = True,
+               clip: str | None = None,
                match: str | None = None, latest: bool = False,
                progress=print) -> list[dict]:
     """Audit every eligible output under `root`, SKIPPING the rest with a reason.
@@ -391,6 +392,7 @@ def audit_tree(root: Path, source_dir: Path, reference: int,
         try:
             got = audit_output(d, src, reference, n_subsample=n_subsample,
                                jobs=jobs, n_threads=n_threads, prescale=prescale,
+                               clip=clip,
                                limit_s=limit_s, progress=progress)
         except (AuditError, ProbeError) as e:
             skipped += 1
@@ -465,6 +467,11 @@ def _main(argv=None) -> int:
                     help="grading reference height (default 2160)")
     ap.add_argument("--store", type=Path, default=None,
                     help="curve store to merge into (default: print only)")
+    # --clip reaches BOTH paths. It used to be passed only to audit_output, so
+    # an --all run silently labelled every point with the source FILENAME — and
+    # a 60s time-limited audit then landed in the same (clip, codec, reference,
+    # height) space as the full-length points from the same file, with nothing
+    # in the store able to tell them apart.
     ap.add_argument("--clip", default=None,
                     help="label for the content (default: the source filename)")
     ap.add_argument("--n-subsample", type=int, default=5, dest="n_subsample",
@@ -514,7 +521,8 @@ def _main(argv=None) -> int:
                                 jobs=args.jobs, n_threads=args.n_threads,
                                 prescale=args.prescale,
                                 n_subsample=args.n_subsample, limit_s=args.limit_s,
-                                match=args.match, latest=args.latest, progress=progress)
+                                match=args.match, latest=args.latest,
+                                clip=args.clip, progress=progress)
         else:
             points = audit_output(args.output_dir, args.source, args.reference,
                                   jobs=args.jobs, n_threads=args.n_threads,
