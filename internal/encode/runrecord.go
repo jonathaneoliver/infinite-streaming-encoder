@@ -193,7 +193,7 @@ func EffectiveConfig(cfg JobConfig) JobConfig {
 
 // stageCodec picks the codec out of a stage key ("encode:hevc:1080p:chunk3",
 // "package:hevc"), or "" for a phase that serves every codec (mezzanine,
-// audio, upload:source).
+// audio, upload:inputs).
 //
 // Scans for a known codec token rather than matching per-prefix, so a stage key
 // shape added on the Python side is classified correctly without this needing

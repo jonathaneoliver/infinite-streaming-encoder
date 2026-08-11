@@ -502,10 +502,35 @@ class EncodeWorkflow:
                 args, env, f"enc-{codec}-{r['label']}-c{i}", priority_key=key))
         await asyncio.gather(*chunk_acts)
 
-        # Finalization (DASH packaging, fragment byteranges, HLS) — one set per
-        # codec. All ride job_top too, so an older job's packaging/manifests
-        # outrank a younger job's chunk encoding and its outputs land first.
+        # Finalization — ONE activity per codec. package-all does the DASH
+        # packaging, the fragment-granularity manifest and the LL-HLS playlists
+        # from a single local copy of the ladder; that is the whole reason it
+        # exists, and the cloud state machine has named one PackageAll task per
+        # codec since.
+        #
+        # This used to call `byteranges` and `hls` after it as separate
+        # activities. Both redid work package-all had already done, and each one
+        # is a phase that downloads the ENTIRE packaged output out of MinIO and
+        # uploads it back — so the tail of every local encode paid two full-ladder
+        # round trips per codec to arrive at bytes it already had. Idempotent, so
+        # nothing was wrong with the output; it was pure transfer.
+        #
+        # Their UI rows survive: cli_local_dist._stage_keys_for maps pkg-<codec>
+        # onto all three, the same way cli_batch does for a pkgall job.
+        #
+        # They ride job_top too, so an older job's packaging outranks a younger
+        # job's chunk encoding and its outputs land first.
+        #
+        # A codec in `host_package` is packaged by the ORCHESTRATOR instead, so
+        # nothing is dispatched for it: packaging in a worker uploads the ladder
+        # to MinIO for the orchestrator to download straight back, and on a
+        # remote worker it crosses the LAN twice to reach a disk on the master.
+        # Absent in plans from an older orchestrator, which correctly reads as
+        # "package everything here" — the old behaviour.
+        host_pkg = set(plan.get("host_package") or [])
         for codec in plan["codecs"]:
+            if codec in host_pkg:
+                continue
             # Packaging reads PARTIAL_DURATION (LL-HLS part length; 0 turns
             # parts off for VOD) and SEGMENT_DURATION. These dispatches passed
             # an empty env, so both silently defaulted to 0.2 / 6.0 — harmless
@@ -518,10 +543,6 @@ class EncodeWorkflow:
             await self._phase(["package-all", "--codec", codec, "--s3-variants",
                               s3_work, "--s3-audio", s3_work, "--s3-out", s3_out],
                               pkg_env, f"pkg-{codec}", priority_key=job_top)
-            for ph in ("byteranges", "hls"):
-                await self._phase([ph, "--codec", codec, "--s3-package", s3_out,
-                                  "--s3-out", s3_out], pkg_env, f"{ph}-{codec}",
-                                  priority_key=job_top)
         return "done"
 
     async def _phase(self, args, env, act_id, priority_key: int | None = None):
