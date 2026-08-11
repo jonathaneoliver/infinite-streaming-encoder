@@ -122,6 +122,52 @@ with tempfile.TemporaryDirectory() as td:
     check("unparseable media leaves one entry per segment", len(urls) == 1)
     check("unparseable media leaves no mediaRange", urls[0].get("mediaRange") is None)
 
+# --- AVERAGE-BANDWIDTH is not multiplied by the fragment count --------------
+# This is the symptom that actually shipped. _average_bandwidth walks the same
+# segment list _extract_segments builds and adds each entry's FILE size, so a
+# fragment-granular list counts one .m4s once per fragment while its duration
+# sums correctly — inflating the figure by exactly fragments-per-segment. A real
+# ladder advertised AVERAGE-BANDWIDTH=232,559,979 for a 7.8 Mbps rung (30.4x on
+# a 6s/0.2s ladder, 5.2x on a 1s one) and iPhones stepped down through every
+# rendition and stalled. Collapsing at parse time fixes it; this pins that.
+from infinite_streaming_encoder.manifests import (  # noqa: E402
+    _average_bandwidth, _parse_dash)
+
+with tempfile.TemporaryDirectory() as td:
+    d = Path(td)
+    SEG_BYTES, SEG_MS, N_SEGS, N_FRAGS = 90_000, 6000, 3, 30
+    (d / "720p").mkdir()
+    (d / "720p" / "init.mp4").write_bytes(b"\0" * 1000)
+    segs = []
+    for i in range(1, N_SEGS + 1):
+        name = f"720p/segment_{i:05d}.m4s"
+        fake_segment(d / name, n_frags=N_FRAGS, frag_bytes=(SEG_BYTES - 432) // N_FRAGS)
+        segs.append((name, SEG_MS))
+    mpd = d / "manifest.mpd"
+    mpd.write_text(segment_mpd(segs).replace(
+        '<Initialization sourceURL="init.mp4"/>',
+        '<Initialization sourceURL="720p/init.mp4"/>'))
+
+    def bandwidth():
+        rep = _parse_dash(mpd)["representations"][0]
+        return _average_bandwidth(rep, d), len(rep["segments"])
+
+    before, n_before = bandwidth()
+    write_fragmented_mpd(d)
+    after, n_after = bandwidth()
+
+    check("segment-granular manifest yields one entry per file", n_before == N_SEGS)
+    check("fragment-granular manifest still yields one entry per file",
+          n_after == N_SEGS)
+    check("bandwidth is unchanged by the expansion", before == after)
+    # The true figure, computed independently of the parser.
+    actual_bytes = 1000 + sum((d / n).stat().st_size for n, _ in segs)
+    expect = int(round(actual_bytes * 8.0 / (N_SEGS * SEG_MS / 1000)))
+    check("bandwidth matches bytes*8/duration", after == expect)
+    # And the specific regression: never inflated by fragments-per-segment.
+    check("bandwidth is not multiplied by the fragment count",
+          after < expect * 2)
+
 # --- the packager's debugging backup does not ship -------------------------
 # Shaka's own SegmentTemplate output is kept so a bad manifest can be blamed on
 # the packager or on us, but nothing reads it, so it belongs in the temp dir and
