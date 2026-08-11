@@ -2929,7 +2929,7 @@ func (j *Job) StagesFor(file, codec string) []StageProgress {
 // and each must account for its own encode time only.
 //
 // Both filters are empty-means-everything. A codec filter keeps the phases with
-// no codec in their key (mezzanine, audio, upload:source) and marks them Shared
+// no codec in their key (mezzanine, audio, upload:inputs) and marks them Shared
 // — they genuinely served this output, they just also served its siblings.
 //
 // Shared by the on-disk timing summary and the per-output run record so the two

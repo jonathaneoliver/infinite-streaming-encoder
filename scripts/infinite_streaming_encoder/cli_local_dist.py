@@ -24,13 +24,19 @@ out. Two implementations of one thing means one of them stops getting fixes:
 and left the pool path passing an empty env. It is gone; see --backend.
 
 DAG:
-  1. upload source -> MinIO
-  2. mezzanine, audio
+  1. mezzanine, built HERE from the mounted source (the source is never staged;
+     see _build_mezzanine_on_host) -> the shared mezz-cache/ in MinIO
+  2. audio
   3. per (codec, rung): plan chunks; dispatch each chunk as a `variant`
      activity across the workers, Temporal retrying; -> chunk mp4s in MinIO
-  4. package-all + fragments + hls per codec -> output_<codec>/ in MinIO
-  5. download output_<codec>/ -> <output-dir>/<stem>_<codec>/ for the Go server
-     to move into OUTPUT_DIR.
+  4. one `package-all` per codec — DASH packaging, the fragment-granularity
+     manifest and the LL-HLS playlists, from one local copy of the ladder.
+     Run HERE by default (_package_on_host), straight into
+     <output-dir>/<stem>_<codec>/ for the Go server to move into OUTPUT_DIR;
+     with --no-host-package it is dispatched as an activity, writes
+     output_<codec>/ to MinIO, and step 5 fetches it back.
+  5. download output_<codec>/ -> <output-dir>/<stem>_<codec>/ (only for codecs
+     step 4 did not package here).
 
 Chunk-plan authority: THIS orchestrator plans the chunks once (from the
 mezzanine it just built) and hands every worker its explicit
@@ -47,8 +53,11 @@ import hashlib
 import math
 import os
 import re
+import shutil
 import signal
+import subprocess
 import sys
+import time
 from dataclasses import replace as dc_replace
 from pathlib import Path
 
@@ -110,7 +119,7 @@ def _ensure_bucket(bucket: str) -> None:
 def _progress_cb(stage_key: str, total_bytes: int):
     """A boto3 transfer Callback that emits throttled ENCODER-STAGE progress
     (every ~2%) for a byte transfer — so the UI shows a moving bar for the
-    otherwise-dark source upload / output download."""
+    otherwise-dark output download."""
     total = max(1, total_bytes)
     sent = [0]
     last = [-5.0]
@@ -125,15 +134,207 @@ def _progress_cb(stage_key: str, total_bytes: int):
     return cb
 
 
-def _upload_source(local: Path, bucket: str, key: str) -> None:
-    _ensure_bucket(bucket)
-    total = local.stat().st_size
-    print(f"[dist] uploading source ({total / 1e6:.0f} MB) -> s3://{bucket}/{key}",
+# Activity ids whose stage rows THIS process already drove to completion, so the
+# workflow-history reader must not re-announce them.
+#
+# The mezzanine is built here now (_build_mezzanine_on_host), and the workflow
+# still schedules its mezzanine activity — which finds the .done and returns
+# immediately. Without this the history reader would see that activity SCHEDULED
+# and emit `mezzanine queued`, walking a row that is already done at 100% back to
+# an empty cell. Nothing downstream guards against that: emit_stage is a plain
+# print and the Go server's upsertStage is last-writer-wins, which is exactly why
+# cli_batch grew its own _emit_stage chokepoint for the same class of race.
+#
+# Keyed by ACTIVITY id, not stage key, so it suppresses one specific announcer
+# rather than muting a row.
+#
+# Not named _HOST_*: in this file `host` already means "which BOX ran a chunk"
+# (_HOST_SEEN, host_marker, ENCODER-HOST), which is a different question from
+# "which PROCESS ran this phase".
+_SELF_RUN_STAGES: set = set()
+
+
+def _build_mezzanine_on_host(input_path: Path, mezz_prefix: str, work_dir: Path,
+                             time_limit_s: float | None) -> bool:
+    """Build the mezzanine HERE, in the orchestrator container, and upload it
+    straight to the shared cache — so the source is never staged at all.
+
+    The local twin of the cloud path's #266, and it removes strictly more: this
+    orchestrator runs on the master with SOURCE_DIR mounted, so the source is
+    already on the disk it would have been uploaded from. Staging it moved a
+    source-sized file into MinIO, a worker pulled the same bytes back out, and
+    the mezzanine it produced went in again — three transfers of a file that had
+    not left the box. Building it here is one.
+
+    Shells out to the SAME `cli_phase mezzanine` the activity runs, with a LOCAL
+    path for --s3-in (the flag is named for the deployment that came first, not
+    for the only thing it accepts). Deliberately not a host-side reimplementation:
+    the chunk plan is built from this mezzanine's exact duration and cli_phase
+    already refuses when the two drift.
+
+    NO workflow change is needed. phase_mezzanine short-circuits on the .done
+    sidecar, so the activity the workflow still schedules finds this build and
+    returns without reading anything — the same shape as the cloud path's
+    MezzCheck, reusing a guard that was already there.
+
+    work_dir sits INSIDE the job's own $TMP_DIR/<jobID>/, because that is the
+    only scratch here that anything cleans: Manager.run removes it on every
+    terminal outcome and tmpstage sweeps it if the server dies first. It must be
+    gone before the run finishes — moveTmpToOutput renames EVERY top-level entry
+    of that directory into OUTPUT_DIR, dot-prefixed or not — which is what the
+    finally below is for. The one path that skips it (this process killed
+    mid-mezzanine) also fails the job, and a failed job moves nothing.
+
+    Returns False on failure, having already said why.
+    """
+    cmd = [sys.executable, "-m", "infinite_streaming_encoder.cli_phase",
+           "mezzanine", "--s3-in", str(input_path), "--s3-out", mezz_prefix]
+    env = dict(os.environ)
+    # cli_phase rmtree's ENCODER_WORK_DIR on entry, so it must not be shared.
+    env["ENCODER_WORK_DIR"] = str(work_dir)
+    # The duration limit (#184) is applied by the mezzanine and nowhere else, so
+    # skipping the activity takes its env with it unless it is supplied here. The
+    # limit is already folded into the cache key, so a limited mezzanine can
+    # never be filed under a full run's key.
+    if time_limit_s and time_limit_s > 0:
+        env["TIME_LIMIT_S"] = f"{time_limit_s:g}"
+    print(f"[dist] building mezzanine on the host -> {mezz_prefix} "
+          f"(no source upload)", flush=True)
+    try:
+        proc = subprocess.Popen(cmd, env=env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert proc.stdout is not None
+        # Relay verbatim. cli_phase emits its own ENCODER-STAGE markers and this
+        # process's stdout IS the channel to the Go server, so the mezzanine bar
+        # runs live through the normal marker path with no bespoke parser.
+        for line in proc.stdout:
+            print(line.rstrip("\n"), flush=True)
+        rc = proc.wait()
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+    if rc != 0:
+        print(f"error: host mezzanine failed (exit {rc})", file=sys.stderr)
+        return False
+    # The source is never staged now, so the activity CANNOT fall back to
+    # building from S3 — its --s3-in points at an object nothing uploaded. Assert
+    # the handoff here, where the message can say what actually went wrong,
+    # rather than letting it surface four retries later as a NoSuchKey on a key
+    # no one expected to be read.
+    bucket, _, rel = mezz_prefix[len("s3://"):].partition("/")
+    if not _object_exists(bucket, f"{rel}/mezzanine.mp4.done"):
+        print(f"error: host mezzanine reported success but {mezz_prefix}/"
+              f"mezzanine.mp4.done is missing", file=sys.stderr)
+        return False
+    _SELF_RUN_STAGES.add("mezzanine")
+    return True
+
+
+def _codec_dir(output_stem: str, codec: str, output_tag: str) -> str:
+    """`<stem>_<codec>[_<tag>]` — this run's local output dir for one codec.
+
+    The profile tag goes AFTER the codec so the `_p200_<codec>` shape that
+    OutputStem / resolveCodec / the watcher all key off stays intact. Two callers
+    need this name — the sync-back that downloads a MinIO-packaged codec, and
+    host packaging, which produces the directory directly — and they must not
+    spell it differently or the same clip lands in two places.
+
+    cli_batch._local_codec_dir is the cloud twin, deliberately not imported: the
+    local orchestrator pulling in the cloud one would couple the two paths for a
+    string.
+    """
+    return f"{output_stem}_{codec}" + (f"_{output_tag}" if output_tag else "")
+
+
+def _package_on_host(codec: str, s3_variants: str, out_dir: Path, dest: Path,
+                     segment_duration: str, partial_duration: str) -> int:
+    """Package one codec HERE, straight into the run's output dir.
+
+    The tail-side twin of _build_mezzanine_on_host, and the local twin of
+    cli_batch._package_on_host (#197). Same shape as both: shell out to the SAME
+    `cli_phase package-all` the activity runs, differing only in `--s3-out` being
+    a local directory (see cli_phase._deliver_dir).
+
+    What it removes is transfer, not queue latency — there is no cold start here.
+    A packaged codec used to be uploaded to MinIO by whichever worker drew the
+    activity and downloaded straight back by this process; if that worker was a
+    remote box, the whole ladder crossed the LAN twice to reach a disk on the
+    master. Packaging here reads the chunks once and writes the result where it
+    is already wanted.
+
+    It also restores LIVE package/fragments/hls rows. cli_phase emits its own
+    per-step markers, but they are CLASS_LIVE and so deliberately not relayed
+    through the activity result — on the worker path they never reach this
+    process, and the three rows can only move together on activity completion.
+    Run here, this process's stdout IS the channel to the Go server.
+
+    NO RETRY. Temporal owned that, and this gives it up: a packaging failure
+    fails the run instead of being rescheduled onto another worker. The trade is
+    the same one #197 made and it is softer here — minutes of local CPU on a box
+    that is already up, against chunk encodes that are hours — but the recovery
+    is worse than cloud's, because a Retry submits a NEW job id and therefore a
+    new staging prefix, which re-encodes everything. Hence the error below: the
+    chunks are still staged, and re-running against the SAME --job-prefix reuses
+    them (cli_phase skips a chunk whose output exists; _emit_reused_chunks
+    colours them as reused).
+
+    Returns the number of files delivered, so the caller can refuse to reclaim
+    staging behind an empty result.
+    """
+    work = out_dir / f".pkg-work-{codec}"
+    env = dict(os.environ)
+    # Each codec gets its own scratch: cli_phase._prepare_work_dir rmtree's
+    # ENCODER_WORK_DIR on entry, so a shared one would delete a sibling codec's
+    # inputs — and only ever on a multi-codec run.
+    env["ENCODER_WORK_DIR"] = str(work)
+    # Read from the workflow plan, not this process's environment, so the
+    # packaging cannot disagree with the timing the chunks were encoded to. A
+    # segment mismatch produces playlists whose boundaries do not land on the
+    # media's keyframes. "0" is a real setting for PARTIAL (LL-HLS parts off),
+    # so only "" means "unset — take cli_phase's default".
+    if segment_duration:
+        env["SEGMENT_DURATION"] = segment_duration
+    if partial_duration:
+        env["PARTIAL_DURATION"] = partial_duration
+    print(f"[dist] packaging {codec} on the host (no worker, no sync-back)",
           flush=True)
-    emit_stage("upload:source", "running", 0.0)
-    _s3().upload_file(str(local), bucket, key,
-                      Callback=_progress_cb("upload:source", total))
-    emit_stage("upload:source", "done", 100.0)
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "infinite_streaming_encoder.cli_phase",
+             "package-all", "--codec", codec,
+             "--s3-variants", s3_variants, "--s3-audio", s3_variants,
+             "--s3-out", str(out_dir)],
+            env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line.rstrip("\n"), flush=True)
+        rc = proc.wait()
+    finally:
+        # Before the rc check, and before anything is moved: this sits inside
+        # $TMP_DIR/<jobID>/, every top-level entry of which moveTmpToOutput
+        # renames into OUTPUT_DIR.
+        shutil.rmtree(work, ignore_errors=True)
+    if rc != 0:
+        raise RuntimeError(
+            f"host packaging failed for {codec} (exit {rc}). The encoded chunks "
+            f"are still staged under {s3_variants} — re-running with the SAME "
+            f"--job-prefix packages them without re-encoding anything.")
+    # cli_phase delivers output_<codec>/; the local contract is
+    # <stem>_<codec>[_<tag>]/ so several codecs of one clip coexist in OUTPUT_DIR.
+    src = out_dir / f"output_{codec}"
+    # `dest != src` is not paranoia: a source named output.mp4 with no duration
+    # suffix gives the stem "output", so dest IS src — and the rmtree below would
+    # then delete the ladder that was just packaged, leaving the rename to fail
+    # on a directory it had removed itself.
+    if dest != src:
+        if dest.exists():
+            shutil.rmtree(dest)
+        src.rename(dest)   # same filesystem — a rename, not a copy
+    n = sum(1 for p in dest.rglob("*") if p.is_file())
+    print(f"[dist] packaged {codec} in {time.monotonic() - t0:.0f}s -> "
+          f"{dest} ({n} file(s))", flush=True)
+    return n
 
 
 def _object_exists(bucket: str, key: str) -> bool:
@@ -384,14 +585,21 @@ def _emit_reused_chunks(bucket: str, work_prefix: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _emit_plan(rungs_by_codec: dict[str, list[Rung]], chunks_by_variant: dict,
-               has_audio: bool) -> None:
-    """Announce upload + mezzanine + every chunk + audio + package/fragments/hls
-    + download, so the UI lays out the full grid up front (like the cloud plan).
-    The upload/download rows animate from the orchestrator's own S3 transfers."""
-    stages: list[Stage] = [
-        Stage(key="upload:source", label="upload source"),
-        Stage(key="mezzanine", label="mezzanine"),
-    ]
+               has_audio: bool, sync_back: bool = True) -> None:
+    """Announce mezzanine + every chunk + audio + package/fragments/hls (+
+    download), so the UI lays out the full grid up front (like the cloud plan).
+
+    Two rows are declared only when something will actually drive them, because
+    a declared stage that never fires is a row that sits pending forever at the
+    end of every run — the same rule cli_batch._emit_plan applies:
+
+      upload:source   never. The mezzanine is built here from the mounted
+                      source, so nothing stages it on any run.
+      download:outputs only when a codec is packaged in MinIO and therefore has
+                      to come back from it. Host packaging writes straight to the
+                      output dir.
+    """
+    stages: list[Stage] = [Stage(key="mezzanine", label="mezzanine")]
     for codec, rungs in rungs_by_codec.items():
         for rung in rungs:
             n = chunks_by_variant[(codec, rung.label)]
@@ -406,7 +614,8 @@ def _emit_plan(rungs_by_codec: dict[str, list[Rung]], chunks_by_variant: dict,
         stages.append(Stage(key=f"package:{codec}", label=f"package {codec}"))
         stages.append(Stage(key=f"fragments:{codec}", label=f"fragments {codec}"))
         stages.append(Stage(key=f"hls:{codec}", label=f"HLS {codec}"))
-    stages.append(Stage(key="download:outputs", label="download outputs"))
+    if sync_back:
+        stages.append(Stage(key="download:outputs", label="download outputs"))
     emit_plan(stages)
 
 
@@ -479,19 +688,38 @@ def _resolve_plan(args, info):
 _ENC_ACT_RE = re.compile(r"^enc-(hevc|h264|av1)-(.+)-c(\d+)$")
 
 
-def _stage_key_for(activity_id: str) -> str | None:
+def _stage_keys_for(activity_id: str) -> list[str]:
+    """The UI rows one activity drives. Usually one; `pkg-<codec>` drives three.
+
+    package-all does the packaging, the fragment expansion and the HLS playlists
+    in a single phase — that is what it is for, and the cloud state machine has
+    named one PackageAll task per codec since. The workflow here kept running the
+    old `byteranges` and `hls` phases after it, so each re-downloaded the whole
+    packaged ladder out of MinIO, redid work package-all had already done, and
+    pushed it back: two full-ladder round trips per codec, for no change to the
+    output. They are gone, and their three rows are driven from the one activity
+    that actually produces them — the same mapping cli_batch._host_stage_keys
+    makes for a pkgall job.
+
+    The three then move in lockstep, which is honest at this granularity:
+    package-all's own per-step markers are CLASS_LIVE, so they are deliberately
+    not relayed through the activity result and never reach this process.
+
+    `byteranges-`/`hls-` are NOT mapped. A farm mid-rolling-update can still have
+    a box running the old workflow, and those activities would then re-announce
+    rows this run had already completed — walking a finished cell backwards,
+    which nothing between here and the UI guards against. Dropping them costs
+    only that the two extra phases run unreported on such a box.
+    """
     if activity_id in ("mezzanine", "audio"):
-        return activity_id
+        return [activity_id]
     m = _ENC_ACT_RE.match(activity_id)
     if m:
-        return f"encode:{m.group(1)}:{m.group(2)}:chunk{m.group(3)}"
+        return [f"encode:{m.group(1)}:{m.group(2)}:chunk{m.group(3)}"]
     if activity_id.startswith("pkg-"):
-        return f"package:{activity_id[4:]}"
-    if activity_id.startswith("byteranges-"):
-        return f"fragments:{activity_id[len('byteranges-'):]}"
-    if activity_id.startswith("hls-"):
-        return f"hls:{activity_id[4:]}"
-    return None
+        c = activity_id[4:]
+        return [f"package:{c}", f"fragments:{c}", f"hls:{c}"]
+    return []
 
 
 async def _emit_temporal_progress(handle, EventType, emitted: dict, client=None) -> None:
@@ -541,17 +769,23 @@ async def _emit_temporal_progress(handle, EventType, emitted: dict, client=None)
                     for marker in _activity_markers(a, client):
                         print(marker, flush=True)
     for aid, st in states.items():
-        key = _stage_key_for(aid)
-        if not key:
+        # A stage this process ran itself is already reported, and at a finer
+        # grain than history can offer. See _SELF_RUN_STAGES.
+        if aid in _SELF_RUN_STAGES:
+            continue
+        keys = _stage_keys_for(aid)
+        if not keys:
             continue
         # Which machine ran this stage → colours the UI chunk/phase plot by box.
         host = hosts.get(aid)
         if host and emitted.get(f"host:{aid}") != host:
             emitted[f"host:{aid}"] = host
-            print(f"[[ENCODER-HOST key={key} instance={host}]]", flush=True)
+            for key in keys:
+                print(f"[[ENCODER-HOST key={key} instance={host}]]", flush=True)
         if emitted.get(aid) != st:
             emitted[aid] = st
-            emit_stage(key, st, 100.0 if st == "done" else 0.0)
+            for key in keys:
+                emit_stage(key, st, 100.0 if st == "done" else 0.0)
 
 
 def _activity_markers(attrs, client) -> list[str]:
@@ -683,11 +917,13 @@ async def _emit_fleet_cpu(handle, client) -> None:
         # machine checks below, which `continue` when identity is unknown. An
         # activity with no reported identity is still running.
         _aid = getattr(pa, "activity_id", "") or ""
-        if getattr(pa, "state", 0) == _PA_STARTED and _aid:
-            _k = _stage_key_for(_aid)
-            if _k and _RUN_SEEN.get(_aid) != 1:
+        if (getattr(pa, "state", 0) == _PA_STARTED and _aid
+                and _aid not in _SELF_RUN_STAGES):
+            _ks = _stage_keys_for(_aid)
+            if _ks and _RUN_SEEN.get(_aid) != 1:
                 _RUN_SEEN[_aid] = 1
-                emit_stage(_k, "running", 0.0)
+                for _k in _ks:
+                    emit_stage(_k, "running", 0.0)
         if not machine:
             continue
         a = agg.setdefault(machine, {"busy": 0, "perf": 0, "chunks": [],
@@ -703,8 +939,9 @@ async def _emit_fleet_cpu(handle, client) -> None:
         aid = getattr(pa, "activity_id", "") or ""
         if getattr(pa, "state", 0) == _PA_STARTED and aid.startswith("enc-"):
             a["chunks"].append(aid)
-            key = _stage_key_for(aid)
-            if key:
+            # An `enc-` id maps to exactly one cell; the multi-key case is
+            # packaging, which never reaches this branch.
+            for key in _stage_keys_for(aid):
                 # Colour the grid cell by the machine running it, from the START —
                 # authoritative here (last_worker_identity) so the cell matches the
                 # fleet swatch + chip for the whole encode, not just at completion.
@@ -763,6 +1000,11 @@ def run_temporal(args: argparse.Namespace) -> int:
 
     bucket = args.s3_bucket
     prefix = args.job_prefix.strip("/")
+    # Where the source WOULD be staged. Nothing puts it there any more — the
+    # mezzanine is built on this box — but the workflow's mezzanine activity
+    # still takes an --s3-in, and a plan without one would not start. It is never
+    # read: that activity short-circuits on the .done this run just wrote, and
+    # _build_mezzanine_on_host refuses to hand off until it has confirmed it.
     src_key = f"{prefix}/input{input_path.suffix}"
     rungs_by_codec, chunks = _resolve_plan(args, info)
     n_chunks = len(chunks)
@@ -770,9 +1012,22 @@ def run_temporal(args: argparse.Namespace) -> int:
         print("error: no ladder rungs fit this source", file=sys.stderr)
         return 1
 
+    # Which codecs THIS process packages. All of them by default: packaging in a
+    # worker uploads the finished ladder to MinIO for this process to download
+    # straight back, and if that worker is a remote box the whole thing crosses
+    # the LAN twice to reach a disk on the master. Kept a per-codec list rather
+    # than a flag so it matches the plan key the workflow reads, and so a future
+    # reason to package one codec remotely does not need a new shape.
+    host_package = [] if args.no_host_package else list(rungs_by_codec)
+    # A worker running an OLDER workflow packages regardless of the plan key, so
+    # its pkg activities would announce over rows this process is driving live.
+    # Suppress them the same way the host-built mezzanine is suppressed.
+    _SELF_RUN_STAGES.update(f"pkg-{c}" for c in host_package)
+
     _emit_plan(rungs_by_codec,
                {(c, r.label): n_chunks for c, rr in rungs_by_codec.items() for r in rr},
-               info.has_audio)
+               info.has_audio,
+               sync_back=any(c not in host_package for c in rungs_by_codec))
     _emit_commercial_cost(rungs_by_codec, info, input_path,
                           hevc_two_pass=not args.hevc_single_pass)
     # Flag chunks left over from a prior (cancelled/failed) run as reused, so a
@@ -780,19 +1035,22 @@ def run_temporal(args: argparse.Namespace) -> int:
     _emit_reused_chunks(bucket, f"{prefix}/work")
 
     # Cross-job mezzanine cache. If this exact source already has a completed
-    # mezzanine in MinIO, the mezzanine phase will reuse it — and since the
-    # source is ONLY consumed by that phase, we can skip uploading it entirely
-    # (the biggest single I/O in the prep). On a miss, upload as usual and the
-    # mezzanine phase populates the shared cache for the next job.
+    # mezzanine in MinIO, every later job reuses it — the source is ONLY consumed
+    # by the mezzanine phase, so a hit skips the whole of the prep. On a miss we
+    # build it HERE rather than staging the source for a worker to build it from,
+    # and the shared cache is populated for the next job either way.
     mezz_rel = _mezz_cache_rel(input_path, time_limit_s)
     mezz_prefix = f"s3://{bucket}/{mezz_rel}"
     if _object_exists(bucket, f"{mezz_rel}/mezzanine.mp4.done"):
-        print(f"[dist] mezzanine cache HIT {mezz_prefix} — skipping source "
-              f"upload + mezzanine (same source encoded before)", flush=True)
+        print(f"[dist] mezzanine cache HIT {mezz_prefix} — skipping the "
+              f"mezzanine entirely (same source encoded before)", flush=True)
         _touch_prefix(bucket, mezz_rel)  # keep it fresh while this job reuses it
-        emit_stage("upload:source", "done", 100.0)
     else:
-        _upload_source(input_path, bucket, src_key)
+        _ensure_bucket(bucket)
+        if not _build_mezzanine_on_host(
+                input_path, mezz_prefix,
+                Path(args.output_dir) / ".mezz-work", time_limit_s):
+            return 1
 
     # Pass count + extra_args come from the ladder profile now; hevc_single_pass
     # remains a per-encode override forcing HEVC single-pass.
@@ -804,6 +1062,10 @@ def run_temporal(args: argparse.Namespace) -> int:
     plan = {
         "bucket": bucket, "job_prefix": prefix, "src_key": src_key,
         "mezz_prefix": mezz_prefix, "job_rank": args.job_rank,
+        # Codecs this process packages itself, so the workflow must not. Absent
+        # in plans from an older orchestrator, which correctly reads as "package
+        # everything in a worker" — the old behaviour.
+        "host_package": host_package,
         # Duration limit (#184) — consumed by the mezzanine activity ONLY. The
         # chunk boundaries below were already planned against the truncated
         # length, so nothing else needs to know.
@@ -940,15 +1202,25 @@ def run_temporal(args: argparse.Namespace) -> int:
     print(f"[dist] workflow result: {result}", flush=True)
 
     out_dir = Path(args.output_dir)
-    downloaded = []
+    delivered = []
     for codec in rungs_by_codec:
-        dest = out_dir / (f"{args.output}_{codec}"
-                          + (f"_{args.output_tag}" if args.output_tag else ""))
-        n = _download_prefix(bucket, f"{prefix}/out/output_{codec}/", dest)
-        print(f"[dist] downloaded {n} file(s) -> {dest}", flush=True)
-        downloaded.append(n)
-    # Same reclaim + empty-download guard as the pool backend above.
-    if downloaded and all(n > 0 for n in downloaded):
+        dest = out_dir / _codec_dir(args.output, codec, args.output_tag)
+        if codec in host_package:
+            try:
+                n = _package_on_host(codec, f"s3://{bucket}/{prefix}/work",
+                                     out_dir, dest,
+                                     str(plan.get("segment_duration", "")),
+                                     str(plan.get("partial_duration", "")))
+            except RuntimeError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 1
+        else:
+            n = _download_prefix(bucket, f"{prefix}/out/output_{codec}/", dest)
+            print(f"[dist] downloaded {n} file(s) -> {dest}", flush=True)
+        delivered.append(n)
+    # Reclaim only behind a non-empty result for EVERY codec. An empty one means
+    # the staging is the only copy of the encode, whichever way it was delivered.
+    if delivered and all(n > 0 for n in delivered):
         _reclaim_staging(bucket, prefix, args.keep_staging)
     print("[dist] done", flush=True)
     return 0
@@ -1010,6 +1282,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="arrival rank among active local-dist jobs (0=oldest); "
                         "folded into each chunk's Temporal priority_key so an "
                         "older job's chunks outrank a younger job's (see #99)")
+    p.add_argument("--no-host-package", action="store_true", dest="no_host_package",
+                   help="package each codec in a WORKER and download the result, "
+                        "instead of packaging here (default: package here — see "
+                        "_package_on_host). The escape hatch for the one thing "
+                        "host packaging gives up, Temporal's retry: a run whose "
+                        "packaging keeps failing can be re-run against the same "
+                        "--job-prefix with this set, and the chunks are reused.")
     p.add_argument("--keep-staging", action="store_true", dest="keep_staging",
                    help="don't delete this job's MinIO staging after the outputs "
                         "download (default: reclaim it — see dist_staging)")

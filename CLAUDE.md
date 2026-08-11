@@ -144,12 +144,102 @@ The worker container's entrypoint is overridden to `scripts/infinite_streaming_e
 
 This paragraph used to describe a `cli_cloud.py` worker receiving `HOST_AWS_DIR` and an env allow-list called `cloudEnvPassthrough`. **That path no longer exists** — the single-box EC2 target was retired when cloud encoding moved to Step Functions + Batch, and `cloudEnvPassthrough` sat unreferenced until staticcheck's U1000 found it. `SUBNET_ID` / `INSTANCE_PROFILE` / `GHCR_PAT` and friends are configured on the Batch job definition now. Cloud jobs do not spawn a worker container from the Go server at all; see "Batch state, event-driven (cloud)".
 
+### Which phases run on the HOST (local-dist)
+
+The local twin of the cloud section above, and it moved for the same reason:
+bytes were crossing a boundary to reach a machine that did not need to be
+involved. Here that boundary is MinIO, and the orchestrator container already
+runs on the master with `SOURCE_DIR` / `TMP_DIR` mounted — so it is the box the
+bytes were already on.
+
+**The mezzanine is built by the orchestrator** (`_build_mezzanine_on_host`),
+shelling out to the same `cli_phase mezzanine` the activity runs with a local
+path for `--s3-in`. Staging the source moved a source-sized file into MinIO, a
+worker pulled the same bytes back out, and the mezzanine went in again — three
+transfers of a file that never left the box; now it is one.
+
+**No workflow change was needed**, for the same reason as cloud: `phase_mezzanine`
+short-circuits on the `.done` sidecar, so the mezzanine activity the workflow
+still schedules finds this build and returns. That guard was already there.
+
+Two consequences:
+
+- **Nothing stages the source any more**, so the mezzanine activity's `--s3-in`
+  points at an object that does not exist and CANNOT serve as a fallback.
+  `_build_mezzanine_on_host` refuses to hand off until it has confirmed the
+  `.done`, so the failure is stated here rather than surfacing four Temporal
+  retries later as a `NoSuchKey` on a key nobody expected to be read.
+- **There is no `upload:source` stage row.** A declared stage that never fires is
+  a row that sits pending forever — the same rule `_emit_plan(sync_back=…)`
+  applies on the cloud path.
+
+The mezzanine's scratch dir lives INSIDE `$TMP_DIR/<jobID>/` because that is the
+only scratch here that anything cleans. It must be gone before the run finishes:
+`moveTmpToOutput` renames **every** top-level entry of that directory into
+`OUTPUT_DIR`, dot-prefixed or not. The one path that skips the cleanup (the
+orchestrator killed mid-mezzanine) also fails the job, and a failed job moves
+nothing.
+
+**The orchestrator packages too** (`_package_on_host`), for every codec unless
+`--no-host-package` is passed. Same mechanism again: the same `cli_phase
+package-all` the activity runs, with a local directory for `--s3-out`. What it
+removes here is transfer rather than queue latency — a worker-packaged codec was
+uploaded to MinIO purely so this process could download it straight back, and if
+that worker was a remote box the whole ladder crossed the LAN twice to reach a
+disk on the master.
+
+This one DOES need a plan key: `host_package` (a list of codecs) tells the
+workflow not to dispatch `pkg-<codec>`. It is read with `plan.get`, so an older
+orchestrator's plan reads as "package everything in a worker" — the old
+behaviour. The key is a contract between two files that fails silently in both
+directions, so `test_dist_stage_state` pins the two spellings together.
+
+Three consequences:
+
+- **The package/fragments/hls rows become LIVE.** `cli_phase`'s per-step markers
+  are `CLASS_LIVE` and so deliberately never relayed through an activity result;
+  run here, this process's stdout IS the channel to the Go server. On the worker
+  path the three rows can only move together, on completion.
+- **No retry.** Temporal owned that and this gives it up. The trade is the same
+  one #197 made and softer — minutes of local CPU against hours of chunk
+  encoding — but the recovery is *worse* than cloud's, because a Retry mints a
+  NEW job id and therefore a new staging prefix, so it re-encodes everything.
+  Re-running against the **same `--job-prefix`** reuses the staged chunks, and
+  that is what the failure message says.
+- **`download:outputs` is dropped from the plan** when every codec is packaged
+  here, and the reclaim guard counts delivered files rather than downloaded ones
+  — an empty result still means the staging is the only copy of the encode.
+
+**`package-all` is the only finalization activity.** It does the DASH packaging,
+the fragment-granularity manifest and the LL-HLS playlists from one local copy of
+the ladder. The workflow used to run `byteranges` and `hls` after it as separate
+activities, each downloading the entire packaged output out of MinIO and pushing
+it back — two full-ladder round trips per codec, to arrive at bytes it already
+had. Idempotent, so nothing was ever wrong with the output; it was pure transfer,
+and the cloud state machine had already dropped them (one `PackageAll` per
+codec).
+
+Their UI rows survive because `cli_local_dist._stage_keys_for` maps
+`pkg-<codec>` onto all three, exactly as `cli_batch._host_stage_keys` does for a
+pkgall job. `byteranges-`/`hls-` are deliberately **not** mapped: a farm
+mid-rolling-update can still have a box running the old workflow, and those
+activities would re-announce rows the run had already finished.
+
+That last point is the one general hazard on this path: **nothing between
+`emit_stage` and the UI stops a cell walking backwards.** `progress.emit_stage`
+is a plain print and Go's `upsertStage` is last-writer-wins — there is no
+`_STAGE_RANK` chokepoint here like the one `cli_batch` grew for the same class of
+race. `_SELF_RUN_STAGES` is the narrow version of that guard: it names the activity
+ids this process already drove itself, so the workflow-history reader cannot
+re-announce them.
+
 ### MinIO staging lifecycle (local-dist)
 
 Every local-dist file stages through `s3://$DIST_S3_BUCKET/jobs/<jobID>-<base>/`
-(source upload, mezzanine, per-chunk encodes, variants, packaged output — ~2.3 GB
-for a typical clip). `encode.DistJobPrefix` is the single definition of that key,
-shared by the orchestrator's `--job-prefix` argument and the GC's keep-list.
+(mezzanine, per-chunk encodes, variants, packaged output — ~2.3 GB for a typical
+clip; the source itself is no longer staged, see above).
+`encode.DistJobPrefix` is the single definition of that key, shared by the
+orchestrator's `--job-prefix` argument and the GC's keep-list.
 
 Reclaim is three layers, all in `scripts/infinite_streaming_encoder/dist_staging.py`:
 
