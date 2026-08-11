@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -303,6 +304,35 @@ func (s *LadderStore) Has(name string) bool {
 	return ok
 }
 
+// validateName rejects a ladder the store does not know, naming it and listing
+// the alternatives — mirroring ladder.py's `unknown ladder 'x' (have: a, b, c)`,
+// which got this right from the start.
+//
+// This exists because resolveRungs returns nil for BOTH "no such ladder" and
+// "this ladder has no rungs for this codec" (#289). Phrased as the latter, the
+// message sends someone hunting for a missing codec column when the ladder is
+// simply not there. Everything that reports one of those two conditions must
+// therefore rule this one out FIRST — the callers are ValidateResBand and
+// buildSFNInput, which is why the error is defined once here rather than at
+// each of them.
+//
+// It is reachable rather than theoretical: JobConfig.Ladder is persisted per
+// job and replayed by Manager.Reconcile, so #286's retirement of the
+// apple-uniq-live / apple-uniq-live-full seeds dangled every stored reference
+// to them. Deleting a custom ladder while a job is queued does the same.
+func (s *LadderStore) validateName(name string) error {
+	if s.Has(name) {
+		return nil
+	}
+	all := s.List()
+	known := make([]string, 0, len(all))
+	for n := range all {
+		known = append(known, n)
+	}
+	sort.Strings(known)
+	return fmt.Errorf("unknown ladder %q (have: %s)", name, strings.Join(known, ", "))
+}
+
 // isSeedName reports whether a name is a built-in ladder (read-only: may not be
 // overwritten or deleted via the API). Derived from defaultSeedLadders so it
 // never drifts as seeds are added/renamed.
@@ -548,13 +578,22 @@ func (s *LadderStore) codecHeightRange(ladderName, codec string) (lo, hi int, ok
 // is a legitimate per-file skip, not a config error. Passing sourceWidth=0 to
 // resolveRungs disables that filter, so this checks the ladder+codec+band only.
 // Returns nil when the band is unset or every selected codec keeps ≥1 rung.
+//
+// It also rejects an unknown ladder, and does that BEFORE the unset-band early
+// return (#289). This is the only ladder validation on the submit path, so
+// while the existence check sat below that return, a job naming a ladder that
+// does not exist — the common case, since most submissions set no band — passed
+// validation and went on to build an execution with no variants at all.
 func (m *Manager) ValidateResBand(cfg JobConfig) error {
-	if cfg.MinRes == "" && cfg.MaxRes == "" {
-		return nil
-	}
 	ladderName := cfg.Ladder
 	if ladderName == "" {
 		ladderName = DefaultLadderName
+	}
+	if err := m.Ladders.validateName(ladderName); err != nil {
+		return err
+	}
+	if cfg.MinRes == "" && cfg.MaxRes == "" {
+		return nil
 	}
 	minH, minSet := resHeight(cfg.MinRes)
 	maxH, maxSet := resHeight(cfg.MaxRes)
@@ -564,6 +603,10 @@ func (m *Manager) ValidateResBand(cfg JobConfig) error {
 		}
 		lo, hi, ok := m.Ladders.codecHeightRange(ladderName, c)
 		if !ok {
+			// Now accurate: the ladder is known to EXIST by this point (the
+			// validateName check above), so an empty height range really does
+			// mean this ladder has no column for this codec. It used to fire
+			// for a missing ladder too, describing it as a missing codec (#289).
 			return fmt.Errorf("ladder %q defines no %s rungs", ladderName, c)
 		}
 		switch {

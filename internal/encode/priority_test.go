@@ -34,10 +34,13 @@ func sfnDoc(t *testing.T) struct {
 			Priority int    `json:"priority"`
 		} `json:"variants"`
 	}
-	in, _ := buildSFNInput(LoadLadderStore(""), LoadEncodeSpeedStore(""),
+	in, _, err := buildSFNInput(LoadLadderStore(""), LoadEncodeSpeedStore(""),
 		"s3://in/x.mp4", "s3://p", "s3://m", "apple-uniq-live-xs", "h264",
 		"", "", false, false, true, false, false, 3840, 30, 334.4, 0,
 		"12", "6", "0.2", "1.0", 9000, nil, nil)
+	if err != nil {
+		t.Fatalf("buildSFNInput: %v", err)
+	}
 	if err := json.Unmarshal([]byte(in), &doc); err != nil {
 		t.Fatalf("unmarshal SFN input: %v", err)
 	}
