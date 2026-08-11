@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
-"""hls_from_dash must handle a per-fragment manifest.mpd.
+"""The two HLS-side guards that survive #282's parse-time collapse.
 
-A fragment-granular manifest.mpd is INTENDED, not a defect: every live ladder
-sets partial_duration (only apple-uniq-vod turns it off) and write_fragmented_mpd
-expands each segment into per-fragment SegmentURLs so a player needs no
-.byteranges sidecar. DASH and HLS just put fragments in different places — DASH
-addresses each as its own SegmentURL, HLS keeps whole segments on the #EXTINF
-media lines and describes fragments as #EXT-X-PART with BYTERANGE.
+`_extract_segments` now regroups fragment entries by @media before anything
+downstream sees them (#282/#285), and `test_fragment_manifest.py` covers that
+thoroughly — including that the bandwidth figure is not multiplied by the
+fragment count. This file deliberately does NOT retest it. What it keeps is the
+two things that collapse does not reach:
 
-Reading fragment entries straight onto the media lines shipped two of four
-ladders unplayable, and nothing in the artifacts said so: manifests valid, every
-segment present, file lists and byte totals reconciling. The only symptom was a
-player walking down every rendition and stalling. Measured, per representation:
+  1. `_average_bandwidth` handed a fragment-granular list DIRECTLY. The collapse
+     makes this unreachable through the normal path, which is exactly why it
+     needs its own test: a symptom that is no longer observable is not evidence
+     that the cause is fixed. Mutation-verified — the pre-dedupe form returns
+     228,000,000 bps against a true 7,600,000 on this fixture (30.0x), matching
+     the 232,559,979 that shipped to within the audio track and container
+     overhead the fixture omits.
 
-    tag  entries  distinct files  AVERAGE-BANDWIDTH shipped
-    6s   1672     56              232,559,979   (30.4x; rung target 7.8 Mbps)
-    1s   1672     335              33,757,127   (5.2x)
-    2s    168     168               7,556,915   (correct; whole-segment manifest)
-    xs   1672     56                5,668,035   (correct, but by luck — master.m3u8
-                                                 was written one second before
-                                                 manifest.mpd was replaced)
+  2. The PLAYLIST built from a collapsed list. `test_fragment_manifest.py` stops
+     at the segment list; these assert what `_write_variant_playlist` then emits,
+     which is what a player actually reads.
 
-Numbers below are those, so a regression reproduces the shipped failure rather
-than a plausible-looking one.
+Why both matter, in one sentence: two of four ladders of one source shipped
+unplayable with every other signal healthy — manifests valid, all segments
+present, byte totals reconciling — and the only visible symptoms were an
+`AVERAGE-BANDWIDTH` of 232,559,979 for a 7.8 Mbps rung and one EXTINF per
+fragment.
 """
 import sys
 import tempfile
@@ -32,7 +33,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from infinite_streaming_encoder.manifests import (  # noqa: E402
     _average_bandwidth,
-    _fold_fragments_to_segments,
     _write_variant_playlist,
 )
 
@@ -40,10 +40,8 @@ FAILURES = []
 
 
 def check(name, cond, detail=""):
-    if cond:
-        print(f"  ok   {name}")
-    else:
-        print(f"  FAIL {name} {detail}")
+    print(f"  {'ok  ' if cond else 'FAIL'} {name}" + ("" if cond else f" {detail}"))
+    if not cond:
         FAILURES.append(name)
 
 
@@ -56,68 +54,35 @@ def whole(n, dur=6.0):
 
 
 def fragmented(n_files, parts, seg_dur=6.0):
-    """What write_fragmented_mpd produces: `parts` entries per file, each
-    carrying an equal share of the segment's duration."""
+    """An UNCOLLAPSED list — what _extract_segments used to hand downstream, and
+    what it would hand downstream again if the regrouping regressed."""
     return [{"url": f"segment_{i:05d}.m4s", "duration": seg_dur / parts}
             for i in range(n_files) for _ in range(parts)]
 
 
-MP = Path("manifest.mpd")
-print("hls granularity repair")
+N, PARTS, SEG_BYTES = 56, 30, 5_700_000
+print("HLS guards downstream of the #282 collapse")
 
-# --- the fold ---------------------------------------------------------------
-info = {"representations": [rep(whole(56))]}
-check("a whole-segment manifest is left alone",
-      _fold_fragments_to_segments(info, MP) == 0
-      and len(info["representations"][0]["segments"]) == 56)
-
-info = {"representations": [rep(fragmented(56, 30), "1080p")]}
-n = _fold_fragments_to_segments(info, MP)
-segs = info["representations"][0]["segments"]
-check("6s shape (30 entries/segment) is folded", n == 1)
-check("folds to one entry per FILE", len(segs) == 56, f"(got {len(segs)})")
-check("durations sum back to the whole segment",
-      all(abs(s["duration"] - 6.0) < 1e-9 for s in segs),
-      f"(got {segs[0]['duration']})")
-check("segment order is preserved",
-      [s["url"] for s in segs] == [f"segment_{i:05d}.m4s" for i in range(56)])
-
-info = {"representations": [rep(fragmented(335, 5, seg_dur=1.0))]}
-_fold_fragments_to_segments(info, MP)
-segs = info["representations"][0]["segments"]
-check("1s shape (5 entries/segment) is folded", len(segs) == 335)
-check("1s durations sum back", all(abs(s["duration"] - 1.0) < 1e-9 for s in segs))
-
-info = {"representations": [rep(whole(56), "a"), rep(fragmented(56, 30), "b")]}
-check("every representation is scanned, not just the first",
-      _fold_fragments_to_segments(info, MP) == 1
-      and len(info["representations"][1]["segments"]) == 56)
-
-# --- what the fold protects -------------------------------------------------
 with tempfile.TemporaryDirectory() as td:
     d = Path(td)
-    SEG_BYTES = 5_700_000      # ~6s of the 1080p rung
-    N, PARTS = 56, 30
     for i in range(N):
         (d / f"segment_{i:05d}.m4s").write_bytes(b"\0" * SEG_BYTES)
     expect = round(N * SEG_BYTES * 8 / (N * 6.0))       # ~7.6 Mbps
 
+    # --- 1. the dedupe, which the collapse makes otherwise unreachable -------
     got = _average_bandwidth(rep(whole(N)), d)
     check("whole-segment AVERAGE-BANDWIDTH is right",
           abs(got - expect) <= 1, f"(got {got:,}, want {expect:,})")
 
-    # Belt and braces: correct even WITHOUT the fold, because each file's bytes
-    # are counted once. This is the arithmetic that produced 232 Mbps.
     got = _average_bandwidth(rep(fragmented(N, PARTS)), d)
-    check("AVERAGE-BANDWIDTH is not inflated even unfolded",
+    check("AVERAGE-BANDWIDTH counts each FILE once, not once per fragment",
           abs(got - expect) <= 1,
-          f"(got {got:,}, want {expect:,} — {got / max(1, expect):.1f}x)")
+          f"(got {got:,}, want {expect:,} — {got / max(1, expect):.1f}x; "
+          f"the pre-dedupe form returns {expect * PARTS:,})")
 
-    # The playlist is what a player actually reads.
-    info = {"representations": [rep(fragmented(N, PARTS))]}
-    _fold_fragments_to_segments(info, MP)
+    # --- 2. the playlist a player actually reads ----------------------------
     out = d / "playlist.m3u8"
-    _write_variant_playlist(info["representations"][0], out, d)
+    _write_variant_playlist(rep(whole(N)), out, d)
     text = out.read_text()
     check("playlist lists each segment once",
           text.count("#EXTINF") == N, f"(got {text.count('#EXTINF')}, want {N})")
