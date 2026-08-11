@@ -64,6 +64,33 @@ docker compose --profile worker up -d
 Or let the master push it over SSH: set `DIST_WORKERS=label=ssh_target` in `.env`
 and `make farm-up` deploys each box (still via `run-worker.sh`).
 
+### Stop the box sleeping
+
+**Required on every macOS worker.** A worker only ever makes *outbound*
+connections, so nothing keeps the machine awake: an idle-looking Mac sleeps
+mid-encode, its in-flight chunks time out and are rescheduled onto the other
+boxes, and it contributes nothing until someone touches a key. The encode still
+completes — that is what Temporal is for — it just quietly runs on fewer
+machines than you configured. Run once, on each worker box:
+
+```
+sudo pmset -a sleep 0 disablesleep 1 powernap 0
+pmset -g | grep -E '^ +(sleep|disablesleep|powernap)'   # verify
+```
+
+`displaysleep` is fine to leave on — the screen may sleep, the system may not.
+`powernap 0` matters because Power Nap wakes the machine only for Apple's own
+background tasks, not for a Docker container waiting on a socket.
+
+Linux workers: check `systemd-sleep` is not armed (`systemctl status
+sleep.target`); a headless server install normally never suspends.
+
+The UI tells you when this bites. A worker pill goes **amber with a ⚠** when the
+box is configured but has stopped polling — asleep, unreachable, or its worker
+container is down — and its tooltip says how long ago it was last seen. That is
+a different pill from the struck-through one, which means *you* disabled it
+(#294).
+
 ## Run an encode
 
 From anywhere that can reach the master (the Go control plane will do this):
