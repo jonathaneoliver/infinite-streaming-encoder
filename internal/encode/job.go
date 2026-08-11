@@ -4838,6 +4838,18 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 			"-e", "AWS_ACCESS_KEY_ID="+envOr("MINIO_ACCESS_KEY", "encoder"),
 			"-e", "AWS_SECRET_ACCESS_KEY="+envOr("MINIO_SECRET_KEY", "encoder-secret"),
 			"-e", "AWS_REGION="+envOr("MINIO_REGION", "us-east-1"),
+			// Which BOX this orchestrator is running on, under the same name
+			// the master's own worker connects to Temporal with. It runs the
+			// mezzanine and the packaging itself now, and a phase that never
+			// reaches a worker has no other way to say where it ran — so
+			// without this the master's lane on the machine timeline is blank
+			// for the head and the tail of every run (#293).
+			//
+			// Deliberately local-dist only. The cloud orchestrator runs the
+			// same host phases, but those lanes are about rented instances and
+			// money; putting this Mac in one would draw a box nobody is billed
+			// for beside the ones they are.
+			"-e", "WORKER_LABEL="+envOr("LOCAL_WORKER_LABEL", "mac"),
 		)
 	}
 	runArgs = append(runArgs, m.EncoderImage)

@@ -157,6 +157,38 @@ def _progress_cb(stage_key: str, total_bytes: int):
 _SELF_RUN_STAGES: set = set()
 
 
+def _emit_self_run_host(activity_id: str) -> None:
+    """Colour the lane of a phase THIS process runs, with the box it runs on.
+
+    A stage's machine only ever comes from an ENCODER-HOST marker, and the two
+    emitters in this file both read it off a Temporal worker — so a phase that
+    never reaches a worker has no machine at all, and the machine timeline drops
+    it (`_laneStages` filters on `s.instance`). Since the mezzanine and the
+    packaging moved onto this box that is the head and the tail of every run:
+    the master draws IDLE for both while it is the only machine doing anything,
+    and those minutes land in the lane's idle arithmetic (#293).
+
+    WORKER_LABEL is the same name the master's own worker connects to Temporal
+    under, so these phases land in that box's existing lane instead of opening a
+    second one for the same machine. Unset — an older server that does not pass
+    it through — emits nothing: a missing lane is a gap, while a guessed one
+    (the container's hostname, say) is a machine that does not exist.
+
+    Both callers run after `_emit_plan`, which is load-bearing rather than
+    incidental: the Go side updates a stage row in place here and, unlike the
+    REUSED marker, does not seed one — a HOST marker for a key with no row yet
+    is dropped in silence.
+    """
+    machine = os.environ.get("WORKER_LABEL", "")
+    if not machine:
+        return
+    for key in _stage_keys_for(activity_id):
+        # No version: this process's build is not what _MACHINE_VERSION holds
+        # (that is what each WORKER reported), and an absent field means "did
+        # not say", which the Go reader keeps distinct from agreement.
+        print(host_marker(key, machine), flush=True)
+
+
 def _build_mezzanine_on_host(input_path: Path, mezz_prefix: str, work_dir: Path,
                              time_limit_s: float | None) -> bool:
     """Build the mezzanine HERE, in the orchestrator container, and upload it
@@ -203,6 +235,9 @@ def _build_mezzanine_on_host(input_path: Path, mezz_prefix: str, work_dir: Path,
         env["TIME_LIMIT_S"] = f"{time_limit_s:g}"
     print(f"[dist] building mezzanine on the host -> {mezz_prefix} "
           f"(no source upload)", flush=True)
+    # Before the build, not after it: the point is the lane being coloured WHILE
+    # this runs, which on a cache miss is the first minutes of the run.
+    _emit_self_run_host("mezzanine")
     try:
         proc = subprocess.Popen(cmd, env=env, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -300,6 +335,9 @@ def _package_on_host(codec: str, s3_variants: str, out_dir: Path, dest: Path,
         env["PARTIAL_DURATION"] = partial_duration
     print(f"[dist] packaging {codec} on the host (no worker, no sync-back)",
           flush=True)
+    # All three rows this activity drives, before the work: they run LIVE from
+    # here (see above), so the lane fills as they do rather than at the end.
+    _emit_self_run_host(f"pkg-{codec}")
     t0 = time.monotonic()
     try:
         proc = subprocess.Popen(
@@ -862,7 +900,7 @@ def _activity_markers(attrs, client) -> list[str]:
 # Temporal PendingActivityState.STARTED — an activity actually executing on a
 # worker right now (vs SCHEDULED = still queued). Stable enum value.
 _PA_STARTED = 2
-_HOST_SEEN: dict = {}   # chunk activity_id -> (machine, version), dedups ENCODER-HOST
+_HOST_SEEN: dict = {}   # activity_id -> (machine, version), dedups ENCODER-HOST
 _MACHINE_VERSION: dict = {}  # machine -> build (image content hash), once it says
 _RUN_SEEN: dict = {}    # activity_id -> 1 once promoted queued -> running
 
@@ -882,7 +920,7 @@ def fleet_marker(machine: str, busy, perf, version: str, chunks: list) -> str:
 
 
 def should_emit_host(aid: str, machine: str, version: str, seen: dict) -> bool:
-    """Is (chunk on machine, running version) NEW information worth a marker?
+    """Is (activity on machine, running version) NEW information worth a marker?
 
     Deduped on the PAIR, not on machine alone. Machine alone looks right and is
     the version that shipped first: it re-tags on failover, which is the case
@@ -904,7 +942,7 @@ def should_emit_host(aid: str, machine: str, version: str, seen: dict) -> bool:
 
 
 def host_marker(key: str, machine: str, version: str = "") -> str:
-    """Build one ENCODER-HOST line — which box, and which build, ran a chunk.
+    """Build one ENCODER-HOST line — which box, and which build, ran an activity.
 
     The version is what makes the PER-CHUNK record in run.json self-describing
     later; `instance` alone answers "where" but never "running what" (#248).
@@ -959,17 +997,22 @@ async def _emit_fleet_cpu(handle, client) -> None:
     agg: dict = {}   # machine -> {"busy", "perf", "chunks": [activity_id, ...]}
     for pa, machine, cpu in seen:
         # A STARTED pending activity is one a worker is executing RIGHT NOW.
+        # Activities this process ran itself are excluded throughout: their rows
+        # are already driven, at a finer grain, by the phase running here — and
+        # the workflow still schedules a mezzanine activity that finds the .done
+        # and returns, so a worker briefly holds it and would otherwise re-tag
+        # the row with ITS box.
+        aid = getattr(pa, "activity_id", "") or ""
+        started = bool(aid) and (getattr(pa, "state", 0) == _PA_STARTED
+                                 and aid not in _SELF_RUN_STAGES)
+        keys = _stage_keys_for(aid) if started else []
         # Promote its stage here — for every activity kind, and before the
         # machine checks below, which `continue` when identity is unknown. An
         # activity with no reported identity is still running.
-        _aid = getattr(pa, "activity_id", "") or ""
-        if (getattr(pa, "state", 0) == _PA_STARTED and _aid
-                and _aid not in _SELF_RUN_STAGES):
-            _ks = _stage_keys_for(_aid)
-            if _ks and _RUN_SEEN.get(_aid) != 1:
-                _RUN_SEEN[_aid] = 1
-                for _k in _ks:
-                    emit_stage(_k, "running", 0.0)
+        if keys and _RUN_SEEN.get(aid) != 1:
+            _RUN_SEEN[aid] = 1
+            for key in keys:
+                emit_stage(key, "running", 0.0)
         if not machine:
             continue
         a = agg.setdefault(machine, {"busy": 0, "perf": 0, "chunks": [],
@@ -982,36 +1025,44 @@ async def _emit_fleet_cpu(handle, client) -> None:
         # Absent from workers older than the heartbeat field, which is itself
         # the answer: a box that cannot say is a box running something old.
         a["version"] = _MACHINE_VERSION.get(machine, "") or a["version"]
-        aid = getattr(pa, "activity_id", "") or ""
-        if getattr(pa, "state", 0) == _PA_STARTED and aid.startswith("enc-"):
+        # Colour the stage by the machine running it, from the START —
+        # authoritative here (last_worker_identity) so the cell matches the
+        # fleet swatch + chip for the whole encode, not just at completion.
+        #
+        # For EVERY activity, not just the chunks. Temporal does not write an
+        # ActivityTaskStarted event into history until the activity completes,
+        # so the history reader below cannot learn where a running phase is —
+        # and a phase gated to `enc-` here meant a long non-chunk one (audio, or
+        # packaging on a run that asked for it in a worker) drew its box as IDLE
+        # for its whole duration, on the exact chart someone consults to ask
+        # what the run is waiting on (#293).
+        #
+        # version rides along so the PER-CHUNK record in run.json says which
+        # build encoded it, not just which box (#248) — the half that answers
+        # the question months later, about a run nobody was watching. It comes
+        # from _MACHINE_VERSION (the box), not from this chunk's own heartbeat,
+        # which is usually not there yet the first time the chunk is seen.
+        #
+        # Deduped on (machine, version), NOT machine alone: failover re-tags,
+        # AND learning the build re-emits exactly once so a chunk first seen
+        # before any heartbeat still gets its version. Keying on machine alone
+        # tagged 2 of 14 chunks in a real run — the first, version-less emission
+        # suppressed every retry. Tested ONCE per activity rather than per key,
+        # because `pkg-<codec>` drives three rows and a per-key test would
+        # record on the first and then suppress the other two.
+        ver = _MACHINE_VERSION.get(machine, "")
+        if keys and should_emit_host(aid, machine, ver, _HOST_SEEN):
+            for key in keys:
+                print(host_marker(key, machine, ver), flush=True)
+        if started and aid.startswith("enc-"):
             a["chunks"].append(aid)
-            # An `enc-` id maps to exactly one cell; the multi-key case is
-            # packaging, which never reaches this branch.
-            for key in _stage_keys_for(aid):
-                # Colour the grid cell by the machine running it, from the START —
-                # authoritative here (last_worker_identity) so the cell matches the
-                # fleet swatch + chip for the whole encode, not just at completion.
-                #
-                # version rides along so the PER-CHUNK record in run.json says
-                # which build encoded it, not just which box (#248) — the half
-                # that answers the question months later, about a run nobody was
-                # watching. It comes from _MACHINE_VERSION (the box), not from
-                # this chunk's own heartbeat, which is usually not there yet the
-                # first time the chunk is seen.
-                #
-                # Deduped on (machine, version), NOT machine alone: failover
-                # re-tags, AND learning the build re-emits exactly once so a
-                # chunk first seen before any heartbeat still gets its version.
-                # Keying on machine alone tagged 2 of 14 chunks in a real run —
-                # the first, version-less emission suppressed every retry.
-                ver = _MACHINE_VERSION.get(machine, "")
-                if should_emit_host(aid, machine, ver, _HOST_SEEN):
-                    print(host_marker(key, machine, ver), flush=True)
-                # Real per-chunk progress: the worker rides ffmpeg's out_time/
-                # duration % on its heartbeat, so a chunk fills 0→100 as it actually
-                # encodes instead of snapping 0→100 on completion.
-                p = (cpu or {}).get("progress")
-                if p is not None and 0 < p < 100:
+            # Real per-chunk progress: the worker rides ffmpeg's out_time/
+            # duration % on its heartbeat, so a chunk fills 0→100 as it actually
+            # encodes instead of snapping 0→100 on completion. Chunks only — a
+            # phase's heartbeat carries no such fraction.
+            p = (cpu or {}).get("progress")
+            if p is not None and 0 < p < 100:
+                for key in keys:
                     emit_stage(key, "running", float(p))
     for m, a in agg.items():
         print(fleet_marker(m, a["busy"], a["perf"], a["version"], a["chunks"]),

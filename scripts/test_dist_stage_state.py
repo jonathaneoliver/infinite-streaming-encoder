@@ -156,6 +156,137 @@ def test_non_chunk_activities_are_promoted_too() -> None:
     assert "package:h264" in got, seen
 
 
+def _host_markers(fn) -> list:
+    """Run fn, returning the [[ENCODER-HOST ...]] lines it printed, as
+    (key, instance) pairs. Printed rather than emitted through a seam, because
+    this process's stdout IS the channel to the Go server."""
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        fn()
+    out = []
+    for line in buf.getvalue().splitlines():
+        if line.startswith("[[ENCODER-HOST "):
+            f = dict(p.split("=", 1) for p in
+                     line[len("[[ENCODER-HOST "):-2].split(" "))
+            out.append((f["key"], f["instance"]))
+    return out
+
+
+def _one_started(activity_id: str, machine: str = "ubuntu"):
+    """A describe() handle + client whose only pending activity is this one,
+    STARTED on `machine`."""
+    import asyncio
+
+    class Handle:
+        async def describe(self):
+            return FakeAttr(raw_description=FakeAttr(pending_activities=[
+                FakeAttr(activity_id=activity_id, state=D._PA_STARTED,
+                         last_worker_identity=machine, heartbeat_details=None),
+            ]))
+
+    class PCV:
+        def from_payloads(self, p):
+            return []
+
+    client = FakeAttr(data_converter=FakeAttr(payload_converter=PCV()))
+    return lambda: asyncio.run(D._emit_fleet_cpu(Handle(), client))
+
+
+def test_a_running_phase_says_which_box_it_is_on() -> None:
+    """#293. A stage's machine only ever arrives on an ENCODER-HOST marker, and
+    the machine timeline drops any stage without one — so a phase that reports
+    none draws its box as IDLE for the whole time it is working, which on the
+    tail phases is exactly when someone consults the chart.
+
+    Temporal writes no ActivityTaskStarted event into history until the activity
+    COMPLETES, so the history reader cannot answer this while it matters. The
+    pending-activity record can, and does: `last_worker_identity` was correct
+    for the entire 9 minutes the stage reported null.
+    """
+    D._RUN_SEEN.clear()
+    D._HOST_SEEN.clear()
+    got = _host_markers(_one_started("pkg-h264"))
+    assert got == [("package:h264", "ubuntu"),
+                   ("fragments:h264", "ubuntu"),
+                   ("hls:h264", "ubuntu")], got
+
+
+def test_every_row_of_a_multi_row_activity_is_coloured() -> None:
+    """The dedup is keyed by ACTIVITY, so it has to be tested once and then the
+    keys looped — testing it per key would record on the first row and suppress
+    the other two, leaving package coloured and fragments/hls blank."""
+    D._RUN_SEEN.clear()
+    D._HOST_SEEN.clear()
+    keys = {k for k, _i in _host_markers(_one_started("pkg-hevc"))}
+    assert keys == {"package:hevc", "fragments:hevc", "hls:hevc"}, keys
+
+
+def test_a_chunk_still_reports_its_box() -> None:
+    """The colouring the phases now share was the chunk grid's first, and the
+    per-chunk plot is the more visible half of it."""
+    D._RUN_SEEN.clear()
+    D._HOST_SEEN.clear()
+    got = _host_markers(_one_started("enc-h264-1080p-c7", machine="macmini"))
+    assert got == [("encode:h264:1080p:chunk7", "macmini")], got
+
+
+def test_a_self_run_phase_is_not_re_tagged_by_the_worker_holding_it() -> None:
+    """The mezzanine is built HERE and the workflow still schedules an activity
+    for it, which a worker picks up, finds the .done and returns from. That
+    worker must not claim the row: the box that did the work is this one, and
+    ENCODER-HOST is last-writer-wins on the Go side."""
+    D._RUN_SEEN.clear()
+    D._HOST_SEEN.clear()
+    D._SELF_RUN_STAGES.add("mezzanine")
+    try:
+        got = _host_markers(_one_started("mezzanine"))
+    finally:
+        D._SELF_RUN_STAGES.discard("mezzanine")
+    assert got == [], f"a worker re-tagged a host-built phase: {got}"
+
+
+def test_host_run_phases_report_this_box() -> None:
+    """The other half of #293, and the bigger one since #298: the mezzanine and
+    the packaging never reach a worker at all, so nothing else can say where
+    they ran — leaving the master blank for the head and the tail of every run
+    while it is the only machine doing anything."""
+    import os
+
+    old = os.environ.get("WORKER_LABEL")
+    os.environ["WORKER_LABEL"] = "mac"
+    try:
+        got = _host_markers(lambda: D._emit_self_run_host("pkg-h264"))
+        assert got == [("package:h264", "mac"), ("fragments:h264", "mac"),
+                       ("hls:h264", "mac")], got
+        assert _host_markers(lambda: D._emit_self_run_host("mezzanine")) == [
+            ("mezzanine", "mac")]
+        # An id that drives no row emits nothing rather than a marker the Go
+        # side would drop anyway.
+        assert _host_markers(lambda: D._emit_self_run_host("byteranges-h264")) == []
+        # Unknown box: a missing lane is a gap, a guessed one is a machine that
+        # does not exist.
+        del os.environ["WORKER_LABEL"]
+        assert _host_markers(lambda: D._emit_self_run_host("mezzanine")) == []
+    finally:
+        if old is None:
+            os.environ.pop("WORKER_LABEL", None)
+        else:
+            os.environ["WORKER_LABEL"] = old
+
+
+def test_host_run_phases_are_coloured_before_they_run() -> None:
+    """Not after. The point is the lane filling WHILE the phase works — a marker
+    emitted on completion colours a box for a run that has already ended."""
+    for fn in (D._build_mezzanine_on_host, D._package_on_host):
+        src = inspect.getsource(fn)
+        emit = src.index("_emit_self_run_host")
+        assert emit < src.index("subprocess.Popen"), (
+            f"{fn.__name__} colours its lane after starting the work")
+
+
 def test_promotion_is_emitted_once_not_every_poll() -> None:
     # The loop polls every second for the life of the run. Re-announcing running
     # for every chunk on every tick would flood the marker channel the whole
