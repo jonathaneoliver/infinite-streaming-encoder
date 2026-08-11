@@ -18,6 +18,13 @@ scripts. Do not invent commands beyond these four:
   unconditionally via `go run …@latest`, so CI is the authority. Install locally
   with `go install honnef.co/go/tools/cmd/staticcheck@latest` and
   `go install golang.org/x/vuln/cmd/govulncheck@latest`.
+  **One step is the exception to "CI is the authority": `sfn schema`.** It asks
+  the real Step Functions API whether it would accept the ASL
+  (`check_sfn_definition.py`), and CI has no AWS credentials, so there it skips
+  *permanently*. It runs only where credentials exist — which is the machine
+  that deploys, and that is why the same script also gates `make deploy` and
+  `make infra-plan` via `require-valid-sfn`, where a skip is a refusal. See
+  "Two Step Functions checks" below.
 - `go test -race ./...` — 27 files, 127 tests across `internal/api`,
   `internal/awswatch`, `internal/encode`, `internal/tmpstage`. `-race` is not
   optional: #196 added it after proving a real SSE data race
@@ -461,6 +468,44 @@ must price the reservation on both sides of its calibration.
 they break. A `Ref::` added on the Batch side that the SFN caller does not
 supply fails at submit (#176), and `make deploy` mid-run deregisters job-def
 revisions — pulling the contract out from under a live execution.
+
+### Two Step Functions checks, asking different questions
+
+`make check` runs both against `definition.json.tpl`, and neither substitutes
+for the other:
+
+| step | script | question |
+| --- | --- | --- |
+| `sfn scopes` | `check_sfn_scopes.py` | is it *consistent* — does every `$.field` a Map body reads get projected by its ItemSelector, and does every `Ref::` a job definition expects get supplied? |
+| `sfn schema` | `check_sfn_definition.py` | is it *valid ASL* — would Step Functions accept it? |
+
+The second exists because a definition AWS rejects passed everything else
+cleanly: valid JSON, `tofu validate` happy, scopes green (#283 put a `Comment`
+key inside three `ContainerOverrides.Environment` entries, where the Batch API
+shape allows only `Name`/`Value`).
+
+**A rejected ASL does not fail the deploy cleanly.** Terraform applies the job
+definitions FIRST, so it bumps and *deregisters* the live revisions, then fails
+on the state machine and leaves it pinned to revisions that no longer exist —
+cloud encoding broken, nothing rolled back, and every retry re-breaking it the
+same way (a revision bump re-renders the ASL, so the SFN resource always
+updates). Which is why the same script is a hard precondition on `make deploy`
+and `make infra-plan` (`require-valid-sfn`, `--require`): validate before
+Terraform mutates anything, and this class becomes "nothing changed".
+
+Two traps in the API it uses, both pinned by `scripts/test_sfn_definition.py`:
+
+- **`aws stepfunctions validate-state-machine-definition` exits 0 when the
+  definition is INVALID.** The call succeeded; the verdict is `result` in the
+  payload. Gate on the exit code and the check passes everything forever.
+- **It exits 0 on an auth failure too**, with nothing on stdout. So "no `result`
+  in the output" must mean *skipped*, never *passed* — and on the deploy path,
+  skipped means refused.
+
+`require-valid-sfn` therefore degrades CLOSED, the opposite of `require-idle`
+right above it. Deploying without being able to validate is precisely the
+situation that costs a half-applied stack, and you need credentials to deploy
+anyway.
 
 **Retries are Batch's, not the state machine's.** SFN's `Retry` covers only
 `Batch.AWSBatchException` / `States.Timeout` — submit-time blips — and its own
