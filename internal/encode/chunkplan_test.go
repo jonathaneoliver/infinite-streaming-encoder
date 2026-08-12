@@ -18,8 +18,19 @@ import (
 //
 // testdata_chunkplan.txt is generated FROM the Python (chunking.plan_chunks +
 // encode_variants._coalesce_runt_tail), so Python stays the authority and this
-// test pins Go to it. Regenerate with the snippet in TestChunkPlanMatchesPython's
-// doc comment if the Python planner intentionally changes.
+// test pins Go to it. When the Python planner intentionally changes:
+//
+//	python3 scripts/gen_chunkplan_golden.py > internal/encode/testdata_chunkplan.txt
+//
+// This comment used to say the snippet was "in TestChunkPlanMatchesPython's doc
+// comment". It was not, and there was no generator at all — so the only way to
+// update the vectors was to hand-write them, which is precisely how a golden
+// file drifts from the thing it exists to pin.
+//
+// Note what this test CANNOT catch: Python being wrong. The vectors come from
+// Python, so a broken planner regenerates into a golden file Go then matches
+// perfectly. scripts/test_chunk_grid.py is the other half — it pins Python's own
+// invariants (segment alignment, the 6s grid, no empty chunks) independently.
 func TestChunkPlanMatchesPython(t *testing.T) {
 	f, err := os.Open("testdata_chunkplan.txt")
 	if err != nil {

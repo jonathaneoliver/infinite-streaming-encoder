@@ -47,10 +47,60 @@ type chunkSpan struct {
 	DurationS string `json:"duration_s"`
 }
 
-// planChunks tiles [0, durationS) into nc near-equal, segment-aligned chunks,
-// mirroring chunking.plan_chunks. Every interior boundary lands on a whole
-// segment (so IDRs/segment edges align); only the final chunk carries the
-// sub-segment tail.
+// chunkGridSeconds is the CROSS-LADDER chunk grid: every chunk boundary lands on
+// a multiple of this, whatever the ladder's segment duration.
+//
+// Chunk boundaries only ever had to be segment boundaries, which meant the same
+// clip cut in different places on each delivery profile — 334s at a 132s target
+// gives 112/111/111 on a 1s ladder, 112/112/110 on 2s and 114/114/106 on 6s.
+// Every chunk boundary is an encoder-state reset, so four ladders that are meant
+// to differ ONLY in delivery profile were also differing in where the encoder
+// restarted. That is the confound docs/ladders-and-delivery.md warns about in
+// the other direction: a comparison intended to isolate one variable quietly
+// carrying a second.
+//
+// 6s because it is the default segment duration and every shipped ladder's
+// segment (1s, 2s, 6s) divides it, so the grid costs those profiles nothing but
+// agreement.
+const chunkGridSeconds = 6.0
+
+// chunkGridMaxUnits bounds the search in chunkGridFor. Reached only by a segment
+// duration with no small common multiple with 6 (7s needs 42), which no ladder
+// has.
+const chunkGridMaxUnits = 240
+
+// chunkGridFor returns the tiling unit for a ladder: the smallest duration that
+// is both a whole number of SEGMENTS and a multiple of chunkGridSeconds — i.e.
+// lcm(segmentS, 6). Segment alignment is a correctness requirement (the packager
+// segments the concatenated variant), the 6s grid is a comparability one, and
+// the LCM is the only value satisfying both.
+//
+// Falls back to the segment duration when no common multiple is found in range,
+// which restores exactly the old behaviour rather than inventing a boundary that
+// is not a segment edge.
+func chunkGridFor(segmentS float64) float64 {
+	if segmentS <= 0 {
+		return chunkGridSeconds
+	}
+	for k := 1; k <= chunkGridMaxUnits; k++ {
+		g := chunkGridSeconds * float64(k)
+		r := g / segmentS
+		// Round(r) >= 1 is load-bearing, not defensive. Without it a segment
+		// LONGER than the grid passes on the first try: 6/1e9 is 6e-9, which
+		// rounds to 0 and sits well inside chunkEps, so the search would return
+		// a 6s grid that is not a whole number of segments — breaking the
+		// correctness half of the contract to satisfy the comparability half.
+		if math.Round(r) >= 1 && math.Abs(r-math.Round(r)) < chunkEps {
+			return g
+		}
+	}
+	return segmentS
+}
+
+// planChunks tiles [0, durationS) into nc near-equal chunks on the ladder's chunk
+// grid (chunkGridFor), mirroring chunking.plan_chunks. Every interior boundary
+// lands on a whole grid unit — so on a segment edge, an IDR, and a multiple of
+// 6s — and only the final chunk carries the sub-grid tail.
 //
 // Deliberately NOT a fixed chunkS tiling with a trailing remainder: a dynamic
 // chunk target of e.g. 330s on a 334s clip would yield one ~full-length chunk
@@ -60,21 +110,32 @@ func planChunks(durationS, chunkS, segmentS float64) []chunkSpan {
 	if durationS <= 0 || chunkS <= 0 || segmentS <= 0 {
 		return []chunkSpan{{Index: 0, StartS: "0", DurationS: formatSeconds(math.Max(durationS, 0))}}
 	}
+	grid := chunkGridFor(segmentS)
 	n := chunkCountForDuration(durationS, chunkS)
-	totalSegments := int(math.Ceil(durationS/segmentS - chunkEps))
-	if totalSegments < n {
-		totalSegments = n
+	totalUnits := int(math.Ceil(durationS/grid - chunkEps))
+	if totalUnits < 1 {
+		totalUnits = 1
 	}
-	base, extra := totalSegments/n, totalSegments%n
+	// A clip cannot be cut into more pieces than it has grid units. Asking for
+	// more used to hand the surplus chunks ZERO duration — 334s at chunkS=3 on a
+	// 6s ladder planned 111 chunks of which 55 encoded nothing, each still a real
+	// Batch job with a queue wait and a container start. Python's _validate
+	// refused chunkS < segmentS and so never reached it; Go has no such guard and
+	// the cloud path did. Clamping gives the caller fewer chunks than asked for,
+	// which is the honest answer and what the count in chunkPlanLine reports.
+	if n > totalUnits {
+		n = totalUnits
+	}
+	base, extra := totalUnits/n, totalUnits%n
 
 	spans := make([]chunkSpan, 0, n)
 	start := 0.0
 	for i := 0; i < n; i++ {
-		segs := base
+		units := base
 		if i < extra {
-			segs++
+			units++
 		}
-		duration := float64(segs) * segmentS
+		duration := float64(units) * grid
 		// The last chunk (or any that would overrun) is clipped to the remainder.
 		if i == n-1 || start+duration > durationS-chunkEps {
 			duration = durationS - start
