@@ -200,9 +200,10 @@ func (m *Manager) projectCloudCostDetail(cfg JobConfig, sourceWidth, fps int, du
 	if d := 1.0 - idle; d > 0 {
 		scale = 1.0 / d
 	}
+	ladderDef, _ := m.Ladders.Get(ladderName)
 	for _, c := range parseCodecSel(cfg.Codec) {
 		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
-			twoPass := c == "hevc" && !cfg.HevcSinglePass
+			twoPass := ladderDef.twoPassFor(c, cfg.HevcSinglePass)
 			sp := m.Speeds.Speed("graviton", c, r.Height, twoPass, r.Preset, fps)
 			if sp <= 0 {
 				continue
@@ -252,9 +253,10 @@ func (m *Manager) projectLocalWallSeconds(cfg JobConfig, sourceWidth, fps int, d
 		cores = 1
 	}
 	var coreSeconds, floor float64
+	ladderDef, _ := m.Ladders.Get(ladderName)
 	for _, c := range parseCodecSel(cfg.Codec) {
 		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
-			twoPass := c == "hevc" && !cfg.HevcSinglePass
+			twoPass := ladderDef.twoPassFor(c, cfg.HevcSinglePass)
 			sp := m.Speeds.LocalSpeed(c, r.Height, twoPass, r.Preset, fps)
 			if sp <= 0 {
 				continue
@@ -437,6 +439,7 @@ func (m *Manager) projectSaaSCosts(cfg JobConfig, sourceWidth, fps int, duration
 	if fps > 30 {
 		mcMult = 2.0
 	}
+	ladderDef, _ := m.Ladders.Get(ladderName)
 	for _, c := range parseCodecSel(cfg.Codec) {
 		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
 			commercial += minutes*_commercialRate(r.Height, c)*cMult + minutes*_commercialRepackPerMin
@@ -444,7 +447,7 @@ func (m *Manager) projectSaaSCosts(cfg JobConfig, sourceWidth, fps int, duration
 			coconut += minutes * _coconutRate(r.Height)
 			bitmovin += minutes * _bitmovinBasePerMin *
 				_bitmovinResFactor(r.Height) * _bitmovinCodecFactor(c) *
-				_bitmovinPassFactor(c == "hevc" && !cfg.HevcSinglePass)
+				_bitmovinPassFactor(ladderDef.twoPassFor(c, cfg.HevcSinglePass))
 		}
 	}
 	if hasAudio {

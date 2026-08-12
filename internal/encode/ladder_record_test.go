@@ -231,7 +231,10 @@ func TestConfigBlockChunkDurationRoundTrips(t *testing.T) {
 		}
 		// clipS 334s: the reference clip. "whole" collapses to it; "12"/"24"
 		// must survive as themselves rather than falling back to 30.
-		if want, have := chunkWant(in), variantChunkSeconds(got, 334, nil, "h264", 1080, false, "medium", 30); have != want {
+		// dynamicTargetWallSeconds: the fixed and whole modes must ignore it,
+		// which is the point — a budget-raised target (#316) may never change a
+		// size the caller asked for explicitly.
+		if want, have := chunkWant(in), variantChunkSeconds(got, dynamicTargetWallSeconds, 334, nil, "h264", 1080, false, "medium", 30); have != want {
 			t.Errorf("chunk_duration %q resolved to %.0fs, want %.0fs", got, have, want)
 		}
 	}
