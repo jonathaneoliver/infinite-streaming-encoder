@@ -824,19 +824,36 @@ class _StepTimer:
         self.marks.append((name, now - self._last))
         self._last = now
 
-    def emit(self, key: str, **extra) -> None:
-        total = time.monotonic() - self._t0
-        kv = " ".join(f"{n}_s={d:.2f}" for n, d in self.marks)
+    def emit(self, key: str, total_s: "float | None" = None,
+             include_marks: bool = True, **extra) -> None:
+        """Emit one TIMING record.
+
+        `total_s` / `include_marks` exist for the members of a shared-decode
+        group (#317). One ffmpeg produces several rungs, so the interval and the
+        per-step marks belong to the BAND, not to each rung: reported whole
+        against every member they multiply the run's worker-seconds by the group
+        size. Measured before this existed — a grouped run reported 19,717
+        worker-seconds against the ungrouped 9,343, i.e. twice as slow while
+        doing the same work in 28% less. The lead carries the interval and the
+        members carry none, which is the same rule the CPU figure follows and
+        for the same reason: a numerator and a denominator have to be split the
+        same way, or not at all.
+        """
+        total = (time.monotonic() - self._t0) if total_s is None else total_s
+        kv = (" ".join(f"{n}_s={d:.2f}" for n, d in self.marks)
+              if include_marks else "")
         # extra carries non-duration measurements (e.g. cpu_s = ffmpeg
         # CPU-seconds) that still ride the same marker so cloud.cpu_report
         # can divide them by reserved-vCPU x encode wall-time per tier.
         extra_kv = "".join(f" {k}={v}" for k, v in extra.items())
         # Machine-readable (parsed by cloud.timing / the app), then human.
-        emit(f"[[ENCODER-TIMING phase={self.phase} key={key} {kv}{extra_kv} "
+        emit(f"[[ENCODER-TIMING phase={self.phase} key={key} "
+             f"{kv + ' ' if kv else ''}{extra_kv.lstrip()} "
              f"total_s={total:.2f}]]")
-        human = ", ".join(f"{n}={d:.1f}s" for n, d in self.marks)
-        print(f"[timing] {self.phase} {key}: {human}, total={total:.1f}s",
-              flush=True)
+        if include_marks:
+            human = ", ".join(f"{n}={d:.1f}s" for n, d in self.marks)
+            print(f"[timing] {self.phase} {key}: {human}, total={total:.1f}s",
+                  flush=True)
 
 
 def _group_rungs(spec: str, lead: "Rung") -> "list[Rung]":
@@ -1158,10 +1175,16 @@ def phase_variant(args: argparse.Namespace) -> int:
     # member instead would multiply the run's Sigma cpu by the group size and
     # make grouping look like a regression.
     for i, (r, _path) in enumerate(to_deliver):
+        lead = i == 0
         extra = {"grouped": str(len(to_deliver))} if grouped_outs else {}
         timer.emit(f"encode:{args.codec}:{r.label}{ci}",
-                   cpu_s=f"{cpu_s:.2f}" if i == 0 else "0.00",
-                   mem_mib=f"{peak_mib:.0f}" if i == 0 else "0",
+                   # A member reports NO interval and NO marks either: they
+                   # measure the band, and reported per rung they multiply the
+                   # run's worker-seconds by the group size.
+                   total_s=None if lead else 0.0,
+                   include_marks=lead,
+                   cpu_s=f"{cpu_s:.2f}" if lead else "0.00",
+                   mem_mib=f"{peak_mib:.0f}" if lead else "0",
                    **extra)
 
     # Feed the control plane's learned-speed model (drives the dynamic chunk

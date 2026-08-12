@@ -288,6 +288,27 @@ def test_grouping_is_reachable_from_a_submitted_job() -> None:
         "the submit CLI cannot ask for it, so the smoke cannot exercise it")
 
 
+def test_a_member_reports_no_interval_and_no_cpu() -> None:
+    """One ffmpeg produces several rungs, so the interval, the per-step marks
+    and the CPU all belong to the BAND. Reported whole against every member they
+    multiply the run's totals by the group size — measured before this was
+    fixed, a grouped run reported 19,717 worker-seconds against the ungrouped
+    9,343: twice as slow, while doing the same work in 28% less CPU.
+
+    A numerator and a denominator have to be split the same way or not at all.
+    Here neither is split: the lead carries both, the members carry neither.
+    """
+    src = inspect.getsource(P.phase_variant)
+    assert "total_s=None if lead else 0.0" in src, (
+        "band members report the band's wall as their own; Sigma worker-seconds "
+        "is then multiplied by the group size")
+    assert "include_marks=lead" in src, (
+        "band members repeat the band's per-step marks (fetch_s, encode_s ...), "
+        "which double-count the same way")
+    assert 'cpu_s=f"{cpu_s:.2f}" if lead else "0.00"' in src, (
+        "band members report the group's CPU as their own")
+
+
 def test_the_group_marker_matches_what_go_parses() -> None:
     """A cross-language contract with no error on either side: the orchestrator
     prints it, the Go server pattern-matches it, and a spelling drift would just
