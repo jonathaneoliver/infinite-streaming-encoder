@@ -4962,9 +4962,26 @@ func workerName(jobID string, fileIdx int) string {
 func (m *Manager) runFileContainer(job *Job, fileIdx int, script string, args []string) error {
 	name := workerName(job.ID, fileIdx)
 
-	exists, _, err := containerState(name)
+	exists, reattachable, err := containerState(name)
 	if err != nil {
 		return fmt.Errorf("inspect %s: %w", name, err)
+	}
+
+	// A container that exists but never RAN cannot be reattached to: it has no
+	// logs and its exit code reads 0, which the caller would take as success
+	// (#323). `docker run` creates then starts, so any start failure — a bad
+	// bind mount, a missing image — leaves exactly this. Remove it and run
+	// fresh, which is what the operator pressing Retry is asking for anyway.
+	if exists && !reattachable {
+		job.AppendLog(fmt.Sprintf(
+			"worker container %s exists but never started — removing and re-running", name))
+		if out, rmErr := exec.Command("docker", "rm", "-f", name).CombinedOutput(); rmErr != nil {
+			// Report it rather than falling through to `docker run`, which would
+			// fail on the name conflict and say something less useful.
+			return fmt.Errorf("remove stale container %s: %w: %s",
+				name, rmErr, strings.TrimSpace(string(out)))
+		}
+		exists = false
 	}
 
 	if !exists {
@@ -5076,10 +5093,10 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 // goroutines pinned on the restart-resilience path. Plain `docker logs`
 // always drains the history and returns.
 func (m *Manager) attachAndWait(job *Job, name string) error {
-	_, running, _ := containerState(name)
-
+	// "running right now", not "has run" — this is choosing between following
+	// the stream and draining a finished container's history.
 	args := []string{"logs", name}
-	if running {
+	if containerIsRunning(name) {
 		args = []string{"logs", "-f", name}
 	}
 	logs := exec.Command("docker", args...)
@@ -5139,16 +5156,77 @@ func (m *Manager) attachAndWait(job *Job, name string) error {
 
 // containerState reports whether a container with the given name exists and,
 // if it does, whether it is currently running.
-func containerState(name string) (exists bool, running bool, err error) {
+// Docker container states, as `docker inspect -f {{.State.Status}}` reports
+// them. Only `running` and `exited` are reattachable; the rest never ran and
+// have neither logs nor a meaningful exit code.
+const (
+	dockerStatusCreated = "created"
+	dockerStatusRunning = "running"
+	dockerStatusExited  = "exited"
+)
+
+// containerState reports whether a container exists, and whether it is
+// REATTACHABLE — meaning it has run, so `docker logs` has something to say and
+// `.State.ExitCode` means what it claims.
+//
+// This used to ask `{{.State.Running}}` and treat any successful inspect as
+// "exists", which quietly conflated two very different situations (#323).
+// `docker run` creates the container and THEN starts it, so a start failure —
+// a bad bind mount, a missing image, exhausted resources — leaves a container
+// with the right name stuck in `created`. `docker inspect` succeeds on it, so
+// the old code took the reattach path:
+//
+//   - `docker logs -f` on a never-started container returns immediately, empty
+//   - `.State.ExitCode` is 0 for `created`
+//
+// Exit 0 is success, so the file was marked encoded and moveTmpToOutput moved
+// whatever happened to be in $TMP_DIR/<job>/ into OUTPUT_DIR — and since the run
+// that hits this is usually a retry, which tends to carry force_reencode, the
+// previous good output was archived to make room for it. Observed live: a
+// directory containing only a .prefetch-h264/ scratch dir was one button press
+// from replacing a complete ladder.
+//
+// So `created` (and `dead`, which is the same story after a failed removal) must
+// report NOT reattachable, and the caller runs a fresh container instead.
+func containerState(name string) (exists bool, reattachable bool, err error) {
 	out, runErr := exec.Command("docker", "inspect",
-		"-f", "{{.State.Running}}", name).Output()
+		"-f", "{{.State.Status}}", name).Output()
 	if runErr != nil {
 		// `docker inspect` exits non-zero when the container doesn't exist;
 		// distinguishing "not found" from a real daemon error would require
 		// parsing stderr, which isn't worth it here — treat non-zero as absent.
 		return false, false, nil
 	}
-	return true, strings.TrimSpace(string(out)) == "true", nil
+	status := strings.TrimSpace(string(out))
+	return true, containerHasRun(status), nil
+}
+
+// containerHasRun reports whether a container in this state has actually
+// executed, so its logs and exit code mean something.
+//
+// An UNKNOWN status returns false deliberately. Being wrong that way costs a
+// duplicate `docker run`, which fails loudly on the name conflict; being wrong
+// the other way is #323 — a silent success that can destroy the previous output.
+func containerHasRun(status string) bool {
+	switch status {
+	case dockerStatusRunning, dockerStatusExited:
+		return true
+	default:
+		// created, dead, paused, restarting, removing, or anything Docker adds.
+		return false
+	}
+}
+
+// containerIsRunning reports whether the container is live RIGHT NOW, which is a
+// different question from whether it has run: attachAndWait needs it to choose
+// between `docker logs -f` and a plain drain.
+func containerIsRunning(name string) bool {
+	out, err := exec.Command("docker", "inspect",
+		"-f", "{{.State.Status}}", name).Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == dockerStatusRunning
 }
 
 func containerExitCode(name string) (int, error) {
