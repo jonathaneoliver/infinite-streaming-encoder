@@ -2326,15 +2326,62 @@ func (m *Manager) GetJob(id string) *Job {
 	return nil
 }
 
+// nextJobIDLocked returns a job ID that no live job is using. Caller holds m.mu.
+//
+// The ID was `time.Now().UnixMilli()` with no uniqueness check, which is fine
+// for one submission and wrong for two in the same millisecond. #324 made that
+// routine: the form now fans out over ladders x codecs, so a three-codec
+// selection fires three POSTs in a tight loop and the server can answer two of
+// them inside one millisecond. Observed in production the day it shipped — two
+// pairs of jobs sharing an ID out of eight submitted.
+//
+// A shared ID is not a cosmetic clash. The ID keys four separate things, and all
+// four collide:
+//
+//   - $TMP_DIR/<id>/ — both jobs encode into one scratch dir, so one job's
+//     moveTmpToOutput walks files the other is still writing. That surfaces as
+//     "encode succeeded but move failed: lstat .../360p/init.mp4: no such file",
+//     which reads like a packaging bug and is not one.
+//   - encoder_job_<id>_f<idx> — the worker container name, so the second job's
+//     `docker run` fails with a name conflict.
+//   - $TMP_DIR/jobs/<id>.json — the restart-resilience state file; one job's
+//     overwrites the other's, so Reconcile can only ever resume one of them.
+//   - DistJobPrefix — both stage into the same MinIO prefix, and either job
+//     finishing reclaims chunks the other may still need.
+//
+// The shape is load-bearing and must stay all-digits: internal/tmpstage tells a
+// reclaimable job directory from the caches and learned state sharing $TMP_DIR
+// by matching ^[0-9]+$. So this bumps the millisecond rather than appending a
+// suffix — a later job still sorts after an earlier one, and the value stays a
+// timestamp to within a few milliseconds.
+//
+// Collisions with a RECONCILED job matter too: m.jobs holds those after a
+// restart, so scanning it covers both. Clock skew backwards would otherwise let
+// a new job reuse a persisted ID whose $TMP_DIR/<id>/ still exists.
+func (m *Manager) nextJobIDLocked() string {
+	inUse := make(map[string]bool, len(m.jobs))
+	for _, j := range m.jobs {
+		inUse[j.ID] = true
+	}
+	ms := time.Now().UnixMilli()
+	for {
+		id := fmt.Sprintf("%d", ms)
+		if !inUse[id] {
+			return id
+		}
+		ms++
+	}
+}
+
 func (m *Manager) Submit(cfg JobConfig) *Job {
 	job := &Job{
-		ID:        fmt.Sprintf("%d", time.Now().UnixMilli()),
 		Config:    cfg,
 		Status:    StatusQueued,
 		StartedAt: time.Now(),
 		Progress:  "queued",
 	}
 	m.mu.Lock()
+	job.ID = m.nextJobIDLocked()
 	m.jobs = append(m.jobs, job)
 	m.mu.Unlock()
 	m.persistState(job, 0)
