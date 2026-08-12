@@ -38,6 +38,7 @@ One Docker image plays three roles: the **server** (Go control plane, default
 - [What it does](#what-it-does)
 - [How it works](#how-it-works)
 - [Performance: single machine vs local farm vs cloud](#performance-single-machine-vs-local-farm-vs-cloud)
+- [What a cloud run actually costs](#what-a-cloud-run-actually-costs)
 - [Quality & VMAF](#quality--vmaf)
 - [Requirements](#requirements)
 - [Quickstart](#quickstart)
@@ -288,7 +289,7 @@ curve:
 | --- | --- | --- | --- |
 | Parallel chunks | this box's slots (`physical-cores ÷ 2`, 2 threads each) | **sum** of every box's slots | scales out to your Batch max-vCPUs |
 | Startup overhead | none | none (workers already up) | ~60–90 s spot boot + ECR pull per cold box (an [AMI](#images--registries) removes the pull) |
-| Marginal cost | electricity | electricity | spot $/vCPU-hr while running; **$0 at rest** |
+| Marginal cost | electricity | electricity | **$0 at rest**, but while running the bill is mostly **egress, not compute** — [see below](#what-a-cloud-run-actually-costs) |
 | Resumability | reattaches on restart | lost chunk reschedules to another box | reclaimed spot chunk retries |
 | Best for | small / quick jobs on one machine | big jobs + idle LAN boxes, no cloud spend | huge jobs, or no local hardware — burst wide, then scale to zero |
 
@@ -310,6 +311,60 @@ cloud run, dig into where the time and CPU went:
 make timing     EXEC=<execution-arn>   # per-phase where-did-the-time-go
 make cpu-report EXEC=<execution-arn>   # per-tier CPU utilization vs reserved vCPU
 ```
+
+## What a cloud run actually costs
+
+**Encoding is the cheap part. Moving the bytes home is the expensive part.**
+
+That is not obvious and it is the opposite of what the table above implies, so here
+is a real run — a 5½-minute 4K source, H.264, 12 rungs, 338 Batch jobs, 11 minutes
+wall:
+
+| what | USD | share |
+| --- | ---: | ---: |
+| **S3 → internet egress** (2.76 GB coming home) | **0.249** | **64%** |
+| **Spot compute** (10.4 vCPU-hr rented) | **0.110** | **28%** |
+| S3 requests, Step Functions, storage, everything else | 0.032 | 8% |
+| **Total** | **0.391** | |
+
+**Egress cost 2.3× the encode.** Every finished ladder is a couple of GB, and AWS
+charges $0.09 for each one that leaves the region — while eleven minutes across ten
+spot instances (96 Graviton vCPUs) cost eleven cents.
+
+Three consequences worth knowing before you tune anything:
+
+- **The biggest lever is not encoding at all — it is `--skip-media-download`.** It
+  leaves the packaged segments in S3 behind a `.remote.json` sidecar and brings home
+  only the manifests, taking that 64% to roughly zero. Fetch a title later, on
+  demand, and pay egress only for what you actually watch.
+- **Host packaging does not save transfer.** Packaging on the control plane
+  ([#197](https://github.com/jonathaneoliver/infinite-streaming-encoder/issues/197))
+  removes a Batch job and its queue wait, but the machine now pulls every *chunk*
+  instead of the packaged output — measured at 2.75 GB against 2.76 GB. It buys
+  latency, not dollars.
+- **Optimising compute optimises 28% of the bill.** Spot is still worth it (on-demand
+  would have cost $0.38 instead of $0.11 — more than the whole run) but that saving
+  is bounded by a number that egress dwarfs.
+
+**The split moves with the codec.** H.264 is fast, so egress dominates. HEVC costs
+~2× the CPU for the same output size, which puts compute and egress roughly level;
+AV1 is slower again and tips it the other way. The rule of thumb: **the faster your
+codec, the more of your bill is transfer.**
+
+**Two more that never show up per-run.** The background AWS-inventory sweep bills
+egress on the *listing XML* — measured over 23 days on a real account, that tracked
+LIST-request count at r=0.99 and spot-hours at only r=0.33, i.e. it is almost
+independent of whether you are encoding. On a day with zero encodes it was 20.3 GB
+out and ~79% of the bill, which is why the S3 walk is opt-in per request rather than
+on a timer. And staging left behind by a failed run keeps being re-listed for the
+lifetime of the bucket's expiry rule.
+
+**Every run reports its own version of this table.** The orchestrator prices spot,
+egress, Step Functions transitions, S3 requests and storage per execution and the
+job card shows the total — along with what it *excludes*, since CloudWatch Logs and
+SQS are not yet threaded through per-run. See
+[`scripts/infinite_streaming_encoder/pricing.py`](scripts/infinite_streaming_encoder/pricing.py)
+for every rate and the reasoning behind it.
 
 ## Quality & VMAF
 
