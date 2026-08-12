@@ -198,3 +198,87 @@ func peakUsefulVCPU(planned []plannedVariant, targetWallS, clipS, segS float64,
 	}
 	return total
 }
+
+// The fixed-chunk-duration guard (#312).
+//
+// budgetedChunkTarget above only sizes DYNAMIC chunking. An explicit
+// --chunk-duration is deliberately left alone — silently growing a size the
+// caller asked for is a worse answer than refusing — so a fixed value has no
+// protection at all, and it scales linearly with content length:
+//
+//	         chunks   events    input
+//	1h @12s   3,600   28,800   219 KB   history over
+//	2h @12s   7,200   57,600   441 KB   history AND input over
+//	4h @30s   5,760   46,080   354 KB   history AND input over
+//
+// Both AWS limits are real and they fail differently, which is why both are
+// checked:
+//
+//   - INPUT (256 KB) fails at StartExecution, immediately, with a payload-size
+//     error that never mentions chunks.
+//   - HISTORY (25,000 events) fails MID-RUN, hours in, after spot capacity has
+//     been launched and paid for.
+//
+// History binds first — ~52 minutes of content at a fixed 12s against ~70 for
+// the input — so the common failure is the expensive one. #312 was filed
+// believing the reverse.
+const (
+	// A Step Functions execution's input is capped at 262,144 bytes. The plan is
+	// held to 80% of it: the chunk descriptors are the part that scales, but the
+	// variants, rungs, flags and S3 URIs around them are not free, and they are
+	// not modelled here.
+	sfnInputLimitBytes = 262144
+	sfnInputBudget     = sfnInputLimitBytes * 4 / 5
+)
+
+// isFixedChunkDuration reports whether the job asked for a specific chunk size,
+// as opposed to "dynamic" (sized by budgetedChunkTarget, which already fits) or
+// "whole" (one chunk per variant). Only a fixed value reaches the guard, and
+// extracting the predicate is what lets a test check the real condition rather
+// than restate the three strings.
+func isFixedChunkDuration(cfg string) bool {
+	return cfg != "" && cfg != "dynamic" && cfg != "whole"
+}
+
+// chunkPlanFits reports whether a whole-job plan clears both AWS limits, and
+// says which one it fails.
+//
+// chunks is counted from the SAME planChunks the build loop calls, and bytes
+// from the SAME marshalled chunkSpan that ships — an arithmetic estimate is
+// wrong in both directions here, because the grid, the runt-tail fold and the
+// 12s quantum all move the count.
+func chunkPlanFits(chunks, bytes int) (ok bool, why string) {
+	events := chunks * sfnEventsPerChunk
+	switch {
+	case events > sfnHistoryLimit && bytes > sfnInputBudget:
+		return false, fmt.Sprintf(
+			"%d chunks: ~%d history events (limit %d) and ~%d KB of execution input (limit %d KB)",
+			chunks, events, sfnHistoryLimit, bytes/1024, sfnInputLimitBytes/1024)
+	case events > sfnHistoryLimit:
+		return false, fmt.Sprintf(
+			"%d chunks: ~%d history events against a %d limit — the run would die PART WAY THROUGH, "+
+				"after spot capacity has been launched",
+			chunks, events, sfnHistoryLimit)
+	case bytes > sfnInputBudget:
+		return false, fmt.Sprintf(
+			"%d chunks: ~%d KB of execution input against a %d KB limit — StartExecution would reject it",
+			chunks, bytes/1024, sfnInputLimitBytes/1024)
+	}
+	return true, ""
+}
+
+// fixedChunkAdvice suggests the smallest whole-second fixed duration that would
+// fit, so the error says what to do rather than only what is wrong. Returns ""
+// when nothing sensible fits, in which case dynamic is the only answer.
+func fixedChunkAdvice(planned []plannedVariant, clipS, segS float64) string {
+	for _, try := range []float64{30, 60, 90, 120, 180, 240} {
+		n := 0
+		for range planned {
+			n += len(planChunks(clipS, try, segS))
+		}
+		if n*sfnEventsPerChunk <= sfnHistoryLimit {
+			return fmt.Sprintf("%.0f", try)
+		}
+	}
+	return ""
+}

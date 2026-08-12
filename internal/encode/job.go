@@ -18,6 +18,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -4695,6 +4696,37 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			// rather than encoding a plan built for a different-length file.
 			ContentDuration: formatSeconds(clipDurationS),
 		})
+	}
+	// Refuse a plan that cannot survive its own execution (#312).
+	//
+	// Only for FIXED chunk durations: dynamic self-scales via budgetedChunkTarget
+	// above, and "whole" is one chunk per variant. A fixed value is left alone on
+	// purpose — silently growing what the caller asked for would be worse than
+	// refusing — which is exactly why it needs a refusal.
+	//
+	// Counted here rather than in the pre-pass because this measures what SHIPS:
+	// the same spans the variants carry, marshalled the same way. The chunk
+	// descriptors are the part that scales with content length, so they are what
+	// the input budget is spent against.
+	if isFixedChunkDuration(chunkCfg) {
+		total := 0
+		for _, v := range variants {
+			total += len(v.Chunks)
+		}
+		bytes := 0
+		if b, err := json.Marshal(variants); err == nil {
+			bytes = len(b)
+		}
+		if ok, why := chunkPlanFits(total, bytes); !ok {
+			msg := fmt.Sprintf("chunk duration %ss does not fit one Step Functions execution — %s",
+				chunkCfg, why)
+			if alt := fixedChunkAdvice(planned, clipDurationS, segS); alt != "" {
+				msg += fmt.Sprintf(". Use --chunk-duration %s, or dynamic, which sizes itself", alt)
+			} else {
+				msg += ". Use dynamic chunking, which sizes itself to fit"
+			}
+			return "", 0, errors.New(msg)
+		}
 	}
 	// Zero variants is never what anyone asked for (#289). Without this the run
 	// submits a Step Functions execution with an empty variants array, no chunks

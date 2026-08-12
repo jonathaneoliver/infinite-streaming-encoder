@@ -244,6 +244,14 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	if ! command -v node >/dev/null 2>&1; then echo "skipped (no node)"; \
 	elif out=$$(node scripts/test_codec_split.js 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	: 'The chunk budget (#316) and the fixed-duration guard (#312) hardcode two'; \
+	: 'AWS quotas. Ask Service Quotas whether they still hold. Needs credentials'; \
+	: 'so it skips in CI, and degrades OPEN — unlike require-valid-sfn, a skip'; \
+	: 'here is harmless: the constants are conservative, so a plan built against'; \
+	: 'them is valid whatever the real quota turns out to be.'; \
+	printf '  sfn quotas     '; \
+	if out=$$(python3 scripts/check_sfn_quotas.py 2>&1); then echo "$$out"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	if [ $$fail -ne 0 ]; then echo; echo "make check: FAILED"; exit 1; fi; \
 	echo "make check: all passed"
 
