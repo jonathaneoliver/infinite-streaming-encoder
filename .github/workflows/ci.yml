@@ -165,6 +165,10 @@ jobs:
             node "$t"
             found=$((found + 1))
           done
+          if [ "$found" -eq 0 ]; then
+            echo "no scripts/test_*.js found — the glob is wrong, not the repo"
+            exit 1
+          fi
           echo "ran $found js test scripts"
 
   terraform:
