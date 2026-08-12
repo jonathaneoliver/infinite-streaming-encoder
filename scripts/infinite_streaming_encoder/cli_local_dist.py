@@ -270,6 +270,43 @@ class _ChunkPrefetcher:
                      if self.failed else ""), flush=True)
 
 
+# Grouped chunk encodes: lead activity id -> every stage key it drives (#317).
+# Populated by _plan_groups, read by _stage_keys_for. The workflow names a
+# grouped activity for its LEAD rung only, so without this the other members'
+# rows never move — the same shape of gap #293 fixed for machines.
+_GROUP_KEYS: dict = {}
+
+
+def _plan_groups(rungs_by_codec: dict, group_bottom: int) -> dict:
+    """Which rungs share a decode, per codec: {codec: [labels, heaviest first]}.
+
+    The bottom `group_bottom` rungs of each codec encode from ONE decode of the
+    chunk instead of one each (#317). The bottom, specifically, because that is
+    where the decode dominates: measured on the farm, a chunk costs 2.15 cores
+    at 2160p and 4.02 at 234p — the encode shrinks while the decode does not.
+    Grouping the big rungs would add memory pressure (1632 MiB peak at 2160p
+    against 345 at 234p) to buy almost nothing, and would put six rungs of the
+    most expensive chunk behind one failure.
+
+    Ordered heaviest-first so the LEAD is the largest member. The lead names the
+    activity, carries the group's CPU in telemetry, and is the rung whose VMAF
+    audit still runs — all of which want the biggest member, not an arbitrary
+    one.
+
+    A group of one is not a group: it would take the shared-decode path to
+    decode once for one rung, which is what the single-rung path already does.
+    """
+    if group_bottom < 2:
+        return {}
+    groups = {}
+    for codec, rr in rungs_by_codec.items():
+        # rungs arrive heaviest-first from the ladder; the bottom N are the tail.
+        members = [r.label for r in rr][-group_bottom:]
+        if len(members) > 1:
+            groups[codec] = members
+    return groups
+
+
 def _emit_self_run_host(activity_id: str) -> None:
     """Colour the lane of a phase THIS process runs, with the box it runs on.
 
@@ -923,6 +960,12 @@ def _stage_keys_for(activity_id: str) -> list[str]:
         return [activity_id]
     m = _ENC_ACT_RE.match(activity_id)
     if m:
+        # A grouped activity is named for its LEAD but drives every member's row
+        # (#317). Registered by _plan_groups; empty for an ungrouped run, which
+        # is the single-key case below.
+        grouped = _GROUP_KEYS.get(activity_id)
+        if grouped:
+            return list(grouped)
         return [f"encode:{m.group(1)}:{m.group(2)}:chunk{m.group(3)}"]
     if activity_id.startswith("pkg-"):
         c = activity_id[4:]
@@ -1249,6 +1292,27 @@ def run_temporal(args: argparse.Namespace) -> int:
     # the LAN twice to reach a disk on the master. Kept a per-codec list rather
     # than a flag so it matches the plan key the workflow reads, and so a future
     # reason to package one codec remotely does not need a new shape.
+    # Shared-decode groups (#317), off unless asked for: a grouped activity is a
+    # different shape of work (one process, several outputs, the sum of their
+    # memory), and turning that on silently would change every run's job mix
+    # without anyone asking for it. The A/B this needs is a ~40-minute farm run.
+    groups = _plan_groups(rungs_by_codec, int(args.group_bottom or 0))
+    for c, members in groups.items():
+        lead = members[0]
+        for ch in chunks:
+            _GROUP_KEYS[f"enc-{c}-{lead}-c{ch.index}"] = [
+                f"encode:{c}:{m}:chunk{ch.index}" for m in members]
+    if groups:
+        print("[dist] shared decode: " + "; ".join(
+            f"{c} [{', '.join(m)}]" for c, m in groups.items()), flush=True)
+        for c, members in groups.items():
+            # Once per codec, not per chunk: membership is a property of the
+            # ladder for the whole run. The machine timeline draws ONE block per
+            # grouped job from this; the chunk grid ignores it and keeps a row
+            # per rung.
+            print(f"[[ENCODER-GROUP codec={c} lead={members[0]} "
+                  f"members={'|'.join(members[1:])}]]", flush=True)
+
     host_package = [] if args.no_host_package else list(rungs_by_codec)
     # A worker running an OLDER workflow packages regardless of the plan key, so
     # its pkg activities would announce over rows this process is driving live.
@@ -1347,6 +1411,10 @@ def run_temporal(args: argparse.Namespace) -> int:
                              else ladder_partial_duration(ladder_def)),
         "codecs": {c: {"two_pass": two_pass[c],
                        "extra_args": ladder_extra_args(ladder_def, c),
+                       # Which rungs share one decode. Read with .get by the
+                       # workflow, so a plan from an older orchestrator (no key)
+                       # reads as "group nothing" — the pre-#317 behaviour.
+                       "group": groups.get(c, []),
                        "rungs": [_rung_dict(c, r, _vmaf_ests) for r in rr]}
                    for c, rr in rungs_by_codec.items()},
     }
@@ -1538,6 +1606,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "host packaging gives up, Temporal's retry: a run whose "
                         "packaging keeps failing can be re-run against the same "
                         "--job-prefix with this set, and the chunks are reused.")
+    p.add_argument("--group-bottom", type=int, default=0, dest="group_bottom",
+                   help="encode the bottom N rungs of each codec from ONE "
+                        "decode per chunk instead of N (#317). 0 (default) "
+                        "keeps one ffmpeg per rung. Their encodes are nearly "
+                        "free next to the shared 4K decode, so this is where "
+                        "the CPU is: a 12-rung two-pass ladder decodes each "
+                        "chunk 24 times and needs 2.")
     p.add_argument("--no-prefetch", action="store_true", dest="no_prefetch",
                    help="don't download chunks as they finish encoding; leave "
                         "every object to the one burst at the start of "

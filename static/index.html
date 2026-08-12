@@ -5180,10 +5180,35 @@ function _laneJobs(local) {
     return [(busy.length ? busy : run).sort(newestFirst)[0]];
 }
 
+// Keys that are MEMBERS of a shared-decode group (#317) — everything the
+// grouped ffmpeg produces except the rung it is named for. One key per member
+// per chunk, derived from the per-codec membership the orchestrator declares.
+function _groupMemberKeys(job) {
+    const out = new Set();
+    ((job || {}).groups || []).forEach(g => {
+        (g.members || []).forEach(label => out.add(`encode:${g.codec}:${label}:`));
+    });
+    return out;
+}
+
 function _laneStages(job) {
     if (!job) return [];
     const hist = (job.stages_history || []).flatMap(h => h.stages || []);
-    return [...(job.stages || []), ...hist].filter(s => s && s.instance && s.started_at);
+    const members = _groupMemberKeys(job);
+    return [...(job.stages || []), ...hist]
+        .filter(s => s && s.instance && s.started_at)
+        // A grouped job is ONE ffmpeg, so it is one block on this chart: the
+        // lane's unit is the unit of DISPATCH, while the grid's unit is the
+        // unit of REPORTING and keeps a row per rung. Drawn from every member
+        // instead, six identical spans would stack into six sub-rows — false
+        // concurrency depth for a single process — and since nrows is shared to
+        // give the lanes a common height, one grouped box would deepen EVERY
+        // lane in the chart.
+        //
+        // The utilisation arithmetic does not depend on this: intervals are
+        // merged per instance before busy time is measured, so identical spans
+        // collapse either way. Only the block list and the count change.
+        .filter(s => !members.has(String(s.key || '').replace(/chunk\d+$/, '')));
 }
 
 // opts.local switches the framing. On cloud these lanes are about MONEY: you pay

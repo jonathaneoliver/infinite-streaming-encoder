@@ -219,6 +219,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  py pkgfetch    '; \
 	if out=$$(python3 scripts/test_package_fetch.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py groupenc    '; \
+	if out=$$(python3 scripts/test_group_encode.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py prefetch    '; \
 	if out=$$(python3 scripts/test_prefetch.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \

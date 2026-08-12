@@ -172,6 +172,18 @@ var (
 	// this run skips (not re-encodes) it — the orchestrator emits it once per
 	// reused chunk at startup. The UI styles those cells distinctly.
 	reusedMarkerRe = regexp.MustCompile(`^\[\[ENCODER-REUSED key=(\S+)\]\]$`)
+	// ENCODER-GROUP declares that several rungs of a codec are encoded by ONE
+	// ffmpeg per chunk, off a shared decode (#317): the lead names the job, the
+	// members are produced alongside it. Emitted once per codec by the
+	// orchestrator, not per chunk — membership is a property of the ladder for
+	// the whole run, and 28 chunks would repeat it 28 times.
+	//
+	// The machine timeline needs this and the chunk grid does not: a lane's unit
+	// is the unit of DISPATCH (one ffmpeg, one block) while the grid's unit is
+	// the unit of REPORTING (one row per rung). Without it, six member rows with
+	// identical spans draw six stacked bars for one process, and the greedy
+	// packer deepens EVERY lane to fit them.
+	groupMarkerRe = regexp.MustCompile(`^\[\[ENCODER-GROUP codec=(\S+) lead=(\S+) members=(\S*)\]\]$`)
 	// Cloud cli_cloud.py prints its computed S3 job id in the plan
 	// header (`  job_id:         20260420T203910Z-1`). That's the prefix
 	// under `s3://.../jobs/` — we capture it so the retry endpoint can
@@ -644,6 +656,26 @@ func (j *Job) parseMarker(line string) bool {
 				}
 				break
 			}
+		}
+		j.mu.Unlock()
+		return true
+	}
+	if m := groupMarkerRe.FindStringSubmatch(line); m != nil {
+		g := StageGroup{Codec: m[1], Lead: m[2]}
+		if m[3] != "" {
+			g.Members = strings.Split(m[3], "|")
+		}
+		j.mu.Lock()
+		replaced := false
+		for i := range j.Groups {
+			if j.Groups[i].Codec == g.Codec {
+				j.Groups[i] = g // a re-announced codec replaces, never appends
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			j.Groups = append(j.Groups, g)
 		}
 		j.mu.Unlock()
 		return true
@@ -1291,6 +1323,16 @@ func (j *Job) MarshalJSON() ([]byte, error) {
 	return json.Marshal((*alias)(j))
 }
 
+// StageGroup is one codec's shared-decode group: the rungs a single ffmpeg
+// encodes together, per chunk (#317). Lead is the rung the activity is named
+// for and the one whose telemetry carries the group's CPU; Members are the
+// others, which have their own grid rows but no separate job.
+type StageGroup struct {
+	Codec   string   `json:"codec"`
+	Lead    string   `json:"lead"`
+	Members []string `json:"members,omitempty"`
+}
+
 type Job struct {
 	ID        string     `json:"id"`
 	Config    JobConfig  `json:"config"`
@@ -1471,6 +1513,11 @@ type Job struct {
 	// Stages reflects ONLY the currently-processing file; finished
 	// files land in StagesHistory.
 	Stages []StageProgress `json:"stages,omitempty"`
+
+	// Groups names the rungs that share one ffmpeg per chunk (#317). The UI
+	// needs it to draw ONE lane block for a grouped job instead of one per
+	// member; the chunk grid ignores it and keeps a row per rung.
+	Groups []StageGroup `json:"groups,omitempty"`
 
 	// OverallProgress is a single 0–100% for the whole encode, WEIGHTED by each
 	// variant's expected wall-time (1/learned-speed) so a slow 4K HEVC 2-pass

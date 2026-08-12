@@ -511,6 +511,164 @@ def encode_variant(
     return out_path
 
 
+def build_group_ffmpeg_cmd(
+    ctx: EncodeContext,
+    codec: str,
+    rungs: "list[Rung]",
+    pass_num: int | None = None,
+    chunk: Chunk | None = None,
+    threads: int | None = None,
+) -> list[str]:
+    """Return the ffmpeg argv that encodes SEVERAL rungs off ONE decode (#317).
+
+    A 12s 4K chunk is decoded once instead of once per rung. For the low rungs
+    the decode IS most of the work — measured on the farm, cores-per-second
+    rises from 2.15 at 2160p to 4.02 at 234p precisely because the encode
+    shrinks while the decode does not. With two passes the same chunk is decoded
+    twice per rung, so a 12-rung ladder decodes it 24 times and needs 2.
+
+    DERIVED from build_ffmpeg_cmd rather than reimplemented: each branch reuses
+    that function's exact option list for its rung, with `-vf <filter>` replaced
+    by a `-map` of the filter_complex branch that already applied it. So the two
+    paths cannot drift in rate control, keyint, pixel format, tagging or
+    fragmentation — a grouped encode differs from N separate ones only in how
+    many times the source is decoded. A drift would not fail a run; it would
+    ship a ladder whose bottom rungs were encoded to different settings than its
+    top ones, found whenever someone compared bitrates.
+
+    TWO-PASS IS SUPPORTED, and needs no special handling for h264/hevc: x264 and
+    x265 carry their stats path INSIDE the codec param string
+    (`:pass=N:stats=<path>`, one per rung from _stats_path), so branches cannot
+    collide. AV1 is the exception — libsvtav1 uses ffmpeg's generic
+    `-pass N -passlogfile PREFIX`, and ffmpeg appends the OUTPUT STREAM INDEX to
+    that prefix (`p-0.log`, `p-1.log`). That is safe only while both passes list
+    the branches in the SAME ORDER, which is why this takes an ordered list and
+    the caller passes the same one twice. Reorder them between passes and pass 2
+    reads another rung's stats.
+
+    Pass 1 muxes each branch to the null sink, exactly as the single-rung path
+    does; N null outputs in one command is fine (verified in the encoder image).
+    """
+    if not rungs:
+        raise ValueError("build_group_ffmpeg_cmd needs at least one rung")
+
+    singles = [build_ffmpeg_cmd(ctx, codec, r, pass_num=pass_num, chunk=chunk,
+                                threads=threads)
+               for r in rungs]
+
+    # Everything before the first `-vf` is input selection and seek: identical
+    # across the rungs of one chunk, which is exactly what makes them shareable.
+    head = singles[0][:singles[0].index("-vf")]
+    for cmd in singles[1:]:
+        if cmd[:cmd.index("-vf")] != head:
+            raise ValueError(
+                "grouped rungs disagree about the input or seek; they must be "
+                "the same chunk of the same mezzanine")
+
+    labels, scales, outputs = [], [], []
+    for i, cmd in enumerate(singles):
+        vf = cmd.index("-vf")
+        # The trailing 3 are `-loglevel warning -stats`, which are global and
+        # are re-added once at the end. Everything between the filter and them
+        # is this branch's own options plus its output (or the null sink).
+        labels.append(f"[s{i}]")
+        scales.append(f"[s{i}]{cmd[vf + 1]}[o{i}]")
+        outputs += ["-map", f"[o{i}]"] + cmd[vf + 2:-3]
+
+    graph = (f"[0:v]split={len(singles)}" + "".join(labels) + ";"
+             + ";".join(scales))
+    return head + ["-filter_complex", graph] + outputs + [
+        "-loglevel", "warning", "-stats"]
+
+
+def encode_variant_group(
+    ctx: EncodeContext,
+    codec: str,
+    rungs: "list[Rung]",
+    chunk: Chunk | None = None,
+    threads: int | None = None,
+) -> "list[tuple[Rung, Path]]":
+    """Encode several rungs from one decode. Returns [(rung, output path), ...].
+
+    The grouped twin of encode_variant, and it keeps that function's contracts:
+    the same pass-count decision, the same .done marker per output, the same
+    argv recording per rung, and the same progress bar shape (two passes fill
+    0-50 and 50-100 rather than resetting).
+
+    Progress mirrors to EVERY member's stage key, because the chunk grid has a
+    row per rung. Reporting one key would leave the rest of the group blank for
+    the whole encode and a working grouped job would read as a stalled one.
+
+    Ordering is load-bearing across the two passes — see build_group_ffmpeg_cmd
+    on AV1's passlogfile suffix — so `rungs` is used as given, twice.
+    """
+    if not rungs:
+        raise ValueError("encode_variant_group needs at least one rung")
+    emit_ffmpeg_version()
+    emit_codec_lib(codec)
+
+    # The ONE definition, shared with encode_variant and the SPEED marker — a
+    # second copy of this decision is exactly what #314 was.
+    two_pass = two_pass_for(ctx, codec)
+
+    if chunk is None:
+        outs = [(r, _variant_path(ctx.output_dir, codec, r.label)) for r in rungs]
+        total_duration_s = ctx.content_duration_s + ctx.padding_duration_s
+    else:
+        outs = [(r, _chunk_path(ctx.output_dir, codec, r.label, chunk.index))
+                for r in rungs]
+        total_duration_s = chunk.duration_s
+    for _r, path in outs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    idx = None if chunk is None else chunk.index
+    keys = [variant_stage_key(codec, r.label, idx) for r in rungs]
+
+    def cmd_for(pass_num: int | None) -> list[str]:
+        argv = build_group_ffmpeg_cmd(ctx, codec, rungs, pass_num=pass_num,
+                                      chunk=chunk, threads=threads)
+        # Recorded against every member, so `run.json`'s per-rung argv keeps
+        # answering "what encoded this rung" — the answer is now one command
+        # that also encoded five others, and that is what it should say.
+        for r in rungs:
+            emit_ffmpeg_argv(codec, r.label, pass_num or 0, argv)
+        return argv
+
+    try:
+        if two_pass:
+            run_ffmpeg_with_progress(
+                cmd_for(1), duration_s=total_duration_s, stage_key=keys[0],
+                extra_stage_keys=keys[1:], pct_lo=0.0, pct_hi=50.0,
+                terminal=False,
+            )
+            run_ffmpeg_with_progress(
+                cmd_for(2), duration_s=total_duration_s, stage_key=keys[0],
+                extra_stage_keys=keys[1:], pct_lo=50.0, pct_hi=100.0,
+            )
+        else:
+            run_ffmpeg_with_progress(
+                cmd_for(None), duration_s=total_duration_s, stage_key=keys[0],
+                extra_stage_keys=keys[1:],
+            )
+    except subprocess.CalledProcessError as e:
+        where = f" chunk{chunk.index}" if chunk is not None else ""
+        raise EncodeError(
+            f"grouped encode failed: {codec} "
+            f"[{', '.join(r.label for r in rungs)}]{where} "
+            f"(ffmpeg exit {e.returncode})"
+        ) from e
+
+    # Every member has to land. package-all discovers variants by LISTING the
+    # staging prefix, so a missing output does not fail anything here — it
+    # produces a run whose ladder is quietly short a rung, found at playback.
+    for r, path in outs:
+        if not path.is_file():
+            raise EncodeError(
+                f"grouped encode produced no output for {codec} {r.label}: {path}")
+        _write_done_marker(path)
+    return outs
+
+
 def concat_stage_key(codec: str, label: str) -> str:
     """Stage key for the per-variant chunk-concat step."""
     return f"concat:{codec}:{label}"

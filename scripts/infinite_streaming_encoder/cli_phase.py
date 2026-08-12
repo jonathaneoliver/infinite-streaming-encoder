@@ -39,6 +39,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace as dc_replace
 from pathlib import Path
 
 from infinite_streaming_encoder.audio import AudioSpec, create_audio
@@ -46,7 +47,8 @@ from infinite_streaming_encoder.chunking import (
     Chunk, DEFAULT_CHUNK_DURATION_S, variant_object_name,
 )
 from infinite_streaming_encoder.encode_variants import (
-    EncodeContext, concat_chunks, encode_variant, two_pass_for,
+    EncodeContext, concat_chunks, encode_variant, encode_variant_group,
+    two_pass_for,
 )
 from infinite_streaming_encoder.ffprobe import probe
 from infinite_streaming_encoder.hls import (
@@ -837,6 +839,35 @@ class _StepTimer:
               flush=True)
 
 
+def _group_rungs(spec: str, lead: "Rung") -> "list[Rung]":
+    """Parse --group into Rungs: 'label:w:h:bitrate[:preset],...'.
+
+    The lead is not implied here — the orchestrator sends the WHOLE group,
+    because the order is its choice and order is load-bearing across two passes
+    (see build_group_ffmpeg_cmd on AV1's passlogfile suffix).
+
+    A member omitting the preset inherits the lead's, which is what the control
+    plane sends: every member of a group comes from one ladder and shares it.
+    Malformed input RAISES rather than silently encoding fewer rungs — a group
+    that quietly dropped a member would produce a ladder missing a rung, and
+    package-all discovers variants by listing, so nothing downstream would
+    notice until playback.
+    """
+    out = []
+    for part in [p for p in spec.split(",") if p.strip()]:
+        f = part.split(":")
+        if len(f) < 4:
+            raise ValueError(f"malformed --group member {part!r}: "
+                             "want label:width:height:bitrate[:preset]")
+        out.append(dc_replace(lead, label=f[0], res_name=f[0],
+                              width=int(f[1]), height=int(f[2]),
+                              bitrate=int(f[3]),
+                              preset=(f[4] if len(f) > 4 and f[4] else lead.preset)))
+    if not out:
+        raise ValueError(f"--group {spec!r} named no rungs")
+    return out
+
+
 def phase_variant(args: argparse.Namespace) -> int:
     work = _prepare_work_dir()
     timer = _StepTimer("variant")
@@ -998,8 +1029,25 @@ def phase_variant(args: argparse.Namespace) -> int:
     # cap, so we can't rely on cgroup detection to size the encode. When unset
     # (0), fall back to the cgroup quota (the AWS Batch path, where vCPU == cap).
     _threads_env = int(os.environ.get("ENCODE_THREADS", "0") or "0")
-    out_path = encode_variant(ctx, args.codec, rung, chunk=chunk,
-                              threads=_threads_env or None)
+    group_spec = (getattr(args, "group", "")
+                  or os.environ.get("ENCODE_GROUP", "")).strip()
+    group_rungs = _group_rungs(group_spec, rung) if group_spec else None
+    if group_rungs:
+        # One decode, N rungs (#317). With two passes the chunk is decoded twice
+        # instead of 2N times. Progress mirrors to every member's stage key, so
+        # the grid shows the group's rungs start and finish together.
+        print(f"[phase variant] grouped encode: {len(group_rungs)} rungs off one "
+              f"decode ({', '.join(r.label for r in group_rungs)})", flush=True)
+        grouped_outs = encode_variant_group(ctx, args.codec, group_rungs,
+                                            chunk=chunk,
+                                            threads=_threads_env or None)
+        # The lead is the rung this job is named for; the VMAF audit and the
+        # already-in-S3 skip above are still about it specifically.
+        out_path = next(p for r, p in grouped_outs if r.label == rung.label)
+    else:
+        grouped_outs = None
+        out_path = encode_variant(ctx, args.codec, rung, chunk=chunk,
+                                  threads=_threads_env or None)
     encode_wall_s = time.monotonic() - _enc_t0
     ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu_s = (ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime)
@@ -1088,14 +1136,33 @@ def phase_variant(args: argparse.Namespace) -> int:
 
     # out_path.name is {codec}_{tier}.mp4 whole-clip, or
     # {codec}_{tier}_chunkNNN.mp4 for a chunk — upload under the same name.
-    out_uri = args.s3_out.rstrip("/") + f"/{out_path.name}"
-    print(f"[phase variant] uploading {out_uri}", flush=True)
-    _upload_with_done(out_path, out_uri)
+    # A grouped job produces one output PER RUNG and every one has to land.
+    # package-all discovers variants by LISTING the staging prefix, so an
+    # unuploaded member fails nothing here — it produces a run whose ladder is
+    # quietly short a rung, found at playback.
+    to_deliver = [(rung, out_path)] if grouped_outs is None else grouped_outs
+    for _r, path in to_deliver:
+        uri = args.s3_out.rstrip("/") + f"/{path.name}"
+        print(f"[phase variant] uploading {uri}", flush=True)
+        _upload_with_done(path, uri)
     timer.mark("upload")
 
     ci = "" if chunk is None else f":chunk{chunk.index}"
-    timer.emit(f"encode:{args.codec}:{args.label}{ci}",
-               cpu_s=f"{cpu_s:.2f}", mem_mib=f"{peak_mib:.0f}")
+    # One TIMING record per rung, so the phase rollup keeps its per-rung rows.
+    # The CPU is the GROUP's — one ffmpeg offers no per-branch attribution — so
+    # it is reported WHOLE against the LEAD and the members report none, tagged
+    # `grouped=N`. Dividing it evenly was tried on the cloud path and is worse:
+    # members run concurrently, so each member's wall IS the group's wall, and a
+    # split numerator over an unsplit denominator rendered a container at ~7.3
+    # cores as 1.22 and coloured it idle. Reporting the full CPU against every
+    # member instead would multiply the run's Sigma cpu by the group size and
+    # make grouping look like a regression.
+    for i, (r, _path) in enumerate(to_deliver):
+        extra = {"grouped": str(len(to_deliver))} if grouped_outs else {}
+        timer.emit(f"encode:{args.codec}:{r.label}{ci}",
+                   cpu_s=f"{cpu_s:.2f}" if i == 0 else "0.00",
+                   mem_mib=f"{peak_mib:.0f}" if i == 0 else "0",
+                   **extra)
 
     # Feed the control plane's learned-speed model (drives the dynamic chunk
     # selector, cost, and ETA): content-seconds encoded vs encode wall-seconds,
@@ -1113,7 +1180,21 @@ def phase_variant(args: argparse.Namespace) -> int:
     two_pass = 1 if two_pass_for(ctx, args.codec) else 0
     machine = os.environ.get("WORKER_LABEL") or "graviton"
     fps_i = max(1, round(float(info.fps)))
-    if encode_wall_s > 0 and content_s > 0:
+    # A GROUPED encode has no honest speed sample to give (#317): one wall time
+    # covers several rungs, so filing it against the lead teaches the model that
+    # the lead is N times slower than it is, and filing it against every member
+    # teaches the same lie N times. The planner sizes chunks from this, so a
+    # poisoned curve would misplan every later run of the source — the same
+    # class of silent wrongness #314 was, arrived at from the other side.
+    #
+    # Suppressed rather than approximated. The model keeps learning from
+    # ungrouped encodes, which over-states a grouped run's cost and therefore
+    # plans conservatively; teaching it what a group really costs needs a
+    # grouped-aware key, which is follow-up work.
+    if grouped_outs:
+        print("[phase variant] grouped encode: no ENCODER-SPEED sample "
+              "(one wall time, several rungs)", flush=True)
+    elif encode_wall_s > 0 and content_s > 0:
         emit(f"[[ENCODER-SPEED machine={machine} codec={args.codec} "
              f"height={rung.height} two_pass={two_pass} preset={args.preset} "
              f"fps={fps_i} content_s={content_s:.1f} "
@@ -1621,6 +1702,13 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="the estimate is a clamped endpoint (rung above the measured "
                         "range) → shown as VMAF≥N; also honors EST_VMAF_CLAMPED env")
     v.add_argument("--preset", default="medium")
+    v.add_argument("--group", default="", help=(
+        "Shared-decode group (#317): 'label:w:h:bitrate[:preset],...' — encode "
+        "every listed rung from ONE decode of the chunk instead of decoding it "
+        "once per rung. Includes the lead. Empty (the default) takes the "
+        "single-rung path unchanged. Also read from ENCODE_GROUP, because an "
+        "empty value has to stay expressible: env may be blank, a Batch Ref:: "
+        "may not (#176)."))
     v.add_argument("--s3-mezz", required=True, dest="s3_mezz")
     v.add_argument("--s3-out", required=True, dest="s3_out")
     v.add_argument("--two-pass", action="store_true", dest="two_pass",
