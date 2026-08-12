@@ -456,6 +456,30 @@ def test_host_packaging_failure_says_the_chunks_survive() -> None:
         "re-encoding the whole ladder")
 
 
+def test_the_task_queue_comes_from_the_environment() -> None:
+    """The server passes TEMPORAL_TASK_QUEUE into this container and every
+    worker reads the same var. A hardcoded default meant changing the queue
+    moved the server and the workers while the ORCHESTRATOR kept starting
+    workflows on "encode" — with no error, because both queues exist and each
+    side succeeds. Found while trying to isolate a run onto one box: the local
+    worker sat on an empty queue while the remote boxes ran the job."""
+    import os
+    old = os.environ.get("TEMPORAL_TASK_QUEUE")
+    os.environ["TEMPORAL_TASK_QUEUE"] = "encode-isolated"
+    try:
+        base = ["--input", "x.mp4", "--output", "x", "--output-dir", "/tmp",
+                "--s3-bucket", "b", "--job-prefix", "jobs/x"]
+        got = D.build_parser().parse_args(base).temporal_task_queue
+        assert got == "encode-isolated", got
+        del os.environ["TEMPORAL_TASK_QUEUE"]
+        assert D.build_parser().parse_args(base).temporal_task_queue == "encode"
+    finally:
+        if old is None:
+            os.environ.pop("TEMPORAL_TASK_QUEUE", None)
+        else:
+            os.environ["TEMPORAL_TASK_QUEUE"] = old
+
+
 def test_temporal_is_the_only_backend() -> None:
     """Temporal is the only backend, and asking for the removed one must FAIL.
 

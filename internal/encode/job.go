@@ -173,6 +173,18 @@ var (
 	// this run skips (not re-encodes) it — the orchestrator emits it once per
 	// reused chunk at startup. The UI styles those cells distinctly.
 	reusedMarkerRe = regexp.MustCompile(`^\[\[ENCODER-REUSED key=(\S+)\]\]$`)
+	// ENCODER-GROUP declares that several rungs of a codec are encoded by ONE
+	// ffmpeg per chunk, off a shared decode (#317): the lead names the job, the
+	// members are produced alongside it. Emitted once per codec by the
+	// orchestrator, not per chunk — membership is a property of the ladder for
+	// the whole run, and 28 chunks would repeat it 28 times.
+	//
+	// The machine timeline needs this and the chunk grid does not: a lane's unit
+	// is the unit of DISPATCH (one ffmpeg, one block) while the grid's unit is
+	// the unit of REPORTING (one row per rung). Without it, six member rows with
+	// identical spans draw six stacked bars for one process, and the greedy
+	// packer deepens EVERY lane to fit them.
+	groupMarkerRe = regexp.MustCompile(`^\[\[ENCODER-GROUP codec=(\S+) lead=(\S+) members=(\S*)\]\]$`)
 	// Cloud cli_cloud.py prints its computed S3 job id in the plan
 	// header (`  job_id:         20260420T203910Z-1`). That's the prefix
 	// under `s3://.../jobs/` — we capture it so the retry endpoint can
@@ -645,6 +657,31 @@ func (j *Job) parseMarker(line string) bool {
 				}
 				break
 			}
+		}
+		j.mu.Unlock()
+		return true
+	}
+	if m := groupMarkerRe.FindStringSubmatch(line); m != nil {
+		g := StageGroup{Codec: m[1], Lead: m[2]}
+		if m[3] != "" {
+			g.Members = strings.Split(m[3], "|")
+		}
+		j.mu.Lock()
+		replaced := false
+		for i := range j.Groups {
+			// Keyed by (codec, LEAD), because a codec has several bands: the
+			// low rungs pack into one, the mid rungs into another. Keying on
+			// codec alone made the second band overwrite the first, so the UI
+			// filtered one band's members out of the lanes and drew the other's
+			// as separate jobs.
+			if j.Groups[i].Codec == g.Codec && j.Groups[i].Lead == g.Lead {
+				j.Groups[i] = g // a re-announced band replaces, never appends
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			j.Groups = append(j.Groups, g)
 		}
 		j.mu.Unlock()
 		return true
@@ -1152,6 +1189,14 @@ type JobConfig struct {
 	// emits an [[ENCODER-VMAF …]] marker; the control plane aggregates per rung.
 	// Off by default (slow — see the cost notes on #24). Local only for now.
 	MeasureVmaf bool `json:"measure_vmaf,omitempty"`
+	// GroupRungs encodes the decode-dominated rungs in BANDS that share one
+	// decode per chunk (#317), instead of one ffmpeg per rung. A property of the
+	// JOB rather than of the box, so an A/B is two submissions of the same
+	// source rather than a farm reconfiguration. Off by default: a grouped
+	// activity is a different shape of work — one process, several outputs, the
+	// sum of their memory — and the band size is still being measured.
+	// local-dist only.
+	GroupRungs bool `json:"group_rungs,omitempty"`
 	// VmafPrescale (#109) builds a near-lossless pre-scaled VMAF reference once
 	// per worker box, so the audit decodes a small fast H.264 file instead of
 	// re-downscaling the native (4K/AV1) mezzanine on every chunk. Only helps
@@ -1290,6 +1335,16 @@ func (j *Job) MarshalJSON() ([]byte, error) {
 	defer j.mu.Unlock()
 	type alias Job
 	return json.Marshal((*alias)(j))
+}
+
+// StageGroup is one codec's shared-decode group: the rungs a single ffmpeg
+// encodes together, per chunk (#317). Lead is the rung the activity is named
+// for and the one whose telemetry carries the group's CPU; Members are the
+// others, which have their own grid rows but no separate job.
+type StageGroup struct {
+	Codec   string   `json:"codec"`
+	Lead    string   `json:"lead"`
+	Members []string `json:"members,omitempty"`
 }
 
 type Job struct {
@@ -1472,6 +1527,11 @@ type Job struct {
 	// Stages reflects ONLY the currently-processing file; finished
 	// files land in StagesHistory.
 	Stages []StageProgress `json:"stages,omitempty"`
+
+	// Groups names the rungs that share one ffmpeg per chunk (#317). The UI
+	// needs it to draw ONE lane block for a grouped job instead of one per
+	// member; the chunk grid ignores it and keeps a row per rung.
+	Groups []StageGroup `json:"groups,omitempty"`
 
 	// OverallProgress is a single 0–100% for the whole encode, WEIGHTED by each
 	// variant's expected wall-time (1/learned-speed) so a slow 4K HEVC 2-pass
@@ -3708,11 +3768,37 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	if !cfg.BurninEnabled() {
 		args = append(args, "--no-burnin")
 	}
+	// Shared decode for the bottom N rungs (#317). Env, not a job field: it is a
+	// property of the BOX (how much oversubscription its slots can take), not of
+	// the encode, and it is off until a farm A/B says otherwise. Passed only
+	// when > 0 so an unset or unparseable value is exactly the old behaviour
+	// rather than "--group-bottom 0" on every command line.
+	// Shared decode (#317). The JOB asks for it; ENCODE_GROUP_SIZE only tunes how
+	// many rungs share one, because the right band size depends on the box's
+	// memory rather than on the encode. Unset or unparseable falls back to the
+	// default, so a job that ticks the box always gets a real group.
+	if cfg.GroupRungs {
+		mp := groupBudgetMPDefault
+		if v, err := strconv.ParseFloat(os.Getenv("ENCODE_GROUP_BUDGET_MP"), 64); err == nil && v > 0 {
+			mp = v
+		}
+		args = append(args, "--group-budget", strconv.FormatFloat(mp, 'f', -1, 64))
+	}
 	// Cross-job priority: an older local-dist job's chunks all outrank a younger
 	// job's on the shared Temporal fleet (see localJobRank). Always passed.
 	args = append(args, "--job-rank", strconv.Itoa(jobRank))
 	return args
 }
+
+// groupBudgetMPDefault caps a shared-decode band by the summed MEGAPIXELS of
+// its members (#317) — a proxy for the memory and encoder threads one process
+// draws, both of which scale with resolution while the saving counts only how
+// many rungs share the decode. Bands therefore come out unequal, which is the
+// point: on a 12-rung 4K ladder 4.2 MP gives seven small rungs in one band
+// (~2.8 GiB, against the 3 GiB per-slot budget and the 2.84 GiB measured for
+// six low rungs), 1080p+954p in another, and leaves the three encode-bound
+// rungs alone — 5 decodes instead of 12.
+const groupBudgetMPDefault = 4.2
 
 // DistJobPrefix is the MinIO key prefix one local-dist file stages under.
 // Shared by the orchestrator's --job-prefix argument and the staging GC's

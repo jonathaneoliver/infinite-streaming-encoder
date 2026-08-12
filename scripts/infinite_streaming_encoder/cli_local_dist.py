@@ -270,6 +270,91 @@ class _ChunkPrefetcher:
                      if self.failed else ""), flush=True)
 
 
+# Grouped chunk encodes: lead activity id -> every stage key it drives (#317).
+# Populated by _plan_groups, read by _stage_keys_for. The workflow names a
+# grouped activity for its LEAD rung only, so without this the other members'
+# rows never move — the same shape of gap #293 fixed for machines.
+_GROUP_KEYS: dict = {}
+
+# Rungs above this height are never grouped: their decode is a small share of
+# their own cost (~13% at 2160p) while they carry the memory (1632 MiB peak
+# against 345 at 234p), so adding one to a group buys a single decode and pays
+# for it in RSS and blast radius. 1080p and below is the decode-dominated half
+# of a 4K ladder.
+_GROUP_MAX_HEIGHT = 1080
+
+
+def _plan_groups(rungs_by_codec: dict, budget_mp: float,
+                 max_height: int = _GROUP_MAX_HEIGHT) -> dict:
+    """Which rungs share a decode, per codec: {codec: [[labels], [labels]]}.
+
+    BANDS, and deliberately UNEQUAL ones. The CPU saved by a band is
+    (members - 1) x decode, so it depends only on how many rungs share a decode,
+    not on which — while the costs (memory, encoder threads, blast radius) scale
+    with rung SIZE. Equal bands therefore pay the big end's costs to buy the
+    small end's savings. Measured on a farm run (job 1786477283273, two-pass
+    h264, 28 chunks/rung), decode+scale is a FLAT 23.9 CPU-s per chunk per pass
+    at every resolution — 12% of a 2160p chunk's cost and 94% of a 234p one:
+
+        equal bands of 3 (<=1080p)   6 decodes/12   -18.0% Sigma cpu   1.7 GiB
+        equal bands of 6 (<=1080p)   5 decodes/12   -21.0%             3.0 GiB
+        tapered by this budget       5 decodes/12   -21.0%             1.9 GiB
+
+    Same saving, less peak: the tail band holds many cheap rungs, the head band
+    only two expensive ones.
+
+    `budget_mp` caps a band by the SUM of its members' megapixels — a proxy for
+    the memory and thread draw of one process running that many encoders, both
+    of which scale with resolution. Calibrated against the one measurement of a
+    real grouped job: six low h264 rungs peaked at 2.84 GiB, against a 3 GiB
+    per-slot budget (_MEM_PER_ENCODE_BYTES).
+
+    FILLED FROM THE BOTTOM UP. The rungs where decode dominates are packed
+    first, so they are guaranteed a band; any leftover then lands at the TOP,
+    which is the cheapest place on the ladder to leave a rung encoding alone
+    (decode is 12-24% of a 1440p-2160p chunk against 94% of a 234p one).
+    Filling downward from the top does the opposite — it spends the budget on
+    the expensive rungs and can strand the cheapest one, which a smoke run did
+    exactly once: 234p encoded solo, paying a whole decode for the cheapest work
+    on the ladder.
+
+    Ordered heaviest-first WITHIN each band, so the LEAD is its largest member:
+    the lead names the activity, carries the group's CPU in telemetry, keeps the
+    VMAF audit, and sets the priority band. Sorted here rather than trusted from
+    the caller — the ladder hands rungs over ASCENDING, and the first cut of
+    this took the last N of that order and grouped the TOP of a smoke ladder.
+    """
+    if budget_mp <= 0:
+        return {}
+
+    def _label_pixels(rungs):
+        px = {r.label: r.width * r.height for r in rungs}
+        return lambda label: px.get(label, 0)
+
+    groups = {}
+    for codec, rr in rungs_by_codec.items():
+        eligible = sorted((r for r in rr if r.height <= max_height),
+                          key=lambda r: r.width * r.height)   # smallest first
+        bands, cur, used = [], [], 0.0
+        for r in eligible:
+            mp = r.width * r.height / 1e6
+            if cur and used + mp > budget_mp:
+                bands.append(cur)
+                cur, used = [], 0.0
+            cur.append(r.label)
+            used += mp
+        if cur:
+            bands.append(cur)
+        # Heaviest-first inside each band: the LEAD is its largest member.
+        # A band of one is dropped — it would take the shared-decode path to
+        # decode once for one rung, which the single-rung path already does.
+        groups[codec] = [sorted(b, key=_label_pixels(rr), reverse=True)
+                         for b in bands if len(b) > 1]
+        if not groups[codec]:
+            del groups[codec]
+    return groups
+
+
 def _emit_self_run_host(activity_id: str) -> None:
     """Colour the lane of a phase THIS process runs, with the box it runs on.
 
@@ -923,6 +1008,12 @@ def _stage_keys_for(activity_id: str) -> list[str]:
         return [activity_id]
     m = _ENC_ACT_RE.match(activity_id)
     if m:
+        # A grouped activity is named for its LEAD but drives every member's row
+        # (#317). Registered by _plan_groups; empty for an ungrouped run, which
+        # is the single-key case below.
+        grouped = _GROUP_KEYS.get(activity_id)
+        if grouped:
+            return list(grouped)
         return [f"encode:{m.group(1)}:{m.group(2)}:chunk{m.group(3)}"]
     if activity_id.startswith("pkg-"):
         c = activity_id[4:]
@@ -1249,6 +1340,29 @@ def run_temporal(args: argparse.Namespace) -> int:
     # the LAN twice to reach a disk on the master. Kept a per-codec list rather
     # than a flag so it matches the plan key the workflow reads, and so a future
     # reason to package one codec remotely does not need a new shape.
+    # Shared-decode groups (#317), off unless asked for: a grouped activity is a
+    # different shape of work (one process, several outputs, the sum of their
+    # memory), and turning that on silently would change every run's job mix
+    # without anyone asking for it. The A/B this needs is a ~40-minute farm run.
+    groups = _plan_groups(rungs_by_codec, float(args.group_budget or 0))
+    for c, bands in groups.items():
+        for members in bands:
+            for ch in chunks:
+                _GROUP_KEYS[f"enc-{c}-{members[0]}-c{ch.index}"] = [
+                    f"encode:{c}:{m}:chunk{ch.index}" for m in members]
+    if groups:
+        print("[dist] shared decode: " + "; ".join(
+            f"{c} " + " ".join("[" + ", ".join(b) + "]" for b in bands)
+            for c, bands in groups.items()), flush=True)
+        for c, bands in groups.items():
+            for members in bands:
+                # Once per codec per band, not per chunk: membership is a
+                # property of the ladder for the whole run. The machine timeline
+                # draws ONE block per grouped job from this; the chunk grid
+                # ignores it and keeps a row per rung.
+                print(f"[[ENCODER-GROUP codec={c} lead={members[0]} "
+                      f"members={'|'.join(members[1:])}]]", flush=True)
+
     host_package = [] if args.no_host_package else list(rungs_by_codec)
     # A worker running an OLDER workflow packages regardless of the plan key, so
     # its pkg activities would announce over rows this process is driving live.
@@ -1347,6 +1461,11 @@ def run_temporal(args: argparse.Namespace) -> int:
                              else ladder_partial_duration(ladder_def)),
         "codecs": {c: {"two_pass": two_pass[c],
                        "extra_args": ladder_extra_args(ladder_def, c),
+                       # Bands of rungs that share one decode. Read with
+                       # .get by the workflow, so a plan from an older
+                       # orchestrator (no key) reads as "group nothing" — the
+                       # pre-#317 behaviour.
+                       "groups": groups.get(c, []),
                        "rungs": [_rung_dict(c, r, _vmaf_ests) for r in rr]}
                    for c, rr in rungs_by_codec.items()},
     }
@@ -1538,6 +1657,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "host packaging gives up, Temporal's retry: a run whose "
                         "packaging keeps failing can be re-run against the same "
                         "--job-prefix with this set, and the chunks are reused.")
+    p.add_argument("--group-budget", type=float, default=0.0,
+                   dest="group_budget",
+                   help="share one decode per chunk across bands of rungs whose "
+                        "summed MEGAPIXELS fit this budget (#317). 0 (default) "
+                        "keeps one ffmpeg per rung. A band's saving is one "
+                        "decode per extra member and its cost scales with "
+                        "resolution, so the bands come out UNEQUAL: a couple of "
+                        "big rungs, many small ones. Rungs above "
+                        f"{_GROUP_MAX_HEIGHT}p are never grouped.")
     p.add_argument("--no-prefetch", action="store_true", dest="no_prefetch",
                    help="don't download chunks as they finish encoding; leave "
                         "every object to the one burst at the start of "
@@ -1575,7 +1703,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--backend", choices=("temporal",), default="temporal")
     p.add_argument("--temporal-address", default="127.0.0.1:7233",
                    dest="temporal_address")
-    p.add_argument("--temporal-task-queue", default="encode",
+    # Defaults to the ENV, not to the literal "encode". The Go server passes
+    # TEMPORAL_TASK_QUEUE into this container and the workers read the same var,
+    # so a hardcoded default meant that changing the queue moved the server and
+    # every worker while the ORCHESTRATOR kept starting workflows on "encode" —
+    # silently, since both queues exist and each side succeeds. It only stayed
+    # invisible because everything uses the default.
+    p.add_argument("--temporal-task-queue",
+                   default=os.environ.get("TEMPORAL_TASK_QUEUE") or "encode",
                    dest="temporal_task_queue")
     return p
 

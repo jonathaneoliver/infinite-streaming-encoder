@@ -388,6 +388,7 @@ def run_ffmpeg_with_progress(
     pct_lo: float = 0.0,
     pct_hi: float = 100.0,
     terminal: bool = True,
+    extra_stage_keys: "list[str] | None" = None,
 ) -> None:
     """Run ffmpeg with `-progress pipe:1` appended and emit live STAGE updates.
 
@@ -405,8 +406,20 @@ def run_ffmpeg_with_progress(
     different channel (stdout → Python → emit_stage), so enabling
     -stats doesn't double-report anything.
 
+    `extra_stage_keys` mirrors every update to further rows (#317). One ffmpeg
+    can produce SEVERAL rungs from a shared decode, and the chunk grid has a row
+    per rung — reporting against one key would leave the rest of the group blank
+    for the whole encode, so a working grouped job would read as a stalled one.
+    The mirrored rows are driven by the same bytes, which is honest: they finish
+    together because they ARE one process.
+
     Raises `subprocess.CalledProcessError` if ffmpeg exits non-zero.
     """
+    keys = [stage_key, *(extra_stage_keys or [])]
+
+    def _emit(status: str, pct: float) -> None:
+        for k in keys:
+            emit_stage(k, status, pct)
     full_cmd = [*cmd, "-progress", "pipe:1", "-stats_period", _FFMPEG_STATS_PERIOD]
 
     # Log the EXACT argv, shell-quoted so it can be pasted and re-run verbatim.
@@ -434,7 +447,7 @@ def run_ffmpeg_with_progress(
     def _scale(p: float) -> float:
         return pct_lo + max(0.0, min(100.0, p)) / 100.0 * (pct_hi - pct_lo)
 
-    emit_stage(stage_key, "running", pct_lo)
+    _emit("running", pct_lo)
 
     proc = subprocess.Popen(
         full_cmd,
@@ -459,7 +472,7 @@ def run_ffmpeg_with_progress(
                 percent = (out_us / (duration_s * 1_000_000.0)) * 100.0
                 now = time.monotonic()
                 if now - last_emit >= _MIN_EMIT_INTERVAL_S:
-                    emit_stage(stage_key, "running", _scale(percent))
+                    _emit("running", _scale(percent))
                     last_emit = now
             elif key == "progress" and value == "end":
                 break
@@ -467,10 +480,10 @@ def run_ffmpeg_with_progress(
         rc = proc.wait()
 
     if rc != 0:
-        emit_stage(stage_key, "failed", pct_lo)
+        _emit("failed", pct_lo)
         raise subprocess.CalledProcessError(rc, full_cmd)
 
     # terminal → the stage is complete (done at pct_hi, normally 100); otherwise
     # this ffmpeg step is a mid-stage segment, so just advance to pct_hi and let
     # the caller emit the final "done" after its remaining work (e.g. upload).
-    emit_stage(stage_key, "done" if terminal else "running", pct_hi)
+    _emit("done" if terminal else "running", pct_hi)

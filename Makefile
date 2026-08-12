@@ -219,6 +219,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  py pkgfetch    '; \
 	if out=$$(python3 scripts/test_package_fetch.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py groupenc    '; \
+	if out=$$(python3 scripts/test_group_encode.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py prefetch    '; \
 	if out=$$(python3 scripts/test_prefetch.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
@@ -1450,6 +1453,12 @@ export FLEET_VERSION_PY
 # is a plain HTTP client, so nothing but python3 is required on this side.
 # `make smoke` and `make oobe` both drive it — they each used to hand-roll the
 # same curl-and-poll block, with subtly different failure handling.
+# Extra encoder_cli flags for `make smoke`, so a variant of the pipeline can be
+# smoked without editing this file (e.g. SMOKE_ARGS=--group-rungs). Empty by
+# default: the smoke's job is the DEFAULT path, and a knob that changed it
+# silently would make every future PASS mean something different.
+SMOKE_ARGS ?=
+
 ENCODE_CLI = PYTHONPATH=scripts python3 -m infinite_streaming_encoder.encoder_cli
 
 encode:               ## submit an encode from the CLI: make encode ARGS="clip.mp4 --target cloud --wait" (--help for the full option list)
@@ -1504,6 +1513,7 @@ smoke: reject-stale-target require-paths build   ## end-to-end smoke: tiny clip 
 	@echo ">>> [smoke] submitting encode (h264, 720p, 12s chunks) + waiting (timeout ~300s)..."
 	@$(ENCODE_CLI) --server http://localhost:$(PORT) \
 	    smoke.mp4 --target local --codec h264 --max-res 720p --chunk-duration 12 \
+	    $(SMOKE_ARGS) \
 	    --wait --timeout 300 || { echo '>>> SMOKE FAIL: encode did not finish'; exit 1; }
 	@d=$$(ls -d $(OUTPUT_DIR)/smoke_p200*h264* 2>/dev/null | head -1); \
 	 if [ -n "$$d" ] && ls "$$d"/*.m3u8 >/dev/null 2>&1; then \

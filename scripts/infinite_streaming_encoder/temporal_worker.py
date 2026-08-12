@@ -417,11 +417,35 @@ class EncodeWorkflow:
         for codec, ci in plan["codecs"].items():
             tp = ci["two_pass"]
             ea = ci.get("extra_args", "")  # per-codec ladder-profile ffmpeg args
-            for r in ci["rungs"]:
+            # Rungs that share ONE decode per chunk (#317), heaviest first, or
+            # [] when the orchestrator did not ask for grouping — and absent
+            # entirely in a plan from an older orchestrator, which reads the
+            # same way. Everything else in this loop is unchanged: a group is
+            # one entry that happens to name several rungs.
+            bands = [[str(x) for x in b] for b in (ci.get("groups") or [])]
+            by_label = {r["label"]: r for r in ci["rungs"]}
+            grouped_labels = {label for b in bands for label in b}
+            solo = [r for r in ci["rungs"] if r["label"] not in grouped_labels]
+            for r in solo:
                 w = (r["height"] * r["height"] * codec_cost.get(codec, 1.0)
                      * (1.8 if tp else 1.0))
                 for c in chunk_plan:
-                    specs.append((w, codec, r, tp, ea, c))
+                    specs.append((w, codec, r, tp, ea, c, None))
+            for band in bands:
+                members = [by_label[label] for label in band if label in by_label]
+                if len(members) < 2:
+                    continue
+                # Scored as the SUM of its members, not the lead's height. A
+                # six-rung job ranked as its cheapest member sorts LAST, and
+                # priority drives dispatch order — on the cloud run that tried
+                # it, the four big rungs finished 28/28 while the grouped ones
+                # sat at 0/28. The sum errs high (they share a decode, so the
+                # group is cheaper than its parts), which keeps the long pole
+                # early — the property ranking exists for.
+                w = sum(m["height"] * m["height"] * codec_cost.get(codec, 1.0)
+                        * (1.8 if tp else 1.0) for m in members)
+                for c in chunk_plan:
+                    specs.append((w, codec, members[0], tp, ea, c, members))
         specs.sort(key=lambda s: s[0], reverse=True)  # most expensive first
         # Enqueue order alone doesn't hold — Temporal doesn't guarantee FIFO
         # dispatch even on a single partition (#96/#99), so cheap chunks leak
@@ -437,7 +461,7 @@ class EncodeWorkflow:
             for idx, wv in enumerate(distinct_w)
         }
         chunk_acts = []
-        for _w, codec, r, tp, ea, c in specs:
+        for _w, codec, r, tp, ea, c, members in specs:
             i = c["index"]
             args = ["variant", "--codec", codec, "--label", r["label"],
                     "--width", str(r["width"]), "--height", str(r["height"]),
@@ -474,7 +498,17 @@ class EncodeWorkflow:
             # (124% / 0.25x), so local-dist encoded apple-uniq-live-xs with a 2.5x
             # looser buffer than the profile specifies and delivered ~25% more
             # bits than the same rung on cloud (#167).
+            # The whole group, lead included, in the order the orchestrator
+            # chose. Order is load-bearing across two passes: AV1's stats file
+            # is keyed by ffmpeg's OUTPUT STREAM INDEX, so pass 2 must list the
+            # branches exactly as pass 1 did. Travels as env rather than a
+            # positional arg for the same reason ENCODE_GROUP does on the cloud
+            # path — an empty value must stay expressible (#176).
+            group_arg = ",".join(
+                f"{m['label']}:{m['width']}:{m['height']}:{m['bitrate']}"
+                for m in (members or []))
             env = {"CHUNK_DURATION_S": str(cd),
+                   "ENCODE_GROUP": group_arg,
                    "TWO_PASS": "1" if tp else "0", "EXTRA_ARGS": ea,
                    "MEASURE_VMAF": "1" if measure_vmaf else "0",
                    "VMAF_PRESCALE": "1" if vmaf_prescale else "0",
