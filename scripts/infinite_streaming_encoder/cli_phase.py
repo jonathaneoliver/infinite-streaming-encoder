@@ -42,7 +42,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from infinite_streaming_encoder.audio import AudioSpec, create_audio
-from infinite_streaming_encoder.chunking import Chunk, DEFAULT_CHUNK_DURATION_S
+from infinite_streaming_encoder.chunking import (
+    Chunk, DEFAULT_CHUNK_DURATION_S, variant_object_name,
+)
 from infinite_streaming_encoder.encode_variants import (
     EncodeContext, concat_chunks, encode_variant, two_pass_for,
 )
@@ -275,6 +277,52 @@ def _download_if_complete(s3_uri: str, dst: Path,
     except (OSError, ValueError):
         return False
     return recorded == dst.stat().st_size
+
+
+def _link_prefetched(dst: Path) -> bool:
+    """Satisfy `dst` from ENCODER_PREFETCH_DIR if a VERIFIED copy is there.
+
+    The orchestrator downloads each chunk as it learns the chunk finished
+    encoding, so by the time this phase runs most of its inputs are already on
+    this disk (#311). It stages into a sibling directory rather than into
+    ENCODER_WORK_DIR, because _prepare_work_dir rmtree's that on entry — the
+    prefetch would be deleted by the very phase meant to consume it.
+
+    Hardlinked, not copied: both directories are inside the job's own tmp dir,
+    so this is one inode and no bytes. A cross-device link (someone pointing the
+    two at different volumes) falls back to the download rather than silently
+    copying a ladder twice.
+
+    VERIFIED means the `.done` sidecar is present and records this file's exact
+    size — the same invariant _download_if_complete enforces. Presence alone is
+    not enough: a chunk re-encoded after a spot reclaim has different bytes under
+    the same key, and trusting presence would package the stale copy. A stale or
+    half-written prefetch therefore costs one download, never a wrong output.
+
+    Returns False for every unhappy case, which is what makes the prefetch an
+    accelerator rather than a dependency: no directory, no file, no sidecar, a
+    size mismatch or any OS error and the caller downloads exactly as it did
+    before this existed.
+    """
+    root = os.environ.get("ENCODER_PREFETCH_DIR", "")
+    if not root:
+        return False
+    src = Path(root) / dst.name
+    marker = src.with_suffix(src.suffix + ".done")
+    try:
+        if not (src.is_file() and marker.is_file()):
+            return False
+        if int(marker.read_text().strip()) != src.stat().st_size:
+            return False
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.unlink(missing_ok=True)
+        os.link(src, dst)
+        dst_marker = dst.with_suffix(dst.suffix + ".done")
+        dst_marker.unlink(missing_ok=True)
+        os.link(marker, dst_marker)
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _cache_keep() -> int:
@@ -806,8 +854,7 @@ def phase_variant(args: argparse.Namespace) -> int:
     # spot-reclaim retry that got far enough to upload — reuse it and skip both
     # the fetch and the encode. S3 only exposes complete objects, so existence
     # == a valid finished output. FORCE_REENCODE overrides.
-    ci_suffix = "" if args.chunk_index is None else f"_chunk{args.chunk_index:03d}"
-    out_name = f"{args.codec}_{args.label}{ci_suffix}.mp4"
+    out_name = variant_object_name(args.codec, args.label, args.chunk_index)
     out_uri = args.s3_out.rstrip("/") + f"/{out_name}"
     ci = "" if args.chunk_index is None else f":chunk{args.chunk_index}"
     if not _env_flag("FORCE_REENCODE") and _s3_exists(out_uri):
@@ -1333,23 +1380,31 @@ def phase_package_all(args: argparse.Namespace) -> int:
 
     wanted: list[tuple[str, Path, str | None]] = []  # (uri, dst, whole-label)
     for label in sorted(whole_labels):
-        wanted.append((args.s3_variants.rstrip("/") + f"/{args.codec}_{label}.mp4",
-                       work / f"{args.codec}_{label}.mp4", label))
+        whole = variant_object_name(args.codec, label)
+        wanted.append((args.s3_variants.rstrip("/") + f"/{whole}",
+                       work / whole, label))
     for base in chunked_bases:
         for i in range(chunk_last[base] + 1):
-            name = f"{args.codec}_{base}_chunk{i:03d}.mp4"
+            name = variant_object_name(args.codec, base, i)
             wanted.append((args.s3_variants.rstrip("/") + f"/{name}", work / name, None))
 
     total_objs = len(wanted)
     got = {"n": 0, "pct": -1.0}
+    reused = {"n": 0, "bytes": 0}
     lock = threading.Lock()
     complete: dict[str, bool] = {}
 
     def _fetch(item: tuple[str, Path, str | None]) -> None:
         uri, dst, _label = item
-        # progress=False: a per-object byte bar from 32 threads at once is noise,
-        # and the phase already reports its own 0->90% below.
-        ok = _download_if_complete(uri, dst, client=s3c, progress=False)
+        ok = _link_prefetched(dst)
+        if ok:
+            with lock:
+                reused["n"] += 1
+                reused["bytes"] += dst.stat().st_size
+        else:
+            # progress=False: a per-object byte bar from 32 threads at once is
+            # noise, and the phase already reports its own 0->90% below.
+            ok = _download_if_complete(uri, dst, client=s3c, progress=False)
         with lock:
             complete[uri] = ok
             got["n"] += 1
@@ -1365,10 +1420,26 @@ def phase_package_all(args: argparse.Namespace) -> int:
             fut.result()  # surface the first failure rather than silently skipping
     dt_fetch = time.monotonic() - t_fetch
     fetched_bytes = sum(d.stat().st_size for _u, d, _l in wanted if d.is_file())
+    # WORDING IS A CONTRACT: cli_batch._PKG_FETCH_RE scans this line to recover
+    # the egress a host-packaged run caused. Reword it and the run reports zero
+    # egress, which makes host packaging look like a saving rather than the
+    # trade it is. scripts/test_host_package.py pins the two together.
+    #
+    # It deliberately still counts EVERY object, including the prefetched ones:
+    # those bytes crossed the same link and were billed the same way, just
+    # earlier. Netting them out here would move the cost off the report rather
+    # than off the bill.
     print(f"[phase package-all] fetched {total_objs} objects, "
           f"{fetched_bytes / 1e6:.0f} MB in {dt_fetch:.0f}s "
           f"({fetched_bytes / 1e6 / max(dt_fetch, 0.001):.1f} MB/s, "
           f"{fetch_workers} threads)", flush=True)
+    # The saving, on its own line so the one above keeps its meaning. This is
+    # the number that says whether the prefetch is working: at 100% the fetch
+    # above is hardlinks and its duration is the tail this removed.
+    if reused["n"]:
+        print(f"[phase package-all] {reused['n']}/{total_objs} objects "
+              f"({reused['bytes'] / 1e6:.0f} MB) came from the prefetch — "
+              f"downloaded during the encode, not after it", flush=True)
 
     # A whole variant that didn't land is simply absent (it may not exist for
     # this codec); a missing CHUNK is a real error, because the SFN has already
@@ -1379,7 +1450,7 @@ def phase_package_all(args: argparse.Namespace) -> int:
     for base in chunked_bases:
         n = chunk_last[base] + 1
         for i in range(n):
-            name = f"{args.codec}_{base}_chunk{i:03d}.mp4"
+            name = variant_object_name(args.codec, base, i)
             uri = args.s3_variants.rstrip("/") + f"/{name}"
             if not complete.get(uri):
                 print(f"error: chunk {name} missing/incomplete under "
@@ -1394,7 +1465,7 @@ def phase_package_all(args: argparse.Namespace) -> int:
         print(f"[phase package-all] joined {n} chunk(s) -> "
               f"{args.codec}_{base}.mp4", flush=True)
         for i in range(n):
-            name = f"{args.codec}_{base}_chunk{i:03d}.mp4"
+            name = variant_object_name(args.codec, base, i)
             (work / name).unlink(missing_ok=True)
             (work / f"{name}.done").unlink(missing_ok=True)
         labels_present.append(base)

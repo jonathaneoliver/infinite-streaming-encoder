@@ -158,3 +158,25 @@ def chunk_count(
     if content_duration_s <= 0:
         raise ValueError(f"content_duration_s must be positive, got {content_duration_s}")
     return max(1, math.ceil(content_duration_s / chunk_duration_s - _EPS))
+
+
+def variant_object_name(codec: str, label: str,
+                        chunk_index: int | None = None) -> str:
+    """`{codec}_{label}[_chunkNNN].mp4` — the name one variant or chunk is
+    written to staging under, and read back from.
+
+    Lives here rather than in `cli_phase` because it is a CONTRACT between
+    processes that never talk to each other: the variant phase writes it, the
+    packaging phase reads it, and (since the prefetch) the orchestrator pulls it
+    down while the encode is still running. A second speller of this name is the
+    exact shape of bug this repo keeps paying for — the telemetry queue name,
+    the staging prefix, `host_package` — and it would fail the same way, with no
+    error on either side: the prefetch would quietly cache nothing, the fetch
+    would quietly download everything, and the only symptom would be a
+    saving that never arrived.
+
+    The index is zero-padded to three digits so a lexical listing of a
+    100+-chunk variant is also chunk order.
+    """
+    ci = "" if chunk_index is None else f"_chunk{chunk_index:03d}"
+    return f"{codec}_{label}{ci}.mp4"

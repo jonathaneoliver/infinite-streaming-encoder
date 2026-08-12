@@ -60,11 +60,12 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import replace as dc_replace
 from pathlib import Path
 
-from infinite_streaming_encoder.chunking import plan_chunks
+from infinite_streaming_encoder.chunking import plan_chunks, variant_object_name
 from infinite_streaming_encoder.encode_variants import _coalesce_runt_tail, variant_stage_key
 from infinite_streaming_encoder.ffprobe import ProbeError, probe
 from infinite_streaming_encoder.ladder import (
@@ -155,6 +156,118 @@ def _progress_cb(stage_key: str, total_bytes: int):
 # (_HOST_SEEN, host_marker, ENCODER-HOST), which is a different question from
 # "which PROCESS ran this phase".
 _SELF_RUN_STAGES: set = set()
+
+
+# The running prefetcher, or None. Module-level for the same reason
+# _SELF_RUN_STAGES is: the completion signal is read deep inside the progress
+# poll, which has no business taking a downloader as a parameter.
+_PREFETCH: "_ChunkPrefetcher | None" = None
+
+
+class _ChunkPrefetcher:
+    """Download each chunk as it finishes encoding, so packaging doesn't (#311).
+
+    Packaging pulls the whole ladder out of staging in one burst AFTER the last
+    chunk lands — 3.4-3.5 GB, 41-64s, half to two thirds of the package phase,
+    all of it serial with nothing. The bytes are ready long before that: the
+    first chunk of a 40-minute run is complete about a minute in.
+
+    So this is not a new signal, it is the existing one used earlier. The
+    progress poll already learns of every completion from Temporal history; each
+    one is handed here and fetched in the background while the rest of the
+    ladder is still encoding.
+
+    THE STREAM IS AN ACCELERATOR, NEVER AN INVENTORY. phase_package_all still
+    builds its fetch list by LISTING the staging prefix, and still fails if an
+    expected chunk is absent. A completion this never hears about, a download
+    that fails, a prefetcher that dies with the first exception — each costs one
+    download later and nothing else. That is why every error here is swallowed:
+    there is no failure mode worth failing a run for, and the alternative is a
+    best-effort optimisation that can take down an encode.
+
+    Only the codecs THIS process will package are prefetched. A codec packaged
+    in a worker is fetched by that worker, from inside the cluster, and pulling
+    it here would be pure waste.
+    """
+
+    def __init__(self, bucket: str, work_prefix: str, dest_root: Path,
+                 codecs: "set[str]", workers: int = 8) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        self._bucket = bucket
+        self._prefix = work_prefix.strip("/")
+        self._root = dest_root
+        self._codecs = codecs
+        self._seen: set = set()
+        self._lock = threading.Lock()
+        self.fetched = 0
+        self.bytes = 0
+        self.failed = 0
+        # One client for the pool. botocore's default connection pool is 10, so
+        # a wider pool than that would queue on sockets rather than run.
+        import boto3
+        from botocore.config import Config
+        self._s3 = boto3.client(
+            "s3",
+            endpoint_url=os.environ["S3_ENDPOINT_URL"],
+            region_name=os.environ.get("AWS_REGION", "us-east-1"),
+            config=Config(s3={"addressing_style": "path"},
+                          max_pool_connections=workers + 4),
+        )
+        self._pool = ThreadPoolExecutor(max_workers=workers,
+                                        thread_name_prefix="prefetch")
+
+    def dir_for(self, codec: str) -> Path:
+        """Sibling of the packaging work dir, never inside it: cli_phase's
+        _prepare_work_dir rmtree's ENCODER_WORK_DIR on entry, so a prefetch
+        staged there would be deleted by the phase meant to consume it."""
+        return self._root / f".prefetch-{codec}"
+
+    def note_activity_done(self, activity_id: str) -> None:
+        """Called for every activity Temporal reports COMPLETED. Non-chunk ids
+        are ignored here — the mezzanine and audio are single objects packaging
+        fetches once, and there is nothing to overlap them with."""
+        m = _ENC_ACT_RE.match(activity_id)
+        if not m:
+            return
+        codec, label, index = m.group(1), m.group(2), int(m.group(3))
+        if codec not in self._codecs:
+            return
+        name = variant_object_name(codec, label, index)
+        with self._lock:
+            if name in self._seen:
+                return          # at-least-once delivery, or a re-read of history
+            self._seen.add(name)
+        self._pool.submit(self._fetch, codec, name)
+
+    def _fetch(self, codec: str, name: str) -> None:
+        dest = self.dir_for(codec)
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            # The .done sidecar FIRST, and the object second: the consumer
+            # accepts a prefetched object only when the sidecar records its
+            # exact size, so a half-written object simply reads as a miss.
+            self._s3.download_file(self._bucket, f"{self._prefix}/{name}.done",
+                                   str(dest / f"{name}.done"))
+            self._s3.download_file(self._bucket, f"{self._prefix}/{name}",
+                                   str(dest / name))
+            size = (dest / name).stat().st_size
+        except Exception:  # noqa: BLE001 — see the class docstring
+            with self._lock:
+                self.failed += 1
+            return
+        with self._lock:
+            self.fetched += 1
+            self.bytes += size
+
+    def close(self) -> None:
+        """Stop fetching. Called before packaging starts — anything still in
+        flight would be racing the consumer for the same file."""
+        self._pool.shutdown(wait=True)
+        if self.fetched or self.failed:
+            print(f"[dist] prefetched {self.fetched} chunk(s), "
+                  f"{self.bytes / 1e6:.0f} MB during the encode"
+                  + (f" ({self.failed} deferred to packaging)"
+                     if self.failed else ""), flush=True)
 
 
 def _emit_self_run_host(activity_id: str) -> None:
@@ -284,7 +397,8 @@ def _codec_dir(output_stem: str, codec: str, output_tag: str) -> str:
 
 
 def _package_on_host(codec: str, s3_variants: str, out_dir: Path, dest: Path,
-                     segment_duration: str, partial_duration: str) -> int:
+                     segment_duration: str, partial_duration: str,
+                     prefetch_dir: Path | None = None) -> int:
     """Package one codec HERE, straight into the run's output dir.
 
     The tail-side twin of _build_mezzanine_on_host, and the local twin of
@@ -324,6 +438,12 @@ def _package_on_host(codec: str, s3_variants: str, out_dir: Path, dest: Path,
     # ENCODER_WORK_DIR on entry, so a shared one would delete a sibling codec's
     # inputs — and only ever on a multi-codec run.
     env["ENCODER_WORK_DIR"] = str(work)
+    # Where the prefetch put this codec's chunks (#311). A sibling of the work
+    # dir, so the handoff is a hardlink rather than a copy — and so cli_phase's
+    # rmtree of ENCODER_WORK_DIR on entry cannot delete it. Unset when nothing
+    # prefetched, which is exactly the pre-#311 behaviour.
+    if prefetch_dir is not None:
+        env["ENCODER_PREFETCH_DIR"] = str(prefetch_dir)
     # Read from the workflow plan, not this process's environment, so the
     # packaging cannot disagree with the timing the chunks were encoded to. A
     # segment mismatch produces playlists whose boundaries do not land on the
@@ -352,10 +472,14 @@ def _package_on_host(codec: str, s3_variants: str, out_dir: Path, dest: Path,
             print(line.rstrip("\n"), flush=True)
         rc = proc.wait()
     finally:
-        # Before the rc check, and before anything is moved: this sits inside
+        # Before the rc check, and before anything is moved: these sit inside
         # $TMP_DIR/<jobID>/, every top-level entry of which moveTmpToOutput
-        # renames into OUTPUT_DIR.
+        # renames into OUTPUT_DIR. The prefetch dir goes the same way and for
+        # the same reason — its contents are hardlinks, so removing it here
+        # frees nothing until the work dir goes too, and both go together.
         shutil.rmtree(work, ignore_errors=True)
+        if prefetch_dir is not None:
+            shutil.rmtree(prefetch_dir, ignore_errors=True)
     if rc != 0:
         raise RuntimeError(
             f"host packaging failed for {codec} (exit {rc}). The encoded chunks "
@@ -844,6 +968,16 @@ async def _emit_temporal_progress(handle, EventType, emitted: dict, client=None)
             aid = sched.get(a.scheduled_event_id)
             if aid:
                 states[aid] = "done"
+                # Start pulling this chunk NOW, while the rest of the ladder is
+                # still encoding, instead of leaving all 336 to one burst after
+                # the last one lands (#311). Best-effort by construction: see
+                # _ChunkPrefetcher. Guarded on `emitted` so re-reading history
+                # each poll does not re-announce a chunk to it every second —
+                # the prefetcher dedupes too, but not paying for the call is
+                # cheaper than deduping it.
+                if _PREFETCH is not None and emitted.get(f"pf:{aid}") is None:
+                    emitted[f"pf:{aid}"] = True
+                    _PREFETCH.note_activity_done(aid)
                 # Relay the markers the worker collected (#141). Without this
                 # the VMAF audit runs on every chunk, costs real time, and is
                 # discarded — the Go scanner tails the ORCHESTRATOR, and workers
@@ -1121,6 +1255,14 @@ def run_temporal(args: argparse.Namespace) -> int:
     # Suppress them the same way the host-built mezzanine is suppressed.
     _SELF_RUN_STAGES.update(f"pkg-{c}" for c in host_package)
 
+    # Pull each chunk down as it finishes rather than all of them after the last
+    # one does (#311). Only for codecs THIS process packages — a worker-packaged
+    # codec is fetched from inside the cluster by that worker.
+    global _PREFETCH
+    if host_package and not args.no_prefetch:
+        _PREFETCH = _ChunkPrefetcher(bucket, f"{prefix}/work",
+                                     Path(args.output_dir), set(host_package))
+
     _emit_plan(rungs_by_codec,
                {(c, r.label): n_chunks for c, rr in rungs_by_codec.items() for r in rr},
                info.has_audio,
@@ -1302,6 +1444,11 @@ def run_temporal(args: argparse.Namespace) -> int:
         return 130
     print(f"[dist] workflow result: {result}", flush=True)
 
+    # Stop fetching before anything consumes what was fetched: an in-flight
+    # download would be racing the packaging phase for the same file.
+    if _PREFETCH is not None:
+        _PREFETCH.close()
+
     out_dir = Path(args.output_dir)
     delivered = []
     for codec in rungs_by_codec:
@@ -1311,7 +1458,8 @@ def run_temporal(args: argparse.Namespace) -> int:
                 n = _package_on_host(codec, f"s3://{bucket}/{prefix}/work",
                                      out_dir, dest,
                                      str(plan.get("segment_duration", "")),
-                                     str(plan.get("partial_duration", "")))
+                                     str(plan.get("partial_duration", "")),
+                                     _PREFETCH.dir_for(codec) if _PREFETCH else None)
             except RuntimeError as e:
                 print(f"error: {e}", file=sys.stderr)
                 return 1
@@ -1390,6 +1538,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "host packaging gives up, Temporal's retry: a run whose "
                         "packaging keeps failing can be re-run against the same "
                         "--job-prefix with this set, and the chunks are reused.")
+    p.add_argument("--no-prefetch", action="store_true", dest="no_prefetch",
+                   help="don't download chunks as they finish encoding; leave "
+                        "every object to the one burst at the start of "
+                        "packaging (the pre-#311 behaviour). An escape hatch "
+                        "for a box where the extra concurrent transfers would "
+                        "compete with the encodes themselves.")
     p.add_argument("--keep-staging", action="store_true", dest="keep_staging",
                    help="don't delete this job's MinIO staging after the outputs "
                         "download (default: reclaim it — see dist_staging)")
