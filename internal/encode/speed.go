@@ -255,8 +255,32 @@ func (s *EncodeSpeedStore) Update(machine, codec string, height int, twoPass boo
 // to the floor (most parallel); fast variants reach the whole clip (one chunk,
 // no joins).
 func dynamicChunkSeconds(speeds *EncodeSpeedStore, codec string, height int, twoPass bool, preset string, fps int, clipDurationS float64) float64 {
+	return dynamicChunkSecondsAt(dynamicTargetWallSeconds, speeds, codec, height, twoPass, preset, fps, clipDurationS)
+}
+
+// dynamicChunkSecondsAt is dynamicChunkSeconds with the wall-time target passed
+// in rather than taken from the constant. The cloud planner raises it when the
+// whole job's chunk count would not fit one Step Functions history (#316); every
+// other caller wants the default and should use dynamicChunkSeconds.
+//
+// Note what does NOT move with the target: dynamicMinChunkSeconds stays both the
+// floor and the quantum. Raising the floor alongside was tried and is worse at
+// the same fit — the floor binds on the SLOWEST rungs, which are already the
+// longest chunks in the run, so lifting it grows the atomic long pole to save
+// chunks that are not where the count is. Raising only the target lengthens the
+// rungs with room to spare first, and reaches the same chunk count with a
+// shorter worst chunk (measured in TestScalingTheFloorTooIsWorseAtTheSameFit:
+// 1361s against 1701s on a 4h HEVC ladder).
+//
+// It is not free either way: a target big enough to fit 4h of HEVC does lift the
+// slowest rungs off the floor eventually, so the makespan floor rises. That is
+// the trade #316 makes knowingly, and chunkBudgetLine states it in the job log.
+func dynamicChunkSecondsAt(targetWallS float64, speeds *EncodeSpeedStore, codec string, height int, twoPass bool, preset string, fps int, clipDurationS float64) float64 {
+	if targetWallS <= 0 {
+		targetWallS = dynamicTargetWallSeconds
+	}
 	// Cloud-batch fans onto Graviton, so size chunks by graviton throughput.
-	c := dynamicTargetWallSeconds * speeds.Speed("graviton", codec, height, twoPass, preset, fps)
+	c := targetWallS * speeds.Speed("graviton", codec, height, twoPass, preset, fps)
 	// Quantize to a whole multiple of the minimum (12/24/36/…), floored at the
 	// minimum. Keeps sizes clean and segment-aligned (12 | 6).
 	c = math.Round(c/dynamicMinChunkSeconds) * dynamicMinChunkSeconds

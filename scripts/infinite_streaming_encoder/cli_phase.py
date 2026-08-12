@@ -44,7 +44,7 @@ from pathlib import Path
 from infinite_streaming_encoder.audio import AudioSpec, create_audio
 from infinite_streaming_encoder.chunking import Chunk, DEFAULT_CHUNK_DURATION_S
 from infinite_streaming_encoder.encode_variants import (
-    EncodeContext, concat_chunks, encode_variant,
+    EncodeContext, concat_chunks, encode_variant, two_pass_for,
 )
 from infinite_streaming_encoder.ffprobe import probe
 from infinite_streaming_encoder.hls import (
@@ -842,13 +842,18 @@ def phase_variant(args: argparse.Namespace) -> int:
         # for every variant of a run; defaults match ladder.py when unset.
         maxrate_percent=int(_env_num("MAXRATE_PERCENT", DEFAULT_MAXRATE_PERCENT)),
         bufsize_multiplier=_env_num("BUFSIZE_MULT", BUFSIZE_MULTIPLIER),
-        # Two-pass is HEVC-only and set per-variant: the Step Function
-        # injects TWO_PASS via containerOverrides only on HEVC variant jobs
-        # (see buildSFNInput — H264 variants get TWO_PASS=false), and the
-        # --two-pass flag covers direct invocation of this phase. This
-        # worker encodes a single codec, so the env already carries the
-        # codec-correct decision; feeding it hevc_two_pass is a no-op for a
-        # non-HEVC job (encode_variants gates on codec == "hevc").
+        # Two-pass is set per-variant: the Step Function injects TWO_PASS via
+        # containerOverrides from the ladder profile's per-codec pass count, and
+        # the --two-pass flag covers direct invocation of this phase. This worker
+        # encodes a single codec, so the env already carries the codec-correct
+        # decision.
+        #
+        # Set alongside `passes` below, which supersedes it — this field is the
+        # pre-profile fallback and survives only for a caller that builds a
+        # context without one. It is NOT "HEVC-only, so a no-op for h264": that
+        # reading is what #314 was, back when the Step Function really did send
+        # TWO_PASS=false for every h264 variant. It sends the profile's count now,
+        # and the profile defaults to 2 for every codec.
         hevc_two_pass=args.two_pass or _env_flag("TWO_PASS"),
         # Per-codec pass count for THIS variant's codec. TWO_PASS is already
         # per-variant (the upstream resolved it from the profile's passes), so
@@ -1052,7 +1057,13 @@ def phase_variant(args: argparse.Namespace) -> int:
     # workers are all Graviton, so "graviton"); preset + fps because encode time
     # scales with both. The Go server's Manager.learnSpeed consumes it.
     content_s = (chunk.end_s - chunk.start_s) if chunk is not None else info.duration_s
-    two_pass = 1 if (args.codec == "hevc" and ctx.hevc_two_pass) else 0
+    # Ask encode_variants what it actually ran. This line used to re-derive the
+    # answer as `args.codec == "hevc" and ctx.hevc_two_pass`, which was correct
+    # only while h264 was single-pass; once the ladder default moved to 2 for
+    # every codec, every two-pass h264 encode reported two_pass=0 and filed its
+    # speed under a key the Go planner never reads (#314). The measurement and
+    # the label must come from one place.
+    two_pass = 1 if two_pass_for(ctx, args.codec) else 0
     machine = os.environ.get("WORKER_LABEL") or "graviton"
     fps_i = max(1, round(float(info.fps)))
     if encode_wall_s > 0 and content_s > 0:

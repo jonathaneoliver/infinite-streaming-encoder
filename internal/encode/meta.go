@@ -249,9 +249,9 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 	// not for keeping the omission. Left as-is for now because nothing reads it
 	// yet; #287 is where that changes.
 	defaultPasses := 2
-	effectivePasses := def.passesFor(codec)
-	if cfg.HevcSinglePass && codec == "hevc" {
-		effectivePasses = 1
+	effectivePasses := 1
+	if def.twoPassFor(codec, cfg.HevcSinglePass) {
+		effectivePasses = 2
 	}
 	metaPasses := 0
 	if effectivePasses != defaultPasses {

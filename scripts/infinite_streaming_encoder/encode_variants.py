@@ -60,9 +60,14 @@ class EncodeContext:
     # "bufsize_multiplier" flows in here; default 0.25x (tight VBV) matches
     # smashing dev — keeps avg/peak consistent across 1s/2s/6s segmentations.
     bufsize_multiplier: float = BUFSIZE_MULTIPLIER
-    # Two-pass software encode for libx265 (ports smashing #965). Two-pass
-    # is a *codec* property, not a global toggle: HEVC (libx265) needs it,
-    # H264 (libx264) does not, and AV1 (libsvtav1) has no two-pass path.
+    # Two-pass software encode for libx265 (ports smashing #965). Two-pass is a
+    # *codec* property, not a global toggle — but the split is no longer the one
+    # this comment used to draw ("HEVC needs it, H264 does not, and AV1 has no
+    # two-pass path"). All three have one now: x264/x265 via `:pass=N:stats=`,
+    # SVT-AV1 via ffmpeg's generic `-pass N -passlogfile` (see build_ffmpeg_cmd),
+    # and the ladder profile decides per codec rather than the codec deciding for
+    # itself. What survives is the reason it is per-codec at all: the gain
+    # differs by encoder and by how tight the VBV is.
     #
     # Why HEVC needs it: single-pass capped VBR distributes bits with only
     # a lookahead window, so on complex content the achieved average falls
@@ -84,13 +89,17 @@ class EncodeContext:
     # internal/encode/ladder_store.go, which owns the decision.
     #
     # LEGACY fallback for the two-pass decision when `passes` (below) is unset —
-    # only meaningful for HEVC. New code sets `passes` instead.
+    # only meaningful for HEVC. New code sets `passes` instead. Read it through
+    # two_pass_for(), never directly: this branch has not described the default
+    # configuration since h264 went two-pass, and #314 is what reading it
+    # directly costs.
     hevc_two_pass: bool = True
     # passes maps a codec to its pass count (1 or 2) — the ladder profile's
-    # per-codec `passes` (defaults h264:1, hevc:2, av1:2). This is the source of
-    # truth for two-pass; when set it supersedes hevc_two_pass and applies to
-    # ANY codec (HEVC, AV1, even H264). A per-codec map because a local run
-    # reuses one context across all codecs; a variant job carries just its own.
+    # per-codec `passes`, which defaults to 2 for EVERY codec (see passesFor in
+    # internal/encode/ladder_store.go and _DEFAULT_PASSES in ladder.py). This is
+    # the source of truth for two-pass; when set it supersedes hevc_two_pass and
+    # applies to ANY codec (HEVC, AV1, and h264). A per-codec map because a local
+    # run reuses one context across all codecs; a variant job carries just its own.
     passes: dict[str, int] | None = None
     # extra_args maps a codec to raw ffmpeg tokens appended after the rung's
     # rate-control block and before the output — the ladder profile's per-codec
@@ -109,6 +118,30 @@ class EncodeContext:
 
 class EncodeError(RuntimeError):
     pass
+
+
+def two_pass_for(ctx: EncodeContext, codec: str) -> bool:
+    """Whether this (context, codec) encodes in two passes.
+
+    The ONE definition. `passes` is the ladder profile's per-codec count and
+    supersedes everything; `hevc_two_pass` is the pre-profile fallback and is
+    only ever consulted when a caller built a context without `passes`.
+
+    Extracted because the encoder and the telemetry each derived this
+    independently and drifted (#314). `encode_variant` used the `passes` branch
+    and ran two passes for h264; `cli_phase`'s ENCODER-SPEED marker used a frozen
+    copy of the `hevc_two_pass` branch and reported one, so 43,021 h264 samples
+    were filed under the 1-pass key while the Go planner read the 2-pass one.
+    Both sides succeeded, neither logged anything, and h264 could not learn a
+    speed no matter how many runs completed.
+
+    Nothing stops a third caller re-deriving it, so the pass count the marker
+    reports is pinned against the pass count the encoder used — see
+    scripts/test_speed_marker_pass.py.
+    """
+    if ctx.passes and codec in ctx.passes:
+        return ctx.passes[codec] == 2
+    return ctx.hevc_two_pass and codec == "hevc"
 
 
 def _variant_path(output_dir: Path, codec: str, label: str) -> Path:
@@ -412,15 +445,7 @@ def encode_variant(
         total_duration_s = chunk.duration_s
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Pass count comes from the ladder profile (ctx.passes; defaults h264:1,
-    # hevc:2, av1:2). Two-pass now applies to ANY codec — HEVC (libx265) and
-    # AV1 (libsvtav1) both need it to hit the target average accurately; H264's
-    # single-pass VBV already lands the average, so it's 1-pass by default.
-    # Falls back to the legacy hevc_two_pass bool when passes is unset.
-    if ctx.passes and codec in ctx.passes:
-        two_pass = ctx.passes[codec] == 2
-    else:
-        two_pass = ctx.hevc_two_pass and codec == "hevc"
+    two_pass = two_pass_for(ctx, codec)
 
     def cmd_for(pass_num: int | None) -> list[str]:
         """This pass's argv, recorded before it runs.

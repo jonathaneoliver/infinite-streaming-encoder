@@ -369,6 +369,64 @@ limit. Before #184 that line was written from the raw string while nothing
 passed it to an encoder, so full-length encodes recorded truncations that never
 happened.
 
+### The whole-job chunk budget (cloud only)
+
+The dynamic chunk selector is **per-variant and stateless** —
+`dynamicChunkSeconds` sizes one rung from its learned speed and knows nothing
+about the rest of the job. The ceiling it lives under is a **whole-job**
+property: 25,000 history events per Step Functions execution, shared by every
+chunk of every rung of every codec in the run.
+
+Nothing connected the two until #316, and the failure mode was the expensive
+one — a 4h HEVC plan sails past submit, launches spot capacity, encodes for
+hours, and dies when the history fills. `budgetedChunkTarget`
+(`internal/encode/chunkbudget.go`) raises the wall-time target until the whole
+plan fits, in a pre-pass before `buildSFNInput`'s per-variant loop. That pre-pass
+is the actual structural change: resolving the rungs and sizing them used to be
+one loop, which made the total unknowable until it was over.
+
+Five things to keep right:
+
+- **It returns the default target untouched whenever the plan already fits**, so
+  every job that works today plans byte-identically. `TestBudgetLeaves-
+  FittingJobsExactlyAsTheyWere` pins the sizes themselves, not just the counts.
+- **It finds the SMALLEST target that fits** — double until something fits, then
+  bisect. Scaling by chunks÷budget and repeating is cheaper and converges in
+  two or three rounds, but overshoots badly: quantising every rung to a 12s grid
+  drops the count faster than the ratio predicts, and a 4h HEVC ladder lands at
+  1,881 chunks against a 2,500 budget. That is a quarter of the run's
+  parallelism given back for nothing, and parallelism is the only currency this
+  spends.
+- **Only when chunking is dynamic.** An explicit `--chunk-duration` is never
+  silently grown to fit — that is #312's job, and failing legibly beats quietly
+  encoding something other than what was asked for.
+- **Scale the TARGET, never the floor.** `dynamicMinChunkSeconds` is both the
+  floor and the quantum, and it binds on the SLOWEST rungs — which are already
+  the longest chunks in the run. Lifting it grows the atomic long pole to save
+  chunks that are not where the count is: measured on a 4h HEVC ladder, the same
+  fit costs a 1701s worst chunk against 1361s for target-only.
+- **The count must come from the same plan that ships.** `plannedChunkCount`
+  calls the same `dynamicChunkSecondsAt` + `planChunks` the build loop calls,
+  because the 12s floor, the 12s quantum, segment tiling and the runt-tail fold
+  each make an arithmetic `clip/chunkSeconds` estimate wrong — in both
+  directions. #312's guard has to use this same join or the two will disagree.
+- **Cloud-only by construction, and that is correct.** `cli_local_dist` plans its
+  own chunks in Python against Temporal, whose limits (51,200 events / 50 MB) are
+  ~3x larger. Do not "fix" the asymmetry.
+
+`sfnEventsPerChunk = 8` is an **estimate** and everything scales by it. Being
+wrong high is the safe direction (fewer chunks than allowed); one
+`get_execution_history` call against a finished execution turns it into a
+measurement, and if the true figure is 6 the budget is 4,166.
+
+This rations against the ceiling rather than lifting it, and the rationing is not
+free: `variantResourcesFor` reserves a flat 2 vCPU for every HEVC chunk because
+x265 tops out around two cores, so for HEVC **chunk count IS the parallelism**.
+Doubling the target roughly halves the peak concurrency the run can use.
+`chunkBudgetLine` states that in the job log, because a run that grows
+13-minute chunks with no explanation reads as the selector misbehaving. #313
+(`Mode: DISTRIBUTED`) is what makes the trade unnecessary.
+
 ### Worker telemetry (`[[ENCODER-*]]` markers)
 
 Every worker reports the same way — a stream of `[[ENCODER-…]]` marker lines —
@@ -823,6 +881,7 @@ Three rules hold this together:
 a pre-#282 package repackages identically, and otherwise walks the `.m4s`. Both
 branches call the same `fragments.parse_segment`, so they cannot disagree.
 - **`version` (worker, fleet view, `run.json`) means ENCODER PAYLOAD, not build** (#248). It is `IMAGE_TAG`, which the Makefile derives as `git log -1 --format=%h -- Dockerfile requirements.txt scripts static` — excluding `internal/` and `cmd/`, while the Dockerfile still copies the Go server binary into the image. Two consequences, both deliberate: a **Go-only change does not move the tag**, so it publishes different image content under the same tag and is invisible to `make fleet-check` by construction; and **rollback is asymmetric** — `make infra-plan IMAGE_TAG=<prev>` restores the encoder payload, not the server binary that shipped in that image (nothing expects it to, since the server is not deployed from the pinned tag). This is the right identity for the question being asked — a chunk's encode behaviour lives in `scripts/`, so two chunks agreeing on `version` ran identical encoder code — but "version" invites a stronger reading than it can support, and someone will eventually chase a server-side skew the tag is correctly refusing to show.
+- **The learned-speed key is a cross-language contract with no schema, and the PASS COUNT is the part that breaks.** A worker prints `[[ENCODER-SPEED … two_pass=N …]]`; Go builds `speedKey` from its own idea of the pass count; `Speed()` is an exact map lookup with **no cross-pass fallback**. So the two agreeing is the entire mechanism, and when they stopped agreeing both sides went on succeeding and logging nothing (#314). h264 wrote `:1:` forever while the planner read `:2:`, so no h264 encode could move the model however many completed, and 43,021 samples piled onto a curve nothing reads. The cause was five copies of one rule — `codec == "hevc" && !hevcSinglePass` — which was correct only while h264 was single-pass and silently wrong the day the ladder default became 2 for every codec. There is now **one definition per language**: `encode_variants.two_pass_for(ctx, codec)` and `LadderDef.twoPassFor(codec, hevcSinglePass)`. Derive it anywhere else and you get the same silent divergence; a grep for `== "hevc" &&` is how you find the next copy. The join is pinned from both ends — `scripts/test_speed_marker_pass.py` checks the marker's label against the argv the encoder actually builds (and that `cli_phase` still *calls* the shared decision, since the bug was an emitter that never did), and `speed_pass_key_test.go` checks that a marker lands in the key the planner reads. Contaminated keys are removed with `scripts/purge_speed_keys.py`, which refuses to run while the server is up: the store is loaded once at startup and rewritten whole on every finished chunk, so a purge underneath a running server is undone by the next one — silently, and looking exactly like it did not work.
 - **A stage's machine comes from `ENCODER-HOST` and from nothing else**, and the machine timeline drops any stage without one (`_laneStages` filters on `s.instance`) — so a phase that fails to say where it ran draws its box as IDLE while it works, and its minutes land in the lane's idle arithmetic (#293). Two emitters, because there are two kinds of phase. A phase in a WORKER is read off Temporal's pending-activity record (`last_worker_identity`) rather than from history: Temporal does not write `ActivityTaskStarted` into history until the activity COMPLETES, so the history reader cannot answer while the answer matters. A phase this process runs itself (the host mezzanine, host packaging) never reaches a worker at all and reports its own box from `WORKER_LABEL` — which is why `buildRunArgs` passes `LOCAL_WORKER_LABEL` into the local-dist orchestrator, and why the two must keep spelling the box the same way or one machine gets two lanes. `_SELF_RUN_STAGES` is excluded from the worker emitter for the same reason it is excluded from the history reader: the workflow still schedules a mezzanine activity that a worker picks up, finds the `.done`, and returns from, and it would otherwise claim a row the master earned. Order matters — the Go handler updates a stage row in place and, unlike `ENCODER-REUSED`, does NOT seed one, so a HOST marker emitted before the plan is dropped in silence.
 - **The pre-flight estimate and the finished run's cost must stay on one basis.** AWS bills the INSTANCE — launch to termination, boot, image pull and the scale-down tail — not the vCPU-time jobs allocate. `_emit_cost_summary` prices the rental; `projectCloudCost` predicts allocation and converts with the one term that reconciles them, `machine = allocated / (1 - idle)`, from `fleetIdleFraction`. Before that term existed the same app quoted ~60% of what it then reported (#237). Two rules keep it honest: the allowance is **shown, never folded in** (an invisible 1.7x next to the Encode button is how the gap survived), and `variantResourcesFor`'s **reservation** must stay on both sides — `unallocated_pct` is defined against reserved vCPU, so pricing measured busy-cores instead would break the calibration and restore the undercount.
 - `$TMP_DIR/spot_samples.json` (`encode.RunSample`) is a **cross-language contract**: Go writes it at every terminal job, `inventory.py`'s `_spot_and_reclaim_stats` reads it **by field name and ignores what it doesn't know**. Adding fields is safe; renaming one silently zeroes the AWS view's spot savings with no error on either side. `idle_pct` there is a lower bound — boxes still alive at run end have their lifetime measured to now — and samples whose `started_at`/`ended_at` overlap another run are excluded from the allowance, because `_emit_machine_rental` counts a concurrent run's time on a shared instance as this run's idle.

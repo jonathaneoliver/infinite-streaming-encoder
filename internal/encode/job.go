@@ -311,7 +311,18 @@ func (m *Manager) computeProgress(job *Job) {
 	if len(job.Stages) == 0 {
 		return
 	}
-	twoPass := !job.Config.HevcSinglePass
+	// Pass count per codec, from the job's ladder profile. Weighting a 2-pass
+	// h264 variant with the 1-pass speed key understates it by ~2x against the
+	// HEVC rungs it shares the bar with, and — since nothing writes that key any
+	// more — pins it to whatever stale value was last there (#314).
+	var ladderDef LadderDef
+	if m.Ladders != nil {
+		name := job.Config.Ladder
+		if name == "" {
+			name = DefaultLadderName
+		}
+		ladderDef, _ = m.Ladders.Get(name)
+	}
 	eff := func(s StageProgress) float64 {
 		switch s.Status {
 		case "done":
@@ -341,8 +352,10 @@ func (m *Manager) computeProgress(job *Job) {
 			if m.Speeds != nil {
 				// Machine-agnostic: relative weights across variants cancel the
 				// per-machine/preset/fps factors, so this need only rank variants
-				// by cost. hevc honours the job's 2-pass setting; others 1-pass.
-				sp = m.Speeds.RelativeSpeed(mm[1], height, mm[1] == "hevc" && twoPass, "", 0)
+				// by cost. The pass count still has to be the one that RAN, since
+				// it selects which learned curve is read.
+				sp = m.Speeds.RelativeSpeed(mm[1], height,
+					ladderDef.twoPassFor(mm[1], job.Config.HevcSinglePass), "", 0)
 			}
 			if sp <= 0 {
 				sp = 0.001
@@ -4210,10 +4223,16 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 // learned encode speed (slow → 12s floor, cheap → whole clip); "whole" → one
 // chunk; a number → that fixed size. clipS==0 (duration unknown) collapses to
 // whole downstream.
-func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, codec string, height int, twoPass bool, preset string, fps int) float64 {
+//
+// targetWallS is the dynamic selector's wall-time target — dynamicTargetWallSeconds
+// normally, raised by budgetedChunkTarget when the whole job's chunk count would
+// not fit one Step Functions history (#316). It is deliberately ignored by the
+// fixed and whole modes: the caller asked for a specific size, and quietly
+// growing it to fit a budget would be a worse answer than #312's explicit refusal.
+func variantChunkSeconds(cfg string, targetWallS, clipS float64, speeds *EncodeSpeedStore, codec string, height int, twoPass bool, preset string, fps int) float64 {
 	switch cfg {
 	case "dynamic", "":
-		return dynamicChunkSeconds(speeds, codec, height, twoPass, preset, fps, clipS)
+		return dynamicChunkSecondsAt(targetWallS, speeds, codec, height, twoPass, preset, fps, clipS)
 	case "whole":
 		if clipS > 0 {
 			return clipS
@@ -4231,7 +4250,7 @@ func variantChunkSeconds(cfg string, clipS float64, speeds *EncodeSpeedStore, co
 // how many chunks, the per-chunk length, and — for the dynamic selector — the
 // speed (learned or seeded) and target that produced it. This is what makes a
 // "why is h264 1080p one whole chunk?" question answerable from the log alone.
-func chunkPlanLine(cfg, codec, label string, height int, twoPass bool, preset string, fps int, speeds *EncodeSpeedStore, chunkS float64, count int, clipS float64) string {
+func chunkPlanLine(cfg string, targetWallS float64, codec, label string, height int, twoPass bool, preset string, fps int, speeds *EncodeSpeedStore, chunkS float64, count int, clipS float64) string {
 	pass := "1-pass"
 	if twoPass {
 		pass = "2-pass"
@@ -4249,8 +4268,15 @@ func chunkPlanLine(cfg, codec, label string, height int, twoPass bool, preset st
 		if n > 0 {
 			src = fmt.Sprintf("learned %.3gx (%d samples)", sp, n)
 		}
-		return fmt.Sprintf("%s [dynamic: %s realtime × %.0fs target → %.0fs, clip %.0fs, min %.0fs]",
-			head, src, dynamicTargetWallSeconds, math.Round(dynamicTargetWallSeconds*sp), clipS, dynamicMinChunkSeconds)
+		// The target is printed rather than read off the constant: a run under a
+		// raised whole-job budget (#316) sizes every variant against a different
+		// number, and a line still quoting 240s would explain the wrong plan.
+		budget := ""
+		if targetWallS > dynamicTargetWallSeconds {
+			budget = fmt.Sprintf(", raised from %.0fs for the job's chunk budget", dynamicTargetWallSeconds)
+		}
+		return fmt.Sprintf("%s [dynamic: %s realtime × %.0fs target → %.0fs, clip %.0fs, min %.0fs%s]",
+			head, src, targetWallS, math.Round(targetWallS*sp), clipS, dynamicMinChunkSeconds, budget)
 	case "whole":
 		return head + " [whole]"
 	default:
@@ -4472,6 +4498,12 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	var variants []sfnVariant
 	var scores []float64 // predicted encode wall per variant, aligned with variants (for rank-based priority)
 	doH264, doHevc, doAV1 := false, false, false
+	// PRE-PASS: resolve which (codec, rung) pairs this run encodes, before
+	// sizing any of their chunks. The two were one loop until #316, which could
+	// not work: the Step Functions history budget is a property of the job's
+	// TOTAL chunk count, and that total is not known until every variant has
+	// been sized. Resolving first makes the budget answerable.
+	var planned []plannedVariant
 	for _, c := range codecs {
 		rungs := store.resolveRungs(ladderName, c, maxRes, minRes, sourceWidth)
 		if len(rungs) == 0 {
@@ -4486,7 +4518,6 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			doAV1 = true
 		}
 		for _, r := range rungs {
-			vcpu, mem := variantResourcesFor(c, r.Height)
 			// Two-pass is owned by the ladder profile's per-codec pass count
 			// (LadderDef.Passes → passesFor), which now defaults to 2 for EVERY
 			// codec — see passesFor for the measurement that moved h264. The
@@ -4496,57 +4527,81 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 			// This comment used to say "h264:2/av1:2 are rejected at save time".
 			// They are not, and never were: validateLadder only checks the codec
 			// name and that the count is 1 or 2.
-			twoPass := ladderDef.passesFor(c) == 2
-			if hevcSinglePass && c == "hevc" {
-				twoPass = false
-			}
-			// Ranking score = predicted encode WALL (content ÷ graviton speed). The
-			// banded SchedulingPriority is assigned by RANK of this score AFTER the
-			// loop (not by clamping the raw score), so the heaviest variant strictly
-			// outranks the merely-heavy — pixels, codec, and pass all fold into the
-			// speed model, self-correcting as speeds are learned.
-			score := clipDurationS
-			if score <= 0 {
-				score = 1
-			}
-			score /= speeds.Speed("graviton", c, r.Height, twoPass, r.Preset, sourceFps)
-			scores = append(scores, score)
-			// Per-variant chunking: size this variant's chunks (dynamic by
-			// complexity, or the job's fixed/whole config), then enumerate them.
-			cs := variantChunkSeconds(chunkCfg, clipDurationS, speeds, c, r.Height, twoPass, r.Preset, sourceFps)
-			// Plan the actual boundaries here, not just a count: the worker is
-			// handed (index, start, duration) and does not re-derive them. See
-			// chunkplan.go for why the authority moved.
-			spans := planChunks(clipDurationS, cs, segS)
-			nc := len(spans)
-			if logf != nil {
-				logf(chunkPlanLine(chunkCfg, c, r.Label, r.Height, twoPass, r.Preset, sourceFps, speeds, cs, nc, clipDurationS))
-			}
-			variants = append(variants, sfnVariant{
-				Codec:   c,
-				Label:   r.Label,
-				Width:   strconv.Itoa(r.Width),
-				Height:  strconv.Itoa(r.Height),
-				Bitrate: strconv.Itoa(r.Bitrate),
-				Preset:  r.Preset,
-				VCPU:    vcpu,
-				Memory:  mem,
-				// "" when the curves have no estimate for this rung; cli_phase
-				// then omits the overlay row rather than failing.
-				EstVmaf:        vmafEst[c+"/"+r.Label][0],
-				EstVmafClamped: vmafEst[c+"/"+r.Label][1],
-				Priority:       0, // assigned by rank below
-				TwoPass:        strconv.FormatBool(twoPass),
-				ExtraArgs:      ladderDef.extraArgsFor(c),
-				Chunks:         spans,
-				ChunkDuration:  strconv.FormatFloat(cs, 'f', -1, 64),
-				Chunked:        strconv.FormatBool(nc > 1),
-				// The duration the boundaries above were planned against. The
-				// worker checks its own mezzanine probe against this and fails
-				// rather than encoding a plan built for a different-length file.
-				ContentDuration: formatSeconds(clipDurationS),
+			planned = append(planned, plannedVariant{
+				codec: c, rung: r, twoPass: ladderDef.twoPassFor(c, hevcSinglePass),
 			})
 		}
+	}
+	// Raise the dynamic wall-time target if the whole job's plan would not fit
+	// one execution's history (#316). Only when chunking IS dynamic: silently
+	// overriding an explicit --chunk-duration would be worse than failing, and
+	// #312's guard is what should reject that case. Returns the default target
+	// untouched whenever the plan already fits, so every job that works today
+	// plans byte-identically.
+	//
+	// Cloud-only by construction, and that is correct: this is the cloud path,
+	// and cli_local_dist plans its own chunks in Python against Temporal, whose
+	// limits (51,200 events / 50 MB) are ~3x larger. Do not "fix" the asymmetry.
+	chunkTarget := dynamicTargetWallSeconds
+	if chunkCfg == "dynamic" || chunkCfg == "" {
+		var before, after int
+		chunkTarget, before, after = budgetedChunkTarget(planned, clipDurationS, segS, speeds, sourceFps)
+		if logf != nil {
+			if line := chunkBudgetLine(chunkTarget, before, after, planned, clipDurationS, segS, speeds, sourceFps); line != "" {
+				logf(line)
+			}
+		}
+	}
+	for _, p := range planned {
+		c, r, twoPass := p.codec, p.rung, p.twoPass
+		vcpu, mem := variantResourcesFor(c, r.Height)
+		// Ranking score = predicted encode WALL (content ÷ graviton speed). The
+		// banded SchedulingPriority is assigned by RANK of this score AFTER the
+		// loop (not by clamping the raw score), so the heaviest variant strictly
+		// outranks the merely-heavy — pixels, codec, and pass all fold into the
+		// speed model, self-correcting as speeds are learned.
+		score := clipDurationS
+		if score <= 0 {
+			score = 1
+		}
+		score /= speeds.Speed("graviton", c, r.Height, twoPass, r.Preset, sourceFps)
+		scores = append(scores, score)
+		// Per-variant chunking: size this variant's chunks (dynamic by
+		// complexity, or the job's fixed/whole config), then enumerate them.
+		// chunkTarget is the default unless the whole-job budget above raised it.
+		cs := variantChunkSeconds(chunkCfg, chunkTarget, clipDurationS, speeds, c, r.Height, twoPass, r.Preset, sourceFps)
+		// Plan the actual boundaries here, not just a count: the worker is
+		// handed (index, start, duration) and does not re-derive them. See
+		// chunkplan.go for why the authority moved.
+		spans := planChunks(clipDurationS, cs, segS)
+		nc := len(spans)
+		if logf != nil {
+			logf(chunkPlanLine(chunkCfg, chunkTarget, c, r.Label, r.Height, twoPass, r.Preset, sourceFps, speeds, cs, nc, clipDurationS))
+		}
+		variants = append(variants, sfnVariant{
+			Codec:   c,
+			Label:   r.Label,
+			Width:   strconv.Itoa(r.Width),
+			Height:  strconv.Itoa(r.Height),
+			Bitrate: strconv.Itoa(r.Bitrate),
+			Preset:  r.Preset,
+			VCPU:    vcpu,
+			Memory:  mem,
+			// "" when the curves have no estimate for this rung; cli_phase
+			// then omits the overlay row rather than failing.
+			EstVmaf:        vmafEst[c+"/"+r.Label][0],
+			EstVmafClamped: vmafEst[c+"/"+r.Label][1],
+			Priority:       0, // assigned by rank below
+			TwoPass:        strconv.FormatBool(twoPass),
+			ExtraArgs:      ladderDef.extraArgsFor(c),
+			Chunks:         spans,
+			ChunkDuration:  strconv.FormatFloat(cs, 'f', -1, 64),
+			Chunked:        strconv.FormatBool(nc > 1),
+			// The duration the boundaries above were planned against. The
+			// worker checks its own mezzanine probe against this and fails
+			// rather than encoding a plan built for a different-length file.
+			ContentDuration: formatSeconds(clipDurationS),
+		})
 	}
 	// Zero variants is never what anyone asked for (#289). Without this the run
 	// submits a Step Functions execution with an empty variants array, no chunks

@@ -483,6 +483,27 @@ func (d LadderDef) passesFor(codec string) int {
 	return 2
 }
 
+// twoPassFor reports whether a codec ACTUALLY encodes in two passes for a given
+// run: the ladder profile's count, with the per-encode HevcSinglePass override
+// forcing HEVC to one. The Go twin of encode_variants.two_pass_for, and the one
+// definition every caller must use.
+//
+// It exists because four callers each carried their own copy of an older rule,
+// `codec == "hevc" && !hevcSinglePass`, which was right while h264 was
+// single-pass and silently wrong the day passesFor started returning 2 for
+// every codec (#314). That literal is the load-bearing half of the same bug on
+// the Python side, and it is the same shape here: nothing fails, the run
+// completes, and the only symptom is a learned-speed key nobody writes to being
+// read by the cost estimate, the progress weighting and the fan-out priority.
+//
+// A grep for `== "hevc" &&` is how you find the next copy.
+func (d LadderDef) twoPassFor(codec string, hevcSinglePass bool) bool {
+	if hevcSinglePass && codec == "hevc" {
+		return false
+	}
+	return d.passesFor(codec) == 2
+}
+
 // resolveRungs returns the rungs to encode for a (ladder, codec), filtered to
 // those that fit the source (no upscale) and the --min-res/--max-res band
 // (both inclusive), with ordinal labels for repeated resolutions. Mirrors
