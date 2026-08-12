@@ -308,6 +308,13 @@ var encodeStageKeyRe = regexp.MustCompile(`^encode:([a-z0-9]+):(\d+)p?(:chunk\d+
 func (m *Manager) computeProgress(job *Job) {
 	job.mu.Lock()
 	defer job.mu.Unlock()
+	// Refresh the queued/active/idle split before the early return: a job that
+	// is queued has no stages yet, and "how long have I been waiting" is exactly
+	// the question worth answering in that state.
+	t := job.timingLocked()
+	job.ActiveSeconds = t.Active.Seconds()
+	job.QueuedSeconds = t.Queued.Seconds()
+	job.IdleSeconds = t.Idle().Seconds()
 	if len(job.Stages) == 0 {
 		return
 	}
@@ -1295,8 +1302,24 @@ type Job struct {
 	// Lets timing anchor on encode start rather than submit (which includes the
 	// upload + queue wait).
 	FanOutAt *time.Time `json:"fan_out_at,omitempty"`
-	Progress string     `json:"progress"`
-	Error    string     `json:"error,omitempty"`
+	// ActiveSeconds / QueuedSeconds / IdleSeconds split the elapsed time the UI
+	// used to show as one number (EndedAt-StartedAt), which counted queue wait as
+	// if it were work — four ladders submitted together under MAX_CONCURRENT=2
+	// reported ~3x spread having done identical work. See activetime.go.
+	//
+	// Serialized rather than left to the client because the client does not have
+	// the stage intervals for a job it has not expanded, and because the same
+	// three numbers go into history.md.
+	//
+	// Derived from Stages, so they are recomputed on every notify() rather than
+	// stored: a stage row can be updated by three sources at three latencies and
+	// an incrementally-maintained total would drift from the rows it claims to
+	// summarize.
+	ActiveSeconds float64 `json:"active_seconds,omitempty"`
+	QueuedSeconds float64 `json:"queued_seconds,omitempty"`
+	IdleSeconds   float64 `json:"idle_seconds,omitempty"`
+	Progress      string  `json:"progress"`
+	Error         string  `json:"error,omitempty"`
 
 	// Outputs are the directory names this job moved into OutputDir, recorded
 	// at the move rather than inferred. Set only on success, so its presence
@@ -3218,26 +3241,49 @@ func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
 		}
 	}
 
-	// Totals row — includes both the sum of measured stage durations
-	// (which may double-count parallel stages if any — unlikely but
-	// noted) and the whole-job wall clock for reference.
+	// Totals — four numbers, because one cannot answer "how long did this take".
+	//
+	//   total measured  SUM of stage durations. This comment used to call
+	//                   double-counting of parallel stages "unlikely"; a run
+	//                   fans 336 chunks across a worker pool, so it overshoots
+	//                   wall clock by ~8x. It is a MACHINE-HOURS measure — what
+	//                   you would bill for — not an elapsed one.
+	//   active          UNION of those intervals: elapsed time with work in
+	//                   flight. The one to compare two runs by.
+	//   queued          submit to first stage: waiting for a MAX_CONCURRENT slot.
+	//   idle            inside the run, no stage on a worker — starvation from a
+	//                   concurrent job. Separate from queued because the causes
+	//                   and the fixes differ.
+	//
+	// active + queued + idle need not equal wall clock: the tail after the last
+	// stage ends (sync-back, cleanup) belongs to none of them.
 	if job.EndedAt != nil {
 		wall := job.EndedAt.Sub(job.StartedAt).Round(time.Second)
+		// From `rows`, not job.Timing(): rows spans EVERY file of a multi-file
+		// job (history + current), while Job.Stages holds only the file in
+		// flight. Using the latter here would silently report a five-file job's
+		// active time as its last file's.
+		all := make([]StageProgress, 0, len(rows))
+		for _, r := range rows {
+			all = append(all, r.stage)
+		}
+		t := jobActiveTime(all, job.StartedAt, *job.EndedAt)
+		prefix := ""
 		if job.TotalFiles > 1 {
+			prefix = "|  "
+		}
+		for _, row := range []struct {
+			label string
+			d     time.Duration
+		}{
+			{"total measured", totalMeasured.Round(100 * time.Millisecond)},
+			{"active", t.Active.Round(time.Second)},
+			{"queued", t.Queued.Round(time.Second)},
+			{"idle", t.Idle().Round(time.Second)},
+			{"wall clock", wall},
+		} {
 			table.WriteString(fmt.Sprintf(
-				"|  | **total measured** |  |  |  | %s |\n",
-				totalMeasured.Round(100*time.Millisecond),
-			))
-			table.WriteString(fmt.Sprintf(
-				"|  | **wall clock** |  |  |  | %s |\n", wall,
-			))
-		} else {
-			table.WriteString(fmt.Sprintf(
-				"| **total measured** |  |  |  | %s |\n",
-				totalMeasured.Round(100*time.Millisecond),
-			))
-			table.WriteString(fmt.Sprintf(
-				"| **wall clock** |  |  |  | %s |\n", wall,
+				"%s| **%s** |  |  |  | %s |\n", prefix, row.label, row.d,
 			))
 		}
 	}
