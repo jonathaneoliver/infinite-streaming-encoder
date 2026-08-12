@@ -369,6 +369,56 @@ limit. Before #184 that line was written from the raw string while nothing
 passed it to an encoder, so full-length encodes recorded truncations that never
 happened.
 
+### The chunk grid: GOP | segment | GRID | chunk
+
+Chunk boundaries used to have to be **segment** boundaries and nothing more, so
+the same clip was cut in different places on every delivery profile:
+
+```
+334s clip, 132s target
+  1s ladder -> 112, 111, 111
+  2s ladder -> 112, 112, 110
+  6s ladder -> 114, 114, 106
+```
+
+Every chunk boundary is an encoder-state reset, so four ladders that are supposed
+to differ **only** in delivery profile were also differing in where the encoder
+restarted. That is `docs/ladders-and-delivery.md`'s warning in the other
+direction — a comparison meant to isolate one variable quietly carrying a second.
+
+So the tiling unit is now `chunkGridFor(segment)` = **lcm(segment, 6s)**
+(`internal/encode/chunkplan.go`, mirrored in `chunking.chunk_grid_for`). All
+three shipped segment durations divide 6, so the grid costs them nothing but
+agreement, and the same clip now cuts identically on every profile.
+
+- **Segment alignment is the CORRECTNESS half, the 6s grid is the COMPARABILITY
+  half, and the LCM is the only value satisfying both.** The grid sits *between*
+  segment and chunk in the chain rather than replacing the segment link. A
+  segment that shares no small multiple with 6 falls back to the segment
+  duration — the old behaviour — rather than inventing a boundary that is not a
+  segment edge.
+- **`round(r) >= 1` in the LCM search is load-bearing.** Without it a segment
+  longer than the grid matches on the first try: `6/1e9` rounds to 0 and sits
+  inside the epsilon, so the search returns a 6s grid that is not a whole number
+  of segments.
+- **Only the FINAL chunk may be off-grid.** It carries the sub-grid tail, and it
+  has to: 334s is not a multiple of 6, and rounding it would mean encoding media
+  that is not there.
+- **A clip cannot be cut into more pieces than it has grid units.** Asking for
+  more used to hand the surplus chunks *zero* duration — 334s at `chunkS=3` on a
+  6s ladder planned 111 chunks of which **55 encoded nothing**, each a real Batch
+  job with a queue wait and a container start. Python's `_validate` refused
+  `chunk < segment` and never reached it; Go has no such guard and the cloud path
+  did. Both clamp now.
+
+Pinned from both ends, and the two halves are not redundant.
+`internal/encode/chunkplan_test.go` pins Go to Python via
+`testdata_chunkplan.txt` — but that file is **generated from Python**
+(`scripts/gen_chunkplan_golden.py`), so it cannot catch Python being wrong: break
+the planner, regenerate, and Go matches the new wrong answer exactly.
+`scripts/test_chunk_grid.py` is what pins Python's own invariants, and it is also
+the only coverage of local-dist, which plans its chunks in Python.
+
 ### The whole-job chunk budget (cloud only)
 
 The dynamic chunk selector is **per-variant and stateless** —

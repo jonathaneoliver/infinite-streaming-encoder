@@ -183,6 +183,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  py passkey     '; \
 	if out=$$(python3 scripts/test_speed_marker_pass.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py chunkgrid   '; \
+	if out=$$(python3 scripts/test_chunk_grid.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py mezzlock    '; \
 	if out=$$(python3 scripts/test_mezz_lock.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
