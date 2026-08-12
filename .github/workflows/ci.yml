@@ -144,6 +144,29 @@ jobs:
           fi
           echo "ran $found python test scripts"
 
+      # The page's JS, checked two ways and neither covers the other:
+      # check_page_js.py PARSES it (syntax), scripts/test_*.js RUN parts of it
+      # (behaviour). `make check` skips the second without node; the runner has
+      # node, so CI is the authority — same split as staticcheck/govulncheck.
+      #
+      # Globbed for the reason the python list above is: an enumerated list goes
+      # stale one merge later, and a CI job that skips a test it believes it is
+      # running is the bug this job exists to catch.
+      - name: page JS
+        run: python3 scripts/check_page_js.py
+
+      - name: js tests
+        run: |
+          set -e
+          shopt -s nullglob
+          found=0
+          for t in scripts/test_*.js; do
+            echo "--- $t"
+            node "$t"
+            found=$((found + 1))
+          done
+          echo "ran $found js test scripts"
+
   terraform:
     runs-on: ubuntu-latest
     steps:

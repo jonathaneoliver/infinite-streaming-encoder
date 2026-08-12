@@ -1330,10 +1330,20 @@ function syncLadderMultiNote() {
     const el = document.getElementById('ladder-multi-note');
     if (!el) return;
     const sel = selectedLadders();
-    if (sel.length <= 1) { el.style.display = 'none'; return; }
+    const cod = submitCodecs();
+    const jobs = sel.length * cod.length;
+    if (jobs <= 1) { el.style.display = 'none'; return; }
     el.style.display = '';
-    el.textContent = `${sel.length} ladders selected → ${sel.length} separate jobs, `
-        + `one output each. Charts and the estimate below show ${sel[0]}.`;
+    // Ladders AND codecs each fan out into their own job (#324), so the count
+    // is the product. Saying only the ladder count would understate it by the
+    // number of codecs, and every one of these costs money on a cloud target —
+    // which is the whole reason this note exists.
+    const parts = [];
+    if (sel.length > 1) parts.push(`${sel.length} ladders`);
+    if (cod.length > 1) parts.push(`${cod.length} codecs`);
+    el.textContent = `${parts.join(' x ')} → ${jobs} separate jobs, one output each. `
+        + `Charts and the estimate below show ${sel[0]}`
+        + (cod.length > 1 ? ` (${cod.join('+')} combined).` : '.');
 }
 
 // Every ladder selected in the encode form, in list order. A multi-select with
@@ -1369,6 +1379,10 @@ function selectedCodecs() {
 function onCodecsChanged() {
     syncResTiers();
     refreshSourceBadges();
+    // The job count is ladders x codecs now (#324), so ticking a codec changes
+    // how many jobs the button starts — the note has to follow it, not just the
+    // ladder selection.
+    syncLadderMultiNote();
 }
 
 // Rebuild the Min/Max Resolution tiers from the SELECTED ladder's actual rung
@@ -2348,10 +2362,12 @@ async function startEncode(force = false) {
             'Re-encode all')) return;
     }
 
+    // No `codec` here on purpose: the submit loop below sets it per job, one
+    // codec each (#324). A combined value would be silently overridden, which
+    // reads as though the job encodes several codecs when it encodes one.
     const body = {
         files: selected,
         target: target,
-        codec: codecValue(),
         measure_vmaf: document.getElementById('measure-vmaf').checked,
         vmaf_prescale: document.getElementById('vmaf-prescale').checked,
         max_res: document.getElementById('max-res').value,
@@ -2410,23 +2426,40 @@ async function startEncode(force = false) {
         return;
     }
 
+    // One job per CODEC as well as per ladder (#324). The codecs share no work
+    // after the mezzanine — which is cached on the source, not the codec, so the
+    // second job skips it — and packaging is already a per-codec branch. What
+    // combining them costs is the chunk budget: budgetedChunkTarget raises ONE
+    // wall-time target for a whole execution, so the codec with the most chunks
+    // sizes the chunks for every codec in it. Measured on a 4h clip, h264's
+    // longest atomic chunk was 1029s alongside HEVC against 274s alone — 3.75x,
+    // for a codec that never came close to the ceiling on its own.
+    //
+    // Output directories already carry the codec (`<stem>_p200_<codec>_<tag>`),
+    // so splitting cannot make two jobs collide the way two ladders can. That is
+    // why there is no codec equivalent of the output-tag clash check above.
+    const codecs = submitCodecs();
+
     const started = [];
     const failed = [];
     for (const name of ladders) {
-        try {
-            const res = await fetch('/api/encode', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ...body, ladder: name })
-            });
-            if (res.ok) { started.push(name); }
-            else { failed.push(`${name}: ${await res.text()}`); }
-        } catch (e) {
-            failed.push(`${name}: ${e.message}`);
+        for (const codec of codecs) {
+            const label = codecs.length > 1 ? `${name}/${codec}` : name;
+            try {
+                const res = await fetch('/api/encode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ...body, ladder: name, codec: codec })
+                });
+                if (res.ok) { started.push(label); }
+                else { failed.push(`${label}: ${await res.text()}`); }
+            } catch (e) {
+                failed.push(`${label}: ${e.message}`);
+            }
         }
     }
 
-    // Report BOTH — a partial submission is the likely failure here (one ladder
+    // Report BOTH — a partial submission is the likely failure here (one job
     // rejected, the rest fine), and saying only "started" would hide it while
     // saying only "failed" would hide the jobs that are now running.
     if (started.length) {
@@ -2437,7 +2470,8 @@ async function startEncode(force = false) {
         switchTab('jobs');
     }
     if (failed.length) {
-        showToast(`${failed.length} of ${ladders.length} failed — ${failed.join(' | ')}`, 'error');
+        const total = ladders.length * codecs.length;
+        showToast(`${failed.length} of ${total} failed — ${failed.join(' | ')}`, 'error');
     }
 }
 
@@ -3650,12 +3684,23 @@ function _vmafBurninSync(fromVmaf) {
 }
 
 function codecValue() {
-    const on = ['h264', 'hevc', 'av1'].filter(c =>
-        document.querySelector(`.codec-cb[value="${c}"]`)?.checked);
-    if (on.length === 0) return 'h264';
+    const on = submitCodecs();
     if (on.length === 3) return 'all';
     if (on.length === 2 && on[0] === 'h264' && on[1] === 'hevc') return 'both';
     return on.join(',');
+}
+
+// The codecs a submit should actually encode, one job each (#324).
+//
+// Deliberately NOT selectedCodecs(), which falls back to EVERY codec when none
+// are ticked so the res-tier list is never empty. That fallback is for display.
+// Using it here would turn an empty selection into three jobs — including AV1,
+// the slowest — where the form has always submitted h264 alone. Same fallback as
+// the old codecValue(), which this now also backs so the two cannot drift.
+function submitCodecs() {
+    const on = ['h264', 'hevc', 'av1'].filter(c =>
+        document.querySelector(`.codec-cb[value="${c}"]`)?.checked);
+    return on.length ? on : ['h264'];
 }
 
 function jobRowHtml(j) {
