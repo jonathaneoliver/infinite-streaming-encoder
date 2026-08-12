@@ -369,6 +369,47 @@ limit. Before #184 that line was written from the raw string while nothing
 passed it to an encoder, so full-length encodes recorded truncations that never
 happened.
 
+### Four numbers for "how long did this job take"
+
+`EndedAt - StartedAt` is not it, and neither is `total measured`. Both were
+already displayed and both are misleading, in opposite directions.
+
+| number | what it is | fails how |
+| --- | --- | --- |
+| `total measured` | SUM of stage durations | overshoots elapsed by the width of the fan-out — ~8x on a 336-chunk run. It is a MACHINE-HOURS measure. |
+| `wall clock` | submit → done | `StartedAt` is set in `Submit`, alongside `Status: queued`, so it counts the wait for a `MAX_CONCURRENT` slot as work |
+| **`active`** | **UNION of running-stage intervals** | the one to compare runs by |
+| `queued` / `idle` | submit → first stage / gaps inside the run | — |
+
+Measured on four ladders submitted together under `MAX_CONCURRENT=2`, all doing
+identical work:
+
+```
+        active    queued      idle    wall     sum
+xs    1h20m16s        5s     2m 0s  1h22m   9h59m
+1s    1h21m27s        5s  1h11m42s  2h33m  10h15m
+2s    1h20m50s  2h31m46s        2s  3h53m  10h36m
+6s    1h21m51s  3h51m12s        4s  5h13m  10h43m
+```
+
+Active spreads 95 seconds; wall spreads 3.8x. The whole apparent "the 6s profile
+is slow" result was submission order — it is last in the queue every time.
+
+- **`queued` and `idle` are kept apart deliberately.** Both are contention, but
+  `1s` above started immediately and was STARVED mid-run while `2s`/`6s` waited
+  in the queue and then ran clean. Same total cost, different cause, different
+  fix; one number cannot say which happened.
+- **The union removes idle, not contention.** Two jobs sharing the worker pool
+  both encode slower, which inflates `active` for both. This fixes the
+  accounting; only running them one at a time fixes the measurement.
+- **`writeTimingSummary` computes from `rows`, not `Job.Stages`.** `rows` spans
+  every file of a multi-file job; `Job.Stages` holds only the file in flight, so
+  using it there would report a five-file job's active time as its last file's.
+- **Recomputed in `computeProgress`, never accumulated.** A stage row can be
+  updated by three sources at three latencies, and an incrementally-maintained
+  total would drift from the rows it claims to summarize.
+- `active + queued + idle` need not equal wall clock — the tail after the last
+  stage ends (sync-back, cleanup) belongs to none of them.
 ### The chunk grid: GOP | segment | GRID | chunk
 
 Chunk boundaries used to have to be **segment** boundaries and nothing more, so

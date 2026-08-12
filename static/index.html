@@ -3591,8 +3591,31 @@ function renderJobStats(el, j) {
     const stat = (label, val) => `<span class="job-stat">${label} <b>${val}</b></span>`;
     const slowest = (j.slowest_job || '').replace(/:/g, ' ').replace(/^encode /, '');
     const cloud = j.cpu_vcpu_h > 0;   // cloud-batch jobs have vCPU-hour telemetry
+    // ACTIVE, not total, is the number to compare two runs by. `total` is
+    // submit -> done, so it counts the wait for a MAX_CONCURRENT slot as though
+    // it were work: four ladders submitted together under a limit of two spread
+    // 1.37h -> 3.88h having done identical work, and the last-submitted profile
+    // looked slow when it was merely last. Active is the union of the job's
+    // running-stage intervals (see internal/encode/activetime.go).
+    //
+    // Total is kept, second and dimmed, because "when will this be done" is a
+    // real question and active cannot answer it. Queued and idle are shown only
+    // when they are non-trivial — on an uncontended run they are noise, and a
+    // number that is always there is a number nobody reads.
+    const showSplit = (j.queued_seconds || 0) + (j.idle_seconds || 0) > 30;
     el.innerHTML =
-          stat('total', formatDuration(totalS))
+          (j.active_seconds > 0
+            ? stat('<span title="Wall-clock time this job had work in flight — the union of its running stages, so parallel chunks count once. Compare runs by this, not by total.">active</span>',
+                   formatDuration(j.active_seconds))
+            : '')
+        + stat('<span title="Submit to done, including time queued behind other jobs. Answers when it finished, not how long the work took.">total</span>',
+               formatDuration(totalS))
+        + (showSplit && j.queued_seconds > 0
+            ? stat('<span title="Waiting for a MAX_CONCURRENT slot before any stage started.">queued</span>',
+                   formatDuration(j.queued_seconds)) : '')
+        + (showSplit && j.idle_seconds > 0
+            ? stat('<span title="Running but with nothing on a worker — starved by a concurrent job competing for the same pool.">idle</span>',
+                   formatDuration(j.idle_seconds)) : '')
         + (j.encode_wall_s ? stat('encode wall', formatDuration(j.encode_wall_s)) : '')
         + (cloud ? stat('CPU', j.cpu_vcpu_h.toFixed(1) + ' <span class="u">vCPU-hr</span>') : '')
         + (j.job_count ? stat('jobs', j.job_count) : '')
