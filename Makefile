@@ -237,6 +237,13 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  page JS       '; \
 	if out=$$(python3 scripts/check_page_js.py 2>&1); then echo "$$out"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	: 'check_page_js.py parses the page; this RUNS part of it. Skips without'; \
+	: 'node, like the staticcheck/tofu/ruff steps above — CI has node, so CI'; \
+	: 'is the authority.'; \
+	printf '  js codecsplit  '; \
+	if ! command -v node >/dev/null 2>&1; then echo "skipped (no node)"; \
+	elif out=$$(node scripts/test_codec_split.js 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	if [ $$fail -ne 0 ]; then echo; echo "make check: FAILED"; exit 1; fi; \
 	echo "make check: all passed"
 
