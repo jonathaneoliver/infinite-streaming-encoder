@@ -27,22 +27,32 @@ func TestGroupMarkerRecordsMembership(t *testing.T) {
 	}
 }
 
-// One group per codec, and a re-announcement REPLACES it. The orchestrator
-// emits this once per codec, but a job that reconnects (or a second file in a
-// multi-file job) can say it again — appending would leave the UI filtering
+// A codec has SEVERAL bands — the low rungs pack into one, the mid rungs into
+// another — so these are keyed by (codec, lead). Keying on codec alone made the
+// second band overwrite the first: the UI then filtered one band's members out
+// of the lanes and drew the other band's as separate jobs.
+//
+// A re-announced BAND still replaces, since a reconnect (or the next file of a
+// multi-file job) says it again and appending would leave the UI filtering
 // against a stale membership as well as the current one.
-func TestGroupMarkerReplacesRatherThanAccumulates(t *testing.T) {
+func TestEachBandIsKeptAndReAnnouncementReplaces(t *testing.T) {
 	j := &Job{}
-	j.parseMarker(`[[ENCODER-GROUP codec=h264 lead=594p members=540p]]`)
-	j.parseMarker(`[[ENCODER-GROUP codec=h264 lead=594p members=540p|432p]]`)
+	j.parseMarker(`[[ENCODER-GROUP codec=h264 lead=720p members=594p|540p]]`)
+	j.parseMarker(`[[ENCODER-GROUP codec=h264 lead=1080p members=954p]]`)
 	j.parseMarker(`[[ENCODER-GROUP codec=hevc lead=540p members=432p]]`)
 
-	if len(j.Groups) != 2 {
-		t.Fatalf("got %d groups, want 2 (one per codec): %+v", len(j.Groups), j.Groups)
+	if len(j.Groups) != 3 {
+		t.Fatalf("got %d groups, want 3 (two h264 bands + one hevc): %+v",
+			len(j.Groups), j.Groups)
+	}
+
+	j.parseMarker(`[[ENCODER-GROUP codec=h264 lead=720p members=594p|540p|432p]]`)
+	if len(j.Groups) != 3 {
+		t.Fatalf("re-announcing a band appended instead of replacing: %+v", j.Groups)
 	}
 	for _, g := range j.Groups {
-		if g.Codec == "h264" && len(g.Members) != 2 {
-			t.Errorf("h264 kept a stale membership: %v", g.Members)
+		if g.Codec == "h264" && g.Lead == "720p" && len(g.Members) != 3 {
+			t.Errorf("band kept a stale membership: %v", g.Members)
 		}
 	}
 }

@@ -422,16 +422,19 @@ class EncodeWorkflow:
             # entirely in a plan from an older orchestrator, which reads the
             # same way. Everything else in this loop is unchanged: a group is
             # one entry that happens to name several rungs.
-            group = [str(x) for x in (ci.get("group") or [])]
+            bands = [[str(x) for x in b] for b in (ci.get("groups") or [])]
             by_label = {r["label"]: r for r in ci["rungs"]}
-            members = [by_label[label] for label in group if label in by_label]
-            solo = [r for r in ci["rungs"] if r["label"] not in set(group)]
+            grouped_labels = {label for b in bands for label in b}
+            solo = [r for r in ci["rungs"] if r["label"] not in grouped_labels]
             for r in solo:
                 w = (r["height"] * r["height"] * codec_cost.get(codec, 1.0)
                      * (1.8 if tp else 1.0))
                 for c in chunk_plan:
                     specs.append((w, codec, r, tp, ea, c, None))
-            if len(members) > 1:
+            for band in bands:
+                members = [by_label[label] for label in band if label in by_label]
+                if len(members) < 2:
+                    continue
                 # Scored as the SUM of its members, not the lead's height. A
                 # six-rung job ranked as its cheapest member sorts LAST, and
                 # priority drives dispatch order — on the cloud run that tried

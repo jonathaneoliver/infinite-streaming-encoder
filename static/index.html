@@ -545,6 +545,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <label title="#109: build a near-lossless pre-scaled VMAF reference ONCE PER WORKER BOX, so the audit decodes a small fast H.264 file instead of re-downscaling the native (4K/AV1) mezzanine on every chunk. VMAF-SPEED only — scores are identical within ~0.4 and it auto-skips when it wouldn't pay off (fewer than 2 renditions, source no slower than the ref, or too big). Needs Measure VMAF on." style="display:block;margin-top:4px"><input type="checkbox" id="vmaf-prescale" style="width:auto;min-width:auto"> VMAF pre-decode</label>
             </div>
             <div class="control-group" style="align-self:center;padding-top:16px">
+                <label title="#317: encode the decode-dominated rungs (1080p and below) in bands of 3 that share ONE decode per chunk, instead of one ffmpeg per rung. With two passes a 12-rung ladder decodes each chunk 24 times and needs one per band per pass; the low rungs' encodes are nearly free next to that shared decode. Local target only. Same output — the ladder and every rung's settings are unchanged."><input type="checkbox" id="group-rungs" style="width:auto;min-width:auto"> Shared decode</label>
+            </div>
+            <div class="control-group" style="align-self:center;padding-top:16px">
                 <label title="Burn the diagnostic text overlay (timecode, bitrate, codec/resolution, encoder, watermark) into every variant. On by default; uncheck for clean output."><input type="checkbox" id="burnin" checked onchange="_vmafBurninSync(false)" style="width:auto;min-width:auto"> Burn-in text overlay</label>
                 <span id="vmaf-burnin-hint" style="display:none;color:#d0a24a;font-size:11px">⚠ overlay biases VMAF — uncheck for accurate scores</span>
             </div>
@@ -2369,6 +2372,7 @@ async function startEncode(force = false) {
         files: selected,
         target: target,
         measure_vmaf: document.getElementById('measure-vmaf').checked,
+        group_rungs: document.getElementById('group-rungs').checked,
         vmaf_prescale: document.getElementById('vmaf-prescale').checked,
         max_res: document.getElementById('max-res').value,
         min_res: document.getElementById('min-res').value,
@@ -3607,6 +3611,7 @@ function _jobConfigHtml(c) {
     if (c.force_reencode) chips.push(chip('force', 're-encode', '#d0883a'));
     // VMAF audit is off by default; flag when on (it also forces overlay off).
     if (c.measure_vmaf) chips.push(chip('vmaf', 'on', '#06d6a0'));
+    if (c.group_rungs) chips.push(chip('shared decode', 'on', '#7f8899'));
     // Overlay is on by default; only flag the exception (burnin === false).
     if (c.burnin === false) chips.push(chip('overlay', 'off', '#d0883a'));
     return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:5px">${chips.join('')}</div>`;
@@ -6689,6 +6694,7 @@ async function forceReencode(fileName, _clickAt) {
         target: document.getElementById('target').value,
         codec: codecValue(),
         measure_vmaf: document.getElementById('measure-vmaf').checked,
+        group_rungs: document.getElementById('group-rungs').checked,
         vmaf_prescale: document.getElementById('vmaf-prescale').checked,
         max_res: document.getElementById('max-res').value,
         min_res: document.getElementById('min-res').value,

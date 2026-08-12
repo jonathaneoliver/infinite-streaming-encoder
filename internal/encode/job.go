@@ -668,8 +668,13 @@ func (j *Job) parseMarker(line string) bool {
 		j.mu.Lock()
 		replaced := false
 		for i := range j.Groups {
-			if j.Groups[i].Codec == g.Codec {
-				j.Groups[i] = g // a re-announced codec replaces, never appends
+			// Keyed by (codec, LEAD), because a codec has several bands: the
+			// low rungs pack into one, the mid rungs into another. Keying on
+			// codec alone made the second band overwrite the first, so the UI
+			// filtered one band's members out of the lanes and drew the other's
+			// as separate jobs.
+			if j.Groups[i].Codec == g.Codec && j.Groups[i].Lead == g.Lead {
+				j.Groups[i] = g // a re-announced band replaces, never appends
 				replaced = true
 				break
 			}
@@ -1183,6 +1188,14 @@ type JobConfig struct {
 	// emits an [[ENCODER-VMAF …]] marker; the control plane aggregates per rung.
 	// Off by default (slow — see the cost notes on #24). Local only for now.
 	MeasureVmaf bool `json:"measure_vmaf,omitempty"`
+	// GroupRungs encodes the decode-dominated rungs in BANDS that share one
+	// decode per chunk (#317), instead of one ffmpeg per rung. A property of the
+	// JOB rather than of the box, so an A/B is two submissions of the same
+	// source rather than a farm reconfiguration. Off by default: a grouped
+	// activity is a different shape of work — one process, several outputs, the
+	// sum of their memory — and the band size is still being measured.
+	// local-dist only.
+	GroupRungs bool `json:"group_rungs,omitempty"`
 	// VmafPrescale (#109) builds a near-lossless pre-scaled VMAF reference once
 	// per worker box, so the audit decodes a small fast H.264 file instead of
 	// re-downscaling the native (4K/AV1) mezzanine on every chunk. Only helps
@@ -3707,11 +3720,37 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	if !cfg.BurninEnabled() {
 		args = append(args, "--no-burnin")
 	}
+	// Shared decode for the bottom N rungs (#317). Env, not a job field: it is a
+	// property of the BOX (how much oversubscription its slots can take), not of
+	// the encode, and it is off until a farm A/B says otherwise. Passed only
+	// when > 0 so an unset or unparseable value is exactly the old behaviour
+	// rather than "--group-bottom 0" on every command line.
+	// Shared decode (#317). The JOB asks for it; ENCODE_GROUP_SIZE only tunes how
+	// many rungs share one, because the right band size depends on the box's
+	// memory rather than on the encode. Unset or unparseable falls back to the
+	// default, so a job that ticks the box always gets a real group.
+	if cfg.GroupRungs {
+		mp := groupBudgetMPDefault
+		if v, err := strconv.ParseFloat(os.Getenv("ENCODE_GROUP_BUDGET_MP"), 64); err == nil && v > 0 {
+			mp = v
+		}
+		args = append(args, "--group-budget", strconv.FormatFloat(mp, 'f', -1, 64))
+	}
 	// Cross-job priority: an older local-dist job's chunks all outrank a younger
 	// job's on the shared Temporal fleet (see localJobRank). Always passed.
 	args = append(args, "--job-rank", strconv.Itoa(jobRank))
 	return args
 }
+
+// groupBudgetMPDefault caps a shared-decode band by the summed MEGAPIXELS of
+// its members (#317) — a proxy for the memory and encoder threads one process
+// draws, both of which scale with resolution while the saving counts only how
+// many rungs share the decode. Bands therefore come out unequal, which is the
+// point: on a 12-rung 4K ladder 4.2 MP gives seven small rungs in one band
+// (~2.8 GiB, against the 3 GiB per-slot budget and the 2.84 GiB measured for
+// six low rungs), 1080p+954p in another, and leaves the three encode-bound
+// rungs alone — 5 decodes instead of 12.
+const groupBudgetMPDefault = 4.2
 
 // DistJobPrefix is the MinIO key prefix one local-dist file stages under.
 // Shared by the orchestrator's --job-prefix argument and the staging GC's

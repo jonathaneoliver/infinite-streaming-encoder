@@ -133,21 +133,79 @@ def test_two_pass_lists_the_branches_in_the_same_order() -> None:
     assert order[0] == order[1], order
 
 
-def test_a_group_of_one_is_not_a_group() -> None:
+def _ladder():
+    """A 12-rung 4K h264 ladder, ASCENDING as the real one arrives."""
+    dims = [(416, 234), (640, 360), (704, 396), (768, 432), (960, 540),
+            (1056, 594), (1280, 720), (1696, 954), (1920, 1080), (2560, 1440),
+            (3200, 1800), (3840, 2160)]
+    return [_rung(f"{h}p", w, h, h * 5) for w, h in dims]
+
+
+def test_grouping_is_off_unless_asked_for() -> None:
+    assert D._plan_groups({"h264": _ladder()}, 0) == {}
+    assert D._plan_groups({"h264": _ladder()}, -1) == {}
+
+
+def test_the_big_rungs_are_never_grouped() -> None:
+    """Their decode is 12-24% of their own cost while they carry the memory
+    (1632 MiB peak at 2160p against 345 at 234p), so adding one to a band buys
+    a single decode and pays for it in RSS and blast radius."""
+    got = D._plan_groups({"h264": _ladder()}, 4.2)["h264"]
+    flat = [label for band in got for label in band]
+    for big in ("2160p", "1800p", "1440p"):
+        assert big not in flat, (big, got)
+    assert "1080p" in flat, "1080p is decode-dominated enough to band"
+
+
+def test_bands_are_filled_from_the_BOTTOM_up() -> None:
+    """The rungs where decode dominates are packed first, so they are
+    guaranteed a band; a leftover then lands at the TOP, the cheapest place on
+    the ladder to leave a rung encoding alone. Filling downward spends the
+    budget on the expensive rungs and can strand the cheapest — which a smoke
+    run did exactly once, leaving 234p to pay a whole decode for the cheapest
+    work on the ladder."""
+    got = D._plan_groups({"h264": _ladder()}, 4.2)["h264"]
+    assert got[0] == ["720p", "594p", "540p", "432p", "396p", "360p", "234p"], got
+    assert got[1] == ["1080p", "954p"], got
+
+
+def test_bands_are_unequal_on_purpose() -> None:
+    """A band's saving is (members - 1) x decode — it counts MEMBERS. Its cost
+    (memory, encoder threads, blast radius) scales with PIXELS. So the cheap end
+    packs wide and the expensive end packs narrow; equal bands would pay the big
+    end's costs to buy the small end's saving."""
+    got = D._plan_groups({"h264": _ladder()}, 4.2)["h264"]
+    assert len({len(b) for b in got}) > 1, ("bands came out equal-sized", got)
+    assert len(got[0]) > len(got[1]), got
+
+
+def test_every_band_is_led_by_its_largest_member() -> None:
+    """The lead names the activity, carries the group's CPU in telemetry, keeps
+    the VMAF audit and sets the priority band."""
+    for band in D._plan_groups({"h264": _ladder()}, 4.2)["h264"]:
+        heights = [int(label.rstrip("p")) for label in band]
+        assert heights == sorted(heights, reverse=True), band
+
+
+def test_a_wider_budget_means_fewer_decodes() -> None:
+    """The knob does the thing it says: the saving is one decode per extra
+    member, so a bigger budget is strictly fewer decodes — until memory stops
+    it, which is what the budget is for."""
+    counts = []
+    for mp in (1.0, 4.2, 99.0):
+        bands = D._plan_groups({"h264": _ladder()}, mp).get("h264", [])
+        grouped = {label for b in bands for label in b}
+        counts.append(len(bands) + sum(1 for r in _ladder()
+                                       if r.label not in grouped))
+    assert counts[0] > counts[1] > counts[2], counts
+    assert counts[2] == 4, ("one band of everything eligible + 3 solo", counts)
+
+
+def test_a_band_of_one_is_dropped() -> None:
     """It would take the shared-decode path to decode once for one rung, which
-    is what the single-rung path already does — with a simpler command."""
-    assert D._plan_groups({"h264": LOW}, 1) == {}
-    assert D._plan_groups({"h264": LOW}, 0) == {}
-
-
-def test_grouping_takes_the_BOTTOM_rungs_lead_first() -> None:
-    """The bottom, because that is where the decode dominates: 2.15 cores at
-    2160p against 4.02 at 234p. The lead is the largest member — it names the
-    activity, carries the group's CPU, and keeps the VMAF audit."""
-    rungs = [_rung("2160p", 3840, 2160, 12000), _rung("1080p", 1920, 1080, 4000),
-             *LOW]
-    got = D._plan_groups({"h264": rungs}, 3)
-    assert got == {"h264": ["594p", "540p", "360p"]}, got
+    is what the single-rung path already does, with a simpler command."""
+    one = [_rung("1080p", 1920, 1080, 4000)]
+    assert D._plan_groups({"h264": one}, 4.2) == {}
 
 
 def test_a_grouped_activity_drives_every_members_row() -> None:
@@ -193,7 +251,7 @@ def test_the_workflow_scores_a_group_by_its_members() -> None:
     """
     wf = (Path(__file__).resolve().parent / "infinite_streaming_encoder"
           / "temporal_worker.py").read_text()
-    assert 'ci.get("group")' in wf, "the workflow no longer reads the plan's group"
+    assert 'ci.get("groups")' in wf, "the workflow no longer reads the plan's bands"
     assert "w = sum(" in wf, "a group is not scored as the sum of its members"
     assert '"ENCODE_GROUP": group_arg' in wf, "the group never reaches the worker"
 
@@ -207,6 +265,27 @@ def test_a_grouped_encode_files_no_speed_sample() -> None:
     assert "if grouped_outs:" in src and "no ENCODER-SPEED sample" in src, (
         "a grouped encode now emits a speed sample; the learned curve it feeds "
         "plans every later run of the source")
+
+
+def test_grouping_is_reachable_from_a_submitted_job() -> None:
+    """The knob has to travel Go -> orchestrator -> workflow -> worker, and the
+    first hop is the one that fails silently: a var the Go side reads and the
+    compose `environment:` block omits is inert under the only configuration
+    that ships. It works when you `go run ./cmd/server` on the host and does
+    nothing in the container, which is the hard way round to discover."""
+    root = Path(__file__).resolve().parent.parent
+    go = (root / "internal" / "encode" / "job.go").read_text()
+    assert "cfg.GroupRungs" in go, (
+        "nothing passes --group-budget; the feature is unreachable from a job")
+    assert '"--group-budget"' in go, go[:0]
+    ui = (root / "static" / "index.html").read_text()
+    assert 'id="group-rungs"' in ui, "no way to ask for it from the UI"
+    assert ui.count("group_rungs: document.getElementById('group-rungs').checked")\
+        == 2, "one of the two submit paths does not send group_rungs"
+    cli = (root / "scripts" / "infinite_streaming_encoder"
+           / "encoder_cli.py").read_text()
+    assert '"group_rungs": "group_rungs"' in cli, (
+        "the submit CLI cannot ask for it, so the smoke cannot exercise it")
 
 
 def test_the_group_marker_matches_what_go_parses() -> None:

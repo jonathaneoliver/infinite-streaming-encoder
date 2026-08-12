@@ -141,6 +141,7 @@ _BOOL_FIELDS = {
     "hevc_single_pass": "hevc_single_pass",
     "measure_vmaf": "measure_vmaf",
     "vmaf_prescale": "vmaf_prescale",
+    "group_rungs": "group_rungs",
 }
 
 # TRI-STATE. These are pointers in JobConfig, where nil means "use the server
@@ -261,6 +262,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="per-rendition VMAF audit after encoding (slow)")
     g.add_argument("--vmaf-prescale", action="store_true",
                    help="build a pre-scaled VMAF reference per worker box")
+    g.add_argument("--group-rungs", action="store_true",
+                   help="encode the decode-dominated rungs in bands sharing one "
+                        "decode per chunk (#317, local only)")
 
     g = p.add_argument_group("mode")
     g.add_argument("--dry-run", action="store_true",

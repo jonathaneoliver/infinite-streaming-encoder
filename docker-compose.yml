@@ -218,6 +218,12 @@ services:
       DIST_S3_BUCKET: ${DIST_S3_BUCKET:-encoder-local}
       DIST_WORKERS: ${DIST_WORKERS:-}
       LOCAL_WORKER_LABEL: ${LOCAL_WORKER_LABEL:-mac}
+      # Megapixel budget for one shared-decode band (#317); the JOB owns the
+      # on/off, this only tunes how wide a band gets, because that depends on
+      # the box's memory. Unset = the server default (4.2 MP). Listed here
+      # because a var the Go side reads and this block omits is inert under the
+      # only configuration that ships.
+      ENCODE_GROUP_BUDGET_MP: ${ENCODE_GROUP_BUDGET_MP:-}
       DIST_WORKER_CONTAINER: ${DIST_WORKER_CONTAINER:-encode-worker}
       # Cloud (AWS Batch + Step Functions) — all lazy: env only, nothing here
       # spins up until a cloud job is submitted. This is "cloud configured."
