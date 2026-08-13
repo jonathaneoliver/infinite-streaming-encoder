@@ -196,6 +196,17 @@ func (s *EncodeSpeedStore) RelativeSpeed(codec string, height int, twoPass bool,
 // local box (ubuntu, the baseline). Machine-agnostic across the local boxes so
 // the makespan model can treat the fleet's cores as a single pool.
 func (s *EncodeSpeedStore) LocalSpeed(codec string, height int, twoPass bool, preset string, fps int) float64 {
+	sp, _ := s.LocalSpeedN(codec, height, twoPass, preset, fps)
+	return sp
+}
+
+// LocalSpeedN is LocalSpeed plus the number of learned keys it averaged. n == 0
+// means the speed is the SEED model, not an observation — a caller predicting
+// wall time has to be able to say which, because a cold key and a key with 40k
+// samples otherwise render with identical confidence. Same silent-divergence
+// class as the pass-count contract (#314): the number is fine, the claim about
+// where it came from is what misleads.
+func (s *EncodeSpeedStore) LocalSpeedN(codec string, height int, twoPass bool, preset string, fps int) (float64, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var sum float64
@@ -207,9 +218,9 @@ func (s *EncodeSpeedStore) LocalSpeed(codec string, height int, twoPass bool, pr
 		}
 	}
 	if n > 0 {
-		return sum / float64(n)
+		return sum / float64(n), n
 	}
-	return seedSpeed("ubuntu", codec, height, twoPass, preset, fps)
+	return seedSpeed("ubuntu", codec, height, twoPass, preset, fps), 0
 }
 
 // SpeedDetail returns the speed plus how many learned samples back it (0 =

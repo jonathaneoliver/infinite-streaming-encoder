@@ -241,8 +241,22 @@ func (m *Manager) localFleetPerfCores() float64 {
 // chunk's wall) since no job finishes faster than its single largest piece. Uses
 // LEARNED local speeds, so a running local encode's estimate converges on reality.
 func (m *Manager) projectLocalWallSeconds(cfg JobConfig, sourceWidth, fps int, durationS float64) float64 {
+	secs, _, _ := m.projectLocalWallDetail(cfg, sourceWidth, fps, durationS)
+	return secs
+}
+
+// projectLocalWallDetail is projectLocalWallSeconds plus the provenance of the
+// speeds it used: how many of the ladder's rungs were priced from LEARNED
+// samples, out of how many were priced at all.
+//
+// The pre-flight estimate has to state that ratio rather than just the number
+// (#343). A cold model still returns a confident-looking figure — seedSpeed
+// never returns <= 0 — so "1h 20m" from zero observations and "1h 20m" from a
+// fully-learned fleet are indistinguishable at the point where someone decides
+// whether to press Encode.
+func (m *Manager) projectLocalWallDetail(cfg JobConfig, sourceWidth, fps int, durationS float64) (float64, int, int) {
 	if m.Speeds == nil || m.Ladders == nil || durationS <= 0 {
-		return 0
+		return 0, 0, 0
 	}
 	ladderName := cfg.Ladder
 	if ladderName == "" {
@@ -253,13 +267,18 @@ func (m *Manager) projectLocalWallSeconds(cfg JobConfig, sourceWidth, fps int, d
 		cores = 1
 	}
 	var coreSeconds, floor float64
+	var learned, rungs int
 	ladderDef, _ := m.Ladders.Get(ladderName)
 	for _, c := range parseCodecSel(cfg.Codec) {
 		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
 			twoPass := ladderDef.twoPassFor(c, cfg.HevcSinglePass)
-			sp := m.Speeds.LocalSpeed(c, r.Height, twoPass, r.Preset, fps)
+			sp, n := m.Speeds.LocalSpeedN(c, r.Height, twoPass, r.Preset, fps)
 			if sp <= 0 {
 				continue
+			}
+			rungs++
+			if n > 0 {
+				learned++
 			}
 			wall := durationS / sp // serial wall to encode this whole variant on one box
 			vcpuStr, _ := variantResourcesFor(c, r.Height)
@@ -273,7 +292,7 @@ func (m *Manager) projectLocalWallSeconds(cfg JobConfig, sourceWidth, fps int, d
 			}
 		}
 	}
-	return math.Max(coreSeconds/cores, floor)
+	return math.Max(coreSeconds/cores, floor), learned, rungs
 }
 
 // --- SaaS baseline pricing (per OUTPUT minute). Ported from commercial_cloud.py
@@ -578,6 +597,20 @@ type EstimateResult struct {
 	IdleMeasured bool    `json:"idle_measured"`
 	// Local targets write straight to disk: no egress, no AWS spend at all.
 	Local bool `json:"local"`
+	// Predicted wall-clock time on the LOCAL fleet, and how much of it came from
+	// learned speeds rather than the seed model (#343).
+	//
+	// This is the "cost" of the local option — money is not, and quoting $0.00
+	// there left every control in the encode form unable to change the one
+	// number it displayed. Same field name as Job.LocalWallSeconds because it is
+	// the same makespan model; the running job's value later supersedes it with
+	// elapsed+ETA.
+	//
+	// Target-independent, like projectAndSetCosts: a cloud run still answers
+	// "what would this cost me in time instead of money".
+	LocalWallSeconds float64 `json:"local_wall_s"`
+	LocalWallLearned int     `json:"local_wall_learned"`
+	LocalWallRungs   int     `json:"local_wall_rungs"`
 }
 
 // EstimateCost projects what a config WOULD cost, before it is submitted.
@@ -625,13 +658,18 @@ func (m *Manager) EstimateCost(cfg JobConfig) (EstimateResult, error) {
 	out.CommercialUSD, out.MediaConvertUSD, out.CoconutUSD, out.BitmovinUSD =
 		m.projectSaaSCosts(cfg, out.Width, out.Fps, totalDur, hasAudio, srcMbps)
 
-	out.Local = cfg.Target != "cloud" && cfg.Target != "cloud-batch"
-	if out.Local {
-		// Nothing is billed: local and local-dist write to disk. Say $0 rather
-		// than omitting the line, so the contrast with cloud is visible.
-		return out, nil
-	}
+	// Computed for BOTH targets, and before the local return below. On a local
+	// target it is the only figure that can move — codec, ladder, res band and
+	// duration all feed it — which is the whole of #343; on cloud it is the
+	// "or N hours of your own hardware" side of the comparison.
+	out.LocalWallSeconds, out.LocalWallLearned, out.LocalWallRungs =
+		m.projectLocalWallDetail(cfg, out.Width, out.Fps, totalDur)
 
+	// The AWS projection runs for BOTH targets. On a cloud run it is the bill;
+	// on a local run it is the "what would this have cost in the cloud"
+	// comparison — which the panel was already making against four SaaS vendors
+	// while omitting our own cloud path, the one baseline the user can actually
+	// act on. Same call either way, so the two can never drift apart.
 	var idle float64
 	out.SpotUSD, out.OnDemandUSD, idle, out.IdleRuns, out.IdleMeasured =
 		m.projectCloudCostDetail(cfg, out.Width, out.Fps, totalDur)
@@ -643,6 +681,16 @@ func (m *Manager) EstimateCost(cfg JobConfig) (EstimateResult, error) {
 		out.EgressGB = m.ladderOutputGB(cfg, out.Width, totalDur)
 		out.EgressUSD = out.EgressGB * EgressUSDPerGB
 	}
+
+	out.Local = cfg.Target != "cloud" && cfg.Target != "cloud-batch"
+	if out.Local {
+		// TotalUSD stays ZERO — it means "what this run will be billed", and a
+		// local run is billed nothing. SpotUSD/EgressUSD above are a what-if and
+		// must never be summed into it, or the local panel would quote a charge
+		// that never arrives and the two bases would stop agreeing (#237).
+		return out, nil
+	}
+
 	out.TotalUSD = out.SpotUSD + out.EgressUSD
 	return out, nil
 }
