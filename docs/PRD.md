@@ -3,6 +3,13 @@
 Status: living document · Reflects `main` (distributed-local + AWS Batch; the
 legacy single-box `local` and one-box EC2 `cloud` paths are retired)
 
+> This document says what the product is **for** and what it must achieve.
+> For what the system observably **does** — the rules, states and trades, at a
+> level you can hold the code to — see the behavioural spec set in
+> [`spec/`](spec/README.md). Where the two disagree, the spec is derived from
+> the implementation and this is derived from intent; that difference is
+> usually the interesting part.
+
 ## 1. Summary
 
 Encoder is a self-hosted control plane for producing adaptive-bitrate (ABR)

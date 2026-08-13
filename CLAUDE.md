@@ -992,6 +992,14 @@ in `internal/encode/job.go` still name it; they describe history, not a path.
 Supporting modules (all stdlib-only except `cloud/*` which uses boto3):
 - `ffprobe.py` — structured ffprobe wrapper; fps as `Fraction` for exact GOP math.
 - `mezzanine.py`, `audio.py`, `encode_variants.py`, `packager.py`, `hls.py` — one per phase; each exposes a pure builder for its ffmpeg/packager argv plus a function that runs the subprocess.
+- **`docs/spec/`** — the behavioural spec set: what the system observably DOES,
+  given inputs, as a complement to `docs/PRD.md`'s what-and-why. Seven files —
+  ingest, job lifecycle, chunk plan, outputs, targets, cost, retention — each in
+  the `docs/spec-template.md` shape and each auditable with `/spec`. Shipped
+  behaviour only; every claim is meant to be falsifiable against the code. It is
+  NOT a substitute for this file: anything needed at EDIT time (a contract
+  between two files, an ordering that fails silently) belongs here, because this
+  is auto-loaded and `docs/` is not.
 - **`docs/ladders-and-delivery.md`** — what a ladder actually contains: rungs
   AND the delivery profile (segment / partial / GOP / VBV) AND the output tag,
   why they are one object, the `peak = maxrate% + bufsize/T` relation that
