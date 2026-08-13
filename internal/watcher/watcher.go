@@ -129,6 +129,10 @@ func (w *Watcher) alreadyEncoded(name string) bool {
 		return false
 	}
 	for _, e := range entries {
+		// Superseded copies live under OUTPUT_DIR/.archive/ since #332, so this
+		// scan no longer meets them; the check stays for a copy an older server
+		// left as a sibling, where treating it as "already encoded" would mean
+		// never re-encoding a clip whose real output someone deleted.
 		if e.IsDir() && strings.HasPrefix(e.Name(), stem+"_") && !encode.IsDatedBackup(e.Name()) {
 			return true
 		}

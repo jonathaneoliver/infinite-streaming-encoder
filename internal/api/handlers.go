@@ -854,6 +854,11 @@ func (s *Server) listOutputs(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		name := e.Name()
+		// The dot check is what excludes the whole superseded-output archive
+		// (OUTPUT_DIR/.archive/, #332) — one entry to skip instead of the 168
+		// dated directories this used to walk and classify on every poll, which
+		// is exactly the cost #228 was about. IsDatedBackup stays as
+		// belt-and-braces for a copy an older server left as a sibling.
 		if strings.HasPrefix(name, ".") || strings.HasSuffix(name, "_tmp") || encode.IsDatedBackup(name) {
 			continue
 		}

@@ -139,7 +139,7 @@ Per-job state is persisted to `$TMP_DIR/jobs/<id>.json` (`{id, config, started_a
 Job lifecycle (`Manager.run`):
 1. Encode each file into `$TMP_DIR/<job_id>/` — partial output never appears in `OutputDir`.
 2. Before launching each file, persist current index to `$TMP_DIR/jobs/<id>.json`.
-3. On success, `moveTmpToOutput` renames each top-level subdir into `OutputDir`. If a dir already exists there: with `ForceReencode=true` it's moved to `OutputDir/.archive/<name>_<timestamp>`; otherwise it's deleted.
+3. On success, `moveTmpToOutput` renames each top-level subdir into `OutputDir`. If a dir already exists there it is **always** preserved — moved to `OutputDir/.archive/<name>_<YYYYMMDD>` (`_HHMMSS` too on a same-day repeat), never deleted, and `ForceReencode` does not change that. This line used to describe a `.archive/` the code did not have and a delete it never did; #332 made the first half true and dropped the second.
 4. If rename fails (cross-device), falls back to `copyDir`.
 5. Per-job log written (ANSI stripped) and `history.md` appended regardless of outcome. State file removed.
 
@@ -351,6 +351,50 @@ because `failed/` is a different size class from the thing you back up.
   on a default install it is still the only thing between the sweep and the
   learned model. What changed is that it is no longer the only thing between a
   human with `rm -rf` and the same files.
+
+### OUTPUT_DIR/.archive: superseded outputs (#332)
+
+A re-encode has always preserved the copy it replaced under a dated name. What
+it never had was anywhere to put them or anything to remove them: they were
+renamed **in place**, as siblings of the live outputs, and reached 168
+directories / ~158 GB against a 208 GB `OUTPUT_DIR`. Four call sites already
+agreed to ignore them (`/api/outputs`, `writeEncodeMetaForDirs`, `autoPromote`,
+the watcher's already-encoded check), which is a good sign they did not belong
+in that directory — and ignoring was not free, since `/api/outputs` still walked
+and classified every one on every poll.
+
+So `archiveExisting` moves them to `OUTPUT_DIR/.archive/` and
+**`internal/outarchive`** sweeps that on `-output-archive-max-age` (30 days,
+`OUTPUT_ARCHIVE_MAX_AGE_D`), the third instance of the sweeper shape
+`internal/tmpstage` and `internal/diststage` already implement.
+
+- **The dot prefix is the mechanism, not decoration.** Every existing
+  `strings.HasPrefix(name, ".")` guard now covers the whole archive, which is
+  what turns the four `IsDatedBackup` checks from load-bearing into
+  belt-and-braces. Keep them: an older server's in-place backups still exist
+  until `MigrateDatedBackups` collects them.
+- **The archived directory's mtime is stamped to NOW when it is archived**
+  (`stampArchived`), and the date in its NAME is still the encode date.
+  Retention here means "how long is a superseded copy kept", and that clock
+  starts when it is superseded. Without the stamp, re-encoding a year-old output
+  would produce an archive already older than any retention window — swept
+  before anyone could compare old against new. The startup migration stamps for
+  the same reason, so the window starts at the upgrade rather than handing 168
+  directories to the first sweep.
+- **Four rules hold a directory, and each one is "this is not a superseded
+  copy".** `.remote.json` / `.pending.json` (S3 holds the only copy of part of
+  it), `.keep` (a human said so — an A/B pair kept as evidence is not a backup),
+  a base name belonging to a queued or running job, and an **orphan**: a dated
+  copy whose live output no longer exists is the LAST copy, not a superseded
+  one, so it is held unless `-output-archive-sweep-orphans` says otherwise. Ten
+  of the master's 168 are orphans, which is also why no keep-N-per-base rule
+  would work — it cannot see them.
+- **A held directory past its retention is logged**, aggregated by reason. An
+  immortal directory nobody can see is how this problem started, and a sidecar
+  archive is immortal by design: `MarkGoneUnderPrefix` only walks the top level,
+  so nothing will ever mark it gone.
+- **`MaxAge` of 0 means disabled** at both the loop and the sweep — the same
+  rule, for the same reason, as `tmpstage`.
 
 ### Duration limit (the UI's "Duration (s)")
 

@@ -99,6 +99,8 @@ type metaRung struct {
 // none of which survives the server process, see RunRecordFile).
 func (m *Manager) writeEncodeMetaForDirs(job *Job, dirs []string) {
 	for _, name := range dirs {
+		// Both are belt-and-braces since #332: `dirs` is what moveTmpToOutput
+		// just moved IN, which never includes the copy it archived out.
 		if IsDatedBackup(name) || strings.HasPrefix(name, ".") {
 			continue
 		}

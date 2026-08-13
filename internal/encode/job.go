@@ -3475,17 +3475,12 @@ func (m *Manager) moveTmpToOutput(tmpDir string) ([]string, error) {
 		dst := filepath.Join(m.OutputDir, e.Name())
 
 		if fi, statErr := os.Stat(dst); statErr == nil {
-			// Preserve the existing copy: rename it in place with the date it was
-			// last modified appended (<name>_<YYYYMMDD>), so a re-encode never
-			// destroys the prior output. A same-day re-encode disambiguates with a
-			// time suffix. These dated backups are skipped by the Outputs list and
-			// the watcher (IsDatedBackup).
-			ts := fi.ModTime().Format("20060102")
-			backup := filepath.Join(m.OutputDir, e.Name()+"_"+ts)
-			if _, err := os.Stat(backup); err == nil {
-				backup = filepath.Join(m.OutputDir, e.Name()+"_"+ts+"_"+fi.ModTime().Format("150405"))
-			}
-			os.Rename(dst, backup)
+			// Preserve the existing copy under OUTPUT_DIR/.archive/, named with
+			// the date it was last modified (<name>_<YYYYMMDD>), so a re-encode
+			// never destroys the prior output. See archive.go — it used to be
+			// renamed in place here, which is how 158 GB of superseded copies
+			// accumulated as siblings of the live outputs (#332).
+			m.archiveExisting(e.Name(), fi.ModTime())
 		}
 
 		if err := os.Rename(src, dst); err != nil {
