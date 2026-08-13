@@ -164,6 +164,14 @@ services:
       SOURCE_DIR: /media/originals
       OUTPUT_DIR: /media/dynamic_content
       TMP_DIR: /media/tmp
+      # Where the image keeps the Python package. NOT optional: the Go default is
+      # `/scripts` (cmd/server/main.go), the image installs to /app/scripts, and
+      # m.ScriptsDir is what builds the argv for the spawned local-dist
+      # orchestrator. Dropped by accident in #333 while STATE_DIR was added
+      # below, which failed EVERY local-dist encode with an exit code 2 and
+      # `can't open file '/scripts/…/cli_local_dist.py'` — a container-only
+      # break, since `go run ./cmd/server` on the host never reads this block.
+      SCRIPTS_DIR: /app/scripts
       # Set ONLY when the operator pointed them somewhere durable (#331). The
       # `:+` form is what keeps this a no-op otherwise: with STATE_DIR unset in
       # .env the server sees an empty value and falls back to TMP_DIR, so the
