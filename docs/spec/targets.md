@@ -71,11 +71,26 @@ implementation — so they are the seam.
 12. **`ENCODER_TELEMETRY_EXEC` is explicitly unset for host phases.** On the host
     stdout *is* the channel to the server, and the orchestrator is the telemetry
     queue's consumer; leaving it set would have it drain its own output back.
+13. **A produced artifact is complete only when its `.done` sidecar exists AND
+    the size recorded in it equals the file's actual size.** The sidecar is
+    written next to every variant MP4 and uploaded alongside every staged
+    object, on both targets, because `cli_phase` is shared (rule 1). Presence
+    alone is not enough and the distinction is not pedantic: a chunk re-encoded
+    after a spot reclaim has different bytes under the same key, so a stale
+    sidecar over a fresh object is exactly the case the size check catches. A
+    mismatch means the object was overwritten mid-upload or landed partial, and
+    the consumer aborts rather than continuing. The same invariant gates three
+    otherwise unrelated decisions: whether `--resume-package-from` counts a
+    variant, whether a staged download is usable, and whether a prefetched chunk
+    (#311) may be hardlinked in instead of re-downloaded.
 
 **Enforced by:** rule 5 by `cmd_poll`'s run-plan construction; rules 7–8 by
-`test_dist_stage_state` and `_emit_plan`; rule 6 by config resolution. Rules 1–4
-are **architectural, not enforced** — nothing fails if a fourth phase is
-reimplemented rather than reused.
+`test_dist_stage_state` and `_emit_plan`; rule 6 by config resolution; rule 13's
+prefetch half by `scripts/test_prefetch.py`, which asserts the sidecar crosses
+with the object — the producing half (`_write_done`, `encode_variants`) has no
+test and fails silently, since a missing sidecar reads as an incomplete artifact
+and simply causes re-work. Rules 1–4 are **architectural, not enforced** —
+nothing fails if a fourth phase is reimplemented rather than reused.
 
 ## Blast radius — what does NOT change
 

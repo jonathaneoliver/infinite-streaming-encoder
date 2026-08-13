@@ -190,6 +190,38 @@ It can be set three ways, in increasing precedence: the derivation above, the
 ladder's own `output_tag`, and a per-encode override (the encode form's tag box,
 `--output-tag` on the CLI).
 
+### What the tags MEAN
+
+`_6s`, `_2s` and `_1s` describe themselves: the output is served at that segment
+length, as encoded. `_xs` does not, and the difference matters more than the
+spelling suggests.
+
+**`_xs` is an interface with a system that is not in this repository.** It marks
+the FLEXIBLE base — the one master go-live repackages into 1s, 2s and 6s — and
+go-live keys off the tag to decide which outputs it may re-chop. Those three
+lengths are go-live's repertoire, not an arbitrary set, which is also why the
+four `apple-uniq-live-*` ladders exist: they are the natively-encoded arm of the
+comparison against them. The name is not a size, either — "xs" reads as
+extra-small and means *any chop*.
+
+**Nothing in THIS repository reads the tag back.** Every use here is
+concatenation into a directory name, plus `ValidPathSegment` on the way in and
+the encode form's collision check at submit. No code branches on the value. So
+renaming `xs`, or letting a ladder derive it by accident, breaks nothing that
+any test or any encode here would notice — the damage is entirely downstream,
+and `TestFlexibleBaseStillDerivesXs`'s failure message is the only place in the
+tree that says so.
+
+**`_xs` is a claim about the encode, and no check ties it to the claim.** The
+flexible base's VBV is split 100% maxrate + 0.25x buffer precisely so that
+`peak/avg = 1.00 + 0.25/T` still satisfies Apple's 1.25x live bound **at T=1s**
+— that bound holding at the shortest chop is what makes the encode safe to
+re-chop at all. But the tag is derived from `segment_duration` being unset and
+from nothing else. A ladder with looser VBV that pins no segment derives `xs`
+just the same, and asserts a re-choppability its own numbers do not support.
+**Not enforced** — the relation is in `ladder_store.go`'s description of
+`apple-uniq-live-xs` and in the VBV section above, and in no guard.
+
 ### The gap this closed
 
 Pinned-segment ladders used to derive `""`. That held while there was ONE of
