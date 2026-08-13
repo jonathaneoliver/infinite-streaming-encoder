@@ -1,6 +1,6 @@
 ---
 description: Write or audit a behavioural spec in docs/ — durable half in the doc, plan half in the issue
-argument-hint: <issue-number> | <path/to/existing-spec.md>
+argument-hint: <issue-number> | <path/to/existing-spec.md> | --help
 allowed-tools: Bash, Read, Write, Edit, Grep, Glob
 ---
 
@@ -27,11 +27,43 @@ still load-bearing today.
 The failure showed up plainly on 2026-08-10, when the user needed a past
 decision back and searched **session history**, not `docs/`.
 
+## Resolve the argument FIRST — do this before anything else
+
+There is no flag parser here; you are it. Classify the argument, and when it is
+not unambiguously one of the two modes, **print usage and stop**. Do not guess:
+an unrecognised argument falling through to Mode B means trying to audit a file
+named `--help`, which is how this section came to exist.
+
+| argument | do |
+| --- | --- |
+| empty, `--help`, `-h`, `help`, `?` | print **Usage** below, stop |
+| all digits (`312`) | **Mode A** |
+| digits with a leading `#` (`#312`) | strip the `#`, **Mode A** |
+| a path that EXISTS | **Mode B** |
+| a path that does NOT exist | say so, `ls docs/*.md`, stop |
+| anything else | say it is ambiguous, show Usage, stop |
+
+Check existence before choosing Mode B — `test -f <arg>` — and resolve relative
+to the repo root, not the cwd.
+
+### Usage
+
+```
+/spec <issue-number>     write a new spec from that issue      e.g. /spec 312
+/spec <path-to-spec.md>  audit an existing spec against code   e.g. /spec docs/PRD.md
+/spec --help             this message
+```
+
+Then list what is actually available to audit: `ls docs/*.md`, excluding
+`spec-template.md` (that is the skeleton, not a spec) and noting that
+`ladders-and-delivery.md` is the reference example rather than an audit target.
+
 ## Mode A — new spec (argument is an issue number)
 
 1. `gh issue view <N> --json number,title,body,comments` — read the issue and
    any decisions in its comments.
-2. Write `docs/<slug>.md` from the skeleton below.
+2. Write `docs/<slug>.md` from the skeleton in `docs/spec-template.md` (see
+   "The skeleton" below — read that file, do not recall it).
 3. **Write the plan half into the ISSUE, not the doc** — touch-point tables
    (file × change), sequencing/phasing, acceptance criteria, and any
    option-recommendation. Post it as an issue comment or fold it into the body.
@@ -51,60 +83,17 @@ Flag `Status:` headers, touch-point tables and sequencing sections for deletion
 
 ## The skeleton
 
-```markdown
-# <Object or behaviour>: <the one-line claim>
+**It lives in `docs/spec-template.md`. Read that file and use the fenced block
+inside it — do not reproduce a skeleton from memory and do not copy one into
+this command.**
 
-<2-3 sentences: why this document exists. Name the defect that made it
-necessary, with an issue number. If nothing broke, say what would break
-without the rules below.>
+Two files that must agree is the failure mode this repo writes rules about, and
+an earlier version of this command embedded its own copy of the template. There
+is one source now.
 
-## The core model
-
-<The ONE distinction everything else depends on — the thing that is not
-obvious and that a reader will get wrong. Usually two things that look like
-one thing, or one thing that looks like two.>
-
-### Why it is one object / why they are separate
-
-<The alternative you rejected and the cost of the choice you made. This is
-what stops the next person re-litigating it.>
-
-## The rules that must hold
-
-1. **<Rule>** — <what breaks when it doesn't, concretely.>
-
-**Enforced by:** <test / check / guard>, or explicitly **"Not enforced."**
-An unenforced rule is a rule; an unenforced rule that reads as enforced is a
-trap.
-
-## Blast radius — what does NOT change
-
-<What keeps working and why. Name the contracts that stay intact — OutputStem,
-resolveCodec, parseOutputMeta, the watcher, the job-definition Ref:: set — and
-the ones that don't.>
-
-## The trade
-
-| option | what it costs | what it buys | status |
-| --- | --- | --- | --- |
-
-<A status column, always. It is what let one table survive while the section
-above it rotted.>
-
-## As it stands
-
-<Current measured state — real values, dated, with where they came from and
-what they DON'T cover. e.g. "all of this is one 4K AV1 high-motion clip; if a
-different master doesn't reproduce, suspect the source before suspecting a
-regression.">
-
-## What is unmeasured
-
-<Only measurements, never decisions. "How much does gop=1 cost vs gop=6 —
-unmeasured, and it bounds the value of the whole idea (#288)." A decision
-belongs in the issue; a missing measurement belongs here and stays useful
-until someone takes it.>
-```
+If `docs/spec-template.md` is missing, say so and stop rather than inventing a
+structure. A spec written to a remembered shape is exactly the artefact the
+template exists to prevent.
 
 ## Reference
 
