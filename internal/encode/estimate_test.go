@@ -80,6 +80,87 @@ func TestEstimateIsZeroAndFlaggedForLocalTargets(t *testing.T) {
 	}
 }
 
+func TestLocalWallPredictionRespondsToTheFormControls(t *testing.T) {
+	// #343: on a local target $0.00 is a literal, so the predicted wall time is
+	// the ONLY figure the panel can show that answers to anything the user
+	// selects. Each of these used to move the estimate by exactly nothing.
+	m := &Manager{Ladders: testStore(t), Speeds: LoadEncodeSpeedStore(filepath.Join(t.TempDir(), "speeds.json"))}
+	base := JobConfig{Codec: "h264", Ladder: DefaultLadderName, Target: "local"}
+
+	oneCodec, _, rungs := m.projectLocalWallDetail(base, 3840, 30, 300)
+	if rungs == 0 || oneCodec <= 0 {
+		t.Skip("seed ladder unavailable")
+	}
+
+	// More codecs is strictly more work on the same fleet.
+	twoCodec, _, _ := m.projectLocalWallDetail(
+		JobConfig{Codec: "both", Ladder: DefaultLadderName, Target: "local"}, 3840, 30, 300)
+	if twoCodec <= oneCodec {
+		t.Fatalf("adding hevc did not increase predicted wall: %v -> %v", oneCodec, twoCodec)
+	}
+
+	// A narrower resolution band is less work.
+	capped, _, _ := m.projectLocalWallDetail(
+		JobConfig{Codec: "h264", Ladder: DefaultLadderName, Target: "local", MaxRes: "720p"}, 3840, 30, 300)
+	if capped >= oneCodec {
+		t.Fatalf("max-res 720p did not reduce predicted wall: %v vs %v", capped, oneCodec)
+	}
+
+	// And twice the content is more wall. Not asserted as exactly 2x: the
+	// makespan is max(coreSeconds/cores, longest atomic chunk), and the floor
+	// term is deliberately not linear.
+	longer, _, _ := m.projectLocalWallDetail(base, 3840, 30, 600)
+	if longer <= oneCodec {
+		t.Fatalf("doubling duration did not increase predicted wall: %v -> %v", oneCodec, longer)
+	}
+}
+
+func TestLocalTargetsCarryTheCloudWhatIfButAreStillBilledNothing(t *testing.T) {
+	// The local panel compared against four SaaS vendors while omitting our own
+	// cloud path — the one baseline the user can act on. So SpotUSD is now
+	// projected for local targets too.
+	//
+	// The trap it must not fall into: TotalUSD means "what this run will be
+	// billed". Folding the what-if into it would quote a local run a charge that
+	// never arrives, and put the estimate and the finished run's report on two
+	// different bases (#237).
+	m := &Manager{Ladders: testStore(t), Speeds: LoadEncodeSpeedStore(filepath.Join(t.TempDir(), "speeds.json"))}
+	cfg := JobConfig{Codec: "h264", Ladder: DefaultLadderName, Target: "local"}
+
+	spot, _, _, _, _ := m.projectCloudCostDetail(cfg, 3840, 30, 300)
+	if spot <= 0 {
+		t.Skip("seed ladder unavailable")
+	}
+
+	// And the same config priced as cloud must agree — one projection, two
+	// presentations. If these diverge the "would be" figure is fiction.
+	cloudCfg := cfg
+	cloudCfg.Target = "cloud"
+	cloudSpot, _, _, _, _ := m.projectCloudCostDetail(cloudCfg, 3840, 30, 300)
+	if cloudSpot != spot {
+		t.Fatalf("local what-if $%v disagrees with the cloud projection $%v for the same ladder", spot, cloudSpot)
+	}
+}
+
+func TestLocalWallSaysWhenItIsGuessing(t *testing.T) {
+	// seedSpeed never returns <= 0, so an unlearned fleet still produces a
+	// confident-looking number. The UI can only mark it as seeded if the
+	// estimate reports the provenance, so a cold store must come back with
+	// learned == 0 rather than silently looking measured.
+	m := &Manager{Ladders: testStore(t), Speeds: LoadEncodeSpeedStore(filepath.Join(t.TempDir(), "speeds.json"))}
+	cfg := JobConfig{Codec: "h264", Ladder: DefaultLadderName, Target: "local"}
+	secs, learned, rungs := m.projectLocalWallDetail(cfg, 3840, 30, 300)
+	if rungs == 0 {
+		t.Skip("seed ladder unavailable")
+	}
+	if secs <= 0 {
+		t.Fatal("a cold speed store must still predict a time, from the seed model")
+	}
+	if learned != 0 {
+		t.Fatalf("cold store reported %d learned rungs — the UI would call a guess a measurement", learned)
+	}
+}
+
 func TestSkipMediaDownloadRemovesEgressFromTheEstimate(t *testing.T) {
 	// The whole point of showing this before the button: ticking "leave media in
 	// S3" should visibly drop the quote. If the estimate ignored the flag it

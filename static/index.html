@@ -171,6 +171,9 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 
 /* Split "Encode ▾" button: default click = safe Encode, caret opens Re-encode.
    Replaces the hidden Alt/right-click force gesture (issue #114). */
+/* Own row for the action, so wrapping in .controls above can never relocate it.
+   Block container + inline-flex button = always hard left, at every width. */
+.encode-actions { margin-top: 16px; }
 .split-btn { position: relative; display: inline-flex; }
 .split-btn #encode-btn { border-top-right-radius: 0; border-bottom-right-radius: 0; }
 .split-caret { padding: 10px 12px; border-left: 1px solid rgba(255,255,255,0.25);
@@ -473,12 +476,12 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <option value="whole">Whole variant (no chunking)</option>
                 </select>
             </div>
-            <div class="control-group" id="spot-group" style="display:none;align-self:center;padding-top:16px">
+            <div class="control-group" id="spot-group" style="display:none;align-self:end;padding-bottom:7px">
                 <label title="Spot is ~2.6× cheaper but AWS can reclaim with 2 min notice. Uncheck to use on-demand (guaranteed, no interruption)."><input type="checkbox" id="use-spot" checked style="width:auto;min-width:auto"> Use spot (cheaper)</label>
             </div>
             <!-- #214. Cloud only: local and local-dist write straight to disk, so
                  there is no egress to avoid and the box would be a no-op. -->
-            <div class="control-group" id="skip-media-group" style="display:none;align-self:center;padding-top:16px">
+            <div class="control-group" id="skip-media-group" style="display:none;align-self:end;padding-bottom:7px">
                 <label title="Bring back manifests and metadata only (~4 MB instead of ~2.6 GB), leaving the segments in S3. Egress is billed per GB and is roughly 3× the compute for a run. Download any output you want to keep from the Outputs tab — but within 7 days, after which S3 staging expires and the media is gone."><input type="checkbox" id="skip-media" style="width:auto;min-width:auto"> Leave media in S3 (fetch on demand)</label>
                 <label title="Do not package at all. The run finishes when the last chunk lands — no packaging job, no sync-back — and the chunks stay in S3 until you press Package in the Outputs tab. Removes the whole post-encode tail (measured at 4m18s, 37-39% of a run) and holds half as much in S3, because the packaged copy is never made. WARNING: the chunks are then the ONLY copy. When staging expires the run is gone and must be re-encoded from the source."><input type="checkbox" id="defer-packaging" style="width:auto;min-width:auto"> Don't package yet (package on demand)</label>
             </div>
@@ -493,7 +496,6 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group">
                 <label title="Bitrate ladder (resolutions + target bitrates) AND its output timing (segment / partial / GOP / VBV). Select SEVERAL to encode the same source as several delivery profiles — one job each. Manage ladders in the Ladders tab.">Ladder / Profile</label>
                 <div id="ladder-list" class="ladder-checks"></div>
-                <div id="ladder-multi-note" style="display:none;font-size:11px;color:#e9c46a;margin-top:3px"></div>
             </div>
             <!-- Options are rebuilt from the SELECTED LADDER's real rung heights
                  by syncResTiers() — these placeholders only cover the moment
@@ -540,28 +542,41 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                  failure leaves the option OFF-and-absent rather than
                  offered-and-broken. Both boxes default unchecked, so a hidden
                  group submits exactly what an untouched visible one would. -->
-            <div class="control-group dev-only" id="vmaf-group" style="align-self:center;padding-top:16px">
+            <div class="control-group dev-only" id="vmaf-group" style="align-self:end;padding-bottom:7px">
                 <label title="Measure per-rendition VMAF quality after encoding (each rendition vs the source at source resolution). Slow — adds a post-encode pass per rung, fanned across the workers. Off by default. Scores show in the Outputs VMAF column. Ticking this clears Burn-in, since the overlay biases VMAF."><input type="checkbox" id="measure-vmaf" onchange="_vmafBurninSync(true)" style="width:auto;min-width:auto"> Measure VMAF</label>
                 <label title="#109: build a near-lossless pre-scaled VMAF reference ONCE PER WORKER BOX, so the audit decodes a small fast H.264 file instead of re-downscaling the native (4K/AV1) mezzanine on every chunk. VMAF-SPEED only — scores are identical within ~0.4 and it auto-skips when it wouldn't pay off (fewer than 2 renditions, source no slower than the ref, or too big). Needs Measure VMAF on." style="display:block;margin-top:4px"><input type="checkbox" id="vmaf-prescale" style="width:auto;min-width:auto"> VMAF pre-decode</label>
             </div>
-            <div class="control-group" style="align-self:center;padding-top:16px">
+            <div class="control-group" style="align-self:end;padding-bottom:7px">
                 <label title="#317: encode the decode-dominated rungs (1080p and below) in bands of 3 that share ONE decode per chunk, instead of one ffmpeg per rung. With two passes a 12-rung ladder decodes each chunk 24 times and needs one per band per pass; the low rungs' encodes are nearly free next to that shared decode. Local target only. Same output — the ladder and every rung's settings are unchanged."><input type="checkbox" id="group-rungs" style="width:auto;min-width:auto"> Shared decode</label>
             </div>
-            <div class="control-group" style="align-self:center;padding-top:16px">
+            <div class="control-group" style="align-self:end;padding-bottom:7px">
                 <label title="Burn the diagnostic text overlay (timecode, bitrate, codec/resolution, encoder, watermark) into every variant. On by default; uncheck for clean output."><input type="checkbox" id="burnin" checked onchange="_vmafBurninSync(false)" style="width:auto;min-width:auto"> Burn-in text overlay</label>
                 <span id="vmaf-burnin-hint" style="display:none;color:#d0a24a;font-size:11px">⚠ overlay biases VMAF — uncheck for accurate scores</span>
             </div>
-            <div class="control-group" id="promote-group" style="display:none;align-self:center;padding-top:16px">
+            <div class="control-group" id="promote-group" style="display:none;align-self:end;padding-bottom:7px">
                 <label id="promote-after-label"><input type="checkbox" id="promote-after" style="width:auto;min-width:auto"> Promote after encode</label>
             </div>
-            <div class="split-btn" id="encode-split">
-                <button class="btn btn-primary" id="encode-btn" onclick="startEncode(false)" title="Encode the checked files: fills in any missing variants and resumes an interrupted run; a brand-new source encodes fully. Already-complete files are skipped." disabled>Encode</button>
-                <button class="btn btn-primary split-caret" id="encode-caret" onclick="toggleEncodeMenu(event)" aria-haspopup="true" aria-expanded="false" title="More encode actions" disabled>&#9662;</button>
-                <div class="split-menu" id="encode-menu" style="display:none">
-                    <div class="split-menu-item" onclick="hideEncodeMenu(); startEncode(true)">Re-encode (replace existing)<small>Archive existing output, produce everything fresh</small></div>
+            </div>
+            <!-- The Encode button is an ACTION, not one of the options. As the
+                 last flex item inside .controls (display:flex; flex-wrap:wrap)
+                 it had no fixed home — it sat after whichever control happened
+                 to end the last row, so every window resize moved it somewhere
+                 new. Its own row, left aligned, means it is always in the same
+                 place regardless of how the options above it wrap. -->
+            <div class="encode-actions">
+                <div class="split-btn" id="encode-split">
+                    <button class="btn btn-primary" id="encode-btn" onclick="startEncode(false)" title="Encode the checked files: fills in any missing variants and resumes an interrupted run; a brand-new source encodes fully. Already-complete files are skipped." disabled>Encode</button>
+                    <button class="btn btn-primary split-caret" id="encode-caret" onclick="toggleEncodeMenu(event)" aria-haspopup="true" aria-expanded="false" title="More encode actions" disabled>&#9662;</button>
+                    <div class="split-menu" id="encode-menu" style="display:none">
+                        <div class="split-menu-item" onclick="hideEncodeMenu(); startEncode(true)">Re-encode (replace existing)<small>Archive existing output, produce everything fresh</small></div>
+                    </div>
                 </div>
             </div>
-            </div>
+            <!-- #343: a property of the WHOLE form (files x ladders x codecs),
+                 not of the ladder picker it used to sit under. Next to the
+                 estimate because they answer the same question — what is this
+                 button about to do, and what will it cost. -->
+            <div id="ladder-multi-note" style="display:none;font-size:11px;color:#e9c46a;margin:6px 0 0"></div>
             <div class="encode-hint" id="encode-estimate" style="display:none"></div>
             <div class="encode-hint"><b>Encode</b> fills in whatever's missing and resumes an interrupted run — a brand-new source encodes fully, an already-complete one is skipped. Use <b>Re-encode</b> (the ▾ menu) to archive existing output and produce every variant fresh.</div>
         </fieldset>
@@ -1326,27 +1341,40 @@ async function loadLadders() {
     syncLadderMultiNote();
 }
 
-// Say how many jobs the button will start, and which ladder the single-ladder
-// views below are describing. Without this the second, third and fourth job are
-// invisible until they appear in the Jobs tab — and each one costs money.
+// Say what the button is about to produce. Without this the second, third and
+// fourth output are invisible until they appear in the Jobs tab — and on a
+// cloud target every one of them costs money.
+//
+// The count is files x ladders x codecs, and that is BOTH the job count and the
+// output count — they are 1:1 (#343).
+//
+// All three dimensions fan out into their own job: the page loops ladders and
+// codecs (#324), and startEncode then splits the file list, one job per file,
+// so each gets its own log, history, cancel and retry (handlers.go). The old
+// note counted only ladders x codecs, so selecting three files understated the
+// button by 3x and, at one ladder and one codec, showed nothing at all.
 function syncLadderMultiNote() {
     const el = document.getElementById('ladder-multi-note');
     if (!el) return;
     const sel = selectedLadders();
     const cod = submitCodecs();
-    const jobs = sel.length * cod.length;
+    const nFiles = document.querySelectorAll('#file-list input:checked').length || 0;
+    const jobs = nFiles * sel.length * cod.length;
     if (jobs <= 1) { el.style.display = 'none'; return; }
     el.style.display = '';
-    // Ladders AND codecs each fan out into their own job (#324), so the count
-    // is the product. Saying only the ladder count would understate it by the
-    // number of codecs, and every one of these costs money on a cloud target —
-    // which is the whole reason this note exists.
     const parts = [];
+    if (nFiles > 1) parts.push(`${nFiles} files`);
     if (sel.length > 1) parts.push(`${sel.length} ladders`);
     if (cod.length > 1) parts.push(`${cod.length} codecs`);
-    el.textContent = `${parts.join(' x ')} → ${jobs} separate jobs, one output each. `
-        + `Charts and the estimate below show ${sel[0]}`
-        + (cod.length > 1 ? ` (${cod.join('+')} combined).` : '.');
+    // Deliberately NOT claiming anything about "charts" or the estimate. The
+    // band charts live in the Ladders tab, and the estimate sums every selected
+    // ladder rather than showing the first (#343). What IS single-ladder here
+    // is the Max/Min Resolution list, so that is what gets named.
+    // "above", not "below": this note now sits at the foot of the panel, so the
+    // Max/Min Resolution controls it refers to are above it. Getting that
+    // backwards is the defect this note had in the first place.
+    el.textContent = `${parts.join(' x ')} → ${jobs} separate jobs, one output each.`
+        + (sel.length > 1 ? ` Resolution tiers above describe ${sel[0]}.` : '');
 }
 
 // Every ladder selected in the encode form, in list order. A multi-select with
@@ -2083,13 +2111,26 @@ function updateSelectedCount() {
     if (none) hideEncodeMenu();
 }
 
+// Setting .checked in script fires NO `change` event, so the #file-list
+// delegation that drives the estimate and the multi-output note never sees
+// these two. Clicking a checkbox does fire one (stopPropagation on the click
+// does not suppress the separate change event), so only the programmatic paths
+// need this — and it deliberately does NOT live in updateSelectedCount, which
+// also runs on every 60s file-list re-render and would turn a per-file ffprobe
+// into a background poll (#228).
+function _selectionChanged() {
+    updateSelectedCount();
+    scheduleCostEstimate();
+    syncLadderMultiNote();
+}
+
 function selectAll() {
     document.querySelectorAll('#file-list input').forEach(cb => cb.checked = true);
-    updateSelectedCount();
+    _selectionChanged();
 }
 function selectNone() {
     document.querySelectorAll('#file-list input').forEach(cb => cb.checked = false);
-    updateSelectedCount();
+    _selectionChanged();
 }
 
 async function loadSources() {
@@ -3394,12 +3435,19 @@ function _runCostHtml(j) {
 // Delegated rather than hooked onto each control: the options block already has
 // a dozen inputs and gains more, and a new one silently not updating the
 // estimate is the kind of staleness nobody notices until the number is wrong.
+// The multi-output note rides the same delegation for the same reason: since
+// #343 it counts FILES as well as ladders and codecs, and file checkboxes live
+// in #file-list where no ladder/codec handler reaches. Undebounced — it is
+// local arithmetic, not a fetch.
 document.addEventListener('DOMContentLoaded', () => {
     for (const sel of ['#encode-options', '#file-list']) {
         const root = document.querySelector(sel);
-        if (root) root.addEventListener('change', scheduleCostEstimate);
+        if (!root) continue;
+        root.addEventListener('change', scheduleCostEstimate);
+        root.addEventListener('change', syncLadderMultiNote);
     }
     scheduleCostEstimate();
+    syncLadderMultiNote();
 });
 
 let _estTimer = null;
@@ -3459,6 +3507,22 @@ async function refreshCostEstimate() {
     } catch (e) { el.style.display = 'none'; }
 }
 
+// The four SaaS baselines summed across every selected ladder, shaped like an
+// estimate so _saasCompare can price a multi-ladder selection unchanged.
+//
+// Without this the comparison silently VANISHED on the second ladder: the
+// single-ladder branches carry _saasCompare and the multi ones did not, so the
+// one selection where the vendor comparison matters most — several delivery
+// profiles of the same source — was the one that hid it.
+function _summedSaaS(sum) {
+    return {
+        coconut_usd: sum('coconut_usd'),
+        commercial_usd: sum('commercial_usd'),
+        mediaconvert_usd: sum('mediaconvert_usd'),
+        bitmovin_usd: sum('bitmovin_usd'),
+    };
+}
+
 // Cheapest-first, so the line answers "who would be cheaper?" at a glance
 // rather than making you compare four numbers.
 function _saasCompare(e, prefix) {
@@ -3508,6 +3572,11 @@ function _excludedRungsNote(e) {
 // source, a rejected config) it is dropped from the sum, and a total quietly
 // covering fewer encodes than the button will start is exactly the kind of
 // under-statement this function exists to prevent — so it is said out loud.
+// got.length is LADDERS, not encodes — codecs are combined inside each request
+// (`codec: codecValue()`), and files fan out server-side. Calling it "N encodes"
+// contradicted the note directly above it, which counts files x ladders x
+// codecs: 2 ladders x 2 codecs read as "2 encodes" beside "4 separate jobs".
+// Say what the number actually is.
 function _estimateHtmlMulti(got, nFiles, asked) {
     const local = got[0].est.local;
     const sum = k => got.reduce((n, g) => n + (g.est[k] || 0), 0);
@@ -3518,15 +3587,30 @@ function _estimateHtmlMulti(got, nFiles, asked) {
         ? ` <span style="color:#e9c46a">(${missing} ladder${missing > 1 ? 's' : ''} could not be priced — total covers ${got.length} of ${asked})</span>`
         : '';
 
-    const split = got.map(g => {
-        const usd = local ? 0 : (g.est.total_usd || 0);
-        return `${escapeHtml(g.name)} <b>$${usd.toFixed(2)}</b>`;
-    }).join(' · ');
+    // Per-ladder split: TIME on local, money on cloud (#343). Splitting $0.00 N
+    // ways told the user nothing, and the ladders differ in exactly the thing
+    // the time model does capture — rung count.
+    const split = got.map(g => local
+        ? `${escapeHtml(g.name)} <b>~${_runSecs(g.est.local_wall_s || 0)}</b>`
+        : `${escapeHtml(g.name)} <b>$${(g.est.total_usd || 0).toFixed(2)}</b>`).join(' · ');
 
     if (local) {
+        // Summed, not maxed: N ladders are N separate jobs queueing behind
+        // MAX_CONCURRENT and sharing one fleet, so their wall times add rather
+        // than overlap. The makespan model already divided each by the fleet's
+        // cores, so summing does not double-count parallelism.
+        const wall = sum('local_wall_s');
+        if (wall > 0) {
+            return `<b>Estimated time</b> ${src} → <b style="color:#6ab04c">~${_runSecs(wall)}</b> `
+                 + `<span style="color:#889">${got.length} ladders priced${_localWallProvenance(got[0].est)} · $0.00, nothing billed`
+                 + _cloudWhatIf(sum('spot_usd'), sum('egress_usd'), got[0].est)
+                 + _saasCompare(_summedSaaS(sum), 'or ')
+                 + `</span>${note}`
+                 + `<div style="color:#889;font-size:11px;margin-top:2px">${split}</div>`
+                 + _excludedRungsNote(got[0].est);
+        }
         return `<b>Estimated cost</b> ${src} → <b style="color:#6ab04c">$0.00</b> `
              + `<span style="color:#889">${got.length} local encodes, nothing billed</span>${note}`
-             + `<div style="color:#889;font-size:11px;margin-top:2px">${split}</div>`
              + _excludedRungsNote(got[0].est);
     }
     const eg = sum('egress_usd');
@@ -3534,17 +3618,62 @@ function _estimateHtmlMulti(got, nFiles, asked) {
     if (eg > 0) parts.push(`$${eg.toFixed(2)} egress (${sum('egress_gb').toFixed(2)} GB)`);
     else parts.push(`<span style="color:#6ab04c">no egress — media stays in S3</span>`);
     return `<b>Estimated cost</b> ${src} → <b>$${sum('total_usd').toFixed(2)}</b> `
-         + `<span style="color:#889">${got.length} encodes · ${parts.join(' · ')}</span>${note}`
+         + `<span style="color:#889">${got.length} ladders priced · ${parts.join(' · ')}`
+         + _saasCompare(_summedSaaS(sum))
+         + `</span>${note}`
          + `<div style="color:#889;font-size:11px;margin-top:2px">${split}</div>`
          + _excludedRungsNote(got[0].est);
+}
+
+// Where a predicted local wall time came from (#343).
+//
+// seedSpeed never returns <= 0, so a cold model produces a figure that looks
+// exactly as confident as one backed by 40k samples. Say which, or the estimate
+// claims an authority it does not have on a fleet that has encoded nothing.
+function _localWallProvenance(e) {
+    const rungs = e.local_wall_rungs || 0;
+    const learned = e.local_wall_learned || 0;
+    if (rungs <= 0) return '';
+    if (learned === 0) return ' · <span style="color:#d0a24a" title="No measured speeds for these rungs on this fleet yet — this is the seed model. It sharpens as encodes complete.">estimated from seed speeds</span>';
+    if (learned >= rungs) return ' · <span style="color:#889" title="Every rung priced from speeds measured on this fleet.">from measured speeds</span>';
+    return ` · <span style="color:#889" title="${rungs - learned} of ${rungs} rungs fall back to the seed model — no measured speed for them on this fleet yet.">${learned}/${rungs} rungs measured</span>`;
+}
+
+// What the same encode would have cost on OUR cloud path, shown on local runs.
+//
+// The local line already compared against four SaaS vendors; the one baseline
+// missing was the one the user can act on by flipping the Target dropdown.
+// spot + egress, matching how TotalUSD is composed for a real cloud run, so the
+// what-if and the bill are the same arithmetic. Carries _idleNote for the same
+// reason the cloud line does: the fleet-idle allowance is stated, never folded
+// in silently (#237).
+function _cloudWhatIf(spotUsd, egressUsd, e) {
+    const total = (spotUsd || 0) + (egressUsd || 0);
+    if (total <= 0) return '';
+    return ` · <span title="What this same ladder would cost on AWS Batch spot, including egress to bring the output home. Flip Target to cloud to actually spend it.">`
+         + `would be <b>$${total.toFixed(2)}</b> on AWS spot</span>${_idleNote(e)}`;
 }
 
 function _estimateHtml(e, nFiles) {
     const mins = (e.duration_s || 0) / 60;
     const src = `${nFiles} file${nFiles > 1 ? 's' : ''} · ${mins.toFixed(1)} min`;
     if (e.local) {
-        // Say $0 explicitly rather than hiding the line — the contrast with the
-        // cloud figure is the useful part of showing this at all.
+        // TIME, not money (#343). A local target bills nothing, so $0.00 was the
+        // only number here and no control in the form could move it. The wall
+        // prediction responds to codec, ladder, res band and duration — which is
+        // what a pre-flight estimate is for. $0.00 stays, demoted, because the
+        // contrast with the cloud figure is still worth a glance.
+        const wall = e.local_wall_s || 0;
+        if (wall > 0) {
+            return `<b>Estimated time</b> ${src} → <b style="color:#6ab04c">~${_runSecs(wall)}</b> `
+                 + `<span style="color:#889">on the local fleet${_localWallProvenance(e)} · $0.00, nothing billed`
+                 + _cloudWhatIf(e.spot_usd, e.egress_usd, e)
+                 + _saasCompare(e, 'or ')
+                 + `</span>`
+                 + _excludedRungsNote(e);
+        }
+        // No speed model (no ladder/speeds loaded): say $0 rather than invent a
+        // time. An absent prediction is better than a fabricated one.
         return `<b>Estimated cost</b> ${src} → <b style="color:#6ab04c">$0.00</b> `
              + `<span style="color:#889">local encode, nothing billed`
              + _saasCompare(e, 'would be ')
