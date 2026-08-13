@@ -142,9 +142,13 @@ the result into a throwaway namespace.
 non-terminal job** — `curl -s localhost:8080/api/jobs`. A bounce mid-encode does
 not fail the run: the encode completes and **PASSES**, having silently lost the
 telemetry of every chunk that ran on the replaced worker (2026-08-08).
-`make deploy` and `make restart` have `require-idle`, but it fires ONCE at entry
-and `publish` then takes minutes before `farm-up` touches a container — anything
-submitted in that window is unguarded and the guard still says idle.
+`make deploy` and `make restart` both have `require-idle`, but they carry it
+differently. `deploy` re-runs it before EACH disruptive step (`publish` →
+re-check → `farm-up` → `infra-plan` → re-check → `infra-apply`), because the
+entry check is minutes stale by the time anything bounces — #248 was a smoke
+encode submitted 29s after a passing check. `restart` still fires it ONCE, and
+every `$(MAKE)` boundary in `deploy` is still a gap. See
+[`docs/spec/release-versioning.md`](docs/spec/release-versioning.md).
 
 **Never bounce the farm without saying so** when another session may own it. A
 worktree that is dev-mounted owns the compose stack for every session on the
@@ -993,9 +997,12 @@ Supporting modules (all stdlib-only except `cloud/*` which uses boto3):
 - `ffprobe.py` — structured ffprobe wrapper; fps as `Fraction` for exact GOP math.
 - `mezzanine.py`, `audio.py`, `encode_variants.py`, `packager.py`, `hls.py` — one per phase; each exposes a pure builder for its ffmpeg/packager argv plus a function that runs the subprocess.
 - **`docs/spec/`** — the behavioural spec set: what the system observably DOES,
-  given inputs, as a complement to `docs/PRD.md`'s what-and-why. Seven files —
-  ingest, job lifecycle, chunk plan, outputs, targets, cost, retention — each in
-  the `docs/spec-template.md` shape and each auditable with `/spec`. Shipped
+  given inputs, as a complement to `docs/PRD.md`'s what-and-why. Eight files —
+  ingest, job lifecycle, chunk plan, outputs, targets, cost, retention, release
+  and versioning — each in
+  the `docs/spec-template.md` shape and each auditable with `/spec`. Its README
+  also lists what the set does NOT cover, so the index is not mistaken for the
+  system. Shipped
   behaviour only; every claim is meant to be falsifiable against the code. It is
   NOT a substitute for this file: anything needed at EDIT time (a contract
   between two files, an ordering that fails silently) belongs here, because this
@@ -1004,8 +1011,10 @@ Supporting modules (all stdlib-only except `cloud/*` which uses boto3):
   AND the delivery profile (segment / partial / GOP / VBV) AND the output tag,
   why they are one object, the `peak = maxrate% + bufsize/T` relation that
   makes a tight VBV the price of re-choppability, the three competing drivers
-  of GOP, and the tag-derivation rule that gives every pinned-segment ladder
-  the SAME empty tag (so two of them overwrite each other).
+  of GOP, and the tag-derivation rule — which since #286 gives each
+  pinned-segment ladder its OWN length as the tag (`6s`/`2s`/`1s`), because all
+  three deriving the same empty tag meant they silently overwrote each other.
+  Its "What the tags MEAN" section is the one to read before touching `xs`.
 - `ladder.py` — rung selection + `--bitrate-override-*` parsing. The tables are
   DATA now (`$STATE_DIR/ladders.json`, which defaults to `$TMP_DIR`), not a
   hardcoded 6-tier × 3-codec block.
@@ -1089,6 +1098,7 @@ not free — each pass is a LIST plus a `head_object` per job prefix.
 ## Things to know when editing
 
 - Output dir naming is a contract shared by `OutputStem`, the encode script (appends `_<codec>`), `parseOutputMeta`, `resolveCodec`, and the watcher's `alreadyEncoded`. Changing the format means touching all of them.
+- **The `_xs` output tag is an interface with go-live, and NOTHING in this repo reads it.** `deriveOutputTag` emits it for the flexible base (no pinned `segment_duration`); go-live keys off it to decide which outputs it may repackage into 1s/2s/6s. Every use here is concatenation into a directory name plus `ValidPathSegment` and the form's collision check — no code branches on the value — so renaming it, or letting a ladder derive it by accident, breaks nothing any test or encode here would notice. `TestFlexibleBaseStillDerivesXs`'s failure message is the only in-tree statement of the consequence. It is also a CLAIM: `xs` asserts the encode's VBV keeps `peak/avg = maxrate% + bufsize/T` inside Apple's 1.25x bound **at T=1s**, which is what makes it safe to re-chop — but the tag is derived from the segment being unset and nothing else, so a loose-VBV ladder that pins no segment asserts a re-choppability its numbers do not support. Unenforced. See [`docs/ladders-and-delivery.md`](docs/ladders-and-delivery.md) § "What the tags MEAN".
 - The worker container name format (`encoder_job_<id>_f<idx>`) is a contract between `runFileContainer` and `Reconcile` — changing it means losing the ability to reattach to workers started by older server versions.
 - The all-digits job ID (`Submit` → `time.Now().UnixMilli()`) is a contract with `internal/tmpstage`, which uses that shape to tell a reclaimable job directory from the caches and learned state sharing `$TMP_DIR`. Give IDs a prefix and the sweeper stops seeing them (a silent leak); name anything else in `$TMP_DIR` with digits alone and it becomes eligible.
 - The docker.sock mount is what lets the Go server spawn and talk to worker containers. Without it, `docker run` / `docker logs -f` / `docker inspect` all fail and no encoding happens.
@@ -1134,7 +1144,7 @@ Three rules hold this together:
 `manifests._segment_fragments` prefers a `.byteranges` sidecar when one exists so
 a pre-#282 package repackages identically, and otherwise walks the `.m4s`. Both
 branches call the same `fragments.parse_segment`, so they cannot disagree.
-- **`version` (worker, fleet view, `run.json`) means ENCODER PAYLOAD, not build** (#248). It is `IMAGE_TAG`, which the Makefile derives as `git log -1 --format=%h -- Dockerfile requirements.txt scripts static` — excluding `internal/` and `cmd/`, while the Dockerfile still copies the Go server binary into the image. Two consequences, both deliberate: a **Go-only change does not move the tag**, so it publishes different image content under the same tag and is invisible to `make fleet-check` by construction; and **rollback is asymmetric** — `make infra-plan IMAGE_TAG=<prev>` restores the encoder payload, not the server binary that shipped in that image (nothing expects it to, since the server is not deployed from the pinned tag). This is the right identity for the question being asked — a chunk's encode behaviour lives in `scripts/`, so two chunks agreeing on `version` ran identical encoder code — but "version" invites a stronger reading than it can support, and someone will eventually chase a server-side skew the tag is correctly refusing to show.
+- **`version` (worker, fleet view, `run.json`) means ENCODER PAYLOAD, not build** (#248). It is `IMAGE_TAG`, which the Makefile derives as `git log -1 --format=%h -- Dockerfile requirements.txt scripts static` — excluding `internal/` and `cmd/`, while the Dockerfile still copies the Go server binary into the image. Two consequences, both deliberate: a **Go-only change does not move the tag**, so it publishes different image content under the same tag and is invisible to `make fleet-check` by construction; and **rollback is asymmetric** — `make infra-plan IMAGE_TAG=<prev>` restores the encoder payload, not the server binary that shipped in that image (nothing expects it to, since the server is not deployed from the pinned tag). This is the right identity for the question being asked — a chunk's encode behaviour lives in `scripts/`, so two chunks agreeing on `version` ran identical encoder code — but "version" invites a stronger reading than it can support, and someone will eventually chase a server-side skew the tag is correctly refusing to show. The full lane model — publish vs promote vs deploy, and why a FAILED deploy is the dangerous outcome — is [`docs/spec/release-versioning.md`](docs/spec/release-versioning.md).
 - **The learned-speed key is a cross-language contract with no schema, and the PASS COUNT is the part that breaks.** A worker prints `[[ENCODER-SPEED … two_pass=N …]]`; Go builds `speedKey` from its own idea of the pass count; `Speed()` is an exact map lookup with **no cross-pass fallback**. So the two agreeing is the entire mechanism, and when they stopped agreeing both sides went on succeeding and logging nothing (#314). h264 wrote `:1:` forever while the planner read `:2:`, so no h264 encode could move the model however many completed, and 43,021 samples piled onto a curve nothing reads. The cause was five copies of one rule — `codec == "hevc" && !hevcSinglePass` — which was correct only while h264 was single-pass and silently wrong the day the ladder default became 2 for every codec. There is now **one definition per language**: `encode_variants.two_pass_for(ctx, codec)` and `LadderDef.twoPassFor(codec, hevcSinglePass)`. Derive it anywhere else and you get the same silent divergence; a grep for `== "hevc" &&` is how you find the next copy. The join is pinned from both ends — `scripts/test_speed_marker_pass.py` checks the marker's label against the argv the encoder actually builds (and that `cli_phase` still *calls* the shared decision, since the bug was an emitter that never did), and `speed_pass_key_test.go` checks that a marker lands in the key the planner reads. Contaminated keys are removed with `scripts/purge_speed_keys.py`, which refuses to run while the server is up: the store is loaded once at startup and rewritten whole on every finished chunk, so a purge underneath a running server is undone by the next one — silently, and looking exactly like it did not work.
 - **A stage's machine comes from `ENCODER-HOST` and from nothing else**, and the machine timeline drops any stage without one (`_laneStages` filters on `s.instance`) — so a phase that fails to say where it ran draws its box as IDLE while it works, and its minutes land in the lane's idle arithmetic (#293). Two emitters, because there are two kinds of phase. A phase in a WORKER is read off Temporal's pending-activity record (`last_worker_identity`) rather than from history: Temporal does not write `ActivityTaskStarted` into history until the activity COMPLETES, so the history reader cannot answer while the answer matters. A phase this process runs itself (the host mezzanine, host packaging) never reaches a worker at all and reports its own box from `WORKER_LABEL` — which is why `buildRunArgs` passes `LOCAL_WORKER_LABEL` into the local-dist orchestrator, and why the two must keep spelling the box the same way or one machine gets two lanes. `_SELF_RUN_STAGES` is excluded from the worker emitter for the same reason it is excluded from the history reader: the workflow still schedules a mezzanine activity that a worker picks up, finds the `.done`, and returns from, and it would otherwise claim a row the master earned. Order matters — the Go handler updates a stage row in place and, unlike `ENCODER-REUSED`, does NOT seed one, so a HOST marker emitted before the plan is dropped in silence.
 - **The pre-flight estimate and the finished run's cost must stay on one basis.** AWS bills the INSTANCE — launch to termination, boot, image pull and the scale-down tail — not the vCPU-time jobs allocate. `_emit_cost_summary` prices the rental; `projectCloudCost` predicts allocation and converts with the one term that reconciles them, `machine = allocated / (1 - idle)`, from `fleetIdleFraction`. Before that term existed the same app quoted ~60% of what it then reported (#237). Two rules keep it honest: the allowance is **shown, never folded in** (an invisible 1.7x next to the Encode button is how the gap survived), and `variantResourcesFor`'s **reservation** must stay on both sides — `unallocated_pct` is defined against reserved vCPU, so pricing measured busy-cores instead would break the calibration and restore the undercount.

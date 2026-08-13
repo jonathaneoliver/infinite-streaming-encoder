@@ -22,11 +22,34 @@ as if it existed.
 | [`targets.md`](targets.md) | `local` vs `cloud` — what genuinely differs, and what deliberately does not |
 | [`cost.md`](cost.md) | the estimate, the reported cost, and the one basis they must share |
 | [`retention.md`](retention.md) | what is reclaimed, when, and what is structurally exempt |
+| [`release-versioning.md`](release-versioning.md) | what a version answers, which act moves which consumer, and why a failed deploy is the dangerous outcome |
 
-The eighth domain — **ladders and delivery profiles** — already has a spec in
+The ninth domain — **ladders and delivery profiles** — already has a spec in
 this shape: [`../ladders-and-delivery.md`](../ladders-and-delivery.md). It is
 not duplicated here. It is also the reference example for
 [`../spec-template.md`](../spec-template.md).
+
+## What this set does NOT cover
+
+Stated so the list above is not mistaken for the system. Each of these is
+observable behaviour with no spec — several are documented in `README.md` or in
+module comments, but none in this falsifiable shape:
+
+- **the operator interface** (`static/index.html`) — the chunk grid, the machine
+  timeline, the Ladders and AWS tabs. Every file here defers *to* the page;
+  [`outputs.md`](outputs.md) rule 3 even parks an unenforced ordering rule there
+- **progress and telemetry as a contract** — the `[[ENCODER-*]]` marker classes
+  and what each transport may drop (CLAUDE.md has the edit-time half)
+- **quality and the VMAF curves** — seeded from one extreme-motion clip, feeding
+  rung-redundancy analysis and the burn-in's estimated VMAF row
+- **scheduling and fairness** — `localJobRank`, Batch job priority,
+  `MAX_CONCURRENT`, `ENCODE_SLOTS`; failures here are invisible in output
+- **the farm as a machine pool** — worker death and Temporal rescheduling
+- **the AWS estate beyond staging** — inventory, the `MaxLifetime` instance reaper
+- **media transforms the operator can see** — the always-AAC-stereo audio rule,
+  padding math, burn-in layers
+- **the trust boundary** — `SECURITY.md` states the LAN-trust posture; nothing
+  specifies what is validated where
 
 ## How these relate
 

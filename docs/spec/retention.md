@@ -29,7 +29,7 @@ take the lot on its first pass.
 | --- | --- | --- | --- |
 | `$TMP_DIR/<job_id>/` | `internal/tmpstage` | 30 min | 24 h (`TMP_STAGING_MAX_AGE_H`) |
 | MinIO `jobs/<prefix>/` | `internal/diststage` | 30 min | 24 h (`DIST_STAGING_MAX_AGE_H`) |
-| S3 failed staging | `awswatch` `gc_failed_staging` | 30 min | 1 h |
+| S3 failed staging | `awswatch` `gc_failed_staging` | 30 min | 1 h — **inert, see below** |
 | `OUTPUT_DIR/.archive/` | `internal/outarchive` | 6 h | 30 days (`OUTPUT_ARCHIVE_MAX_AGE_D`) |
 
 Plus two backstops that are not sweepers: the S3 bucket's `jobs/` lifecycle rule
@@ -103,6 +103,18 @@ a re-encode has always preserved the copy it replaced under a dated name.
 | sweeping orphans by default | would delete the last copy of an output | — | rejected, opt-in only |
 
 ## As it stands
+
+**`gc_failed_staging` is inert and has been since 2026-07-22.** Its eligibility
+shape is a `<prefix>_FAILED` object, and the only thing that ever wrote one was
+the EC2 user-data retired with `cli_cloud.py` in `5c4b581`. Nothing in the tree
+writes `_FAILED` now, so every `head_object` it issues 404s and it reaps
+nothing — while still costing a `list_objects_v2` per pass plus a head per job
+prefix, against a bill where LIST count is the dominant term (see
+[`cost.md`](cost.md)). Failed cloud staging is therefore reclaimed by the
+bucket's `jobs/` lifecycle rule on the `staging_retention_days` clock, not on
+the 1 h clock this row advertises. The shape rule is right; its writer is gone,
+which is the failure mode a shape-based sweeper has and an age-based one does
+not.
 
 Typical local-dist staging is **~2.3 GB per file** (mezzanine, per-chunk
 encodes, variants, packaged output). The source itself is no longer staged, so

@@ -94,7 +94,15 @@ Defaults on the master as configured: `-watch-interval` 30 s, `AUTO_WATCH` from
 `.env`, `MAX_CONCURRENT` gating how many jobs run at once (submission is never
 gated — only `run`).
 
-Video extensions only; `isVideoExt` is the filter.
+Video extensions only; `isVideoExt` is the filter, and the list is hardwired:
+`.mp4`, `.mkv`, `.mov`, `.avi`, `.webm`, `.ts`, `.m3u8`. Anything else in
+`SOURCE_DIR` is invisible to the watcher and to `GET /api/sources`.
+
+**`.ts` and `.m3u8` carry two hardwired meanings each.** Under `SOURCE_DIR`
+they are submittable sources; under `/content/` they are delivery artifacts that
+`mediaFileServer` types for playback (see [`outputs.md`](outputs.md)). The two
+never meet — different directories, different handlers — but a reader who learns
+the extension in one place will read it wrongly in the other.
 
 ## What is unmeasured
 
