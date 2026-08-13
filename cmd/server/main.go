@@ -13,6 +13,7 @@ import (
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/awswatch"
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/diststage"
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/encode"
+	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/outarchive"
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/tmpstage"
 	"github.com/jonathaneoliver/infinite-streaming-encoder/internal/watcher"
 )
@@ -118,6 +119,21 @@ func main() {
 	tmpStageMaxAge := flag.Duration("tmp-staging-max-age",
 		time.Duration(intEnv("TMP_STAGING_MAX_AGE_H", 24))*time.Hour,
 		"reclaim job staging idle longer than this (also the crashed-job debugging window)")
+
+	// OUTPUT_DIR/.archive/ reclaim (#332) — the superseded copies a re-encode
+	// preserves, which nothing ever removed: 168 dirs / ~158 GB on the master.
+	// Day-scale rather than hour-scale, because what sits here is finished work
+	// and the window is "how long might I want to compare against the old one".
+	outArchiveInterval := flag.Duration("output-archive-interval", 6*time.Hour,
+		"superseded-output sweep interval; 0 disables")
+	outArchiveMaxAge := flag.Duration("output-archive-max-age",
+		time.Duration(intEnv("OUTPUT_ARCHIVE_MAX_AGE_D", 30))*24*time.Hour,
+		"reclaim a superseded output archived longer ago than this; 0 disables")
+	// Off by default: an archive whose base output is gone is not a superseded
+	// copy, it is the last one. Ten of the master's are in exactly that state.
+	outArchiveOrphans := flag.Bool("output-archive-sweep-orphans",
+		env("OUTPUT_ARCHIVE_SWEEP_ORPHANS", "") == "true",
+		"also reclaim archived outputs whose base output no longer exists")
 	flag.Parse()
 
 	// Empty means "wherever it has always been", resolved once here so the rest
@@ -178,6 +194,15 @@ func main() {
 			}
 		},
 	})
+
+	// Collect the dated backups older versions left as siblings of the live
+	// outputs. Before Reconcile, so a resumed job's move cannot race it, and
+	// unconditional because it is a rename within one directory: nothing is
+	// deleted here, and each collected copy starts its retention clock now.
+	if n := mgr.MigrateDatedBackups(); n > 0 {
+		log.Printf("archive: collected %d superseded output(s) into %s/",
+			n, encode.ArchiveDirName)
+	}
 	mgr.Reconcile()
 
 	// The -auto-watch flag / AUTO_WATCH env is only the *default*; a persisted
@@ -235,6 +260,16 @@ func main() {
 		Interval:  *tmpStageInterval,
 		MaxAge:    *tmpStageMaxAge,
 		ActiveIDs: mgr.ActiveJobIDs,
+	})
+
+	// Same reason for the ordering: a resumed job is in the keep-list before
+	// the first sweep can look at the copy it is about to supersede.
+	go outarchive.Run(context.Background(), outarchive.Config{
+		OutputDir:    *outputDir,
+		Interval:     *outArchiveInterval,
+		MaxAge:       *outArchiveMaxAge,
+		SweepOrphans: *outArchiveOrphans,
+		ActiveStems:  mgr.ActiveOutputStems,
 	})
 
 	srv := api.NewServer(mgr)

@@ -50,7 +50,8 @@ func isRemoteDest(d string) bool {
 
 // autoPromote rsyncs each freshly-moved output to the configured destinations
 // after a job's "promote after encode" run, logging the per-destination result
-// into the job. Dated backups are skipped (only live output dirs promote).
+// into the job. Dated backups are skipped (only live output dirs promote) —
+// belt-and-braces since #332, as an archived copy is no longer in `moved`.
 // Best-effort — a promote failure doesn't fail the job; the encode succeeded.
 func (m *Manager) autoPromote(job *Job, moved []string) {
 	if len(PromoteDests()) == 0 {

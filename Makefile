@@ -235,6 +235,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  py outfetch    '; \
 	if out=$$(python3 scripts/test_output_fetch.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py outarchive  '; \
+	if out=$$(python3 scripts/test_output_archive.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py statedir    '; \
 	if out=$$(python3 scripts/test_state_dir.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \

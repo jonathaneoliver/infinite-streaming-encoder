@@ -223,6 +223,13 @@ services:
       DIST_STAGING_MAX_AGE_H: ${DIST_STAGING_MAX_AGE_H:-}
       DIST_STAGING_LIFECYCLE_DAYS: ${DIST_STAGING_LIFECYCLE_DAYS:-}
       TMP_STAGING_MAX_AGE_H: ${TMP_STAGING_MAX_AGE_H:-}
+      # Superseded outputs under OUTPUT_DIR/.archive/ (#332). Days, not hours —
+      # what sits there is finished work. 0 disables the sweep entirely, which
+      # is only reachable from here, so the knob has to be passed to exist.
+      OUTPUT_ARCHIVE_MAX_AGE_D: ${OUTPUT_ARCHIVE_MAX_AGE_D:-}
+      # An archived copy whose base output is gone is the LAST copy, so it is
+      # held unless this says otherwise.
+      OUTPUT_ARCHIVE_SWEEP_ORPHANS: ${OUTPUT_ARCHIVE_SWEEP_ORPHANS:-}
       # Distributed-local (Temporal + MinIO) wiring. Cluster addresses default to
       # the master's own host-published ports.
       TEMPORAL_UI_ADDR: ${TEMPORAL_UI_ADDR:-http://host.docker.internal:8233}
