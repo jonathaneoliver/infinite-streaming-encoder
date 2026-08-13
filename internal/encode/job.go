@@ -1726,6 +1726,13 @@ type Manager struct {
 	ScriptsDir  string
 	DockerImage string
 
+	// StateDir holds the irreplaceable JSONs, RecordDir the permanent record
+	// (#331). Both EMPTY means "not configured", which resolves to TmpDir — the
+	// original layout — so read them through stateDir()/recordDir(), never
+	// directly. See statedir.go.
+	StateDir  string
+	RecordDir string
+
 	// Host-side paths (as the Docker daemon sees them) for bind-mounting into
 	// worker containers. When the Go server is itself inside a container,
 	// `-v SourceDir:...` would refer to the wrong path because `docker run`
@@ -1734,6 +1741,9 @@ type Manager struct {
 	HostOutputDir string
 	HostTmpDir    string
 	HostAWSDir    string
+	// Host path of StateDir. Only needed when StateDir is NOT under TmpDir,
+	// since a worker container reads the ladder store out of it.
+	HostStateDir string
 
 	// Image used for detached worker containers.
 	EncoderImage string
@@ -1744,20 +1754,20 @@ type Manager struct {
 	StateMachineArn string
 
 	// Ladders is the persisted ladder store (built-in + user-defined). Owns
-	// $TmpDir/ladders.json; resolves the concrete rungs for the cloud path.
+	// $STATE_DIR/ladders.json; resolves the concrete rungs for the cloud path.
 	Ladders *LadderStore
 
 	// Curves holds measured VMAF-vs-bitrate points used to ESTIMATE a ladder
-	// rung's quality without encoding ($TmpDir/quality-curves.json overlaying
+	// rung's quality without encoding ($STATE_DIR/quality-curves.json overlaying
 	// the built-in seed). Design-time only — never a claim about a real encode.
 	Curves *CurveStore
 
 	// Speeds learns per-variant encode speed (content/wall) from completed
-	// encodes ($TmpDir/encode_speeds.json); the dynamic chunk selector uses it.
+	// encodes ($STATE_DIR/encode_speeds.json); the dynamic chunk selector uses it.
 	Speeds *EncodeSpeedStore
 
 	// Persisted global settings (e.g. watcher on/off) owned at
-	// $TmpDir/settings.json. Survives restarts so a UI toggle sticks.
+	// $STATE_DIR/settings.json. Survives restarts so a UI toggle sticks.
 	settingsMu sync.Mutex
 	settings   Settings
 
@@ -2039,15 +2049,20 @@ func (m *Manager) triggerWarm() {
 }
 
 type ManagerConfig struct {
-	SourceDir       string
-	OutputDir       string
-	TmpDir          string
+	SourceDir string
+	OutputDir string
+	TmpDir    string
+	// Empty = TmpDir, the pre-#331 layout. MigrateDurableState must have run
+	// before NewManager when these differ, because the stores are loaded here.
+	StateDir        string
+	RecordDir       string
 	ScriptsDir      string
 	DockerImage     string
 	HostSourceDir   string
 	HostOutputDir   string
 	HostTmpDir      string
 	HostAWSDir      string
+	HostStateDir    string
 	EncoderImage    string
 	StateMachineArn string
 	MaxConcurrent   int
@@ -2072,23 +2087,31 @@ func NewManager(cfg ManagerConfig) *Manager {
 	}
 	os.MkdirAll(cfg.TmpDir, 0755)
 	m := &Manager{
-		Ladders:         LoadLadderStore(filepath.Join(cfg.TmpDir, "ladders.json")),
-		Curves:          LoadCurveStore(filepath.Join(cfg.TmpDir, "quality-curves.json")),
-		Speeds:          LoadEncodeSpeedStore(filepath.Join(cfg.TmpDir, "encode_speeds.json")),
 		SourceDir:       cfg.SourceDir,
 		OutputDir:       cfg.OutputDir,
 		TmpDir:          cfg.TmpDir,
+		StateDir:        cfg.StateDir,
+		RecordDir:       cfg.RecordDir,
 		ScriptsDir:      cfg.ScriptsDir,
 		DockerImage:     cfg.DockerImage,
 		HostSourceDir:   cfg.HostSourceDir,
 		HostOutputDir:   cfg.HostOutputDir,
 		HostTmpDir:      cfg.HostTmpDir,
 		HostAWSDir:      cfg.HostAWSDir,
+		HostStateDir:    cfg.HostStateDir,
 		EncoderImage:    cfg.EncoderImage,
 		StateMachineArn: cfg.StateMachineArn,
 		sem:             make(chan struct{}, cfg.MaxConcurrent),
 		inventoryNudge:  cfg.InventoryNudge,
 	}
+	// Loaded through StatePath rather than from cfg.TmpDir, so all three follow
+	// StateDir together — a store left behind while the others moved is the
+	// half-migrated state MigrateDurableState exists to avoid.
+	os.MkdirAll(m.stateDir(), 0o755)
+	os.MkdirAll(m.recordDir(), 0o755)
+	m.Ladders = LoadLadderStore(m.StatePath("ladders.json"))
+	m.Curves = LoadCurveStore(m.StatePath("quality-curves.json"))
+	m.Speeds = LoadEncodeSpeedStore(m.StatePath("encode_speeds.json"))
 	m.launchCond = sync.NewCond(&m.launchMu)
 	return m
 }
@@ -2455,7 +2478,7 @@ func (m *Manager) Submit(cfg JobConfig) *Job {
 func (m *Manager) run(job *Job, startIdx int) {
 	// Diagnostics stream to their own file from the first line. Set here rather
 	// than at teardown so a run that crashes or is cancelled still leaves them.
-	logsDir := filepath.Join(m.TmpDir, "logs")
+	logsDir := m.RecordPath("logs")
 	if err := os.MkdirAll(logsDir, 0o755); err == nil {
 		job.mu.Lock()
 		job.diagPath = filepath.Join(logsDir, job.ID+".diag.log")
@@ -2600,7 +2623,7 @@ type RunSample struct {
 // runSamplesPath is the single definition of the rolling log's location. Shared
 // with fleetIdleFraction; inventory.py holds the Python-side copy (SPOT_LOG).
 func (m *Manager) runSamplesPath() string {
-	return filepath.Join(m.TmpDir, "spot_samples.json")
+	return m.StatePath("spot_samples.json")
 }
 
 // readRunSamples loads the rolling log. Absent or corrupt reads as empty — a
@@ -2650,7 +2673,7 @@ func (m *Manager) persistSpotSample(job *Job) {
 // user can inspect user-data.log, half-encoded variant MP4s, etc. after
 // the job exits.
 func (m *Manager) preserveTmpForFailure(job *Job, jobTmpDir string) {
-	failedRoot := filepath.Join(m.TmpDir, "failed")
+	failedRoot := m.RecordPath("failed")
 	os.MkdirAll(failedRoot, 0755)
 	dst := filepath.Join(failedRoot, job.ID)
 	// Collision shouldn't happen (job IDs are monotonic epoch ms) but
@@ -2835,7 +2858,7 @@ func (m *Manager) removeJobContainers(id string) {
 }
 
 func (m *Manager) writeHistory(job *Job) {
-	logsDir := filepath.Join(m.TmpDir, "logs")
+	logsDir := m.RecordPath("logs")
 	os.MkdirAll(logsDir, 0755)
 	job.closeDiag() // flush + release the diagnostic stream for this run
 
@@ -2846,7 +2869,7 @@ func (m *Manager) writeHistory(job *Job) {
 	os.WriteFile(logPath, []byte(cleaned), 0644)
 
 	// Append entry to history.md
-	historyPath := filepath.Join(m.TmpDir, "history.md")
+	historyPath := m.RecordPath("history.md")
 	f, err := os.OpenFile(historyPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
@@ -3399,7 +3422,7 @@ func (m *Manager) writeTimingSummary(f *os.File, job *Job) {
 	f.WriteString(table.String())
 
 	// Echo into the per-job log file for quick greppability.
-	logPath := filepath.Join(m.TmpDir, "logs", job.ID+".log")
+	logPath := filepath.Join(m.RecordPath("logs"), job.ID+".log")
 	if lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0644); err == nil {
 		lf.WriteString("\n=== Stage timing ===\n")
 		var lastFL string
@@ -5106,17 +5129,27 @@ func (m *Manager) buildRunArgs(job *Job, name, script string, scriptArgs []strin
 		// prior mezzanines / variants — the work_dir is on the host
 		// filesystem, not inside the ephemeral container layer.
 		"-e", "TMPDIR=" + m.TmpDir,
-		// Point the Python encoder at the persisted ladder store (mounted via
-		// TmpDir) so custom/edited ladders resolve for local encodes too. The
-		// file is written by the control plane; cloud variant jobs don't need
-		// it (they get concrete rungs from the SFN).
-		"-e", "LADDER_STORE=" + filepath.Join(m.TmpDir, "ladders.json"),
+		// Point the Python encoder at the persisted ladder store so custom/edited
+		// ladders resolve for local encodes too. The file is written by the
+		// control plane; cloud variant jobs don't need it (they get concrete
+		// rungs from the SFN). Reached through TmpDir's mount by default, or
+		// through the state-dir mount added below when the two differ (#331) —
+		// the path has to be one the CONTAINER can open, not just this process.
+		"-e", "LADDER_STORE=" + m.StatePath("ladders.json"),
 		// Run the orchestrator via python3 rather than exec'ing the script
 		// directly, so it works whether the script is baked into the image (+x)
 		// or bind-mounted from the host working tree (HOST_SCRIPTS_DIR, where the
 		// file keeps the host's non-executable mode). The script path is passed
 		// as the first argument below, after the image.
 		"--entrypoint", "python3",
+	}
+	// A state dir outside TmpDir is not covered by the mounts above, so the
+	// LADDER_STORE path just set would not resolve inside the container and the
+	// encoder would silently fall back to the built-in ladders — a custom ladder
+	// then encodes as something else, with no error anywhere. Read-only: the
+	// store is the control plane's to write.
+	if hs := m.hostStateDir(); hs != "" {
+		runArgs = append(runArgs, "-v", hs+":"+m.stateDir()+":ro")
 	}
 	// Dev: overlay the host's working-tree encoder package onto the image's, so
 	// a spawned orchestrator (local-dist) runs current code without a rebuild.

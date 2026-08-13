@@ -11,8 +11,11 @@ predates everything below.
 
 A ladder is **the rung table AND the delivery profile**, in one object
 (`LadderDef`, `internal/encode/ladder_store.go`), persisted to
-`$TMP_DIR/ladders.json`. It is user configuration, not learned state — unlike
-`encode_speeds.json` and `quality-curves.json` which sit beside it.
+`$STATE_DIR/ladders.json` (which defaults to `$TMP_DIR`, its pre-#331 home). It
+is user configuration, not learned state — unlike `encode_speeds.json` and
+`quality-curves.json` which sit beside it. Nothing else holds a copy of what you
+author here, which is why the directory is now something you can point at a
+backed-up volume.
 
 | field | what it is |
 | --- | --- |

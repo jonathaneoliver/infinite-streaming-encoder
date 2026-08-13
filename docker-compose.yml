@@ -150,6 +150,12 @@ services:
       - ${SOURCE_DIR:-/SOURCE_DIR-not-set}:/media/originals
       - ${OUTPUT_DIR:-/OUTPUT_DIR-not-set}:/media/dynamic_content
       - ${TMP_DIR:-/TMP_DIR-not-set}:/media/tmp
+      # Durable state + permanent record (#331). Both fall back to TMP_DIR, so
+      # an install that sets neither mounts the same host directory twice and
+      # behaves exactly as before — the server resolves STATE_DIR/RECORD_DIR to
+      # TMP_DIR when they are unset, so nothing reads these paths in that case.
+      - ${STATE_DIR:-${TMP_DIR:-/TMP_DIR-not-set}}:/media/state
+      - ${RECORD_DIR:-${TMP_DIR:-/TMP_DIR-not-set}}:/media/record
       - /var/run/docker.sock:/var/run/docker.sock   # spawn + control worker/orchestrator containers
       - ${HOME}/.aws:/root/.aws:ro                  # cloud (AWS) creds — lazy, only used by cloud jobs
       - ${HOME}/.ssh:/root/.ssh:ro                  # toggle remote workers over ssh (dist.go)
@@ -158,12 +164,22 @@ services:
       SOURCE_DIR: /media/originals
       OUTPUT_DIR: /media/dynamic_content
       TMP_DIR: /media/tmp
-      SCRIPTS_DIR: /app/scripts
+      # Set ONLY when the operator pointed them somewhere durable (#331). The
+      # `:+` form is what keeps this a no-op otherwise: with STATE_DIR unset in
+      # .env the server sees an empty value and falls back to TMP_DIR, so the
+      # /media/state mount above (which is then TMP_DIR again) is never read and
+      # no migration runs. Set them and the state moves out of the disposable
+      # directory on the next boot.
+      STATE_DIR: ${STATE_DIR:+/media/state}
+      RECORD_DIR: ${RECORD_DIR:+/media/record}
       # Host-side paths — used only for `-v` flags when spawning sibling workers,
       # since `docker run -v` resolves against the HOST filesystem.
       HOST_SOURCE_DIR: ${SOURCE_DIR}
       HOST_OUTPUT_DIR: ${OUTPUT_DIR}
       HOST_TMP_DIR: ${TMP_DIR}
+      # Spawned orchestrators read ladders.json out of the state dir, so they
+      # need the HOST side of it whenever it is not inside TMP_DIR.
+      HOST_STATE_DIR: ${STATE_DIR:-}
       HOST_AWS_DIR: ${HOME}/.aws
       # The image the server spawns worker/orchestrator containers from — same as
       # this service's own image so local + spawned code match.

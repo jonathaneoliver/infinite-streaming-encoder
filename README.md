@@ -628,6 +628,12 @@ required; everything else has a working default. See
 [`.env.example`](.env.example). Key groups:
 
 - **Host paths (required):** `SOURCE_DIR`, `OUTPUT_DIR`, `TMP_DIR`.
+- **Durable state (optional, recommended):** `STATE_DIR` (the ladders you
+  authored + the learned speed/quality models — ~250 KB that exists nowhere
+  else) and `RECORD_DIR` (`logs/`, `history.md`, `failed/`). Both default to
+  `TMP_DIR`, where they used to live; point them at a backed-up volume and the
+  server moves them there once, on its next start. That is what makes
+  `rm -rf $TMP_DIR/*` safe.
 - **Server:** `AUTO_WATCH`, `DEFAULT_TARGET` (`local` | `cloud`),
   `DEFAULT_CODEC`, `DEFAULT_MAX_RES`, `MAX_CONCURRENT`.
 - **Distributed-local:** `MASTER_IP`, `DIST_WORKERS`, `ENCODE_SLOTS`, plus
@@ -697,7 +703,8 @@ One `Dockerfile`, published/used four ways:
 
 Every ffmpeg invocation logs its exact argv, shell-quoted, as a single
 `[ffmpeg] …` line — copy it out of the log and it re-runs verbatim. It is written
-where the encode ran, which differs per path: the job log (`$TMP_DIR/logs/`) for
+where the encode ran, which differs per path: the job log (`$RECORD_DIR/logs/`,
+which defaults to `$TMP_DIR/logs/`) for
 a local encode, `docker logs encode-worker` on the box that took the chunk for
 local-dist, and CloudWatch `/aws/batch/infinite-streaming-encoder` for cloud
 (**7-day retention** — past that the evidence is gone).

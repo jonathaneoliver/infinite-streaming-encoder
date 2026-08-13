@@ -3,12 +3,11 @@ package encode
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
 )
 
 // Settings holds persisted, user-toggleable global preferences. Kept small and
 // JSON-shaped so the UI can read/write it wholesale. Persisted to
-// $TmpDir/settings.json; the persisted value wins over env/flag defaults on
+// $STATE_DIR/settings.json; the persisted value wins over env/flag defaults on
 // startup so a toggle sticks across restarts.
 type Settings struct {
 	// WatcherEnabled gates the source-dir auto-encode watcher. When false the
@@ -17,7 +16,7 @@ type Settings struct {
 }
 
 func (m *Manager) settingsPath() string {
-	return filepath.Join(m.TmpDir, "settings.json")
+	return m.StatePath("settings.json")
 }
 
 // InitSettings seeds settings with the given defaults, then overlays any

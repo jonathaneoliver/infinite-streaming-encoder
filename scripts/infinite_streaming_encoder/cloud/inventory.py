@@ -622,6 +622,19 @@ def _annotate_init_states(instances: list[dict]) -> None:
             inst["init_state"] = "idle"
 
 
+def _state_dir() -> str:
+    """Where the Go server keeps its durable JSON (#331).
+
+    STATE_DIR first, then TMP_DIR — the pre-#331 location, and still the answer
+    on any install that has not moved it, since the server resolves STATE_DIR to
+    TMP_DIR and exports it. Getting this wrong has NO error path on either side:
+    spot_samples.json would simply read as empty and the AWS view's spot savings
+    would show zero, which looks like a quiet fleet rather than a wrong path.
+    """
+    return (os.environ.get("STATE_DIR") or os.environ.get("TMP_DIR")
+            or os.environ.get("TMPDIR") or "/tmp")
+
+
 def _record_fleet_samples(hourly_usd: float, fleet: dict) -> dict:
     """Append a fleet sample to a persisted log and return the trailing-24h
     spend (integrated burn rate) plus a recent history for sparklines. No Cost
@@ -631,13 +644,11 @@ def _record_fleet_samples(hourly_usd: float, fleet: dict) -> dict:
     Sample record: [ts, hourly_usd, used_vcpus, total_vcpus, queued, running].
     Old 2-field [ts, hourly] records are tolerated for backward compat.
     """
-    # Persist to the app's host-mounted TMP_DIR (survives server restarts) —
+    # Persist to the app's host-mounted state dir (survives server restarts) —
     # NOT the container's ephemeral /tmp, which every restart/deploy wipes,
     # resetting the trailing-24h integral to "since last restart". TMPDIR is the
     # standard-lib fallback (usually unset here); /tmp is the last resort.
-    path = os.environ.get("COST_LOG") or os.path.join(
-        os.environ.get("TMP_DIR") or os.environ.get("TMPDIR") or "/tmp",
-        "cost_samples.json")
+    path = os.environ.get("COST_LOG") or os.path.join(_state_dir(), "cost_samples.json")
     now = datetime.now(timezone.utc).timestamp()
     cutoff = now - 24 * 3600
     samples: list[list] = []
@@ -700,9 +711,7 @@ def _spot_and_reclaim_stats() -> dict:
     """Accumulated 'saved by using spot' + trailing-24h reclaim-waste %, read
     from the Go server's spot_samples.json (one entry per finished cloud-batch
     job: ts, lost_s, total_s, spot_usd, ondemand_usd, saved_usd)."""
-    path = os.environ.get("SPOT_LOG") or os.path.join(
-        os.environ.get("TMP_DIR") or os.environ.get("TMPDIR") or "/tmp",
-        "spot_samples.json")
+    path = os.environ.get("SPOT_LOG") or os.path.join(_state_dir(), "spot_samples.json")
     try:
         with open(path) as f:
             samples = json.load(f)

@@ -52,6 +52,15 @@ func main() {
 	sourceDir := flag.String("source-dir", env("SOURCE_DIR", "/media/originals"), "source video directory")
 	outputDir := flag.String("output-dir", env("OUTPUT_DIR", "/media/dynamic_content"), "encode output directory")
 	tmpDir := flag.String("tmp-dir", env("TMP_DIR", "/media/tmp"), "temporary directory for in-progress encodes")
+	// #331: the irreplaceable state and the permanent record used to live inside
+	// TMP_DIR, which meant a directory called "tmp" could not actually be
+	// cleared. Both default to it, so an install that sets neither is unchanged;
+	// pointing them at a durable, backed-up volume is what makes TMP_DIR
+	// genuinely disposable. See internal/encode/statedir.go.
+	stateDir := flag.String("state-dir", env("STATE_DIR", ""),
+		"directory for irreplaceable state (ladders, learned curves/speeds, settings); empty = TMP_DIR")
+	recordDir := flag.String("record-dir", env("RECORD_DIR", ""),
+		"directory for the permanent record (logs/, history.md, failed/); empty = TMP_DIR")
 	scriptsDir := flag.String("scripts-dir", env("SCRIPTS_DIR", "/scripts"), "directory containing encode scripts")
 	// No personal-namespace fallback (#149): a fork would otherwise silently
 	// report and pass the upstream author's image. Empty degrades gracefully —
@@ -67,6 +76,7 @@ func main() {
 	hostSourceDir := flag.String("host-source-dir", env("HOST_SOURCE_DIR", ""), "host path for SourceDir (for worker container mounts)")
 	hostOutputDir := flag.String("host-output-dir", env("HOST_OUTPUT_DIR", ""), "host path for OutputDir")
 	hostTmpDir := flag.String("host-tmp-dir", env("HOST_TMP_DIR", ""), "host path for TmpDir")
+	hostStateDir := flag.String("host-state-dir", env("HOST_STATE_DIR", ""), "host path for StateDir (only needed when it is not under TmpDir)")
 	hostAWSDir := flag.String("host-aws-dir", env("HOST_AWS_DIR", ""), "host path for ~/.aws (cloud jobs only)")
 	encoderImage := flag.String("encoder-image", env("ENCODER_IMAGE", "encoder:latest"), "image used for worker containers")
 	stateMachineArn := flag.String("state-machine-arn", env("STATE_MACHINE_ARN", ""), "Step Functions state machine ARN for the cloud-batch target (empty disables that target)")
@@ -110,6 +120,38 @@ func main() {
 		"reclaim job staging idle longer than this (also the crashed-job debugging window)")
 	flag.Parse()
 
+	// Empty means "wherever it has always been", resolved once here so the rest
+	// of the process — and the Python helpers below — see one answer.
+	if *stateDir == "" {
+		*stateDir = *tmpDir
+	}
+	if *recordDir == "" {
+		*recordDir = *tmpDir
+	}
+	if *stateDir == *tmpDir {
+		// Already covered by the TmpDir mount; a stale HOST_STATE_DIR would
+		// otherwise bind-mount a second host path over it.
+		*hostStateDir = ""
+	} else if *hostStateDir == "" {
+		// Not fatal here — the server itself reads the state fine. It is the
+		// SPAWNED worker containers that cannot, so say which thing breaks.
+		log.Printf("WARNING: -state-dir is %s but HOST_STATE_DIR is unset; spawned worker "+
+			"containers will not see ladders.json and will fall back to the built-in ladders", *stateDir)
+	}
+
+	// Before NewManager, which loads three of these stores in its constructor.
+	// One-time, idempotent, and loud: a store left behind is silent — the
+	// encoder just replans from a cold model and re-learns.
+	for _, mg := range encode.MigrateDurableState(*tmpDir, *stateDir, *recordDir) {
+		log.Printf("state migration: %s", mg)
+	}
+	// The Python helpers (inventory.py's cost/spot samples) resolve the same
+	// directory from the environment. Set from the RESOLVED value rather than
+	// trusting the inherited env, so a -state-dir flag and a STATE_DIR var can
+	// never disagree about where spot_samples.json is — a disagreement neither
+	// side would report, since both would simply find no samples.
+	os.Setenv("STATE_DIR", *stateDir)
+
 	// Buffered so a job start/finalize never blocks on nudging the awswatch
 	// inventory refresh; a pending nudge coalesces with any already queued.
 	warmTrigger := make(chan struct{}, 1)
@@ -117,12 +159,15 @@ func main() {
 		SourceDir:       *sourceDir,
 		OutputDir:       *outputDir,
 		TmpDir:          *tmpDir,
+		StateDir:        *stateDir,
+		RecordDir:       *recordDir,
 		ScriptsDir:      *scriptsDir,
 		DockerImage:     *dockerImage,
 		HostSourceDir:   *hostSourceDir,
 		HostOutputDir:   *hostOutputDir,
 		HostTmpDir:      *hostTmpDir,
 		HostAWSDir:      *hostAWSDir,
+		HostStateDir:    *hostStateDir,
 		EncoderImage:    *encoderImage,
 		StateMachineArn: *stateMachineArn,
 		MaxConcurrent:   *maxConcurrent,
@@ -204,6 +249,8 @@ func main() {
 	log.Printf("  source: %s", *sourceDir)
 	log.Printf("  output: %s", *outputDir)
 	log.Printf("  tmp: %s", *tmpDir)
+	log.Printf("  state: %s", *stateDir)
+	log.Printf("  record: %s", *recordDir)
 	log.Printf("  scripts: %s", *scriptsDir)
 	log.Printf("  max concurrent: %d", *maxConcurrent)
 	if err := http.ListenAndServe(*addr, srv.Mux); err != nil {
