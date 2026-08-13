@@ -388,9 +388,20 @@ class EncodeWorkflow:
         mezz_env = {}
         if float(plan.get("time_limit_s") or 0) > 0:
             mezz_env["TIME_LIMIT_S"] = str(plan["time_limit_s"])
-        await self._phase(["mezzanine", "--s3-in", f"s3://{b}/{plan['src_key']}",
-                           "--s3-out", mezz], mezz_env, "mezzanine",
-                          priority_key=job_top)
+        # mezz_ready: the orchestrator already put the mezzanine in MinIO — it
+        # either built it on the host or confirmed the cross-job cache hit — so
+        # there is nothing here to do. The activity only ever short-circuited on
+        # the .done sidecar in that case, re-running the check the orchestrator
+        # had just done, on whatever box drew it: 2s of dispatch and a cross-LAN
+        # HEAD, and a row attributed to a machine that did no work.
+        #
+        # Absent in plans from an older orchestrator, which correctly reads as
+        # "run it" — and phase_mezzanine still guards itself either way, so this
+        # removes a redundant check rather than the only one.
+        if not plan.get("mezz_ready"):
+            await self._phase(["mezzanine", "--s3-in", f"s3://{b}/{plan['src_key']}",
+                               "--s3-out", mezz], mezz_env, "mezzanine",
+                              priority_key=job_top)
         if plan.get("has_audio"):
             await self._phase(["audio", "--s3-mezz", mezz, "--s3-out", s3_work],
                               {}, "audio", priority_key=job_top)
