@@ -42,7 +42,13 @@ implementation — so they are the seam.
 4. **Neither host phase required a state-machine change**, and that is the rule
    to follow if a third phase moves: each reuses a Choice the graph already had.
    `mezz_cached` routes past Mezzanine; `do_h264`/`do_hevc`/`do_av1` gate nothing
-   but the per-codec packaging branch.
+   but the per-codec packaging branch. The Temporal workflow had no equivalent
+   Choice, so `local` carries the same two decisions as plan keys — `mezz_ready`
+   and `host_package`. **Both are read with `plan.get`**, so a worker still on
+   older code falls back to running the phase itself, which is the pre-host
+   behaviour and not a failure. That matters because a farm is updated box by
+   box: a plan key that a worker must understand would break every run until the
+   last box was bounced.
 5. **`do_h264` means "the STATE MACHINE packages h264"**, not "h264 was
    encoded". `buildSFNInput` computes them as `doX && !packageOnHost`. A caller
    needing the set of encoded codecs must take the union with `host_package`, or

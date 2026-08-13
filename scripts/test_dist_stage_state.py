@@ -434,6 +434,59 @@ def test_host_packaging_is_the_default_with_an_escape() -> None:
     assert p.parse_args(base + ["--no-host-package"]).no_host_package is True
 
 
+def test_cached_mezzanine_is_reused_not_attributed_to_a_box() -> None:
+    """A cache hit means NO box built the mezzanine. Naming the worker that drew
+    the short-circuit guard reads as 'ubuntu built it' when ubuntu did a HEAD and
+    returned. And with mezz_ready the row has no other announcer at all, so the
+    `done` here is the only thing that will ever move it off pending."""
+    src = inspect.getsource(D.run_temporal)
+    hit = src.split("mezzanine cache HIT")[1].split("else:")[0]
+    # Code only. The comment there names the helper it is deliberately NOT
+    # calling, which is the whole point of the comment and would fail below.
+    hit = "\n".join(ln for ln in hit.splitlines()
+                    if not ln.lstrip().startswith("#"))
+    assert '_emit_reused("mezzanine")' in hit, (
+        "a cached mezzanine no longer emits ENCODER-REUSED; the row loses the "
+        "neutral styling that distinguishes it from work someone did")
+    assert 'emit_stage("mezzanine", "done"' in hit, (
+        "a cached mezzanine never completes its row — no activity is scheduled, "
+        "so nothing else will")
+    assert "_emit_self_run_host" not in hit and "host_marker" not in hit, (
+        "a cached mezzanine attributes the row to a machine — nothing built it")
+
+
+def test_a_self_run_mezzanine_is_never_re_announced_by_history() -> None:
+    """Both branches — built here, or found warm in the cache — leave the row
+    done. Only a farm mid-rolling-update can still schedule the activity, and its
+    SCHEDULED event would walk that finished row back to `queued`."""
+    import re
+
+    src = inspect.getsource(D.run_temporal)
+    # At the function's own indent — i.e. OUTSIDE the mezzanine if/else, so both
+    # the cache hit and the host build are covered. Indented, it guards one
+    # branch and leaves the other to be walked backwards.
+    assert re.search(r'^    _SELF_RUN_STAGES\.add\("mezzanine"\)$', src, re.M), (
+        "the mezzanine history row is unsuppressed, or suppressed inside only "
+        "one branch of the if/else; an older worker's activity walks it back "
+        "to queued")
+
+
+def test_mezz_ready_stops_the_workflow_scheduling_the_activity() -> None:
+    """The orchestrator has already put the mezzanine in MinIO by the time the
+    workflow starts, so the activity could only re-run the check it had just
+    done — on whatever box drew it. Contract between two files, read as text
+    because temporalio is not installed on the host."""
+    wf = (Path(__file__).resolve().parent / "infinite_streaming_encoder"
+          / "temporal_worker.py").read_text()
+    assert 'if not plan.get("mezz_ready"):' in wf, (
+        "the workflow no longer honours mezz_ready; every run pays the "
+        "redundant guard activity again")
+    src = inspect.getsource(D.run_temporal)
+    assert '"mezz_ready": True' in src, (
+        "the orchestrator no longer sends mezz_ready, so the workflow will "
+        "keep scheduling the activity")
+
+
 def test_packaged_dir_rename_tolerates_dest_equal_to_src() -> None:
     """cli_phase delivers output_<codec>/ and this renames it to
     <stem>_<codec>/. A source named output.mp4 with no duration suffix gives the

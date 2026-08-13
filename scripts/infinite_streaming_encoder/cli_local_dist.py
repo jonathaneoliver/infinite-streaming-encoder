@@ -141,9 +141,11 @@ def _progress_cb(stage_key: str, total_bytes: int):
 # Activity ids whose stage rows THIS process already drove to completion, so the
 # workflow-history reader must not re-announce them.
 #
-# The mezzanine is built here now (_build_mezzanine_on_host), and the workflow
-# still schedules its mezzanine activity — which finds the .done and returns
-# immediately. Without this the history reader would see that activity SCHEDULED
+# The mezzanine is built here now (_build_mezzanine_on_host) and `mezz_ready`
+# tells the workflow not to schedule its mezzanine activity at all — so on a
+# matched farm nothing else announces that row. This is the guard for the farm
+# that ISN'T matched: a box still running the old workflow ignores mezz_ready and
+# schedules the activity anyway, and the history reader would see it SCHEDULED
 # and emit `mezzanine queued`, walking a row that is already done at 100% back to
 # an empty cell. Nothing downstream guards against that: emit_stage is a plain
 # print and the Go server's upsertStage is last-writer-wins, which is exactly why
@@ -461,7 +463,6 @@ def _build_mezzanine_on_host(input_path: Path, mezz_prefix: str, work_dir: Path,
         print(f"error: host mezzanine reported success but {mezz_prefix}/"
               f"mezzanine.mp4.done is missing", file=sys.stderr)
         return False
-    _SELF_RUN_STAGES.add("mezzanine")
     return True
 
 
@@ -1402,12 +1403,29 @@ def run_temporal(args: argparse.Namespace) -> int:
             print(f"[dist] mezzanine cache HIT {mezz_prefix} — skipping the "
                   f"mezzanine entirely (same source encoded before)", flush=True)
             _touch_prefix(bucket, mezz_rel)  # keep it fresh while this job reuses it
+            # REUSED, and deliberately NOT _emit_self_run_host: no box built this
+            # one. Naming a machine here reads as "the mac built the mezzanine"
+            # when it did a HEAD and returned — which is what the workflow's
+            # activity used to claim, for whichever worker drew the no-op guard.
+            # Same marker a resumed chunk uses, already styled as a distinct
+            # neutral rather than a machine colour.
+            #
+            # The `done` is load-bearing now rather than cosmetic: mezz_ready
+            # means no activity is scheduled, so this is the ONLY thing that will
+            # ever move this row off pending.
+            _emit_reused("mezzanine")
+            emit_stage("mezzanine", "done", 100.0)
         else:
             _ensure_bucket(bucket)
             if not _build_mezzanine_on_host(
                     input_path, mezz_prefix,
                     Path(args.output_dir) / ".mezz-work", time_limit_s):
                 return 1
+    # Either way this process drove the row to done, so the history reader must
+    # not re-announce it. Only reachable on a farm mid-rolling-update — an older
+    # worker ignores mezz_ready and schedules the activity anyway, and the
+    # SCHEDULED event would walk a finished row back to `queued`.
+    _SELF_RUN_STAGES.add("mezzanine")
 
     # Pass count + extra_args come from the ladder profile now; hevc_single_pass
     # remains a per-encode override forcing HEVC single-pass.
@@ -1423,6 +1441,19 @@ def run_temporal(args: argparse.Namespace) -> int:
         # in plans from an older orchestrator, which correctly reads as "package
         # everything in a worker" — the old behaviour.
         "host_package": host_package,
+        # The mezzanine is already in MinIO — this process either built it or
+        # confirmed the cache hit — so the workflow must not schedule its
+        # mezzanine activity at all.
+        #
+        # That activity was harmless but not free: it short-circuits on the .done
+        # sidecar, so it re-ran the check THIS process had just done, on whatever
+        # box drew it. Measured at 2s of dispatch + a cross-LAN HEAD, against
+        # 300ms to actually build the mezzanine here — and it attributed the row
+        # to a machine that did nothing.
+        #
+        # Absent in plans from an older orchestrator, which correctly reads as
+        # "run the activity", and the activity still guards itself.
+        "mezz_ready": True,
         # Duration limit (#184) — consumed by the mezzanine activity ONLY. The
         # chunk boundaries below were already planned against the truncated
         # length, so nothing else needs to know.
