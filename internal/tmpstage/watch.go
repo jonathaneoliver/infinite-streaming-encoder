@@ -11,11 +11,18 @@
 // could find it. 6.8 GB had accumulated that way over four months.
 //
 // Scope is structural, not a list of exclusions: $TMP_DIR also holds the
-// deliberate encode_<stem>/ mezzanine caches, the learned-state JSON that sizes
-// every chunk plan (encode_speeds.json, ladders.json, quality-curves.json) and
-// the permanent record (logs/, history.md, failed/). Only names matching
-// ^[0-9]+$ — the epoch-ms job ID shape — are eligible, so everything else is
-// out of scope by construction rather than by a rule someone can forget.
+// deliberate encode_<stem>/ mezzanine caches, and — unless STATE_DIR/RECORD_DIR
+// point elsewhere (#331) — the learned-state JSON that sizes every chunk plan
+// (encode_speeds.json, ladders.json, quality-curves.json) and the permanent
+// record (logs/, history.md, failed/). Only names matching ^[0-9]+$ — the
+// epoch-ms job ID shape — are eligible, so everything else is out of scope by
+// construction rather than by a rule someone can forget.
+//
+// That guard STAYS now that the state can live outside this directory, and it
+// is deliberately belt-and-braces: STATE_DIR defaults to $TMP_DIR, so on a
+// default install this is still the only thing standing between the sweep and
+// the learned model. What #331 changed is that it is no longer the only thing
+// standing between a HUMAN with `rm -rf` and the same files.
 package tmpstage
 
 import (

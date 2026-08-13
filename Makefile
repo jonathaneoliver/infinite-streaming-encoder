@@ -69,6 +69,13 @@ REMOTE_IMAGE ?= $(GHCR_IMAGE):latest
 # empty in normal runs (the orchestrator then uses the image's baked scripts).
 HOST_SCRIPTS_DIR ?=
 
+# Where the durable state actually lives on the HOST (#331). Deliberately not a
+# `STATE_DIR ?= $(TMP_DIR)` default: this Makefile exports every variable, and
+# an exported STATE_DIR would tell compose to mount TMP_DIR at /media/state and
+# make the server think the two are different directories.
+HOST_STATE_PATH = $(or $(STATE_DIR),$(TMP_DIR))
+HOST_RECORD_PATH = $(or $(RECORD_DIR),$(TMP_DIR))
+
 # ---- Compose bring-up --------------------------------------------------------
 # One unified docker-compose.yml drives the whole farm via profiles (master =
 # cluster + server + worker; worker = worker only). Optional promote overlays are
@@ -227,6 +234,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py outfetch    '; \
 	if out=$$(python3 scripts/test_output_fetch.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py statedir    '; \
+	if out=$$(python3 scripts/test_state_dir.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py cli         '; \
 	if out=$$(python3 scripts/test_encoder_cli.py 2>&1); then echo "ok"; \
@@ -1167,7 +1177,7 @@ ladder-audit:         ## measure one output's ladder into the VMAF curve store (
 	$(LADDER_AUDIT_PY) \
 	  --output-dir "$(OUTPUT_DIR)/$(OUT)" --source "$(SRC)" \
 	  --reference $(LADDER_AUDIT_REFERENCE) \
-	  --store "$(TMP_DIR)/quality-curves.json" \
+	  --store "$(HOST_STATE_PATH)/quality-curves.json" \
 	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)
 
 ladder-audit-all:     ## audit eligible outputs; skips burn-in/no-metadata. MATCH=<substr> scopes to a clip; LATEST=1 = newest per codec only
@@ -1175,7 +1185,7 @@ ladder-audit-all:     ## audit eligible outputs; skips burn-in/no-metadata. MATC
 	$(LADDER_AUDIT_PY) \
 	  --all "$(OUTPUT_DIR)" --source-dir "$(SOURCE_DIR)" \
 	  --reference $(LADDER_AUDIT_REFERENCE) \
-	  --store "$(TMP_DIR)/quality-curves.json" \
+	  --store "$(HOST_STATE_PATH)/quality-curves.json" \
 	  $(if $(MATCH),--match "$(MATCH)",) \
 	  $(if $(LATEST),--latest,) \
 	  $(if $(LIMIT_S),--limit-s $(LIMIT_S),)
@@ -1621,7 +1631,7 @@ smoke-cloud-assert:
 	   echo ">>> SMOKE-CLOUD FAIL: $$d has playlists but ZERO segments — the manifest"; \
 	   echo "    describes media that is not on disk."; exit 1; fi; \
 	 mz="not determined"; \
-	 jl=$$(ls -t $(TMP_DIR)/logs/*.log 2>/dev/null | head -1); \
+	 jl=$$(ls -t $(HOST_RECORD_PATH)/logs/*.log 2>/dev/null | head -1); \
 	 if [ -n "$$jl" ]; then \
 	   if grep -q 'building mezzanine on the host' "$$jl" 2>/dev/null; then \
 	     mz="mezzanine BUILT"; else mz="mezzanine CACHE-HIT (not exercised)"; fi; \
@@ -1656,10 +1666,16 @@ OOBE_KEEP ?=
 # dirs, and cluster addresses (server + worker reach the isolated cluster via
 # host.docker.internal at the OOBE ports). Fed to the same unified compose file
 # via its own project (-p), so it's fully isolated from the live farm.
+#
+# STATE_DIR/RECORD_DIR are overridden for the same reason as the other paths,
+# and it matters MORE than for a scratch dir: unset here they would inherit
+# .env's, and a throwaway first-run test would file its learned speeds into the
+# real model and toggle the real settings.json.
 OOBE_ENV = CONTAINER_NAME=$(OOBE_SERVER) DIST_WORKER_CONTAINER=$(OOBE_WORKER) \
 	PORT=$(OOBE_PORT) TEMPORAL_PORT=$(OOBE_TEMPORAL_PORT) TEMPORAL_UI_PORT=$(OOBE_TEMPORAL_UI_PORT) \
 	MINIO_API_PORT=$(OOBE_MINIO_PORT) MINIO_CONSOLE_PORT=$(OOBE_MINIO_CONSOLE_PORT) \
 	SOURCE_DIR=$(OOBE_DIR)/source OUTPUT_DIR=$(OOBE_DIR)/output TMP_DIR=$(OOBE_DIR)/tmp \
+	STATE_DIR=$(OOBE_DIR)/state RECORD_DIR=$(OOBE_DIR)/record \
 	TEMPORAL_ADDRESS=host.docker.internal:$(OOBE_TEMPORAL_PORT) \
 	MINIO_ENDPOINT=http://host.docker.internal:$(OOBE_MINIO_PORT) \
 	S3_ENDPOINT_URL=http://host.docker.internal:$(OOBE_MINIO_PORT) \
@@ -1670,7 +1686,8 @@ OOBE_COMPOSE = docker compose -p $(OOBE_PROJECT) -f docker-compose.yml -f docker
 .PHONY: oobe oobe-down
 oobe: build   ## isolated first-run test: own dirs/ports/cluster -> encode -> assert -> tear down
 	@echo ">>> [oobe] fresh dirs under $(OOBE_DIR)"
-	@rm -rf $(OOBE_DIR); mkdir -p $(OOBE_DIR)/source $(OOBE_DIR)/output $(OOBE_DIR)/tmp
+	@rm -rf $(OOBE_DIR); mkdir -p $(OOBE_DIR)/source $(OOBE_DIR)/output $(OOBE_DIR)/tmp \
+	  $(OOBE_DIR)/state $(OOBE_DIR)/record
 	@echo ">>> [oobe] generating a tiny clip in the isolated source dir..."
 	@docker run --rm -v "$(OOBE_DIR)/source:/src" --entrypoint ffmpeg $(IMAGE_NAME) \
 	  -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 \

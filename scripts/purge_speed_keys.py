@@ -25,12 +25,18 @@ server container is up unless you pass --force.
 """
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-DEFAULT_STORE = "/media/tmp/encode_speeds.json"
+# Run from the HOST, so these are host paths. STATE_DIR wins once the store has
+# been moved out of $TMP_DIR (#331); the literal is the container's default view
+# and the last resort when neither var is set.
+DEFAULT_STORE = os.path.join(
+    os.environ.get("STATE_DIR") or os.environ.get("TMP_DIR") or "/media/tmp",
+    "encode_speeds.json")
 
 
 def server_running(name: str) -> bool | None:

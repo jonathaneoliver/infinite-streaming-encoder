@@ -289,19 +289,68 @@ keep-list.
 
 `$TMP_DIR` holds four kinds of thing and only one is garbage, so **eligibility
 is the `^[0-9]+$` job-ID directory shape, not age** — the `encode_<stem>/`
-mezzanine caches, the learned state that sizes every chunk plan
-(`encode_speeds.json`, `quality-curves.json`), the ladder CONFIGURATION
-(`ladders.json` — user-authored, not learned) and the permanent
-record (`logs/`, `history.md`, `failed/`) are out of scope structurally rather
-than by a rule someone can forget. `MaxAge` of 0 means *disabled* at both the
-loop and the sweep, because read literally it puts the cutoff at now and takes
-every job directory with it.
+mezzanine caches, and (unless `STATE_DIR` / `RECORD_DIR` moved them, below) the
+learned state that sizes every chunk plan (`encode_speeds.json`,
+`quality-curves.json`), the ladder CONFIGURATION (`ladders.json` —
+user-authored, not learned) and the permanent record (`logs/`, `history.md`,
+`failed/`) are out of scope structurally rather than by a rule someone can
+forget. `MaxAge` of 0 means *disabled* at both the loop and the sweep, because
+read literally it puts the cutoff at now and takes every job directory with it.
 
 Idle is measured over the whole tree, not the top-level directory's own mtime,
 which an encode writing deep inside it never touches. The walk stops at the
 first recent file, so a live directory costs a few stats and only a doomed one
 is walked in full — which is where the reclaimed byte count in the log comes
 from.
+
+### STATE_DIR / RECORD_DIR: what is NOT temporary (#331)
+
+The rule right above — eligibility is structural, not age — existed *only*
+because irreplaceable state shared a directory called `tmp`, and it protected
+against exactly one actor. It did nothing about a human running `rm -rf
+$TMP_DIR/*` to reclaim space, or `rm -rf $TMP_DIR/encode_*` to clear the
+mezzanine caches — **a glob that also matches `encode_speeds.json`** — or the
+volume being unplugged.
+
+So the location is a choice now. Both **default to `$TMP_DIR`**, so an install
+that sets neither is byte-identical:
+
+| | holds | size |
+| --- | --- | --- |
+| `STATE_DIR` | `ladders.json`, `quality-curves.json`, `encode_speeds.json`, `spot_samples.json`, `cost_samples.json`, `settings.json` | ~250 KB, **recoverable from nowhere** |
+| `RECORD_DIR` | `logs/`, `history.md`, `failed/` | tens of MB, and `failed/` can hold GBs |
+| `$TMP_DIR` | `<jobid>/`, `encode_<stem>/`, `jobs/*.json`, the mezzanine lock | GBs, genuinely disposable |
+
+The point is not tidiness: it is that **`$TMP_DIR` becomes disposable**, which
+is what every cleanup path already assumed. They are two knobs rather than one
+because `failed/` is a different size class from the thing you back up.
+
+- **`MigrateDurableState` runs before `NewManager`**, which loads three of the
+  stores in its constructor. It never overwrites a destination and never
+  deletes a source it could not copy, so a repeat boot is a no-op and the worst
+  case is both copies existing *and being told about it*. A half-migrated state
+  is worse than either end state and it is silent — the encoder simply replans
+  from a cold model and re-learns.
+- **Read paths through `StatePath` / `RecordPath`**, never by joining `TmpDir`.
+  Empty resolves to `TmpDir`, which is what every `&Manager{TmpDir: …}` in the
+  tests relies on. `test_state_dir.py` greps for the join coming back.
+- **Two silent cross-language crossings.** `spot_samples.json` is written by Go
+  and read by `inventory.py`; disagree about the directory and the AWS view's
+  spot savings read zero, which looks like a quiet fleet. `ladders.json`
+  reaches Python as `LADDER_STORE`, and a **separate state dir must also be
+  bind-mounted** into spawned worker containers or that path does not exist
+  there and the encoder falls back to the built-in ladders — a custom ladder
+  then encodes as something else. Hence `HOST_STATE_DIR`, and hence
+  `cmd/server` writing its *resolved* `STATE_DIR` back into its own environment
+  so the Python helpers cannot disagree with the flag.
+- **The compose block passes `STATE_DIR: ${STATE_DIR:+/media/state}`.** The `:+`
+  is load-bearing: unset must stay EMPTY, or the server sees `/media/state` ≠
+  `/media/tmp` and "migrates" between two mounts of the same host directory.
+  The mounts themselves fall back to `${TMP_DIR}` so they always resolve.
+- **`internal/tmpstage`'s guard stays.** `STATE_DIR` defaults to `$TMP_DIR`, so
+  on a default install it is still the only thing between the sweep and the
+  learned model. What changed is that it is no longer the only thing between a
+  human with `rm -rf` and the same files.
 
 ### Duration limit (the UI's "Duration (s)")
 
@@ -845,7 +894,8 @@ Supporting modules (all stdlib-only except `cloud/*` which uses boto3):
   of GOP, and the tag-derivation rule that gives every pinned-segment ladder
   the SAME empty tag (so two of them overwrite each other).
 - `ladder.py` — rung selection + `--bitrate-override-*` parsing. The tables are
-  DATA now (`$TMP_DIR/ladders.json`), not a hardcoded 6-tier × 3-codec block.
+  DATA now (`$STATE_DIR/ladders.json`, which defaults to `$TMP_DIR`), not a
+  hardcoded 6-tier × 3-codec block.
 - `gop.py` — `KEYINT = round(fps × gop_s)`, min 1, on Fraction fps.
 - `padding.py` — LCM-based segment-boundary padding; 0.5s skip-threshold.
 - `burnin.py` — 5-layer drawtext filter (timecode, rate, codec+res+fps, encoder, watermark) + optional PADDING label on padded frames only.
@@ -975,5 +1025,5 @@ branches call the same `fragments.parse_segment`, so they cannot disagree.
 - **The learned-speed key is a cross-language contract with no schema, and the PASS COUNT is the part that breaks.** A worker prints `[[ENCODER-SPEED … two_pass=N …]]`; Go builds `speedKey` from its own idea of the pass count; `Speed()` is an exact map lookup with **no cross-pass fallback**. So the two agreeing is the entire mechanism, and when they stopped agreeing both sides went on succeeding and logging nothing (#314). h264 wrote `:1:` forever while the planner read `:2:`, so no h264 encode could move the model however many completed, and 43,021 samples piled onto a curve nothing reads. The cause was five copies of one rule — `codec == "hevc" && !hevcSinglePass` — which was correct only while h264 was single-pass and silently wrong the day the ladder default became 2 for every codec. There is now **one definition per language**: `encode_variants.two_pass_for(ctx, codec)` and `LadderDef.twoPassFor(codec, hevcSinglePass)`. Derive it anywhere else and you get the same silent divergence; a grep for `== "hevc" &&` is how you find the next copy. The join is pinned from both ends — `scripts/test_speed_marker_pass.py` checks the marker's label against the argv the encoder actually builds (and that `cli_phase` still *calls* the shared decision, since the bug was an emitter that never did), and `speed_pass_key_test.go` checks that a marker lands in the key the planner reads. Contaminated keys are removed with `scripts/purge_speed_keys.py`, which refuses to run while the server is up: the store is loaded once at startup and rewritten whole on every finished chunk, so a purge underneath a running server is undone by the next one — silently, and looking exactly like it did not work.
 - **A stage's machine comes from `ENCODER-HOST` and from nothing else**, and the machine timeline drops any stage without one (`_laneStages` filters on `s.instance`) — so a phase that fails to say where it ran draws its box as IDLE while it works, and its minutes land in the lane's idle arithmetic (#293). Two emitters, because there are two kinds of phase. A phase in a WORKER is read off Temporal's pending-activity record (`last_worker_identity`) rather than from history: Temporal does not write `ActivityTaskStarted` into history until the activity COMPLETES, so the history reader cannot answer while the answer matters. A phase this process runs itself (the host mezzanine, host packaging) never reaches a worker at all and reports its own box from `WORKER_LABEL` — which is why `buildRunArgs` passes `LOCAL_WORKER_LABEL` into the local-dist orchestrator, and why the two must keep spelling the box the same way or one machine gets two lanes. `_SELF_RUN_STAGES` is excluded from the worker emitter for the same reason it is excluded from the history reader: the workflow still schedules a mezzanine activity that a worker picks up, finds the `.done`, and returns from, and it would otherwise claim a row the master earned. Order matters — the Go handler updates a stage row in place and, unlike `ENCODER-REUSED`, does NOT seed one, so a HOST marker emitted before the plan is dropped in silence.
 - **The pre-flight estimate and the finished run's cost must stay on one basis.** AWS bills the INSTANCE — launch to termination, boot, image pull and the scale-down tail — not the vCPU-time jobs allocate. `_emit_cost_summary` prices the rental; `projectCloudCost` predicts allocation and converts with the one term that reconciles them, `machine = allocated / (1 - idle)`, from `fleetIdleFraction`. Before that term existed the same app quoted ~60% of what it then reported (#237). Two rules keep it honest: the allowance is **shown, never folded in** (an invisible 1.7x next to the Encode button is how the gap survived), and `variantResourcesFor`'s **reservation** must stay on both sides — `unallocated_pct` is defined against reserved vCPU, so pricing measured busy-cores instead would break the calibration and restore the undercount.
-- `$TMP_DIR/spot_samples.json` (`encode.RunSample`) is a **cross-language contract**: Go writes it at every terminal job, `inventory.py`'s `_spot_and_reclaim_stats` reads it **by field name and ignores what it doesn't know**. Adding fields is safe; renaming one silently zeroes the AWS view's spot savings with no error on either side. `idle_pct` there is a lower bound — boxes still alive at run end have their lifetime measured to now — and samples whose `started_at`/`ended_at` overlap another run are excluded from the allowance, because `_emit_machine_rental` counts a concurrent run's time on a shared instance as this run's idle.
+- `$STATE_DIR/spot_samples.json` (`encode.RunSample`) is a **cross-language contract**: Go writes it at every terminal job, `inventory.py`'s `_spot_and_reclaim_stats` reads it **by field name and ignores what it doesn't know**. Adding fields is safe; renaming one silently zeroes the AWS view's spot savings with no error on either side. `idle_pct` there is a lower bound — boxes still alive at run end have their lifetime measured to now — and samples whose `started_at`/`ended_at` overlap another run are excluded from the allowance, because `_emit_machine_rental` counts a concurrent run's time on a shared instance as this run's idle.
 - `projectCloudCost` hardcodes `"graviton"` **on purpose**: `infra/terraform/modules/compute/main.tf` runs one compute env, c8g/c7g only, so a cloud-batch job cannot land on Intel or AMD. Honouring `JobConfig.CpuArch` would quote hardware the run can never reach. The form's cpu-arch control is hidden as retired legacy for the same reason. Wire it up when a second compute env exists, not before.

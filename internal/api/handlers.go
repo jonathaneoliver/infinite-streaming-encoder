@@ -155,7 +155,7 @@ func NewServer(mgr *encode.Manager) *Server {
 	s.Mux.HandleFunc("POST /api/aws/batch-jobs/terminate", s.awsTerminateBatchJob)
 	s.Mux.HandleFunc("POST /api/aws/batch/stop-all", s.awsBatchStopAll)
 	// Serve encode logs
-	s.Mux.Handle("GET /logs/", http.StripPrefix("/logs/", http.FileServer(http.Dir(filepath.Join(mgr.TmpDir, "logs")))))
+	s.Mux.Handle("GET /logs/", http.StripPrefix("/logs/", http.FileServer(http.Dir(mgr.RecordPath("logs")))))
 	// Serve encoded output files (segments, manifests) for HLS.js playback
 	s.Mux.Handle("GET /content/", http.StripPrefix("/content/", mediaFileServer(mgr.OutputDir)))
 	// Serve source files for direct playback
@@ -1099,7 +1099,7 @@ func (s *Server) outputLogs(w http.ResponseWriter, r *http.Request) {
 					Status:  string(j.Status),
 					Started: j.StartedAt.Format("2006-01-02 15:04:05"),
 				}
-				logPath := filepath.Join(s.Manager.TmpDir, "logs", j.ID+".log")
+				logPath := filepath.Join(s.Manager.RecordPath("logs"), j.ID+".log")
 				if _, err := os.Stat(logPath); err == nil {
 					entry.LogFile = j.ID + ".log"
 				}
@@ -1109,7 +1109,7 @@ func (s *Server) outputLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Also scan the logs directory for any log files (covers jobs from previous runs)
-	logsDir := filepath.Join(s.Manager.TmpDir, "logs")
+	logsDir := s.Manager.RecordPath("logs")
 	if entries, err := os.ReadDir(logsDir); err == nil {
 		seen := make(map[string]bool)
 		for _, l := range logs {

@@ -367,13 +367,16 @@ def _store_path() -> str | None:
     """Filesystem path to the persisted ladder store, or None.
 
     The Go control plane owns the store (ladders.json) and sets LADDER_STORE
-    on worker containers; we also probe the mounted temp dir as a fallback.
+    on worker containers; we also probe the mounted state/temp dirs as a
+    fallback. STATE_DIR leads because that is where the store lives once it has
+    been moved out of $TMP_DIR (#331); the rest are the pre-#331 locations, and
+    a default install still finds it there.
     """
     import os
     p = os.environ.get("LADDER_STORE")
     if p:
         return p
-    for env in ("TMPDIR", "ENCODER_TMP_ROOT", "TMP_DIR"):
+    for env in ("STATE_DIR", "TMPDIR", "ENCODER_TMP_ROOT", "TMP_DIR"):
         base = os.environ.get(env)
         if base:
             return os.path.join(base, "ladders.json")

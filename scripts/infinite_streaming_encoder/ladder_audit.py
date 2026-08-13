@@ -4,7 +4,9 @@ This is the repeatable form of the one-off analysis in `docs/vmaf-audit/` — th
 reports that produced the built-in seed curves in `internal/encode/quality_curve.go`.
 Running it on your own content replaces those estimates with measurements of
 material you actually care about, without a rebuild: the control plane overlays
-`$TMP_DIR/quality-curves.json` on the built-in seed (see `LoadCurveStore`).
+`$STATE_DIR/quality-curves.json` on the built-in seed (see `LoadCurveStore`);
+`make ladder-audit` passes that path, which falls back to `$TMP_DIR` on an
+install that has not moved its state out of there (#331).
 
 What it measures, and what it does NOT:
 
