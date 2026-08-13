@@ -62,6 +62,18 @@ green for the path it claimed to be covering, which is worse than no gate at
 all. If you add a knob to a target here, add it to the target and not only to
 this file.
 
+**`make smoke-cloud` spends real money, and `make deploy` mutates shared
+infrastructure — never run either unprompted.** smoke-cloud launches spot
+capacity and transfers media; deploy bumps and *deregisters* live Batch job-def
+revisions, which fails any execution already in flight. Both are the
+maintainer's call on the maintainer's account. Say which one you want run and
+why, then wait.
+
+Do not mutate the smoke fixture `$SOURCE_DIR/smoke.mp4` either. `make
+smoke-cloud` `touch`es it deliberately to move the mezzanine cache key and force
+a real mezzanine run — the key is `name|size|mtime`, so an out-of-band edit
+makes that gate silently meaningless in either direction.
+
 ## Commands
 
 Build and run (Go, for local dev outside Docker):
@@ -80,6 +92,27 @@ make shell         # exec into container
 make stop / clean
 ```
 
+**"Is it deployed?" is four different questions, and there is a target for
+each.** Asked ~15 times across the sessions this file exists to prevent; the
+answers were always in the Makefile and never here.
+```
+make status         # what is deployed where, vs what THIS TREE says it should be
+make fleet-check    # which workers are actually connected + their payload version,
+                    #   then falls through to cloud-payload
+make cloud-payload  # what encoder payload the ACTIVE Batch job definitions are on
+make doctor         # preflight: .env, host tools, per-target config
+```
+Read them in that order, and read `version` as **encoder payload, not build**
+(see the `version` note under "Things to know when editing"). A green `make
+status` with a Go-only change still means the tag did not move — that is
+correct, not a bug, and it is the single most common way this question gets
+answered wrongly.
+
+`fleet-check` cannot answer the pre-flight form. The server learns a box's
+version from the **chunk heartbeat**, so before any encode has run it reports
+"none reported yet". The connect line proves the worker knows its build; the
+control plane does not until work flows (#248).
+
 Farm bring-up (distributed-local encoding — Temporal + MinIO, no AWS). The whole
 thing lives in the **unified root `docker-compose.yml`** with two profiles:
 ```
@@ -90,6 +123,34 @@ make farm-test-up     # publish the working tree under a throwaway dev-<branch>-
                       # bugs farm-dev-up hides. TAG=<name> to override.
 docker compose --profile worker up -d   # an EXTRA box: worker only (dials master's LAN Temporal/MinIO)
 ```
+
+**Under `farm-dev-up`, editing a file IS deploying it.** `HOST_SCRIPTS_DIR`
+live-mounts `scripts/infinite_streaming_encoder/` and `cli_phase` runs as a
+**fresh subprocess per phase** — so an edit to the package lands in the next
+phase of a job already in flight, with no bounce, no restart and no log line.
+Discovered 2026-08-11 while a four-ladder full-length comparison was mid-run;
+the fix was to hold a rebase for two hours rather than produce a comparison set
+whose members were built by different code.
+
+The mount boundary stops **at the package directory**. `scripts/test_*.py` is
+outside it, so test files are safe to touch mid-run — which is what makes
+mutation-testing possible during an encode. To check a hypothesis against the
+package itself without mutating it, read the source, edit the string, and `exec`
+the result into a throwaway namespace.
+
+**Before any `farm-up` / `farm-dev-up` / `deploy` / `restart`, check for a
+non-terminal job** — `curl -s localhost:8080/api/jobs`. A bounce mid-encode does
+not fail the run: the encode completes and **PASSES**, having silently lost the
+telemetry of every chunk that ran on the replaced worker (2026-08-08).
+`make deploy` and `make restart` have `require-idle`, but it fires ONCE at entry
+and `publish` then takes minutes before `farm-up` touches a container — anything
+submitted in that window is unguarded and the guard still says idle.
+
+**Never bounce the farm without saying so** when another session may own it. A
+worktree that is dev-mounted owns the compose stack for every session on the
+box, and "the farm is running someone's uncommitted tree" is the first
+hypothesis whenever two outputs of the same source disagree structurally.
+
 `master` profile = postgres + temporal + temporal-ui + minio + server + worker;
 `worker` profile = worker only (MinIO/Temporal are **master-only**). The server,
 worker, cluster, and the old `run-worker.sh` are all folded into this one file;
@@ -1026,4 +1087,6 @@ branches call the same `fragments.parse_segment`, so they cannot disagree.
 - **A stage's machine comes from `ENCODER-HOST` and from nothing else**, and the machine timeline drops any stage without one (`_laneStages` filters on `s.instance`) — so a phase that fails to say where it ran draws its box as IDLE while it works, and its minutes land in the lane's idle arithmetic (#293). Two emitters, because there are two kinds of phase. A phase in a WORKER is read off Temporal's pending-activity record (`last_worker_identity`) rather than from history: Temporal does not write `ActivityTaskStarted` into history until the activity COMPLETES, so the history reader cannot answer while the answer matters. A phase this process runs itself (the host mezzanine, host packaging) never reaches a worker at all and reports its own box from `WORKER_LABEL` — which is why `buildRunArgs` passes `LOCAL_WORKER_LABEL` into the local-dist orchestrator, and why the two must keep spelling the box the same way or one machine gets two lanes. `_SELF_RUN_STAGES` is excluded from the worker emitter for the same reason it is excluded from the history reader: the workflow still schedules a mezzanine activity that a worker picks up, finds the `.done`, and returns from, and it would otherwise claim a row the master earned. Order matters — the Go handler updates a stage row in place and, unlike `ENCODER-REUSED`, does NOT seed one, so a HOST marker emitted before the plan is dropped in silence.
 - **The pre-flight estimate and the finished run's cost must stay on one basis.** AWS bills the INSTANCE — launch to termination, boot, image pull and the scale-down tail — not the vCPU-time jobs allocate. `_emit_cost_summary` prices the rental; `projectCloudCost` predicts allocation and converts with the one term that reconciles them, `machine = allocated / (1 - idle)`, from `fleetIdleFraction`. Before that term existed the same app quoted ~60% of what it then reported (#237). Two rules keep it honest: the allowance is **shown, never folded in** (an invisible 1.7x next to the Encode button is how the gap survived), and `variantResourcesFor`'s **reservation** must stay on both sides — `unallocated_pct` is defined against reserved vCPU, so pricing measured busy-cores instead would break the calibration and restore the undercount.
 - `$STATE_DIR/spot_samples.json` (`encode.RunSample`) is a **cross-language contract**: Go writes it at every terminal job, `inventory.py`'s `_spot_and_reclaim_stats` reads it **by field name and ignores what it doesn't know**. Adding fields is safe; renaming one silently zeroes the AWS view's spot savings with no error on either side. `idle_pct` there is a lower bound — boxes still alive at run end have their lifetime measured to now — and samples whose `started_at`/`ended_at` overlap another run are excluded from the allowance, because `_emit_machine_rental` counts a concurrent run's time on a shared instance as this run's idle.
+- **Cost figures never subtract free tier.** Every estimate and every reported cost is what the run would cost with the allowance already exhausted. Asked three separate times (2026-07-29, 08-05, 08-07); the reason is that the free tier is a property of the account's month, not of the run, so folding it in makes two identical runs quote different numbers and makes a `$0.00` line read as "this is free" when it means "you have not hit the cap yet". State the allowance separately if it is interesting — the same rule the fleet-idle allowance follows in the bullet above.
+- **VMAF uses ONE reference model across a whole ladder, and it is chosen by the ladder's TOP rung, not per-rung.** `vmaf_4k_v0.6.1` when any rung exceeds 1080p. Switching models between rungs makes the scores incomparable, which is the only thing the ladder audit exists to compare — a 4K HEVC rung and a 1080p h264 rung scored under different models cannot be put in the same table. Asked four times (2026-07-25 through 08-11). `quality-curves.json` records `model` and the common resolution per point for exactly this reason; a curve without them is unusable, and the Ladders tab's estimates are keyed by `(codec, height, bitrate, clip)` and ignore VBV and GOP entirely (#288).
 - `projectCloudCost` hardcodes `"graviton"` **on purpose**: `infra/terraform/modules/compute/main.tf` runs one compute env, c8g/c7g only, so a cloud-batch job cannot land on Intel or AMD. Honouring `JobConfig.CpuArch` would quote hardware the run can never reach. The form's cpu-arch control is hidden as retired legacy for the same reason. Wire it up when a second compute env exists, not before.
