@@ -203,6 +203,31 @@ def fold(scores: list[float], period: int) -> list[float]:
     return [statistics.fmean(b) if b else 0.0 for b in buckets]
 
 
+def fold_fraction(scores: list[float], period: int, buckets: int = 60) -> list[float]:
+    """Fold onto a common 0..1 axis — position as a FRACTION of the period.
+
+    Needed the moment two variants are overlaid, because a comparison run
+    changes the period on purpose: the 2s-GOP variant folds over 60 frames and
+    the 1s baseline over 30. Plotting both against absolute frame offset puts
+    the second variant's mid-GOP under the first's next IDR and invents a
+    phase shift that is not in the data. Fraction-of-period is the only axis on
+    which differently-periodic series are comparable.
+
+    Returns `buckets` means; empty when there is not enough data to fill them.
+    """
+    if period < 2 or len(scores) < period:
+        return []
+    sums = [0.0] * buckets
+    counts = [0] * buckets
+    for i, s in enumerate(scores):
+        b = min(buckets - 1, (i % period) * buckets // period)
+        sums[b] += s
+        counts[b] += 1
+    if any(c == 0 for c in counts):
+        return []
+    return [sums[b] / counts[b] for b in range(buckets)]
+
+
 def diagnose(folded: list[float]) -> str:
     """Read the mechanism off the folded curve's shape out of the IDR."""
     if len(folded) < 6:
@@ -219,9 +244,27 @@ def diagnose(folded: list[float]) -> str:
         return ("NORMAL GOP DRIFT — quality peaks at the IDR and decays across "
                 "the GOP as prediction drift accumulates. Expected in every "
                 "encode; not the pulsing you are chasing.")
+    if idr < mean and late > mean:
+        # Measured on a real 145 kbps / 234p rung: IDR 19.98 against a cycle
+        # mean of 26.09, trough at +2, climbing to 36.93 by +27 — 82% of the
+        # mean, peak to trough, at 1 Hz.
+        #
+        # This branch used to say "unusual — suspect keyframe placement or a
+        # reference mismatch", which sent the reader after the wrong thing. It
+        # is the SAME VBV starvation as above, one degree worse: the buffer is
+        # too small to hold an I-frame at all, so the encoder cannot spend on
+        # the keyframe either. The I-frame is coded badly, and the GOP is a
+        # recovery ramp from it. Expect this below the bitrate where an
+        # I-frame stops fitting in bufsize_multiplier x bitrate seconds.
+        return ("STARVED KEYFRAME — the IDR is the WORST frame and quality "
+                "climbs across the GOP, resetting at the next one. The VBV "
+                "buffer cannot hold an I-frame at this bitrate, so even the "
+                "keyframe is compressed hard. Raise bufsize_multiplier, or "
+                "lengthen the GOP so the cost is amortised less often.")
     if idr < mean:
-        return ("IDR ITSELF IS THE LOW POINT — unusual. Suspect a keyframe "
-                "placement or reference mismatch rather than rate control.")
+        return ("IDR IS THE LOW POINT but quality does not recover across the "
+                "GOP — that is not rate control. Suspect keyframe placement or "
+                "a reference mismatch.")
     return "no clear shape — amplitude may be below the noise floor"
 
 

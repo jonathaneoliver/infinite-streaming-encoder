@@ -147,6 +147,63 @@ def test_a_chunk_period_is_reported_as_the_chunk():
     print("ok  a chunk-period pulse is reported at the chunk period")
 
 
+def test_starved_keyframe_is_named_not_called_unusual():
+    """Regression from REAL data: a 145 kbps/234p rung folded to IDR 19.98
+    against a cycle mean of 26.09, trough at +2, climbing to 36.93 by +27.
+    The tool called that "unusual — suspect keyframe placement", sending the
+    reader after the wrong thing. It is VBV starvation one degree worse: the
+    buffer cannot hold an I-frame, so the keyframe itself is coded badly.
+    """
+    from analyze_vmaf_periodicity import diagnose
+    measured = [19.98, 17.15, 15.65, 18.18, 18.03, 17.82, 18.46, 18.94, 19.45,
+                24.29, 24.07, 23.86, 24.78, 25.70, 26.45, 29.19, 29.51, 27.78,
+                29.02, 28.37, 28.34, 34.04, 31.57, 30.91, 31.28, 32.87, 31.30,
+                36.93, 34.58, 34.44]
+    d = diagnose(measured)
+    assert "STARVED KEYFRAME" in d, f"real starved-keyframe fold diagnosed as: {d}"
+    print("ok  a starved keyframe is named, not called unusual")
+
+
+def test_fraction_fold_aligns_different_periods():
+    """Overlaying variants is the whole point of the comparison run, and the
+    comparison CHANGES the period on purpose (the 2s-GOP variant). Folded on a
+    fraction axis, the same-shaped pulse must land in the same place whether
+    its period is 30 frames or 60 — on an absolute-frame axis it would not.
+    """
+    from analyze_vmaf_periodicity import fold_fraction
+
+    def pulse(period, cycles=200, seed=7):
+        rng = random.Random(seed)
+        out = []
+        for i in range(period * cycles):
+            pos = i % period
+            frac = pos / period
+            shape = 3.0 if pos == 0 else (-3.0 if frac < 0.25 else -3.0 + 4.8 * frac)
+            out.append(70.0 + shape + content_drift(i, rng))
+        return out
+
+    a = fold_fraction(pulse(30), 30, buckets=20)
+    b = fold_fraction(pulse(60), 60, buckets=20)
+    assert a and b, "fold_fraction returned nothing"
+    # Same shape, so the trough must sit in the same bucket for both.
+    assert abs(a.index(min(a)) - b.index(min(b))) <= 1, \
+        f"trough at bucket {a.index(min(a))} vs {b.index(min(b))} — periods not aligned"
+    # And the peak-to-trough amplitudes must agree to within noise.
+    amp_a, amp_b = max(a) - min(a), max(b) - min(b)
+    assert abs(amp_a - amp_b) < 0.35 * max(amp_a, amp_b), \
+        f"amplitudes disagree: {amp_a:.2f} vs {amp_b:.2f}"
+    print("ok  fraction-fold aligns a 30-frame and a 60-frame period")
+
+
+def test_fraction_fold_refuses_partial_buckets():
+    """A short series with more buckets than cycles would leave buckets empty
+    and draw a curve out of one or two frames. Better to return nothing."""
+    from analyze_vmaf_periodicity import fold_fraction
+    assert fold_fraction([1.0] * 25, 30, buckets=20) == [], \
+        "folded a series shorter than one period"
+    print("ok  fraction-fold refuses a series it cannot fill")
+
+
 if __name__ == "__main__":
     test_finds_the_planted_period()
     test_planted_period_is_significant()
@@ -155,4 +212,7 @@ if __name__ == "__main__":
     test_fold_recovers_the_amplitude()
     test_detrend_removes_drift_but_keeps_the_pulse()
     test_a_chunk_period_is_reported_as_the_chunk()
+    test_starved_keyframe_is_named_not_called_unusual()
+    test_fraction_fold_aligns_different_periods()
+    test_fraction_fold_refuses_partial_buckets()
     print("PASS")
