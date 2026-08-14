@@ -168,6 +168,12 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .chunk-cell { position: relative; flex: 1 1 0; min-width: 3px; height: 10px; background: #1a2a4a; border-radius: 3px; overflow: hidden; }
 /* On-screen hint under Start Encode explaining the force-reencode gesture. */
 .encode-hint { margin-top: 10px; font-size: 12px; color: #8a9bb5; line-height: 1.5; }
+/* Per-control hint (#349): the description of the CURRENT choice, shown
+   without a hover. min-height is load-bearing — without it, switching to an
+   option whose description wraps to a different number of lines shifts every
+   control to the right of it. */
+.control-hint { margin-top: 4px; font-size: 11px; line-height: 1.35; color: #8a9bb5;
+                max-width: 260px; min-height: 30px; }
 
 /* Split "Encode ▾" button: default click = safe Encode, caret opens Re-encode.
    Replaces the hidden Alt/right-click force gesture (issue #114). */
@@ -450,12 +456,23 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 retry behaviour, interruption-resistant.
             </div>
             <div class="controls">
+            <!-- #349, worked example. The description lives in the DOM ONCE and
+                 has three readers: this control's live hint, a screen reader via
+                 aria-describedby, and the demo recorder, which reads data-desc
+                 rather than carrying its own copy of the same sentence. The
+                 OPTION descriptions matter as much as the control's: the whole
+                 point of Target is the difference between the two. -->
             <div class="control-group">
-                <label>Target</label>
-                <select id="target" onchange="onTargetChange()">
-                    <option value="local">Local (all machines)</option>
-                    <option value="cloud">Cloud (AWS Batch)</option>
+                <label for="target">Target</label>
+                <select id="target" onchange="onTargetChange()"
+                        aria-describedby="target-hint"
+                        data-desc="Where the encode runs.">
+                    <option value="local"
+                            data-desc="Spreads the work across every machine on this network. Costs time, not money.">Local (all machines)</option>
+                    <option value="cloud"
+                            data-desc="Submits the job to AWS Batch on spot capacity. Costs money, and adds controls for spot, leaving media in S3, and deferred packaging.">Cloud (AWS Batch)</option>
                 </select>
+                <div class="control-hint" id="target-hint"></div>
             </div>
             <div class="control-group" id="cpu-arch-group" style="display:none">
                 <label>CPU (cloud)</label>
@@ -2282,7 +2299,23 @@ function renderSources() {
     updateSelectedCount();
 }
 
+// Show the selected option's own description. Generic on purpose: any select
+// whose options differ in KIND can opt in by giving its options a data-desc.
+function syncOptionHint(selectId, hintId) {
+    const sel = document.getElementById(selectId);
+    const hint = document.getElementById(hintId);
+    if (!sel || !hint) return;
+    const opt = sel.options[sel.selectedIndex];
+    hint.textContent = (opt && opt.dataset.desc) || sel.dataset.desc || '';
+}
+
+// The hint must be right BEFORE the user touches anything — onTargetChange only
+// fires on change (and, oddly, from the cloud-not-configured fallback), so the
+// control would otherwise describe nothing until first use.
+document.addEventListener('DOMContentLoaded', () => syncOptionHint('target', 'target-hint'));
+
 function onTargetChange() {
+    syncOptionHint('target', 'target-hint');
     const target = document.getElementById('target').value;
     const isAnyCloud = isAnyCloudTarget(target);
     document.getElementById('cloud-warning').style.display =
