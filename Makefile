@@ -250,6 +250,13 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  py sfnschema   '; \
 	if out=$$(python3 scripts/test_sfn_definition.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	: 'The demo tooling is judged by WATCHING a video, which CI cannot do.'; \
+	: 'These two parts have right answers instead of taste: the written->spoken'; \
+	: 'table, and the git-tracked narrative round-trip that joins script to'; \
+	: 'recording by index. Stdlib only — no ffmpeg, no voice engine.'; \
+	printf '  py demospeech  '; \
+	if out=$$(python3 scripts/test_demo_pronunciation.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  python compile '; \
 	if out=$$(cd scripts && python3 -m compileall -q infinite_streaming_encoder 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
