@@ -491,7 +491,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 </select>
             </div>
             <div class="control-group" id="chunk-dur-group">
-                <label title="How each variant is split into parallel chunks. CLOUD (AWS Batch): Dynamic sizes each variant's chunks by learned encode speed (~4 min work per chunk, min 30s) — slow 4K HEVC splits into many, cheap H264 runs whole. LOCAL (Temporal): Dynamic = a fixed 12s default (no per-variant model); fixed sizes and Whole behave the same as cloud. Fixed: smaller chunks = more parallelism, more join overhead. Whole variant = one continuous encode per tier, NO chunk boundaries (use this to rule out chunk-boundary effects).">Chunking</label>
+                <label for="chunk-duration" title="How each variant is split into parallel chunks. CLOUD (AWS Batch): Dynamic sizes each variant's chunks by learned encode speed (~4 min work per chunk, min 30s) — slow 4K HEVC splits into many, cheap H264 runs whole. LOCAL (Temporal): Dynamic = a fixed 12s default (no per-variant model); fixed sizes and Whole behave the same as cloud. Fixed: smaller chunks = more parallelism, more join overhead. Whole variant = one continuous encode per tier, NO chunk boundaries (use this to rule out chunk-boundary effects).">Chunking</label>
                 <select id="chunk-duration"
                         data-desc="How each variant is split into pieces that encode in parallel.">
                     <option value="dynamic"
@@ -521,8 +521,13 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     data-desc="The run finishes when the last chunk lands: no packaging, no sync-back, and none of the post-encode tail. Press Package in Outputs when you want it. Until then the chunks in S3 are the ONLY copy, and expiry costs the whole run."> Don't package yet (package on demand)</label>
             </div>
             <div class="control-group">
-                <label>Codec</label>
-                <div id="codec" class="codec-checks" role="group" aria-label="Codec"
+                <!-- A <label for> cannot point at a group of checkboxes, so the
+                     group borrows the VISIBLE label as its name. aria-labelledby
+                     rather than aria-label: the latter is a second copy of the
+                     same words, and the two drift the first time one is
+                     reworded. -->
+                <label id="codec-label">Codec</label>
+                <div id="codec" class="codec-checks" role="group" aria-labelledby="codec-label"
                      data-desc="Which encoders to run. Each codec is a separate job with its own output directory, so two codecs is two jobs, not one job twice as long.">
                     <label><input type="checkbox" class="codec-cb" value="h264" checked onchange="onCodecsChanged()"
                         data-desc="Plays everywhere. Fastest of the three to encode, and the one to pick when you only want the pipeline exercised."> H.264</label>
@@ -533,22 +538,22 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 </div>
             </div>
             <div class="control-group">
-                <label title="Bitrate ladder (resolutions + target bitrates) AND its output timing (segment / partial / GOP / VBV). Select SEVERAL to encode the same source as several delivery profiles — one job each. Manage ladders in the Ladders tab.">Ladder / Profile</label>
-                <div id="ladder-list" class="ladder-checks" role="group" aria-label="Ladder / Profile"
+                <label id="ladder-label" title="Bitrate ladder (resolutions + target bitrates) AND its output timing (segment / partial / GOP / VBV). Select SEVERAL to encode the same source as several delivery profiles — one job each. Manage ladders in the Ladders tab.">Ladder / Profile</label>
+                <div id="ladder-list" class="ladder-checks" role="group" aria-labelledby="ladder-label"
                      data-desc="A ladder is the resolutions and bitrates AND the delivery timing that goes with them — segment, partial, GOP and VBV. Pick several to encode one source as several delivery profiles, one job each."></div>
             </div>
             <!-- Options are rebuilt from the SELECTED LADDER's real rung heights
                  by syncResTiers() — these placeholders only cover the moment
                  before /api/ladders lands. -->
             <div class="control-group">
-                <label title="Drop ladder rungs TALLER than this. Tiers come from the selected ladder.">Max Resolution</label>
+                <label for="max-res" title="Drop ladder rungs TALLER than this. Tiers come from the selected ladder.">Max Resolution</label>
                 <select id="max-res" onchange="syncResTiers()"
                         data-desc="Drops ladder rungs taller than this. The tiers listed come from the selected ladder's real rung heights, not a fixed set.">
                     <option value="">No limit (all rungs)</option>
                 </select>
             </div>
             <div class="control-group">
-                <label title="Drop ladder rungs SHORTER than this. Combined with Max Resolution it selects a contiguous band of the ladder.">Min Resolution</label>
+                <label for="min-res" title="Drop ladder rungs SHORTER than this. Combined with Max Resolution it selects a contiguous band of the ladder.">Min Resolution</label>
                 <select id="min-res" onchange="syncResTiers()"
                         data-desc="Drops ladder rungs shorter than this. With Max Resolution it selects a contiguous band of the ladder rather than a top or a bottom.">
                     <option value="">No limit (all rungs)</option>
@@ -560,7 +565,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                        data-desc="Encode only the first N seconds, snapped to a whole segment so chunk boundaries still land on segment edges. Blank encodes the whole clip, and so does any value at or above the clip's own length.">
             </div>
             <div class="control-group">
-                <label title="Optional suffix appended to the output dir name (<stem>_<suffix>_<codec>). Use it to keep comparison encodes of the same source side-by-side on disk instead of archiving each other — e.g. 'local12', 'localwhole'. Blank = the ladder's default (usually 'xs').">Output suffix</label>
+                <label for="output-tag" title="Optional suffix appended to the output dir name (<stem>_<suffix>_<codec>). Use it to keep comparison encodes of the same source side-by-side on disk instead of archiving each other — e.g. 'local12', 'localwhole'. Blank = the ladder's default (usually 'xs').">Output suffix</label>
                 <input type="text" id="output-tag" placeholder="ladder default" style="width:110px"
                        data-desc="Appended to the output directory name, after the codec. Set one to keep comparison encodes of the same source side by side instead of each archiving the last.">
             </div>
@@ -2328,7 +2333,14 @@ function renderSources() {
         </div>
     ` + sorted.map(f => `
         <div class="file-item" oncontextmenu="showSourceContextMenu(event, '${escapeAttr(f.name)}')">
-            <input type="checkbox" value="${f.name}" ${checked.has(f.name) ? 'checked' : ''} onclick="event.stopPropagation(); updateSelectedCount()">
+            <!-- The filename is in a SIBLING span, not a wrapping <label>, so
+                 nothing associates the two: all 21 of these announced as an
+                 unnamed checkbox. aria-label rather than restructuring the row,
+                 because the visible text carries the name and this only has to
+                 say which one. -->
+            <input type="checkbox" value="${f.name}" ${checked.has(f.name) ? 'checked' : ''}
+                   aria-label="Select ${escapeAttr(f.name)}"
+                   onclick="event.stopPropagation(); updateSelectedCount()">
             <span class="file-name" onclick="this.parentElement.querySelector('input').click()">${f.name}</span>
             <span class="src-badge-slot">${sourceStatusBadge(f.name)}</span>
             <span class="file-size">${formatSize(f.size)}</span>
@@ -2380,10 +2392,14 @@ function initControlDescriptions(root) {
             hint = document.createElement('div');
             hint.id = hintId;
             hint.className = perOption ? 'control-hint' : 'sr-only';
-            // A checkbox lives INSIDE its <label>, so afterend puts the hint
-            // between the box and its text — invisible, and still the label's
-            // own text is the accessible NAME, which is what we want.
-            el.insertAdjacentElement('afterend', hint);
+            // OUTSIDE the <label>, not after the control. A checkbox lives
+            // inside its label, so inserting after the input puts the hint in
+            // the label's text content — and the accessible NAME is computed
+            // from that text. The result announced "Encodes the decode-dominated
+            // rungs… Shared decode" as the checkbox's name, i.e. the description
+            // ate the name. Invisible on screen, and only visible in the
+            // computed accessibility tree.
+            (el.closest('label') || el).insertAdjacentElement('afterend', hint);
         }
         if (perOption && !el.dataset.hintBound) {
             el.addEventListener('change', () => syncOptionHint(el.id, hintId));
@@ -6996,7 +7012,7 @@ function playSource(name) {
         <div class="player-container">
             <div class="player-header">
                 <span class="player-title">${escapeHtml(name)} (source)</span>
-                <button class="player-close" onclick="closePlayer(this.closest('.player-modal'))">&times;</button>
+                <button class="player-close" aria-label="Close" title="Close" onclick="closePlayer(this.closest('.player-modal'))">&times;</button>
             </div>
             <video class="player-video" controls autoplay src="${url}"></video>
             <div class="player-info">Direct source playback</div>
@@ -7021,7 +7037,7 @@ async function viewEncodeLogs(dirName) {
         <div class="player-container" style="max-width:900px">
             <div class="player-header">
                 <span class="player-title">Encode logs: ${escapeHtml(dirName)}</span>
-                <button class="player-close" onclick="this.closest('.modal-overlay').remove()">&times;</button>
+                <button class="player-close" aria-label="Close" title="Close" onclick="this.closest('.modal-overlay').remove()">&times;</button>
             </div>
             <div id="log-modal-content" style="color:#888;padding:12px">Loading...</div>
         </div>
@@ -7112,7 +7128,7 @@ function playContent(playlistPath, dirName) {
         <div class="player-container">
             <div class="player-header">
                 <span class="player-title">${escapeHtml(playlistPath)}</span>
-                <button class="player-close" onclick="closePlayer(this.closest('.player-modal'))">&times;</button>
+                <button class="player-close" aria-label="Close" title="Close" onclick="closePlayer(this.closest('.player-modal'))">&times;</button>
             </div>
             <video class="player-video" id="player-video" controls autoplay></video>
             <div class="player-info" id="player-info"></div>

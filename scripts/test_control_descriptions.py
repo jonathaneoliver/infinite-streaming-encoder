@@ -40,7 +40,9 @@ class Controls(HTMLParser):
         self.depth = 0          # div nesting inside .controls; 0 = outside
         self.controls = []      # (tag, ident, attrs)
         self.selects = []       # (ident, [option descs])
+        self.labels = []        # (attrs, wraps_input) for <label> in .controls
         self._cur_select = None
+        self._label = None      # open <label>, awaiting its first child
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -53,6 +55,14 @@ class Controls(HTMLParser):
             return
 
         ident = a.get("id") or a.get("name") or a.get("value") or "?"
+        if tag == "label":
+            self.labels.append([a, False, ""])   # attrs, wraps_input, text
+            self._label = self.labels[-1]
+            return
+        if tag in ("select", "input", "textarea") and self._label is not None:
+            # <label><input …> Text</label> — implicit association, which is as
+            # good as for= and does not need one.
+            self._label[1] = True
         if tag in ("select", "input", "textarea"):
             # Buttons and the encode split-menu are actions, not options; they
             # are outside .controls anyway, but be explicit.
@@ -69,7 +79,15 @@ class Controls(HTMLParser):
             # (Codec, Ladder). It carries the group-level description.
             self.controls.append(("group", ident, a))
 
+    def handle_data(self, data):
+        # Name a label by what it SAYS. Half of them have no id or class, and
+        # "label ? is associated with no control" sends the reader hunting.
+        if self._label is not None and data.strip():
+            self._label[2] = (self._label[2] + " " + data.strip()).strip()
+
     def handle_endtag(self, tag):
+        if tag == "label":
+            self._label = None
         if tag == "select":
             self._cur_select = None
         if tag == "div" and self.depth:
@@ -128,13 +146,39 @@ def main():
             bad.append("select   %-20s describes %d of %d options — the hint "
                        "goes blank on the rest" % (ident, len(have), len(descs)))
 
-    if bad:
-        print("FAIL: %d control(s) in the encode form are not described (#349)" % len(bad))
-        for b in bad:
+    # A description answers "what is it for". A NAME answers "what is this", and
+    # it is the half a screen reader announces first — an unassociated <label>
+    # is just text sitting near a control, and clicking it does not focus the
+    # control either. Three ways to associate, all equally good:
+    #   <label for=…>   ·   <label><input …></label>   ·   id + aria-labelledby
+    labelled_by = set()
+    for _, _, a in p.controls:
+        ref = a.get("aria-labelledby")
+        if ref:
+            labelled_by.update(ref.split())
+    unnamed = []
+    for a, wraps, text in p.labels:
+        if wraps or a.get("for"):
+            continue
+        if a.get("id") and a["id"] in labelled_by:
+            continue
+        unnamed.append("label    %-20s is associated with no control"
+                       % ((text or a.get("id") or "?")[:20]))
+
+    if bad or unnamed:
+        print("FAIL: %d control(s) in the encode form are not properly "
+              "described or named (#349)" % (len(bad) + len(unnamed)))
+        for b in bad + unnamed:
             print("  " + b)
-        print("\nAdd data-desc=\"…\" to the control. Nothing else is needed —")
-        print("initControlDescriptions() wires the hint, aria-describedby and")
-        print("the demo recorder from that one attribute.")
+        if bad:
+            print("\nDESCRIPTION (what is it FOR): add data-desc=\"…\" to the")
+            print("control. Nothing else is needed — initControlDescriptions()")
+            print("wires the hint, aria-describedby and the demo recorder from")
+            print("that one attribute.")
+        if unnamed:
+            print("\nNAME (what IS it): associate the label with its control —")
+            print("<label for=\"…\">, <label><input …></label>, or give the label")
+            print("an id and point the control's aria-labelledby at it.")
         return 1
 
     # The wiring itself, pinned from the other end: the attribute is inert
@@ -153,7 +197,8 @@ def main():
 
     described = sum(1 for _, _, a in p.controls if (a.get("data-desc") or "").strip())
     opts = sum(len([d for d in ds if d]) for _, ds in p.selects)
-    print("ok (%d control(s), %d option(s) described)" % (described, opts))
+    print("ok (%d control(s), %d option(s) described; %d label(s) associated)"
+          % (described, opts, len(p.labels)))
     return 0
 
 
