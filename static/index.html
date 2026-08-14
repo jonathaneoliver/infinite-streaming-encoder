@@ -44,7 +44,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .file-size { color: #888; font-size: 0.85rem; width: 80px; text-align: right; }
 .file-count { color: #666; font-size: 0.8rem; margin-left: 12px; }
 
-.controls { display: flex; gap: 16px; flex-wrap: wrap; align-items: end; margin-top: 16px; }
+/* TOP aligned, not bottom. It was `align-items: end` so that bare checkboxes sat
+   on the same baseline as the inputs beside them, which is right while every
+   item in a row is the same height. #349's descriptions made them variable —
+   they wrap to one or two lines depending on the text and the window — so
+   bottom alignment now pushes the CONTROLS up and down by however long the
+   neighbouring hint happens to be. Aligning the tops pins the thing the eye
+   actually tracks and lets the hints hang. */
+.controls { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; margin-top: 16px; }
 .encode-options { border: 1px solid #2a3a5e; border-radius: 6px; padding: 16px 16px 18px; margin-top: 20px; background: #0f1b33; }
 .cloud-warning { background: rgba(255, 169, 77, 0.1); border: 1px solid #ffa94d; border-radius: 4px; padding: 10px 14px; margin-bottom: 16px; color: #ffa94d; font-size: 0.85rem; }
 .cloud-warning a { color: #ffd89b; text-decoration: underline; cursor: pointer; }
@@ -491,7 +498,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 </select>
             </div>
             <div class="control-group" id="chunk-dur-group">
-                <label for="chunk-duration" title="How each variant is split into parallel chunks. CLOUD (AWS Batch): Dynamic sizes each variant's chunks by learned encode speed (~4 min work per chunk, min 30s) — slow 4K HEVC splits into many, cheap H264 runs whole. LOCAL (Temporal): Dynamic = a fixed 12s default (no per-variant model); fixed sizes and Whole behave the same as cloud. Fixed: smaller chunks = more parallelism, more join overhead. Whole variant = one continuous encode per tier, NO chunk boundaries (use this to rule out chunk-boundary effects).">Chunking</label>
+                <label for="chunk-duration">Chunking</label>
                 <select id="chunk-duration"
                         data-desc="How each variant is split into pieces that encode in parallel.">
                     <option value="dynamic"
@@ -508,16 +515,16 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                             data-desc="One continuous encode per rung, with no chunk boundaries at all. Use it to rule out boundary effects when comparing encodes.">Whole variant (no chunking)</option>
                 </select>
             </div>
-            <div class="control-group" id="spot-group" style="display:none;align-self:end;padding-bottom:7px">
-                <label title="Spot is ~2.6× cheaper but AWS can reclaim with 2 min notice. Uncheck to use on-demand (guaranteed, no interruption)."><input type="checkbox" id="use-spot" checked style="width:auto;min-width:auto"
+            <div class="control-group" id="spot-group" style="display:none;padding-top:22px">
+                <label><input type="checkbox" id="use-spot" checked style="width:auto;min-width:auto"
                     data-desc="Spot capacity is roughly 2.6x cheaper, but AWS can reclaim an instance with two minutes' notice. A reclaimed chunk is retried on fresh capacity. Unchecked means on-demand: guaranteed, and not interruptible."> Use spot (cheaper)</label>
             </div>
             <!-- #214. Cloud only: local and local-dist write straight to disk, so
                  there is no egress to avoid and the box would be a no-op. -->
-            <div class="control-group" id="skip-media-group" style="display:none;align-self:end;padding-bottom:7px">
-                <label title="Bring back manifests and metadata only (~4 MB instead of ~2.6 GB), leaving the segments in S3. Egress is billed per GB and is roughly 3× the compute for a run. Download any output you want to keep from the Outputs tab — but within 7 days, after which S3 staging expires and the media is gone."><input type="checkbox" id="skip-media" style="width:auto;min-width:auto"
+            <div class="control-group" id="skip-media-group" style="display:none;padding-top:22px">
+                <label><input type="checkbox" id="skip-media" style="width:auto;min-width:auto"
                     data-desc="Brings home the manifests and metadata only — about 4 MB instead of 2.6 GB — and leaves the segments in S3. Fetch them later from Outputs, but within 7 days: after that the staging expires and the media is gone."> Leave media in S3 (fetch on demand)</label>
-                <label title="Do not package at all. The run finishes when the last chunk lands — no packaging job, no sync-back — and the chunks stay in S3 until you press Package in the Outputs tab. Removes the whole post-encode tail (measured at 4m18s, 37-39% of a run) and holds half as much in S3, because the packaged copy is never made. WARNING: the chunks are then the ONLY copy. When staging expires the run is gone and must be re-encoded from the source."><input type="checkbox" id="defer-packaging" style="width:auto;min-width:auto"
+                <label><input type="checkbox" id="defer-packaging" style="width:auto;min-width:auto"
                     data-desc="The run finishes when the last chunk lands: no packaging, no sync-back, and none of the post-encode tail. Press Package in Outputs when you want it. Until then the chunks in S3 are the ONLY copy, and expiry costs the whole run."> Don't package yet (package on demand)</label>
             </div>
             <div class="control-group">
@@ -538,7 +545,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 </div>
             </div>
             <div class="control-group">
-                <label id="ladder-label" title="Bitrate ladder (resolutions + target bitrates) AND its output timing (segment / partial / GOP / VBV). Select SEVERAL to encode the same source as several delivery profiles — one job each. Manage ladders in the Ladders tab.">Ladder / Profile</label>
+                <label id="ladder-label">Ladder / Profile</label>
                 <div id="ladder-list" class="ladder-checks" role="group" aria-labelledby="ladder-label"
                      data-desc="A ladder is the resolutions and bitrates AND the delivery timing that goes with them — segment, partial, GOP and VBV. Pick several to encode one source as several delivery profiles, one job each."></div>
             </div>
@@ -546,14 +553,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                  by syncResTiers() — these placeholders only cover the moment
                  before /api/ladders lands. -->
             <div class="control-group">
-                <label for="max-res" title="Drop ladder rungs TALLER than this. Tiers come from the selected ladder.">Max Resolution</label>
+                <label for="max-res">Max Resolution</label>
                 <select id="max-res" onchange="syncResTiers()"
                         data-desc="Drops ladder rungs taller than this. The tiers listed come from the selected ladder's real rung heights, not a fixed set.">
                     <option value="">No limit (all rungs)</option>
                 </select>
             </div>
             <div class="control-group">
-                <label for="min-res" title="Drop ladder rungs SHORTER than this. Combined with Max Resolution it selects a contiguous band of the ladder.">Min Resolution</label>
+                <label for="min-res">Min Resolution</label>
                 <select id="min-res" onchange="syncResTiers()"
                         data-desc="Drops ladder rungs shorter than this. With Max Resolution it selects a contiguous band of the ladder rather than a top or a bottom.">
                     <option value="">No limit (all rungs)</option>
@@ -565,7 +572,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                        data-desc="Encode only the first N seconds, snapped to a whole segment so chunk boundaries still land on segment edges. Blank encodes the whole clip, and so does any value at or above the clip's own length.">
             </div>
             <div class="control-group">
-                <label for="output-tag" title="Optional suffix appended to the output dir name (<stem>_<suffix>_<codec>). Use it to keep comparison encodes of the same source side-by-side on disk instead of archiving each other — e.g. 'local12', 'localwhole'. Blank = the ladder's default (usually 'xs').">Output suffix</label>
+                <label for="output-tag">Output suffix</label>
                 <input type="text" id="output-tag" placeholder="ladder default" style="width:110px"
                        data-desc="Appended to the output directory name, after the codec. Set one to keep comparison encodes of the same source side by side instead of each archiving the last.">
             </div>
@@ -599,22 +606,22 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                  failure leaves the option OFF-and-absent rather than
                  offered-and-broken. Both boxes default unchecked, so a hidden
                  group submits exactly what an untouched visible one would. -->
-            <div class="control-group dev-only" id="vmaf-group" style="align-self:end;padding-bottom:7px">
-                <label title="Measure per-rendition VMAF quality after encoding (each rendition vs the source at source resolution). Slow — adds a post-encode pass per rung, fanned across the workers. Off by default. Scores show in the Outputs VMAF column. Ticking this clears Burn-in, since the overlay biases VMAF."><input type="checkbox" id="measure-vmaf" onchange="_vmafBurninSync(true)" style="width:auto;min-width:auto"
+            <div class="control-group dev-only" id="vmaf-group" style="padding-top:22px">
+                <label><input type="checkbox" id="measure-vmaf" onchange="_vmafBurninSync(true)" style="width:auto;min-width:auto"
                     data-desc="Scores every rendition against the source after encoding, fanned across the workers. Slow: one extra pass per rung. Ticking it clears Burn-in, because the overlay biases the score."> Measure VMAF</label>
-                <label title="#109: build a near-lossless pre-scaled VMAF reference ONCE PER WORKER BOX, so the audit decodes a small fast H.264 file instead of re-downscaling the native (4K/AV1) mezzanine on every chunk. VMAF-SPEED only — scores are identical within ~0.4 and it auto-skips when it wouldn't pay off (fewer than 2 renditions, source no slower than the ref, or too big). Needs Measure VMAF on." style="display:block;margin-top:4px"><input type="checkbox" id="vmaf-prescale" style="width:auto;min-width:auto"
+                <label style="display:block;margin-top:4px"><input type="checkbox" id="vmaf-prescale" style="width:auto;min-width:auto"
                     data-desc="Builds one near-lossless scaled reference per worker box, so the audit decodes a small H.264 file instead of re-downscaling the 4K mezzanine on every chunk. Speed only — scores move by under half a point. Needs Measure VMAF."> VMAF pre-decode</label>
             </div>
-            <div class="control-group" style="align-self:end;padding-bottom:7px">
-                <label title="#317: encode the decode-dominated rungs (1080p and below) in bands of 3 that share ONE decode per chunk, instead of one ffmpeg per rung. With two passes a 12-rung ladder decodes each chunk 24 times and needs one per band per pass; the low rungs' encodes are nearly free next to that shared decode. Local target only. Same output — the ladder and every rung's settings are unchanged."><input type="checkbox" id="group-rungs" style="width:auto;min-width:auto"
+            <div class="control-group" style="padding-top:22px">
+                <label><input type="checkbox" id="group-rungs" style="width:auto;min-width:auto"
                     data-desc="Encodes the decode-dominated rungs — 1080p and below — in bands of three that share one decode per chunk instead of one ffmpeg each. Local target only. The ladder and every rung's settings are unchanged, so the output is the same."> Shared decode</label>
             </div>
-            <div class="control-group" style="align-self:end;padding-bottom:7px">
-                <label title="Burn the diagnostic text overlay (timecode, bitrate, codec/resolution, encoder, watermark) into every variant. On by default; uncheck for clean output."><input type="checkbox" id="burnin" checked onchange="_vmafBurninSync(false)" style="width:auto;min-width:auto"
+            <div class="control-group" style="padding-top:22px">
+                <label><input type="checkbox" id="burnin" checked onchange="_vmafBurninSync(false)" style="width:auto;min-width:auto"
                     data-desc="Burns timecode, bitrate, codec, resolution, encoder and a watermark into every variant, so a frame says what produced it. On by default; uncheck for clean output."> Burn-in text overlay</label>
                 <span id="vmaf-burnin-hint" style="display:none;color:#d0a24a;font-size:11px">⚠ overlay biases VMAF — uncheck for accurate scores</span>
             </div>
-            <div class="control-group" id="promote-group" style="display:none;align-self:end;padding-bottom:7px">
+            <div class="control-group" id="promote-group" style="display:none;padding-top:22px">
                 <label id="promote-after-label"><input type="checkbox" id="promote-after" style="width:auto;min-width:auto"
                     data-desc="rsyncs each finished output to the live locations as soon as the job completes, instead of pressing Promote per output afterwards. Best-effort: a failed copy is logged and does not fail the encode."> Promote after encode</label>
             </div>
@@ -2406,6 +2413,13 @@ function initControlDescriptions(root) {
             el.dataset.hintBound = '1';
         }
         el.setAttribute('aria-describedby', hintId);
+        // The hover comes from the SAME definition. Hand-written titles were the
+        // second copy this whole change exists to remove — twelve of them said
+        // the same thing as their data-desc in different words, and one still
+        // opened with an issue number ("#317: encode the decode-dominated
+        // rungs…"). A select with per-option text already shows the visible
+        // hint, so a tooltip on top of it is noise.
+        if (!perOption && !el.title) el.title = el.dataset.desc;
         syncOptionHint(el.id, hintId);
     });
 }
