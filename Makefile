@@ -244,6 +244,11 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  py statedir    '; \
 	if out=$$(python3 scripts/test_state_dir.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	: 'A control with no data-desc is wired to nothing in THREE places at once'; \
+	: '(hint, aria-describedby, demo narration) and errors in none of them.'; \
+	printf '  py ctrldesc    '; \
+	if out=$$(python3 scripts/test_control_descriptions.py 2>&1); then echo "$$out"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py cli         '; \
 	if out=$$(python3 scripts/test_encoder_cli.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
