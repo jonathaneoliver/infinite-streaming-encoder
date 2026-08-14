@@ -44,7 +44,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .file-size { color: #888; font-size: 0.85rem; width: 80px; text-align: right; }
 .file-count { color: #666; font-size: 0.8rem; margin-left: 12px; }
 
-.controls { display: flex; gap: 16px; flex-wrap: wrap; align-items: end; margin-top: 16px; }
+/* TOP aligned, not bottom. It was `align-items: end` so that bare checkboxes sat
+   on the same baseline as the inputs beside them, which is right while every
+   item in a row is the same height. #349's descriptions made them variable —
+   they wrap to one or two lines depending on the text and the window — so
+   bottom alignment now pushes the CONTROLS up and down by however long the
+   neighbouring hint happens to be. Aligning the tops pins the thing the eye
+   actually tracks and lets the hints hang. */
+.controls { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; margin-top: 16px; }
 .encode-options { border: 1px solid #2a3a5e; border-radius: 6px; padding: 16px 16px 18px; margin-top: 20px; background: #0f1b33; }
 .cloud-warning { background: rgba(255, 169, 77, 0.1); border: 1px solid #ffa94d; border-radius: 4px; padding: 10px 14px; margin-bottom: 16px; color: #ffa94d; font-size: 0.85rem; }
 .cloud-warning a { color: #ffd89b; text-decoration: underline; cursor: pointer; }
@@ -174,6 +181,12 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
    control to the right of it. */
 .control-hint { margin-top: 4px; font-size: 11px; line-height: 1.35; color: #8a9bb5;
                 max-width: 260px; min-height: 30px; }
+/* The other half of #349: a description that never changes has nothing to say
+   on screen that the hover does not, so it is announced and not drawn. Clipped
+   rather than display:none — a hidden element is removed from the accessibility
+   tree, which would defeat the aria-describedby pointing at it. */
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+           overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
 /* Split "Encode ▾" button: default click = safe Encode, caret opens Re-encode.
    Replaces the hidden Alt/right-click force gesture (issue #114). */
@@ -456,12 +469,13 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 retry behaviour, interruption-resistant.
             </div>
             <div class="controls">
-            <!-- #349, worked example. The description lives in the DOM ONCE and
-                 has three readers: this control's live hint, a screen reader via
-                 aria-describedby, and the demo recorder, which reads data-desc
-                 rather than carrying its own copy of the same sentence. The
-                 OPTION descriptions matter as much as the control's: the whole
-                 point of Target is the difference between the two. -->
+            <!-- #349. Every control below carries its own description in
+                 data-desc, and initControlDescriptions() wires all of them —
+                 there is no per-control JS. Target keeps its hint <div> in the
+                 markup because it is the one worth seeing in the source; the
+                 rest are created at init. The OPTION descriptions matter as
+                 much as the control's wherever the options differ in KIND: the
+                 whole point of Target is the difference between the two. -->
             <div class="control-group">
                 <label for="target">Target</label>
                 <select id="target" onchange="onTargetChange()"
@@ -475,82 +489,115 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <div class="control-hint" id="target-hint"></div>
             </div>
             <div class="control-group" id="cpu-arch-group" style="display:none">
-                <label>CPU (cloud)</label>
-                <select id="cpu-arch">
+                <label for="cpu-arch">CPU (cloud)</label>
+                <select id="cpu-arch"
+                        data-desc="Retired, and hidden for that reason. There is one compute environment and it is Graviton only, so a cloud job cannot land on Intel or AMD whatever this says.">
                     <option value="graviton" selected>Graviton ARM (c7g)</option>
                     <option value="intel">Intel Xeon (c7i) — needs multi-arch image</option>
                     <option value="amd">AMD EPYC (c7a) — needs multi-arch image</option>
                 </select>
             </div>
             <div class="control-group" id="chunk-dur-group">
-                <label title="How each variant is split into parallel chunks. CLOUD (AWS Batch): Dynamic sizes each variant's chunks by learned encode speed (~4 min work per chunk, min 30s) — slow 4K HEVC splits into many, cheap H264 runs whole. LOCAL (Temporal): Dynamic = a fixed 12s default (no per-variant model); fixed sizes and Whole behave the same as cloud. Fixed: smaller chunks = more parallelism, more join overhead. Whole variant = one continuous encode per tier, NO chunk boundaries (use this to rule out chunk-boundary effects).">Chunking</label>
-                <select id="chunk-duration">
-                    <option value="dynamic">Dynamic (cloud: learned · local: 12s)</option>
-                    <option value="12" selected>12s chunks (max parallelism)</option>
-                    <option value="30">30s chunks</option>
-                    <option value="60">60s chunks</option>
-                    <option value="300">5m chunks</option>
-                    <option value="whole">Whole variant (no chunking)</option>
+                <label for="chunk-duration">Chunking</label>
+                <select id="chunk-duration"
+                        data-desc="How each variant is split into pieces that encode in parallel.">
+                    <option value="dynamic"
+                            data-desc="Cloud sizes each variant from its learned encode speed, aiming at ~4 minutes of work per chunk. Local has no per-variant model and uses a flat 12s.">Dynamic (cloud: learned · local: 12s)</option>
+                    <option value="12" selected
+                            data-desc="Maximum parallelism. Also the most chunk boundaries, each one a queue wait, a container start and an encoder reset.">12s chunks (max parallelism)</option>
+                    <option value="30"
+                            data-desc="Fewer, longer chunks. Less per-chunk overhead, and fewer pieces to spread across the fleet.">30s chunks</option>
+                    <option value="60"
+                            data-desc="Noticeably less parallelism on a short clip — a 2-minute source is only two chunks per rung.">60s chunks</option>
+                    <option value="300"
+                            data-desc="Only worth it on a long source. On a short one the fleet finishes the first chunks and then sits idle.">5m chunks</option>
+                    <option value="whole"
+                            data-desc="One continuous encode per rung, with no chunk boundaries at all. Use it to rule out boundary effects when comparing encodes.">Whole variant (no chunking)</option>
                 </select>
             </div>
-            <div class="control-group" id="spot-group" style="display:none;align-self:end;padding-bottom:7px">
-                <label title="Spot is ~2.6× cheaper but AWS can reclaim with 2 min notice. Uncheck to use on-demand (guaranteed, no interruption)."><input type="checkbox" id="use-spot" checked style="width:auto;min-width:auto"> Use spot (cheaper)</label>
+            <div class="control-group" id="spot-group" style="display:none;padding-top:22px">
+                <label><input type="checkbox" id="use-spot" checked style="width:auto;min-width:auto"
+                    data-desc="Spot capacity is roughly 2.6x cheaper, but AWS can reclaim an instance with two minutes' notice. A reclaimed chunk is retried on fresh capacity. Unchecked means on-demand: guaranteed, and not interruptible."> Use spot (cheaper)</label>
             </div>
             <!-- #214. Cloud only: local and local-dist write straight to disk, so
                  there is no egress to avoid and the box would be a no-op. -->
-            <div class="control-group" id="skip-media-group" style="display:none;align-self:end;padding-bottom:7px">
-                <label title="Bring back manifests and metadata only (~4 MB instead of ~2.6 GB), leaving the segments in S3. Egress is billed per GB and is roughly 3× the compute for a run. Download any output you want to keep from the Outputs tab — but within 7 days, after which S3 staging expires and the media is gone."><input type="checkbox" id="skip-media" style="width:auto;min-width:auto"> Leave media in S3 (fetch on demand)</label>
-                <label title="Do not package at all. The run finishes when the last chunk lands — no packaging job, no sync-back — and the chunks stay in S3 until you press Package in the Outputs tab. Removes the whole post-encode tail (measured at 4m18s, 37-39% of a run) and holds half as much in S3, because the packaged copy is never made. WARNING: the chunks are then the ONLY copy. When staging expires the run is gone and must be re-encoded from the source."><input type="checkbox" id="defer-packaging" style="width:auto;min-width:auto"> Don't package yet (package on demand)</label>
+            <div class="control-group" id="skip-media-group" style="display:none;padding-top:22px">
+                <label><input type="checkbox" id="skip-media" style="width:auto;min-width:auto"
+                    data-desc="Brings home the manifests and metadata only — about 4 MB instead of 2.6 GB — and leaves the segments in S3. Fetch them later from Outputs, but within 7 days: after that the staging expires and the media is gone."> Leave media in S3 (fetch on demand)</label>
+                <label><input type="checkbox" id="defer-packaging" style="width:auto;min-width:auto"
+                    data-desc="The run finishes when the last chunk lands: no packaging, no sync-back, and none of the post-encode tail. Press Package in Outputs when you want it. Until then the chunks in S3 are the ONLY copy, and expiry costs the whole run."> Don't package yet (package on demand)</label>
             </div>
             <div class="control-group">
-                <label>Codec</label>
-                <div id="codec" class="codec-checks">
-                    <label><input type="checkbox" class="codec-cb" value="h264" checked onchange="onCodecsChanged()"> H.264</label>
-                    <label><input type="checkbox" class="codec-cb" value="hevc" checked onchange="onCodecsChanged()"> HEVC</label>
-                    <label><input type="checkbox" class="codec-cb" value="av1" onchange="onCodecsChanged()"> AV1</label>
+                <!-- A <label for> cannot point at a group of checkboxes, so the
+                     group borrows the VISIBLE label as its name. aria-labelledby
+                     rather than aria-label: the latter is a second copy of the
+                     same words, and the two drift the first time one is
+                     reworded. -->
+                <label id="codec-label">Codec</label>
+                <div id="codec" class="codec-checks" role="group" aria-labelledby="codec-label"
+                     data-desc="Which encoders to run. Each codec is a separate job with its own output directory, so two codecs is two jobs, not one job twice as long.">
+                    <label><input type="checkbox" class="codec-cb" value="h264" checked onchange="onCodecsChanged()"
+                        data-desc="Plays everywhere. Fastest of the three to encode, and the one to pick when you only want the pipeline exercised."> H.264</label>
+                    <label><input type="checkbox" class="codec-cb" value="hevc" checked onchange="onCodecsChanged()"
+                        data-desc="Better quality per bit than H.264 and much slower. x265 tops out near two cores, so on the cloud path its chunk count IS its parallelism."> HEVC</label>
+                    <label><input type="checkbox" class="codec-cb" value="av1" onchange="onCodecsChanged()"
+                        data-desc="The slowest by a wide margin. Off by default — turn it on deliberately, not to see what happens."> AV1</label>
                 </div>
             </div>
             <div class="control-group">
-                <label title="Bitrate ladder (resolutions + target bitrates) AND its output timing (segment / partial / GOP / VBV). Select SEVERAL to encode the same source as several delivery profiles — one job each. Manage ladders in the Ladders tab.">Ladder / Profile</label>
-                <div id="ladder-list" class="ladder-checks"></div>
+                <label id="ladder-label">Ladder / Profile</label>
+                <div id="ladder-list" class="ladder-checks" role="group" aria-labelledby="ladder-label"
+                     data-desc="A ladder is the resolutions and bitrates AND the delivery timing that goes with them — segment, partial, GOP and VBV. Pick several to encode one source as several delivery profiles, one job each."></div>
             </div>
             <!-- Options are rebuilt from the SELECTED LADDER's real rung heights
                  by syncResTiers() — these placeholders only cover the moment
                  before /api/ladders lands. -->
             <div class="control-group">
-                <label title="Drop ladder rungs TALLER than this. Tiers come from the selected ladder.">Max Resolution</label>
-                <select id="max-res" onchange="syncResTiers()">
+                <label for="max-res">Max Resolution</label>
+                <select id="max-res" onchange="syncResTiers()"
+                        data-desc="Drops ladder rungs taller than this. The tiers listed come from the selected ladder's real rung heights, not a fixed set.">
                     <option value="">No limit (all rungs)</option>
                 </select>
             </div>
             <div class="control-group">
-                <label title="Drop ladder rungs SHORTER than this. Combined with Max Resolution it selects a contiguous band of the ladder.">Min Resolution</label>
-                <select id="min-res" onchange="syncResTiers()">
+                <label for="min-res">Min Resolution</label>
+                <select id="min-res" onchange="syncResTiers()"
+                        data-desc="Drops ladder rungs shorter than this. With Max Resolution it selects a contiguous band of the ladder rather than a top or a bottom.">
                     <option value="">No limit (all rungs)</option>
                 </select>
             </div>
             <div class="control-group">
-                <label>Duration (s)</label>
-                <input type="text" id="time-limit" placeholder="full clip">
+                <label for="time-limit">Duration (s)</label>
+                <input type="text" id="time-limit" placeholder="full clip"
+                       data-desc="Encode only the first N seconds, snapped to a whole segment so chunk boundaries still land on segment edges. Blank encodes the whole clip, and so does any value at or above the clip's own length.">
             </div>
             <div class="control-group">
-                <label title="Optional suffix appended to the output dir name (<stem>_<suffix>_<codec>). Use it to keep comparison encodes of the same source side-by-side on disk instead of archiving each other — e.g. 'local12', 'localwhole'. Blank = the ladder's default (usually 'xs').">Output suffix</label>
-                <input type="text" id="output-tag" placeholder="ladder default" style="width:110px">
+                <label for="output-tag">Output suffix</label>
+                <input type="text" id="output-tag" placeholder="ladder default" style="width:110px"
+                       data-desc="Appended to the output directory name, after the codec. Set one to keep comparison encodes of the same source side by side instead of each archiving the last.">
             </div>
             <div class="control-group">
-                <label>HLS Format</label>
-                <select id="hls-format">
-                    <option value="fmp4">fMP4 (default)</option>
-                    <option value="ts">MPEG-TS</option>
-                    <option value="both">Both</option>
+                <label for="hls-format">HLS Format</label>
+                <select id="hls-format"
+                        data-desc="Which HLS packaging to write alongside the DASH output.">
+                    <option value="fmp4"
+                            data-desc="Fragmented MP4. The low-latency form, and what the rest of this system expects.">fMP4 (default)</option>
+                    <option value="ts"
+                            data-desc="MPEG-TS segments, for players that cannot take fMP4. No low-latency parts.">MPEG-TS</option>
+                    <option value="both"
+                            data-desc="Writes both forms from the same encode. Roughly doubles the packaging time and the disk it lands on.">Both</option>
                 </select>
             </div>
             <div class="control-group">
-                <label>Padding</label>
-                <select id="padding">
-                    <option value="">Off (default)</option>
-                    <option value="black">Black</option>
-                    <option value="pink">Pink</option>
+                <label for="padding">Padding</label>
+                <select id="padding"
+                        data-desc="Pads the clip out so it ends on a segment boundary.">
+                    <option value=""
+                            data-desc="No padding. If the clip does not divide evenly the final segment is short.">Off (default)</option>
+                    <option value="black"
+                            data-desc="Pads with black frames. The burn-in overlay labels them, so padding is visible on playback.">Black</option>
+                    <option value="pink"
+                            data-desc="Pads with pink frames — the same thing, but impossible to mistake for real content while reviewing.">Pink</option>
                 </select>
             </div>
             <!-- developer-only: .dev-only hides it in CSS, and
@@ -559,19 +606,24 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                  failure leaves the option OFF-and-absent rather than
                  offered-and-broken. Both boxes default unchecked, so a hidden
                  group submits exactly what an untouched visible one would. -->
-            <div class="control-group dev-only" id="vmaf-group" style="align-self:end;padding-bottom:7px">
-                <label title="Measure per-rendition VMAF quality after encoding (each rendition vs the source at source resolution). Slow — adds a post-encode pass per rung, fanned across the workers. Off by default. Scores show in the Outputs VMAF column. Ticking this clears Burn-in, since the overlay biases VMAF."><input type="checkbox" id="measure-vmaf" onchange="_vmafBurninSync(true)" style="width:auto;min-width:auto"> Measure VMAF</label>
-                <label title="#109: build a near-lossless pre-scaled VMAF reference ONCE PER WORKER BOX, so the audit decodes a small fast H.264 file instead of re-downscaling the native (4K/AV1) mezzanine on every chunk. VMAF-SPEED only — scores are identical within ~0.4 and it auto-skips when it wouldn't pay off (fewer than 2 renditions, source no slower than the ref, or too big). Needs Measure VMAF on." style="display:block;margin-top:4px"><input type="checkbox" id="vmaf-prescale" style="width:auto;min-width:auto"> VMAF pre-decode</label>
+            <div class="control-group dev-only" id="vmaf-group" style="padding-top:22px">
+                <label><input type="checkbox" id="measure-vmaf" onchange="_vmafBurninSync(true)" style="width:auto;min-width:auto"
+                    data-desc="Scores every rendition against the source after encoding, fanned across the workers. Slow: one extra pass per rung. Ticking it clears Burn-in, because the overlay biases the score."> Measure VMAF</label>
+                <label style="display:block;margin-top:4px"><input type="checkbox" id="vmaf-prescale" style="width:auto;min-width:auto"
+                    data-desc="Builds one near-lossless scaled reference per worker box, so the audit decodes a small H.264 file instead of re-downscaling the 4K mezzanine on every chunk. Speed only — scores move by under half a point. Needs Measure VMAF."> VMAF pre-decode</label>
             </div>
-            <div class="control-group" style="align-self:end;padding-bottom:7px">
-                <label title="#317: encode the decode-dominated rungs (1080p and below) in bands of 3 that share ONE decode per chunk, instead of one ffmpeg per rung. With two passes a 12-rung ladder decodes each chunk 24 times and needs one per band per pass; the low rungs' encodes are nearly free next to that shared decode. Local target only. Same output — the ladder and every rung's settings are unchanged."><input type="checkbox" id="group-rungs" style="width:auto;min-width:auto"> Shared decode</label>
+            <div class="control-group" style="padding-top:22px">
+                <label><input type="checkbox" id="group-rungs" style="width:auto;min-width:auto"
+                    data-desc="Encodes the decode-dominated rungs — 1080p and below — in bands of three that share one decode per chunk instead of one ffmpeg each. Local target only. The ladder and every rung's settings are unchanged, so the output is the same."> Shared decode</label>
             </div>
-            <div class="control-group" style="align-self:end;padding-bottom:7px">
-                <label title="Burn the diagnostic text overlay (timecode, bitrate, codec/resolution, encoder, watermark) into every variant. On by default; uncheck for clean output."><input type="checkbox" id="burnin" checked onchange="_vmafBurninSync(false)" style="width:auto;min-width:auto"> Burn-in text overlay</label>
+            <div class="control-group" style="padding-top:22px">
+                <label><input type="checkbox" id="burnin" checked onchange="_vmafBurninSync(false)" style="width:auto;min-width:auto"
+                    data-desc="Burns timecode, bitrate, codec, resolution, encoder and a watermark into every variant, so a frame says what produced it. On by default; uncheck for clean output."> Burn-in text overlay</label>
                 <span id="vmaf-burnin-hint" style="display:none;color:#d0a24a;font-size:11px">⚠ overlay biases VMAF — uncheck for accurate scores</span>
             </div>
-            <div class="control-group" id="promote-group" style="display:none;align-self:end;padding-bottom:7px">
-                <label id="promote-after-label"><input type="checkbox" id="promote-after" style="width:auto;min-width:auto"> Promote after encode</label>
+            <div class="control-group" id="promote-group" style="display:none;padding-top:22px">
+                <label id="promote-after-label"><input type="checkbox" id="promote-after" style="width:auto;min-width:auto"
+                    data-desc="rsyncs each finished output to the live locations as soon as the job completes, instead of pressing Promote per output afterwards. Best-effort: a failed copy is logged and does not fail the encode."> Promote after encode</label>
             </div>
             </div>
             <!-- The Encode button is an ACTION, not one of the options. As the
@@ -2288,7 +2340,14 @@ function renderSources() {
         </div>
     ` + sorted.map(f => `
         <div class="file-item" oncontextmenu="showSourceContextMenu(event, '${escapeAttr(f.name)}')">
-            <input type="checkbox" value="${f.name}" ${checked.has(f.name) ? 'checked' : ''} onclick="event.stopPropagation(); updateSelectedCount()">
+            <!-- The filename is in a SIBLING span, not a wrapping <label>, so
+                 nothing associates the two: all 21 of these announced as an
+                 unnamed checkbox. aria-label rather than restructuring the row,
+                 because the visible text carries the name and this only has to
+                 say which one. -->
+            <input type="checkbox" value="${f.name}" ${checked.has(f.name) ? 'checked' : ''}
+                   aria-label="Select ${escapeAttr(f.name)}"
+                   onclick="event.stopPropagation(); updateSelectedCount()">
             <span class="file-name" onclick="this.parentElement.querySelector('input').click()">${f.name}</span>
             <span class="src-badge-slot">${sourceStatusBadge(f.name)}</span>
             <span class="file-size">${formatSize(f.size)}</span>
@@ -2299,23 +2358,77 @@ function renderSources() {
     updateSelectedCount();
 }
 
-// Show the selected option's own description. Generic on purpose: any select
-// whose options differ in KIND can opt in by giving its options a data-desc.
-function syncOptionHint(selectId, hintId) {
-    const sel = document.getElementById(selectId);
+// Show a control's description: the SELECTED OPTION's where the options differ
+// in kind, the control's own otherwise.
+function syncOptionHint(elId, hintId) {
+    const el = document.getElementById(elId);
     const hint = document.getElementById(hintId);
-    if (!sel || !hint) return;
-    const opt = sel.options[sel.selectedIndex];
-    hint.textContent = (opt && opt.dataset.desc) || sel.dataset.desc || '';
+    if (!el || !hint) return;
+    // `.options` exists only on <select>; an input or a checkbox group has just
+    // the one description.
+    const opt = el.options ? el.options[el.selectedIndex] : null;
+    hint.textContent = (opt && opt.dataset.desc) || el.dataset.desc || '';
 }
 
-// The hint must be right BEFORE the user touches anything — onTargetChange only
-// fires on change (and, oddly, from the cloud-not-configured fallback), so the
-// control would otherwise describe nothing until first use.
-document.addEventListener('DOMContentLoaded', () => syncOptionHint('target', 'target-hint'));
+// #349. Every control in the encode form describes itself in the DOM once, and
+// three things read that one definition: the user, a screen reader, and the
+// demo recorder (which reads data-desc rather than carrying its own copy of the
+// sentence, so the narration cannot drift from the UI).
+//
+// The description is DRAWN only when it changes — i.e. when the options carry
+// their own data-desc. A static description rendered under every control would
+// be a wall of prose that never moves and that everyone stops reading; that one
+// goes to the hover, which `title` still provides, and to the accessibility
+// tree. Per the accname spec `aria-describedby` WINS over `title`, so the two
+// coexisting is not a double announcement.
+//
+// Nothing here is per-control. Add a control with a data-desc and it is wired;
+// scripts/test_control_descriptions.py fails the build if you add one without.
+function initControlDescriptions(root) {
+    root = root || document.querySelector('.controls');
+    if (!root) return;
+    // NOT `[data-desc]` alone: options carry one too, and a hint <div> inserted
+    // after an <option> is a div inside a <select>. Options are read through
+    // their parent select, which is the only thing that needs wiring.
+    root.querySelectorAll('[data-desc]:not(option)').forEach((el, i) => {
+        if (!el.id) el.id = 'ctl-desc-' + i;
+        const hintId = el.id + '-hint';
+        const perOption = el.tagName === 'SELECT' && !!el.querySelector('option[data-desc]');
+        let hint = document.getElementById(hintId);
+        if (!hint) {
+            hint = document.createElement('div');
+            hint.id = hintId;
+            hint.className = perOption ? 'control-hint' : 'sr-only';
+            // OUTSIDE the <label>, not after the control. A checkbox lives
+            // inside its label, so inserting after the input puts the hint in
+            // the label's text content — and the accessible NAME is computed
+            // from that text. The result announced "Encodes the decode-dominated
+            // rungs… Shared decode" as the checkbox's name, i.e. the description
+            // ate the name. Invisible on screen, and only visible in the
+            // computed accessibility tree.
+            (el.closest('label') || el).insertAdjacentElement('afterend', hint);
+        }
+        if (perOption && !el.dataset.hintBound) {
+            el.addEventListener('change', () => syncOptionHint(el.id, hintId));
+            el.dataset.hintBound = '1';
+        }
+        el.setAttribute('aria-describedby', hintId);
+        // The hover comes from the SAME definition. Hand-written titles were the
+        // second copy this whole change exists to remove — twelve of them said
+        // the same thing as their data-desc in different words, and one still
+        // opened with an issue number ("#317: encode the decode-dominated
+        // rungs…"). A select with per-option text already shows the visible
+        // hint, so a tooltip on top of it is noise.
+        if (!perOption && !el.title) el.title = el.dataset.desc;
+        syncOptionHint(el.id, hintId);
+    });
+}
+
+// Before the user touches anything: a change handler alone would leave every
+// control describing nothing until its first use.
+document.addEventListener('DOMContentLoaded', () => initControlDescriptions());
 
 function onTargetChange() {
-    syncOptionHint('target', 'target-hint');
     const target = document.getElementById('target').value;
     const isAnyCloud = isAnyCloudTarget(target);
     document.getElementById('cloud-warning').style.display =
@@ -6913,7 +7026,7 @@ function playSource(name) {
         <div class="player-container">
             <div class="player-header">
                 <span class="player-title">${escapeHtml(name)} (source)</span>
-                <button class="player-close" onclick="closePlayer(this.closest('.player-modal'))">&times;</button>
+                <button class="player-close" aria-label="Close" title="Close" onclick="closePlayer(this.closest('.player-modal'))">&times;</button>
             </div>
             <video class="player-video" controls autoplay src="${url}"></video>
             <div class="player-info">Direct source playback</div>
@@ -6938,7 +7051,7 @@ async function viewEncodeLogs(dirName) {
         <div class="player-container" style="max-width:900px">
             <div class="player-header">
                 <span class="player-title">Encode logs: ${escapeHtml(dirName)}</span>
-                <button class="player-close" onclick="this.closest('.modal-overlay').remove()">&times;</button>
+                <button class="player-close" aria-label="Close" title="Close" onclick="this.closest('.modal-overlay').remove()">&times;</button>
             </div>
             <div id="log-modal-content" style="color:#888;padding:12px">Loading...</div>
         </div>
@@ -7029,7 +7142,7 @@ function playContent(playlistPath, dirName) {
         <div class="player-container">
             <div class="player-header">
                 <span class="player-title">${escapeHtml(playlistPath)}</span>
-                <button class="player-close" onclick="closePlayer(this.closest('.player-modal'))">&times;</button>
+                <button class="player-close" aria-label="Close" title="Close" onclick="closePlayer(this.closest('.player-modal'))">&times;</button>
             </div>
             <video class="player-video" id="player-video" controls autoplay></video>
             <div class="player-info" id="player-info"></div>
