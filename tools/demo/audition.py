@@ -29,6 +29,10 @@ import narrate_sentences as ns        # noqa: E402
 CACHE = os.path.join(os.environ.get("DEMO_DIR",
                      os.path.expanduser("~/Desktop/encoder-demo")), "audition")
 
+# These are one-second phrases against a server that answers in ~2s when well.
+# 45s is "something is wrong", not "be patient" — see narrate_sentences.
+GEN_TIMEOUT_S = int(os.environ.get("AUDITION_TIMEOUT_S", "45"))
+
 
 def play(path):
     # afplay is macOS; ffplay is the fallback everywhere else. Neither being
@@ -42,16 +46,22 @@ def play(path):
     return False
 
 
-def speak(text, voice, do_play):
-    os.makedirs(CACHE, exist_ok=True)
+def cache_path(text, voice):
     key = hashlib.sha1(("%s|%s" % (voice or "", text)).encode()).hexdigest()[:12]
-    dest = os.path.join(CACHE, "a-%s.wav" % key)
+    return os.path.join(CACHE, "a-%s.wav" % key)
+
+
+def speak(text, voice, play_it):
+    os.makedirs(CACHE, exist_ok=True)
+    dest = cache_path(text, voice)
     if not os.path.exists(dest):
-        d = ns.generate(text, dest, profile=voice)
+        d = ns.generate(text, dest, profile=voice, timeout_s=GEN_TIMEOUT_S)
         if not d:
-            print("      (generation failed — is the voice server up on %s?)" % ns.BASE)
+            print("      GENERATION FAILED for %r after %ds." % (text[:40], GEN_TIMEOUT_S))
+            print("      The server accepts requests and reports 'generating' even when")
+            print("      it is wedged, so this is what that looks like. Restart Voicebox.")
             return None
-    if do_play:
+    if play_it:
         play(dest)
     return dest
 
@@ -70,13 +80,37 @@ def main():
     do_play = not args.no_play
     width = max(len(p) for p in phrases)
 
+    # TWO PASSES, and the split is the point: Voicebox plays a clip itself as it
+    # finishes generating. Generating and playing in one loop therefore plays
+    # every new clip TWICE, a beat apart — which sounds like an echo and makes
+    # the pronunciation impossible to judge, the one thing this tool is for.
+    # Warming the cache first means the listening pass never triggers playback
+    # from anywhere but here. It also paces the listening evenly instead of
+    # stalling for a generation between each line.
+    todo = []
     for p in phrases:
         spoken = p if args.raw else pronounce.for_speech(p)
-        changed = spoken != p
+        todo.append((p, spoken, spoken != p))
+
+    want = []
+    for p, spoken, changed in todo:
+        if args.both and changed:
+            want.append(p)
+        want.append(spoken)
+    missing = [t for t in want if not os.path.exists(cache_path(t, args.voice))]
+    if missing:
+        print("generating %d clip(s)…" % len(missing))
+        for t in missing:
+            if speak(t, args.voice, play_it=False) is None:
+                return 1
+        print()
+
+    for p, spoken, changed in todo:
         print("%-*s  ->  %s%s" % (width, p, spoken, "" if changed else "   (unchanged)"))
         if args.both and changed:
-            print("      written form first…")
+            print("      written…")
             speak(p, args.voice, do_play)
+            print("      spoken…")
         path = speak(spoken, args.voice, do_play)
         if path and not do_play:
             print("      %s" % path)

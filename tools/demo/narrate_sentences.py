@@ -84,7 +84,19 @@ def is_heading(s):
     return len(t.split()) <= HEAD_MAX_WORDS and t.endswith(".")
 
 
-def generate(text, dest, profile=None, engine=None):
+# How long to wait for one take. A healthy server returns a short sentence in
+# under two seconds (measured: 47 consecutive takes, 1.5-1.9s each), so the
+# default is not a pacing allowance — it is the ceiling for a LONG narration
+# line on a busy machine.
+#
+# Callers auditioning one-second clips should pass something short. A wedged
+# server keeps answering, keeps reporting "generating", and never finishes, so
+# the only thing separating "slow" from "dead" is this number: at 600 it looked
+# exactly like a slow success for ten minutes per clip.
+GEN_TIMEOUT_S = 600
+
+
+def generate(text, dest, profile=None, engine=None, timeout_s=GEN_TIMEOUT_S):
     if os.path.exists(dest) and dur(dest) >= MIN_CLIP_S:
         return dur(dest)
     payload = {"profile_id": profile or PROFILE, "text": text}
@@ -96,7 +108,7 @@ def generate(text, dest, profile=None, engine=None):
     r = api_post("/generate", payload)
     gid = r["id"]
     status = r.get("status")
-    for _ in range(600):
+    for _ in range(int(timeout_s)):
         if status in ("completed", "complete", "done", "ready", "failed", "error"):
             break
         time.sleep(1)
