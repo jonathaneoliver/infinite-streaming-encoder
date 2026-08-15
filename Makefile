@@ -275,6 +275,13 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	if ! command -v node >/dev/null 2>&1; then echo "skipped (no node)"; \
 	elif out=$$(node scripts/test_codec_split.js 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	: 'The demo narration reads the app own descriptions (#356). A literal'; \
+	: 'caption creeping back is invisible until someone WATCHES a 14-minute'; \
+	: 'video and notices it describes a control that changed.'; \
+	printf '  js demodesc    '; \
+	if ! command -v node >/dev/null 2>&1; then echo "skipped (no node)"; \
+	elif out=$$(node scripts/test_demo_descriptions.js 2>&1); then echo "$$out"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	: 'The chunk budget (#316) and the fixed-duration guard (#312) hardcode two'; \
 	: 'AWS quotas. Ask Service Quotas whether they still hold. Needs credentials'; \
 	: 'so it skips in CI, and degrades OPEN — unlike require-valid-sfn, a skip'; \

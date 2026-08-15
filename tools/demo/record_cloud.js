@@ -9,6 +9,9 @@
 //     so it can never claim a fan-out that did not happen (v1 asserted three
 //     machines on a run that used one).
 const { chromium } = require('playwright');
+// #356: the narration reads the app's own descriptions instead of carrying its
+// own copy of them.
+const { readControl, optionDesc, firstSentence } = require('./describe');
 
 const BASE = process.env.BASE || 'http://localhost:8080';
 // See record_local.js — artifacts go to the WORK dir, never next to the script.
@@ -243,8 +246,17 @@ async function main() {
     await page.evaluate(() => window.__spot(null));
   }
 
-  await explainSel('#target',
-    'Target: cloud. The identical job goes to AWS Batch instead of the machines on this network.');
+  // Read from the DOM (#356), and take only the FIRST SENTENCE of the cloud
+  // option's description. Its second sentence lists the controls choosing cloud
+  // reveals — spot, leave-media-in-S3, defer packaging — and this run uses none
+  // of them: it downloads the media as part of the encode. Narrating controls
+  // the viewer never sees used would be describing the form rather than the run.
+  {
+    const target = await readControl(page, '#target');
+    const first = firstSentence(optionDesc(target, 'cloud')).replace(/\.$/, '');
+    await explainSel('#target',
+      `Target: cloud. ${first}, instead of the machines on this network.`);
+  }
   await page.selectOption('#target', 'cloud');
   await sleep(1600);
   // Bring the media home rather than leaving it in S3, so the output is
