@@ -93,6 +93,17 @@ says("5m 30s", "5 minutes 30 seconds")
 print("\nresolutions")
 says("1080p", "1080 p")
 
+print("\nprose symbols — new since #356, when the narration became the app's own text")
+# The descriptions in static/index.html are written to be READ. They use the
+# symbols prose uses, and until #356 no caption ever contained one, because
+# every caption was hand-written for the ear.
+says("~4 minutes", "about 4 minutes")
+says("2.6x cheaper", "2.6 times cheaper")
+says("rungs — 1080p and below — in bands", "rungs, 1080 p and below, in bands")
+# A tilde not introducing a number is left alone: it is a path, not an
+# approximation, and "about /Users" is nonsense.
+says("~/Desktop", "~/Desktop")
+
 print("\na whole caption, the way one actually reads")
 says("The 6s ladder at 1080p took 1h 39m on ffmpeg.",
      "The 6 seconds ladder at 1080 p took 1 hour 39 minutes on FF MPEG.")

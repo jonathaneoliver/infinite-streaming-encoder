@@ -75,6 +75,14 @@ BASE_SPEECH = [
     (r"(?i)\bffmpeg\b", "FF MPEG"),   # what actually sounded right when typed by hand
     (r"\bOUTPUT_DIR\b", "the output directory"),
     (r"apple-uniq-live-xs", "apple uniq live x s"),
+    # Since #356 the narration is the app's OWN description text, which is
+    # written to be read rather than heard — so it uses the symbols prose uses.
+    # "~4 minutes" is silent or literal depending on the engine; neither is the
+    # word the sentence needs. Same for "2.6x" and an em dash, which reads as a
+    # comma-length pause only if it is one.
+    (r"~(?=\d)", "about "),
+    (r"\b(\d+(?:\.\d+)?)x\b", r"\1 times"),
+    (r"\s+—\s+", ", "),
     (r"\b(\d+)p\b", r"\1 p"),
     # Durations as the app prints them: "1h 39m" is read "one aitch thirty nine
     # em" unless expanded. These reach the narration whenever a figure is quoted
@@ -117,6 +125,10 @@ SAMPLES = [
     "1m left",
     "a 6s ladder",
     "1s segments",
+    # The prose symbols the app's own descriptions use (#356).
+    "about ~4 minutes of work per chunk",
+    "spot is 2.6x cheaper",
+    "the low rungs — 1080p and below — share a decode",
 ]
 
 

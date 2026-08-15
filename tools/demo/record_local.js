@@ -9,6 +9,10 @@
 //     so it can never claim a fan-out that did not happen (v1 asserted three
 //     machines on a run that used one).
 const { chromium } = require('playwright');
+// #356: the narration reads the app's own descriptions instead of carrying its
+// own copy of them.
+const { readControl, describedControls, narrationFor, optionDesc,
+        assertTourCovers } = require('./describe');
 
 const BASE = process.env.BASE || 'http://localhost:8080';
 // Every artifact goes to the WORK dir, never next to the script. These tools now
@@ -317,55 +321,85 @@ async function main() {
     await page.evaluate(() => window.__spot(null));
   };
 
+  // --- The control tour: the app's own words ------------------------------
+  //
+  // Nothing below writes a control description. Each line is read out of the
+  // live DOM (`data-desc`, plus the name from whatever labels the control), so
+  // the narration cannot claim something the UI does not. See describe.js.
+  //
+  // TOUR is the ORDER and the choreography — which controls to dwell on, and
+  // where to show options by selecting them. It is NOT the list of what has a
+  // description: that comes from the page, and assertTourCovers throws before
+  // the take if the two disagree.
+  const described = await describedControls(page);
+  const TOUR = ['target', 'chunk-duration', 'codec', 'ladder-list', 'max-res',
+                'min-res', 'time-limit', 'output-tag', 'group-rungs', 'burnin',
+                'promote-after'];
+  const COVERED_BY_GROUP = [
+    // The three codec checkboxes are spoken for by the #codec group; narrating
+    // each would say "each codec is its own job" four times.
+    ...described.filter(c => /^ctl-desc-/.test(c.id)).map(c => c.id),
+    // Cloud-only, and this is the local take. They are shown when Target
+    // switches to cloud below, but the local tour does not dwell on them.
+    'use-spot', 'skip-media', 'defer-packaging',
+    // Hidden: retired legacy (one compute env means it can do nothing), and
+    // developer-only behind ?developer=1.
+    'cpu-arch', 'measure-vmaf', 'vmaf-prescale',
+    // Selects whose options are read from the ladder, described by their own
+    // controls above.
+    'hls-format', 'padding',
+  ];
+  assertTourCovers(described, TOUR, COVERED_BY_GROUP);
+
   // Establish the panel before walking its controls — the tour previously cut
   // straight from picking a file to explaining Target, with nothing saying what
   // the viewer was now looking at.
   await explain('#encode-options',
     'These are the encoding options. Everything that decides what gets produced, and where it runs.');
   await say('Here is what each control does.');
-  await explain('#target',
-    'Target is where the encode runs. Local spreads it across the machines on this network. Cloud submits it to AWS Batch instead.');
+
+  const target = await readControl(page, '#target');
+  await explain('#target', narrationFor(target));
   // A native select popup is an OS widget and does not appear in a page
   // recording, so the options are shown by SELECTING them rather than by
-  // opening the list.
+  // opening the list — and each option speaks its OWN data-desc.
   await page.selectOption('#target', 'cloud');
   await sleep(1200);
   { const h = headline(await settle());
-    await spotEstimate(`Choosing cloud reveals three more controls, for spot capacity, leaving the media in S3, and deferring packaging. The estimate switches from time to money. ${h ? 'About ' + h + ' for this clip.' : ''}`); }
+    await spotEstimate(`${optionDesc(target, 'cloud')} The estimate switches from time to money. ${h ? 'About ' + h + ' for this clip.' : ''}`); }
   await page.selectOption('#target', 'local');
   await sleep(1200);
-  await say('Back to local, and the estimate is time again.');
-  await explain('#chunk-duration',
-    'Chunking is how each rung is split for parallel encoding.');
-  // Same reason as Target: show the options by selecting them, not by opening
-  // a native popup the recorder cannot capture. Only the two that matter.
+  await say(`${optionDesc(target, 'local')} And the estimate is time again.`);
+
+  const chunking = await readControl(page, '#chunk-duration');
+  await explain('#chunk-duration', narrationFor(chunking));
+  // Same reason as Target: show the options by selecting them. Only the two
+  // that matter — the ends of the range, not every rung of it.
   {
     const orig = await page.inputValue('#chunk-duration');
-    await page.selectOption('#chunk-duration', 'dynamic');
-    await sleep(1000);
-    await say('Dynamic sizes each chunk from learned encode speed, aiming for about four minutes of work per chunk.');
-    await page.selectOption('#chunk-duration', '12');
-    await sleep(1000);
-    await say('Twelve second chunks cut it as finely as the segments allow, for maximum parallelism across the farm.');
+    for (const v of ['dynamic', '12']) {
+      await page.selectOption('#chunk-duration', v);
+      await sleep(1000);
+      await say(optionDesc(chunking, v));
+    }
     await page.selectOption('#chunk-duration', orig);
     await sleep(600);
   }
-  await explain('#codec',
-    'Codec. H.264, HEVC or AV1. Each one becomes its own job, because they share no work after the mezzanine.');
-  await explain('#ladder-list',
-    'The ladder carries the rungs and the delivery profile together. Segment length, partial length, GOP and VBV. Select several and the same source is encoded several ways, one job each.');
-  await explainPair('#max-res', '#min-res',
-    'Max and min resolution drop the rungs taller or shorter than the values you set, selecting a band of the ladder.');
-  await explain('#time-limit',
-    'Duration encodes only the first part of the clip. Useful for testing a long source quickly.');
-  await explain('#output-tag',
-    'Output suffix names the output directory, so comparison encodes of one source sit side by side instead of replacing each other.');
-  await explain('#group-rungs',
-    'Shared decode encodes the lower rungs in bands that share one decode per chunk, instead of decoding the same chunk once per rung.');
-  await explain('#burnin',
-    'Burn-in writes timecode, bitrate and codec onto every frame. Useful for diagnosis, switched off for clean output.');
-  await explain('#promote-after',
-    'Promote copies each finished output to the delivery host as soon as it is done.');
+
+  for (const id of ['codec', 'ladder-list']) {
+    await explain('#' + id, narrationFor(await readControl(page, '#' + id)));
+  }
+  // Max and min are one idea shown as two controls, so they are spotlit
+  // together and described from the pair — the second description completes
+  // the first ("…with Max Resolution it selects a contiguous band").
+  {
+    const mx = await readControl(page, '#max-res');
+    const mn = await readControl(page, '#min-res');
+    await explainPair('#max-res', '#min-res', `${narrationFor(mx)} ${narrationFor(mn)}`);
+  }
+  for (const id of ['time-limit', 'output-tag', 'group-rungs', 'burnin', 'promote-after']) {
+    await explain('#' + id, narrationFor(await readControl(page, '#' + id)));
+  }
 
   // --- How the plan scales -------------------------------------------------
   //
