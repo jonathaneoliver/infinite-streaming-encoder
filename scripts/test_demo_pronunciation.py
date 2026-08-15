@@ -63,6 +63,18 @@ says("ffmpeg", "FF MPEG")
 says("FFmpeg", "FF MPEG")
 says("FFMPEG", "FF MPEG")
 
+print("\nLL-HLS before HLS — a REAL ordering dependency, unlike the two below")
+# A hyphen is a word boundary, so \bHLS\b matches inside "LL-HLS" and leaves
+# "LL-H L S". Ordering is the only thing that prevents it: once HLS has fired
+# there is no "LL-HLS" left for a later rule to catch. Found by listening to
+# `pronounce.py --list`, which is what that listing is for.
+says("LL-HLS playlists", "L L H L S playlists")
+says("plain HLS", "plain H L S")
+hls_last = [r for r in pronounce.SPEECH if r[0] != r"\bLL-HLS\b"] + [(r"\bLL-HLS\b", "L L H L S")]
+check("moving LL-HLS after HLS breaks it",
+      pronounce.for_speech("LL-HLS", hls_last) == "LL-H L S",
+      "the counterexample no longer reproduces")
+
 print("\nfMP4 is not shadowed by the later bare MP4 rule")
 # Held by \b (there is no word boundary between `f` and `M`), NOT by ordering —
 # the module docstring used to claim the opposite.
@@ -144,6 +156,17 @@ with tempfile.TemporaryDirectory() as td:
         check("an invalid regex raises at LOAD time", False, "it was accepted")
     except Exception:
         check("an invalid regex raises at LOAD time", True)
+
+print("\nevery rule has a sample you can hear")
+# `pronounce.py --list` prints SAMPLES, and `audition.py` speaks them. A rule
+# absent from that list is one nobody will ever listen to — and listening is
+# the only way to judge a pronunciation, since no assertion here can tell you
+# that "L L H L S" sounds better than "LL-H L S". This keeps the audible
+# surface equal to the actual surface.
+missing = pronounce.unfired()
+check("no rule is unauditionable", not missing,
+      "add a sample to pronounce.SAMPLES for: "
+      + ", ".join(p for p, _ in missing))
 
 print("\nnarrative round-trip — text in git, timings in cues.json, joined by index")
 # The 7-of-42 case that broke the first version: a caption containing a newline

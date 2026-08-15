@@ -61,6 +61,12 @@ DEPLURALISE = [
 
 BASE_SPEECH = [
     (r"\bAWS\b", "A W S"), (r"\bVBV\b", "V B V"), (r"\bCPU\b", "C P U"),
+    # LL-HLS BEFORE HLS, and this one really is an ordering dependency — unlike
+    # fMP4/MP4, which `\b` protects. A hyphen IS a word boundary, so `\bHLS\b`
+    # matches inside "LL-HLS" and leaves "LL-H L S": two letters said as a word,
+    # then three said separately. Once HLS has fired there is no "LL-HLS" left
+    # for a later rule to catch, so putting this second would do nothing.
+    (r"\bLL-HLS\b", "L L H L S"),
     (r"\bHLS\b", "H L S"), (r"\bAV1\b", "A V one"), (r"\bfMP4\b", "fragmented M P four"),
     (r"\bMP4\b", "M P four"), (r"\bS3\b", "S three"), (r"\bFPV\b", "F P V"),
     (r"\b4K\b", "four K"), (r"\bH\.264\b", "H 264"), (r"\bHEVC\b", "H E V C"),
@@ -78,6 +84,39 @@ BASE_SPEECH = [
     (r"\b(\d+)m (\d+)s\b", r"\1 minutes \2 seconds"),
     (r"\b(\d+)m\b", r"\1 minutes"),
     (r"\b(\d+)s\b", r"\1 seconds"),
+]
+
+
+# The vocabulary that has actually bitten, as things you can READ and HEAR
+# rather than as regexes. Every rule above must fire on at least one of these —
+# `scripts/test_demo_pronunciation.py` checks that, because a rule with no
+# sample is a rule nobody will ever audition, and the only way to judge a
+# pronunciation is to listen to it.
+#
+# `audition.py` speaks this list.
+SAMPLES = [
+    "AWS Batch",
+    "the VBV is tight",
+    "CPU bound",
+    "the HLS master playlist",
+    "LL-HLS playlists",
+    "AV1 takes longer",
+    "an fMP4 fragment",
+    "the MP4 mezzanine",
+    "staged in S3",
+    "an FPV clip",
+    "a 4K source",
+    "H.264 and HEVC",
+    "ffmpeg does the work",
+    "it lands in OUTPUT_DIR",
+    "the apple-uniq-live-xs ladder",
+    "1080p and 2160p",
+    "1h 39m remaining",
+    "1h on one machine",
+    "5m 30s of encoding",
+    "1m left",
+    "a 6s ladder",
+    "1s segments",
 ]
 
 
@@ -117,7 +156,40 @@ def for_speech(t, rules=None):
     return t
 
 
+def unfired(rules=None, samples=None):
+    """Rules that no sample exercises — i.e. pronunciations nobody can audition."""
+    rules = rules if rules is not None else SPEECH
+    samples = samples if samples is not None else SAMPLES
+    out = []
+    for pat, rep in rules:
+        if not any(re.search(pat, for_speech(s, _upto(rules, pat))) for s in samples):
+            out.append((pat, rep))
+    return out
+
+
+def _upto(rules, pat):
+    """The rules applied before `pat` — what the text looks like when it runs."""
+    for i, (p, _) in enumerate(rules):
+        if p == pat:
+            return rules[:i]
+    return rules
+
+
 if __name__ == "__main__":
     import sys
-    for line in (sys.argv[1:] or [l.rstrip("\n") for l in sys.stdin]):
+    args = sys.argv[1:]
+    if args and args[0] in ("--list", "-l"):
+        w = max(len(s) for s in SAMPLES)
+        print("%-*s  %s" % (w, "WRITTEN", "SPOKEN"))
+        print("%-*s  %s" % (w, "-" * w, "-" * 40))
+        for s in SAMPLES:
+            spoken = for_speech(s)
+            print("%-*s  %s%s" % (w, s, spoken, "" if spoken != s else "   (unchanged)"))
+        miss = unfired()
+        if miss:
+            print("\n%d rule(s) with no sample — nobody can audition these:" % len(miss))
+            for pat, rep in miss:
+                print("  %-24s -> %s" % (pat, rep))
+        sys.exit(0)
+    for line in (args or [l.rstrip("\n") for l in sys.stdin]):
         print(for_speech(line))
