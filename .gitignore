@@ -27,3 +27,8 @@ ENCODER_COMPARISON.md
 # into the repo root when no output dir is given.
 fleet-lanes.png
 *.playwright.png
+
+# The demo recorders need playwright. Everything else they produce goes to
+# $DEMO_DIR (outside the repo) by design — only tools/demo/narrative/ is
+# tracked, because the script is source and the 130 MB of video is not.
+tools/demo/node_modules/
