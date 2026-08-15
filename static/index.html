@@ -637,7 +637,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <button class="btn btn-primary" id="encode-btn" onclick="startEncode(false)" title="Encode the checked files: fills in any missing variants and resumes an interrupted run; a brand-new source encodes fully. Already-complete files are skipped." disabled>Encode</button>
                     <button class="btn btn-primary split-caret" id="encode-caret" onclick="toggleEncodeMenu(event)" aria-haspopup="true" aria-expanded="false" title="More encode actions" disabled>&#9662;</button>
                     <div class="split-menu" id="encode-menu" style="display:none">
-                        <div class="split-menu-item" onclick="hideEncodeMenu(); startEncode(true)">Re-encode (replace existing)<small>Archive existing output, produce everything fresh</small></div>
+                        <div class="split-menu-item" onclick="hideEncodeMenu(); startEncode(true)">Re-encode (replace existing)<small>The previous copy is archived, never deleted — then every variant is produced fresh</small></div>
                     </div>
                 </div>
             </div>
@@ -646,7 +646,8 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                  estimate because they answer the same question — what is this
                  button about to do, and what will it cost. -->
             <div id="ladder-multi-note" style="display:none;font-size:11px;color:#e9c46a;margin:6px 0 0"></div>
-            <div class="encode-hint" id="encode-estimate" style="display:none"></div>
+            <div class="encode-hint" id="encode-estimate" style="display:none"
+                 title="Predicts the whole plan before anything runs — every file, ladder and codec in the current selection. Local targets predict time; cloud targets predict money."></div>
             <div class="encode-hint"><b>Encode</b> fills in whatever's missing and resumes an interrupted run — a brand-new source encodes fully, an already-complete one is skipped. Use <b>Re-encode</b> (the ▾ menu) to archive existing output and produce every variant fresh.</div>
         </fieldset>
     </div>
@@ -695,14 +696,16 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 <div id="tab-jobs" class="tab-content">
     <div class="jobs-overview" id="jobs-overview" style="display:none"></div>
     <div class="panel fleet-panel" id="jobs-cloud-fleet-panel" style="display:none">
-        <h2 class="fleet-h2" onclick="toggleFleet('cloud')"><span class="fold-chevron">▾</span>Cloud Fleet<span class="fleet-summary" id="cloud-fleet-summary"></span></h2>
+        <h2 class="fleet-h2" onclick="toggleFleet('cloud')"
+            title="How many spot instances Batch has launched and what they are costing. Instances outlive the encode: after the last chunk lands they stay up — idle, and still billing — until Batch scales them down."><span class="fold-chevron">▾</span>Cloud Fleet<span class="fleet-summary" id="cloud-fleet-summary"></span></h2>
         <div class="fleet-body">
             <div class="aws-summary" id="jobs-cloud-metrics"></div>
             <div id="jobs-fleet-full" title="Live cloud fleet — per-instance packing, utilization, and lifecycle (from the AWS inventory)"></div>
         </div>
     </div>
     <div class="panel fleet-panel" id="jobs-local-fleet-panel" style="display:none">
-        <h2 class="fleet-h2" onclick="toggleFleet('local')"><span class="fold-chevron">▾</span>Local Fleet<span class="fleet-summary" id="local-fleet-summary"></span></h2>
+        <h2 class="fleet-h2" onclick="toggleFleet('local')"
+            title="Every machine on this network that is polling for chunks, with its CPU, its slot packing, and what it is encoding right now. Costs time, not money."><span class="fold-chevron">▾</span>Local Fleet<span class="fleet-summary" id="local-fleet-summary"></span></h2>
         <div class="fleet-body">
             <div class="aws-summary" id="jobs-local-metrics"></div>
             <div id="jobs-local-fleet" title="Live local cluster — per-machine CPU, packing, and the chunks running on each box"></div>
@@ -3983,9 +3986,42 @@ function submitCodecs() {
     return on.length ? on : ['h264'];
 }
 
+// What a status MEANS, which is not always what it looks like (#356).
+//
+// The one that matters is cloud + queued. Batch has to launch spot instances
+// and pull the image before a single frame is encoded, so the job sits with
+// nothing moving for minutes — it reads as stalled, and the natural response is
+// to cancel a run that is working correctly. The narration in the demo said
+// this out loud and the UI said nothing; this is that sentence, in the app.
+function jobStatusHint(j) {
+    const cloud = j.config.target === 'cloud' || j.config.target === 'cloud-batch';
+    switch (j.status) {
+        case 'queued':
+            return cloud
+                ? 'Waiting for compute resources. Batch is launching spot instances and pulling the image before a single frame is encoded — minutes of nothing moving is normal here.'
+                : 'Waiting for a MAX_CONCURRENT slot. Nothing has started yet, and the wait counts towards wall clock but not towards active time.';
+        case 'running':
+            return cloud
+                ? 'Every chunk is an independent Batch job, spread across as many spot instances as Batch will give us.'
+                : 'Chunks are on one queue that every worker on the network polls.';
+        case 'done':
+            return cloud
+                ? 'The encode finished. Instances may still be up — idle, and still billing — until Batch scales them down.'
+                : 'The encode finished and the output was moved into OUTPUT_DIR.';
+        case 'failed':
+            return 'The run did not complete. The job log has the failing phase; staged chunks survive for the debugging window.';
+        case 'cancelled':
+            return 'Stopped before completion. Cancelling stops the orchestrator, so its own staging cleanup never runs — the GC reclaims it later.';
+        case 'move-failed':
+            return 'The encode succeeded but the output could not be moved into OUTPUT_DIR. The work is not lost; the destination is the problem.';
+        default:
+            return '';
+    }
+}
+
 function jobRowHtml(j) {
     const cloudBadge = (j.config.target === 'cloud' || j.config.target === 'cloud-batch')
-        ? `<span class="job-cloud-badge" onclick="switchTab('aws')" title="Click to view AWS resources">☁ cloud</span>`
+        ? `<span class="job-cloud-badge" onclick="switchTab('aws')" title="This job is a Step Functions execution: every chunk becomes its own AWS Batch job on spot capacity. Click to view the AWS resources it is using.">☁ cloud</span>`
         : '';
     return `
         <div class="job" id="job-${j.id}">
@@ -3998,7 +4034,7 @@ function jobRowHtml(j) {
                     <span class="job-reclaim-badge" style="display:none"></span>
                     <span class="job-saved-badge" style="display:none"></span>
                 </div>
-                <span class="job-status status-${j.status}">${j.status.toUpperCase()}</span>
+                <span class="job-status status-${j.status}" title="${escapeAttr(jobStatusHint(j))}">${j.status.toUpperCase()}</span>
             </div>
             ${_jobConfigHtml(j.config)}
             <div class="job-prog" style="display:none"></div>
@@ -4365,9 +4401,14 @@ function updateJobRow(row, j) {
     if (j.status === 'failed' && j.failure_reason === 'spot_interrupted') {
         status.className = 'job-status status-spot-terminated';
         status.textContent = 'SPOT TERMINATED';
+        status.title = 'AWS reclaimed the spot capacity. Expected and retryable — the chunks that finished are still staged.';
     } else {
         status.className = 'job-status status-' + j.status;
         status.textContent = j.status.toUpperCase();
+        // The row is rendered ONCE and updated in place from here on, so a hint
+        // set only in jobRowHtml would describe the status the job had when it
+        // was first drawn — which for a cloud run is 'queued' for its whole life.
+        status.title = jobStatusHint(j);
     }
     row.querySelector('.job-progress').textContent = j.progress || '';
 
