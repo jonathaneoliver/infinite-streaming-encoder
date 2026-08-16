@@ -555,8 +555,13 @@ async function main() {
     'The fleet summary: which machines are up, how many cores are busy, and what they are doing right now.', 7000);
   await spotlight('timeline-live',
     'The machine timeline. One lane per box, filling in as chunks land, showing where the run waited.', 7500);
+  // "One row per chunk, per rung" was WRONG, and had been since v1 of this
+  // driver — it survived two rewrites and being brought in-tree unread. The
+  // page groups by codec:tier (groupStagesForDisplay) and renders each chunk as
+  // a CELL inside its variant's row, so a full ladder is ~14 rows, not 336.
+  // Anyone watching the screen could see the claim was false; nobody checked.
   await spotlight('jobcard',
-    'And the job itself, expanded into its stages. One row per chunk, per rung, as each one completes.', 7500);
+    'And the job itself, expanded into its stages. One row per variant, one cell per chunk, filling in as each completes.', 7500);
   await say('', 0);
 
   const started = Date.now();

@@ -49,7 +49,7 @@
 [32] The job is now a Temporal workflow \nor Batch for AWS Cloud.
 [33] The fleet summary\nwhich machines are up, how many cores are busy, and what they are doing right now.
 [34] The machine timeline. One lane per box, filling in as chunks land, showing where the run waited.
-[35] And the job itself, expanded into its stages. One row per variant.
+[35] And the job itself, expanded into its stages. One row per variant, one cell per chunk, filling in as each completes.
 [36] The chunks were encoded in parallel across 3 machines: mac, macmini, ubuntu.
 [37] The encode  is  complete. \nThe Outputs tab lists what landed in OUTPUT_DIR.
 [38] The package opens into three areas.

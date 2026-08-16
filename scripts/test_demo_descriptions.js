@@ -109,6 +109,45 @@ for (const file of ['record_local.js', 'record_cloud.js']) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 4. The narration's STRUCTURAL claim about the job card must match the page.
+//
+// Sections 1-3 cover text quoted FROM the app. This covers the other kind: a
+// sentence the driver writes itself, describing what the screen looks like.
+// Nothing quotes it, so nothing could contradict it.
+//
+// "One row per chunk, per rung" shipped in v1 of the driver, survived two
+// rewrites and being brought in-tree, and was false the whole time — the page
+// groups by codec:tier and renders each chunk as a CELL inside its variant's
+// row, so a full ladder is ~14 rows and not 336. It was corrected by hand on a
+// finished take, and the correction was then lost to the next recording.
+//
+// Two-sided on purpose. If the page ever DOES render a row per chunk, this
+// fails too and says the narration is now the stale half.
+const pageSrc = fs.readFileSync(PAGE, 'utf8');
+const groupsIntoCells = /rows\.push\(\{\s*kind:\s*'chunks'[\s\S]{0,120}cells:\s*\[\]/.test(pageSrc)
+                        && /groupIndex\[gk\]\]\.cells\.push/.test(pageSrc);
+
+for (const file of ['record_local.js', 'record_cloud.js']) {
+  // Strip line comments BEFORE extracting strings. An apostrophe in prose
+  // ("its variant's row") opens a match that runs to the next one and swallows
+  // whatever is between — which is how the first version of this check failed
+  // on the comment explaining the very bug it was written for.
+  const src = fs.readFileSync(path.join(DEMO, file), 'utf8')
+                .split('\n').map(l => l.replace(/^\s*\/\/.*$/, '')).join('\n');
+  const says = [...src.matchAll(/'((?:[^'\\\n]|\\.){20,})'/g)].map(m => m[1]);
+  const perChunkRow = says.filter(s => /row per chunk/i.test(s));
+
+  if (groupsIntoCells && perChunkRow.length) {
+    fail.push(`${file} narrates "row per chunk", but groupStagesForDisplay groups ` +
+              'by codec:tier and makes each chunk a CELL. One row per VARIANT.');
+  }
+  if (!groupsIntoCells && says.some(s => /row per variant/i.test(s))) {
+    fail.push(`${file} narrates "row per variant", but the page no longer groups ` +
+              'chunks into cells — the narration is now the stale half.');
+  }
+}
+
 if (fail.length) {
   console.log(`FAIL: ${fail.length} problem(s)`);
   for (const f of fail) console.log('  ' + f);

@@ -25,7 +25,7 @@
 [08] Waiting for compute resources. Batch is launching spot instances and pulling the image before a single frame is encoded.
 [09] The cloud fleet: how many spot instances Batch has launched, and what they are costing.
 [10] Per-instance packing and lifecycle, read from the AWS inventory.
-[11] And the job, expanded. One row per chunk, per rung, as Batch works through the fan-out.
+[11] And the job, expanded. One row per variant, one cell per chunk, as Batch works through the fan-out.
 [12] Machines are up. Every chunk is now an independent Batch job, spread across as many instances as Batch will give us.
 [13] The encode has finished, but the instances are still up — idle, and still billing, until Batch scales them down.
 [14] The run reports what it actually cost, against what the same ladder would cost elsewhere — and how much of the machine time nobody was using.
