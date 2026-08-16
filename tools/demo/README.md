@@ -34,6 +34,7 @@ nothing in-tree to notice. Three from building it, none of them demo bugs:
 | `narrator_app.py` + `narrator.html` | browser editor: scrub, edit caption text, audition/select voices, drag the fast-forward range, export with a progress bar |
 | `narrate_sentences.py` | text → speech, sentence-split with controlled pauses, hash-cached |
 | `pronounce.py` | written → spoken (`4K` → "four K"). The one piece with a test |
+| `audition.py` | speaks that vocabulary aloud, so you can judge it by ear |
 | `make_ass.py` | cues → ASS subtitles positioned in the caption strip |
 | `join.py` | concatenates halves with a fade to black, preserving every audio track |
 | `edit_text.py` | narration in and out of a plain text file, and in and out of git |
@@ -104,6 +105,31 @@ Edit the tracked file, commit, and `git diff` shows what changed about what is
 
 Caption text may contain newlines (7 of the first demo's 42 cues do); they are
 escaped as `\n` in the tracked file so one cue stays one line.
+
+## Checking the pronunciations
+
+```bash
+python3 pronounce.py --list    # the vocabulary, written -> spoken
+python3 audition.py            # the same list, out loud
+python3 audition.py --both     # written form first, then spoken — the A/B
+```
+
+`make check`'s `py demospeech` asserts fixed pairs; it can tell you the table
+changed and never that it sounds wrong. The listing and the audition are how
+you answer the second question, and every rule is required to have a sample in
+`pronounce.SAMPLES` so nothing is unauditionable.
+
+Two things worth knowing when it misbehaves:
+
+- **Generation happens up front, playback second.** Voicebox plays a clip
+  itself as it finishes generating, so generating and playing in one loop plays
+  every new clip twice a beat apart — an echo that makes the pronunciation
+  impossible to judge. Clips are cached by the SPOKEN text, so changing a rule
+  invalidates exactly the clips it affects.
+- **A wedged voice server looks like a slow one.** It keeps accepting requests
+  and reporting `generating` forever. `audition.py` gives up after 45s and says
+  so; restart Voicebox. (`narrate_sentences` still allows 600s, which is right
+  for a long narration line and was badly wrong for a one-second clip.)
 
 ## Rules learned the hard way
 
