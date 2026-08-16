@@ -69,6 +69,9 @@ BASE_SPEECH = [
     (r"\bLL-HLS\b", "L L H L S"),
     (r"\bHLS\b", "H L S"), (r"\bAV1\b", "A V one"), (r"\bfMP4\b", "fragmented M P four"),
     (r"\bMP4\b", "M P four"), (r"\bS3\b", "S three"), (r"\bFPV\b", "F P V"),
+    # "H 264" is JUDGED CORRECT, not merely untested — auditioned 2026-08-16 and
+    # the engine reads the digits acceptably. Left as digits deliberately: the
+    # obvious "improvement" to "H two six four" was considered and is not needed.
     (r"\b4K\b", "four K"), (r"\bH\.264\b", "H 264"), (r"\bHEVC\b", "H E V C"),
     # Written as ffmpeg, spoken as the letters. Without this the only way to
     # get the pronunciation right was to misspell it ON SCREEN.
@@ -91,6 +94,15 @@ BASE_SPEECH = [
     (r"\b(\d+)h\b", r"\1 hours"),
     (r"\b(\d+)m (\d+)s\b", r"\1 minutes \2 seconds"),
     (r"\b(\d+)m\b", r"\1 minutes"),
+    # Note this reads "a 6s ladder" as "a 6 SECONDS ladder", where English wants
+    # the adjectival "6 second". AUDITIONED 2026-08-16 AND ACCEPTED — it is
+    # unambiguous heard aloud, which is the only test that counts here.
+    #
+    # Left alone on purpose. Distinguishing a duration from a modifier needs to
+    # know the following word, so the fix is a list of nouns ("ladder",
+    # "profile", "segment") that will be wrong for the first one nobody added.
+    # If it ever grates, spell the ladder out in the narrative instead — the
+    # narration is authored text and can simply say "six second ladder".
     (r"\b(\d+)s\b", r"\1 seconds"),
 ]
 
