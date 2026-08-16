@@ -86,6 +86,23 @@ BASE_SPEECH = [
     (r"~(?=\d)", "about "),
     (r"\b(\d+(?:\.\d+)?)x\b", r"\1 times"),
     (r"\s+—\s+", ", "),
+    # A COLON is the same problem as the em dash above, and it was being fixed
+    # the expensive way. Reviewing the hand edits made to a finished take, the
+    # single most repeated change was deleting colons — "The fleet summary:
+    # which machines are up" -> "The fleet summary which machines are up",
+    # "Codec: H.264 only" -> "Codec   H.264 only". Those are not rewrites of the
+    # narration; they are the same sentence with punctuation the voice reads
+    # badly taken out, retyped by hand on every take because a per-take text
+    # file cannot hold a rule.
+    #
+    # A comma, not deletion: the pause is wanted, it is the COLON that is not.
+    # That is the same trade the em-dash rule above makes.
+    #
+    # Requires trailing whitespace, so "13:24:51" and "https://" are untouched.
+    # Since #356 the narration is largely the app's own data-desc text, which
+    # uses colons freely ("Slow: one extra pass per rung"), so this now reaches
+    # lines no narrative file could have edited.
+    (r":\s+", ", "),
     (r"\b(\d+)p\b", r"\1 p"),
     # Durations as the app prints them: "1h 39m" is read "one aitch thirty nine
     # em" unless expanded. These reach the narration whenever a figure is quoted
@@ -118,6 +135,7 @@ SAMPLES = [
     "AWS Batch",
     "the VBV is tight",
     "CPU bound",
+    "Codec: H.264 only",
     "the HLS master playlist",
     "LL-HLS playlists",
     "AV1 takes longer",

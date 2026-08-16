@@ -90,6 +90,21 @@ says("1s", "1 second")
 says("6s", "6 seconds")
 says("5m 30s", "5 minutes 30 seconds")
 
+print("\ncolons — punctuation the voice reads badly, fixed once instead of per take")
+# The most-repeated hand edit on a finished take was deleting colons. A comma,
+# not deletion: the pause is wanted, the colon is not — same trade as the em
+# dash rule beside it. Since #356 this reaches the app's own data-desc text,
+# which uses colons freely and which no narrative file could have edited.
+says("The fleet summary: which machines are up.",
+     "The fleet summary, which machines are up.")
+says("Slow: one extra pass per rung.", "Slow, one extra pass per rung.")
+says("Unchecked means on-demand: guaranteed, and not interruptible.",
+     "Unchecked means on-demand, guaranteed, and not interruptible.")
+# Requires trailing whitespace, so machine-readable colons survive. A timecode
+# read as "thirteen comma twenty four" would be worse than the disease.
+says("at 13:24:51 the chunk started", "at 13:24:51 the chunk started")
+says("see https://example.com/x", "see https://example.com/x")
+
 print("\nresolutions")
 says("1080p", "1080 p")
 
