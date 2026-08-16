@@ -13,6 +13,14 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 .tab { padding: 10px 24px; cursor: pointer; color: #888; font-size: 0.95rem; font-weight: 500; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.15s; }
 .tab:hover { color: #ccc; }
 .tab.active { color: #4361ee; border-bottom-color: #4361ee; }
+/* #355: the tabs are keyboard-operable now, so focus has to be VISIBLE — an
+   invisible focus ring is the same as no keyboard support, you just cannot see
+   where you are. :focus-visible, not :focus, so a mouse click does not leave a
+   ring behind it. */
+.tab:focus-visible { outline: 2px solid #4cc9f0; outline-offset: -2px; border-radius: 3px 3px 0 0; }
+/* The panel takes focus when a tab is activated from the keyboard, so it needs
+   a ring too — but a faint one: it is a region, not a control. */
+.tab-content:focus-visible { outline: 2px solid #2a3a5e; outline-offset: 4px; border-radius: 4px; }
 .tab-content { display: none; }
 .tab-content.active { display: block; }
 
@@ -433,17 +441,36 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
     </label>
 </div>
 
-<div class="tabs">
-    <div class="tab active" onclick="switchTab('originals')">Originals</div>
-    <div class="tab" onclick="switchTab('outputs')">Outputs</div>
-    <div class="tab" onclick="switchTab('jobs')">Jobs</div>
-    <div class="tab" onclick="switchTab('ladders')">Ladders</div>
-    <div class="tab tab-aws" onclick="switchTab('aws')">AWS ☁</div>
-    <div class="tab" onclick="switchTab('about')" style="margin-left:auto">About</div>
+<!-- #355. These were <div onclick> with no role and no tabindex, so the app had
+     exactly one input device: there was no way to change tab from the keyboard,
+     and nothing announced them as tabs.
+     Roving tabindex — the selected tab is the only one in the tab order, and
+     Left/Right/Home/End move between them once you are there. That is the ARIA
+     tablist pattern; see onTabKey() for the one place this deliberately departs
+     from it. -->
+<div class="tabs" role="tablist" aria-label="Main views">
+    <div class="tab active" id="tab-btn-originals" role="tab" aria-selected="true"
+         aria-controls="tab-originals" tabindex="0" onclick="switchTab('originals')">Originals</div>
+    <div class="tab" id="tab-btn-outputs" role="tab" aria-selected="false"
+         aria-controls="tab-outputs" tabindex="-1" onclick="switchTab('outputs')">Outputs</div>
+    <div class="tab" id="tab-btn-jobs" role="tab" aria-selected="false"
+         aria-controls="tab-jobs" tabindex="-1" onclick="switchTab('jobs')">Jobs</div>
+    <div class="tab" id="tab-btn-ladders" role="tab" aria-selected="false"
+         aria-controls="tab-ladders" tabindex="-1" onclick="switchTab('ladders')">Ladders</div>
+    <div class="tab tab-aws" id="tab-btn-aws" role="tab" aria-selected="false"
+         aria-controls="tab-aws" tabindex="-1" onclick="switchTab('aws')">AWS &#9729;</div>
+    <div class="tab" id="tab-btn-about" role="tab" aria-selected="false"
+         aria-controls="tab-about" tabindex="-1" onclick="switchTab('about')"
+         style="margin-left:auto">About</div>
 </div>
+<!-- Announcements for people who cannot see the page change (#355). POLITE, and
+     deliberately sparse: this page updates every 2s and reading all of it aloud
+     would be unusable. Only the things you would otherwise sit waiting for —
+     see announce(). -->
+<div id="a11y-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <!-- ENCODE TAB -->
-<div id="tab-originals" class="tab-content active">
+<div id="tab-originals" class="tab-content active" role="tabpanel" aria-labelledby="tab-btn-originals" tabindex="0">
     <div class="panel" id="sources-panel">
         <h2>Source Files <span style="font-size:0.7rem;color:#5d6b82;font-weight:400">— or drag &amp; drop videos here to upload</span></h2>
         <div class="select-actions">
@@ -654,7 +681,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 </div>
 
 <!-- OUTPUTS TAB -->
-<div id="tab-outputs" class="tab-content">
+<div id="tab-outputs" class="tab-content" role="tabpanel" aria-labelledby="tab-btn-outputs" tabindex="0">
     <div class="panel">
         <div id="outputs-header">
             <h2>Encoded Content</h2>
@@ -693,7 +720,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 </div>
 
 <!-- JOBS TAB -->
-<div id="tab-jobs" class="tab-content">
+<div id="tab-jobs" class="tab-content" role="tabpanel" aria-labelledby="tab-btn-jobs" tabindex="0">
     <div class="jobs-overview" id="jobs-overview" style="display:none"></div>
     <div class="panel fleet-panel" id="jobs-cloud-fleet-panel" style="display:none">
         <h2 class="fleet-h2" onclick="toggleFleet('cloud')"
@@ -720,7 +747,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 </div>
 
 <!-- LADDERS TAB -->
-<div id="tab-ladders" class="tab-content">
+<div id="tab-ladders" class="tab-content" role="tabpanel" aria-labelledby="tab-btn-ladders" tabindex="0">
     <div class="panel">
         <h2 style="display:flex;align-items:center;gap:12px">Ladders
             <button class="btn btn-primary" style="margin-left:auto" onclick="newLadder()">+ New ladder</button>
@@ -735,7 +762,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
 </div>
 
 <!-- AWS TAB -->
-<div id="tab-aws" class="tab-content">
+<div id="tab-aws" class="tab-content" role="tabpanel" aria-labelledby="tab-btn-aws" tabindex="0">
     <div class="panel aws-panel">
         <div class="aws-header">
             <h2>AWS Resources</h2>
@@ -860,7 +887,7 @@ make clear-costs  # this button's sweep AND the AMI, in one command</code></pre>
 </div>
 
 <!-- ABOUT TAB -->
-<div id="tab-about" class="tab-content">
+<div id="tab-about" class="tab-content" role="tabpanel" aria-labelledby="tab-btn-about" tabindex="0">
     <div class="panel">
         <h2>About</h2>
 
@@ -984,6 +1011,13 @@ function showToast(message, type = '') {
     toast.className = 'toast' + (type ? ' toast-' + type : '');
     toast.textContent = message;
     container.appendChild(toast);
+    // #355. A toast IS the "something happened" channel — 42 call sites, all
+    // results of a user action — and it is purely visual and gone in 4s. The
+    // live region is its non-visual twin, so hooking it here covers submissions,
+    // fetch, package, promote and every validation refusal at once, and covers
+    // the next one nobody has written yet. Keep it that way: anything put on a
+    // TIMER must not toast, or it will be read aloud on that timer too.
+    announce(message);
     setTimeout(() => { toast.style.opacity = '0'; toast.style.transition = 'opacity 0.3s'; setTimeout(() => toast.remove(), 300); }, 4000);
 }
 
@@ -1330,19 +1364,25 @@ function startIdleWatch() {
 // itself, and a stamp here would reset the very idleness that triggered it.
 // A user's own tab click stamps through the pointerdown listener instead.
 function switchTab(name) {
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t => {
+        t.classList.remove('active');
+        // Roving tabindex: only the selected tab is in the page's tab order, so
+        // Tab moves THROUGH the tablist in one press rather than six. Arrow
+        // keys move within it — see onTabKey.
+        t.setAttribute('tabindex', '-1');
+        t.setAttribute('aria-selected', 'false');
+    });
     document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
     document.querySelector(`.tab-content#tab-${name}`).classList.add('active');
-    // Robust index lookup by onclick attr — earlier code used a hardcoded
-    // ['encode','outputs','jobs'] array that fell out of sync when the
-    // AWS tab was added.
-    const tabs = document.querySelectorAll('.tab');
-    for (const tab of tabs) {
-        const attr = tab.getAttribute('onclick') || '';
-        if (attr.includes(`switchTab('${name}')`)) {
-            tab.classList.add('active');
-            break;
-        }
+    // By id, not by matching the onclick attribute as a string. The lookup this
+    // replaces was itself a fix for a hardcoded index array that fell out of
+    // sync when the AWS tab was added; aria-controls made the pairing explicit,
+    // so neither workaround is needed now.
+    const btn = document.getElementById('tab-btn-' + name);
+    if (btn) {
+        btn.classList.add('active');
+        btn.setAttribute('tabindex', '0');
+        btn.setAttribute('aria-selected', 'true');
     }
     if (name === 'outputs') pollNow('outputs');
     // Opening the AWS tab is the one moment someone is actually looking at the
@@ -1355,6 +1395,71 @@ function switchTab(name) {
     // one-shot loads above cover the immediate refresh; syncPollers' own
     // resume-fetch is suppressed for _POLL_FRESH_MS so it doesn't double up.
     syncPollers();
+}
+
+// Keyboard operation of the tablist (#355).
+//
+// MANUAL activation: an arrow key moves focus, and Enter or Space activates.
+// The ARIA pattern's default is automatic activation — arrowing to a tab
+// selects it — and that is the right default when a panel is already there.
+// It is the wrong one here: opening the AWS tab fires the S3 prefix walk,
+// which is billed as internet egress and is the single most expensive thing
+// this page can do. Arrowing past AWS on the way to About would spend money.
+// So focus and selection are separate, which is exactly the case the pattern
+// carves out for expensive panels.
+function onTabKey(e) {
+    const tabs = [...document.querySelectorAll('.tabs [role="tab"]')];
+    const i = tabs.indexOf(document.activeElement);
+    if (i < 0) return;
+    let j = null;
+    switch (e.key) {
+        // Wraps, because a tablist is a ring — falling off the end and stopping
+        // is how you end up arrowing back and forth hunting for the last tab.
+        case 'ArrowRight': j = (i + 1) % tabs.length; break;
+        case 'ArrowLeft':  j = (i - 1 + tabs.length) % tabs.length; break;
+        case 'Home':       j = 0; break;
+        case 'End':        j = tabs.length - 1; break;
+        case 'Enter':
+        case ' ':
+            e.preventDefault();
+            tabs[i].click();
+            // Move focus INTO the panel just opened. Without this, the next Tab
+            // press goes to whatever follows the tablist in the DOM, which is
+            // the panel — but only by luck of source order, and the panels are
+            // not in tab order.
+            document.querySelector('.tab-content.active')?.focus();
+            return;
+        default: return;
+    }
+    e.preventDefault();
+    // Roving tabindex has to MOVE, not just focus: leaving the old tab at 0
+    // would put two tabs in the page's tab order.
+    tabs[i].setAttribute('tabindex', '-1');
+    tabs[j].setAttribute('tabindex', '0');
+    tabs[j].focus();
+}
+document.addEventListener('DOMContentLoaded', () => {
+    document.querySelector('.tabs')?.addEventListener('keydown', onTabKey);
+});
+
+// Say something to a screen reader (#355).
+//
+// The live region is POLITE and the list of things that reach it is short on
+// purpose. This page repaints every two seconds; announcing progress, the
+// fleet table or a chunk grid would produce a stream nobody could listen
+// through, and `assertive` anywhere here would be actively hostile.
+//
+// What qualifies: the things you would otherwise SIT AND WAIT for. A run
+// finishing is the whole reason the page is open; a submission is the
+// confirmation that a click did anything.
+function announce(msg) {
+    const el = document.getElementById('a11y-live');
+    if (!el || !msg) return;
+    // Same text twice is not re-announced by most screen readers, and two jobs
+    // can finish with identical wording. Clearing first forces the second one
+    // to be spoken.
+    el.textContent = '';
+    setTimeout(() => { el.textContent = msg; }, 60);
 }
 
 // ---- Ladders ----
@@ -4909,6 +5014,11 @@ function connectSSE() {
             // scan (/api/outputs walks every output dir: ~0.8s).
             const TERMINAL = ['done', 'failed', 'cancelled', 'move-failed'];
             if (was && was !== job.status && TERMINAL.includes(job.status)) {
+                // #355. This guard is already exactly right for announcing:
+                // `was` is unset on the snapshot, so a page load with twenty
+                // finished jobs says nothing, and the repeated terminal frames
+                // the stream sends are collapsed by the transition test.
+                announce(`${(job.config.files || []).join(', ')} ${job.status}.`);
                 loadOutputs();
                 // A just-finished encode is what you come back to look at, so
                 // the Jobs view stays put for _IDLE_SETTLED_MS from here rather
