@@ -249,6 +249,11 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  py ctrldesc    '; \
 	if out=$$(python3 scripts/test_control_descriptions.py 2>&1); then echo "$$out"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	: 'Keyboard operability regresses INVISIBLY: with a mouse the app behaves'; \
+	: 'identically, and the people it breaks for cannot report it.'; \
+	printf '  py tabsem      '; \
+	if out=$$(python3 scripts/test_tab_semantics.py 2>&1); then echo "$$out"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py cli         '; \
 	if out=$$(python3 scripts/test_encoder_cli.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
