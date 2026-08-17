@@ -411,6 +411,18 @@ class EncodeWorkflow:
         # them comes from a pre-#176 orchestrator, and the worker it would reach
         # no longer derives its own, so failing here beats encoding blind.
         chunk_plan = plan["chunks"]
+        # Per-variant boundaries (#362). Absent in a plan from an older
+        # orchestrator, which correctly reads as "one grid for everything" — the
+        # uniform chunk_plan above, i.e. exactly today's behaviour. Keyed
+        # "codec/label", the same spelling the VMAF estimates use.
+        chunks_by_variant = plan.get("chunks_by_variant") or {}
+
+        def _chunks_for(codec: str, label: str) -> list:
+            """This variant's grid, or the uniform one. A rung Go did not size
+            has no entry and must not be skipped — it is a normal variant that
+            simply shares the default plan."""
+            return chunks_by_variant.get(f"{codec}/{label}") or chunk_plan
+
         content_duration_s = float(plan["content_duration_s"])
         # Dispatch HIGHEST-COST chunks first (LPT scheduling): a chunk's expected
         # cost ~ height² × codec-factor × pass-factor, so the slow 4K HEVC 2-pass
@@ -440,7 +452,7 @@ class EncodeWorkflow:
             for r in solo:
                 w = (r["height"] * r["height"] * codec_cost.get(codec, 1.0)
                      * (1.8 if tp else 1.0))
-                for c in chunk_plan:
+                for c in _chunks_for(codec, r["label"]):
                     specs.append((w, codec, r, tp, ea, c, None))
             for band in bands:
                 members = [by_label[label] for label in band if label in by_label]
@@ -455,7 +467,10 @@ class EncodeWorkflow:
                 # early — the property ranking exists for.
                 w = sum(m["height"] * m["height"] * codec_cost.get(codec, 1.0)
                         * (1.8 if tp else 1.0) for m in members)
-                for c in chunk_plan:
+                # The band runs as its LEAD rung's activity, so it runs on the
+                # lead's grid — the same rung _GROUP_KEYS maps the UI rows from.
+                # Taking any other member's would key rows nothing fills.
+                for c in _chunks_for(codec, members[0]["label"]):
                     specs.append((w, codec, members[0], tp, ea, c, members))
         specs.sort(key=lambda s: s[0], reverse=True)  # most expensive first
         # Enqueue order alone doesn't hold — Temporal doesn't guarantee FIFO

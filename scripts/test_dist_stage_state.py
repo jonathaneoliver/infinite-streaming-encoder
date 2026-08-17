@@ -422,6 +422,38 @@ def test_host_package_plan_key_matches_what_the_workflow_reads() -> None:
         "package nothing it was told to skip")
 
 
+def test_chunks_by_variant_plan_key_matches_what_the_workflow_reads() -> None:
+    """`chunks_by_variant` is the same shape of contract as `host_package` above,
+    and it fails the same way: silently, in both directions (#362).
+
+    Spelled differently in the two files and the workflow falls back to the
+    uniform `chunks` for every rung — every variant encoded on one grid again,
+    which is precisely the behaviour this replaced, with no error anywhere. The
+    UI would be the only witness: `_emit_plan` draws its chunk grid from the
+    per-variant counts, so the rows would be sized for a plan nothing ran.
+
+    Read as text for the same reason as above — temporalio is not installed on
+    the host.
+    """
+    wf = (Path(__file__).resolve().parent / "infinite_streaming_encoder"
+          / "temporal_worker.py").read_text()
+    assert 'plan.get("chunks_by_variant")' in wf, (
+        "the workflow no longer reads chunks_by_variant; every variant would "
+        "fall back to the uniform grid and per-variant sizing would be inert")
+    assert "_chunks_for(codec," in wf, (
+        "the workflow reads chunks_by_variant but no longer dispatches on it")
+    src = inspect.getsource(D.run_temporal)
+    assert '"chunks_by_variant"' in src, (
+        "the orchestrator no longer sends chunks_by_variant; the workflow would "
+        "silently use one grid for every rung")
+    # The uniform list must SURVIVE alongside it: it is what an unsized rung uses
+    # and what a worker on pre-#362 code reads. Dropping it turns a rolling
+    # update into a run with no chunk plan at all.
+    assert '"chunks": [' in src, (
+        "the orchestrator dropped the uniform chunks list; a rung Go did not "
+        "size, and any worker still on older code, would have no plan")
+
+
 def test_host_packaging_is_the_default_with_an_escape() -> None:
     """On by default — a worker-packaged codec is uploaded to MinIO purely so
     this process can download it straight back. The escape exists because host

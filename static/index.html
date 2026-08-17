@@ -529,7 +529,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <select id="chunk-duration"
                         data-desc="How each variant is split into pieces that encode in parallel.">
                     <option value="dynamic"
-                            data-desc="Cloud sizes each variant from its learned encode speed, aiming at ~4 minutes of work per chunk. Local has no per-variant model and uses a flat 12s.">Dynamic (cloud: learned · local: 12s)</option>
+                            data-desc="Sizes each variant from its learned encode speed, aiming at ~4 minutes of work per chunk — so a cheap rung is one long chunk, 4K HEVC is many short ones, and they finish together. Cloud sizes for Graviton; local sizes for the slowest box on the farm, since any worker can pick up any chunk.">Dynamic (learned encode speed)</option>
                     <option value="12" selected
                             data-desc="Maximum parallelism. Also the most chunk boundaries, each one a queue wait, a container start and an encoder reset.">12s chunks (max parallelism)</option>
                     <option value="30"

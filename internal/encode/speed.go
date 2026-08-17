@@ -223,6 +223,41 @@ func (s *EncodeSpeedStore) LocalSpeedN(codec string, height int, twoPass bool, p
 	return seedSpeed("ubuntu", codec, height, twoPass, preset, fps), 0
 }
 
+// LocalSpeedSlowest is the local fleet's SLOWEST learned speed for a variant,
+// not its average — the two answer different questions and #362 needs this one.
+//
+// LocalSpeedN predicts wall time, and an average is right for that: the run
+// spreads over every box, so the fleet's mean throughput is what the clock
+// follows. Chunk SIZING is a bound. The target is "no chunk is much more than
+// ~4 minutes of work", and chunks go onto one queue that every worker polls, so
+// the box that takes a given chunk is unknown when it is planned. Size by the
+// mean and the promise is false on the slow box by exactly its ratio; size by
+// the slowest and it holds for whoever picks it up.
+//
+// Smaller atoms are also the forgiving direction on a heterogeneous fleet: a
+// fast box simply takes more of them, where one oversized chunk on the slowest
+// box is a tail nothing can rebalance.
+//
+// Same graviton exclusion and same cold-start seed as LocalSpeedN, so a store
+// with nothing learned sizes exactly as it predicts.
+func (s *EncodeSpeedStore) LocalSpeedSlowest(codec string, height int, twoPass bool, preset string, fps int) (float64, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	slowest, n := 0.0, 0
+	for k, v := range s.speeds {
+		if v > 0 && !strings.HasPrefix(k, "graviton:") && keyMatchNoMachine(k, codec, height, twoPass, preset, fps) {
+			if n == 0 || v < slowest {
+				slowest = v
+			}
+			n++
+		}
+	}
+	if n > 0 {
+		return slowest, n
+	}
+	return seedSpeed("ubuntu", codec, height, twoPass, preset, fps), 0
+}
+
 // SpeedDetail returns the speed plus how many learned samples back it (0 =
 // seeded from the model, not yet observed). For chunk-plan logging.
 func (s *EncodeSpeedStore) SpeedDetail(machine, codec string, height int, twoPass bool, preset string, fps int) (float64, int) {
@@ -291,7 +326,32 @@ func dynamicChunkSecondsAt(targetWallS float64, speeds *EncodeSpeedStore, codec 
 		targetWallS = dynamicTargetWallSeconds
 	}
 	// Cloud-batch fans onto Graviton, so size chunks by graviton throughput.
-	c := targetWallS * speeds.Speed("graviton", codec, height, twoPass, preset, fps)
+	return quantizeChunkSeconds(targetWallS*speeds.Speed("graviton", codec, height, twoPass, preset, fps), clipDurationS)
+}
+
+// dynamicLocalChunkSeconds is dynamicChunkSecondsAt for the LOCAL fleet (#362).
+//
+// Everything about the dynamic selector except its throughput term is
+// target-neutral — the 240s wall-time target, the 12s quantum and floor, the
+// clamp to clip are properties of "how big should a chunk be", not of where it
+// runs. The cloud/local split was the ONE hardcoded argument
+// (`speeds.Speed("graviton", …)`), which is why local collapsed to a fixed
+// 2×segment: not because the model was missing, but because nothing asked it.
+// speedKey has always carried the machine, so the farm's boxes were being
+// learned all along.
+//
+// No whole-job budget pass here, unlike cloud: #316 rations against Step
+// Functions' 25,000-event history, and Temporal's limits are ~3x larger. The
+// target is always the default.
+func dynamicLocalChunkSeconds(speeds *EncodeSpeedStore, codec string, height int, twoPass bool, preset string, fps int, clipDurationS float64) float64 {
+	sp, _ := speeds.LocalSpeedSlowest(codec, height, twoPass, preset, fps)
+	return quantizeChunkSeconds(dynamicTargetWallSeconds*sp, clipDurationS)
+}
+
+// quantizeChunkSeconds turns "content seconds that fit the wall-time target"
+// into a plannable chunk length. Shared by both targets so they cannot drift:
+// the sizing differs only in whose throughput went in.
+func quantizeChunkSeconds(c, clipDurationS float64) float64 {
 	// Quantize to a whole multiple of the minimum (12/24/36/…), floored at the
 	// minimum. Keeps sizes clean and segment-aligned (12 | 6).
 	c = math.Round(c/dynamicMinChunkSeconds) * dynamicMinChunkSeconds
