@@ -293,8 +293,16 @@ async function main() {
     }
     return prev || '';
   };
+  // The local estimate names its basis after the figure, and the phrase CHANGES
+  // with the selection: one ladder reads "~45s on the local fleet", several read
+  // "~90s 2 ladders priced". Matching only the first spelling returned null for
+  // every multi-ladder reading — so the scaling segment, whose whole point is
+  // watching the number grow, dropped its largest number and ended mid-sentence
+  // on "…4 separate jobs, one output each." Silently, because the caption
+  // degrades gracefully when there is no figure.
   const headline = (t) => {
-    const m = t.match(/→\s*~?([^·]+?)\s+on the local fleet/) || t.match(/→\s*(\$[\d.]+)/);
+    const m = t.match(/→\s*~?([^·]+?)\s+(?:on the local fleet|\d+ ladders priced)/)
+           || t.match(/→\s*(\$[\d.]+)/);
     return m ? m[1].trim() : null;
   };
   // The note ends with "Resolution tiers above describe <ladder>." — guidance
