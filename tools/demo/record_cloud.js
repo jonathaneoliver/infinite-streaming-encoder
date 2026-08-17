@@ -387,8 +387,11 @@ async function main() {
     'The cloud fleet: how many spot instances Batch has launched, and what they are costing.', 7000);
   await spotlight('timeline-live',
     'Per-instance packing and lifecycle, read from the AWS inventory.', 7500);
+  // See record_local.js — the page groups rows by codec:tier and renders each
+  // chunk as a cell inside its variant's row, so "one row per chunk" was never
+  // what the screen showed.
   await spotlight('jobcard',
-    'And the job, expanded. One row per chunk, per rung, as Batch works through the fan-out.', 7500);
+    'And the job, expanded. One row per variant, one cell per chunk, as Batch works through the fan-out.', 7500);
   await say('', 0);
 
   const started = Date.now();
