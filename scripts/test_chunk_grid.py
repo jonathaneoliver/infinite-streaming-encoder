@@ -132,6 +132,58 @@ check("334s at chunk=1s on a 1s ladder clamps rather than emitting empties",
       len(plan) < n_asked and all(c.duration_s > 0 for c in plan),
       f"asked {n_asked}, planned {len(plan)}")
 
+
+# ---------------------------------------------------------------------------
+# Per-variant chunking on the local target (#362).
+#
+# Go sizes each (codec, rung) from learned encode speed and hands the answer
+# over as --variant-chunk CODEC/LABEL:SECONDS. Two properties matter here and
+# neither is visible from the Go side: that the parser agrees with the shape Go
+# emits, and that an unsized rung still gets a plan.
+from infinite_streaming_encoder.cli_local_dist import (  # noqa: E402
+    _parse_variant_chunks,
+)
+
+parsed = _parse_variant_chunks(["h264/1080p:24", "hevc/2160p:132.0", "h264/360p:2004"])
+check("--variant-chunk parses to (codec, label) -> seconds",
+      parsed == {("h264", "1080p"): 24.0, ("hevc", "2160p"): 132.0,
+                 ("h264", "360p"): 2004.0},
+      f"got {parsed}")
+
+# A label is free text from the ladder JSON. rsplit(":", 1) then split("/", 1)
+# is what makes a slash in the label survive; pin it, because the failure is a
+# silently unsized rung rather than an error.
+check("a label containing a slash still parses",
+      _parse_variant_chunks(["h264/1080p/hi:36"]) == {("h264", "1080p/hi"): 36.0},
+      f"got {_parse_variant_chunks(['h264/1080p/hi:36'])}")
+
+# Malformed entries are cosmetic-grade failures: the rung falls back to the
+# uniform plan, which is what every local run did before this existed. Never
+# worth failing a 40-minute encode over.
+for bad in ["nonsense", "h264/1080p", "h264/1080p:abc", "h264/1080p:0",
+            "h264/1080p:-12", "", None]:
+    check(f"malformed {bad!r} is skipped, not fatal",
+          _parse_variant_chunks([bad]) == {}, f"got {_parse_variant_chunks([bad])}")
+
+# The planner is the SAME one either way — a sized rung and an unsized one differ
+# only in the seconds handed to plan_chunks, so segment alignment, the 6s grid
+# and the runt-tail fold cannot diverge between them.
+for seg in LADDER_SEGMENTS:
+    sized = plan_chunks(334.0, 132.0, seg)
+    unsized = plan_chunks(334.0, 12.0, seg)
+    check(f"seg={seg}: a sized rung and an unsized one both tile the clip",
+          abs(sum(c.duration_s for c in sized) - 334.0) < EPS
+          and abs(sum(c.duration_s for c in unsized) - 334.0) < EPS)
+    check(f"seg={seg}: differently-sized variants really do differ",
+          len(sized) != len(unsized),
+          f"both planned {len(sized)} chunks — per-variant sizing is doing nothing")
+    # The point of the whole change: a cheap rung is ONE chunk while an expensive
+    # one is many, and both still land on segment edges.
+    for c in sized[:-1]:
+        check(f"seg={seg}: sized interior boundary is a whole segment",
+              abs((c.duration_s / seg) - round(c.duration_s / seg)) < EPS,
+              f"{c.duration_s} is not a multiple of {seg}")
+
 print()
 if failures:
     print(f"FAILED ({len(failures)}): " + ", ".join(failures))

@@ -834,6 +834,31 @@ def _parse_vmaf_estimates(items: list) -> dict:
     return out
 
 
+def _parse_variant_chunks(items: list) -> dict:
+    """Parse --variant-chunk 'CODEC/LABEL:SECONDS' into (codec, label) -> float.
+
+    Go sizes each variant from learned encode speed and hands the answer over
+    (#362); nothing here re-derives it. The learned-speed KEY is a cross-language
+    contract with no schema and #314 is what deriving it twice costs, so this
+    reads a number and does not reconstruct the reasoning behind it.
+
+    Malformed or non-positive entries are skipped rather than fatal, and a
+    variant with no entry falls back to --chunk-duration — the one-size answer
+    that is still today's behaviour. Degrading to a uniform plan is always
+    correct; refusing to plan is not."""
+    out: dict = {}
+    for it in items or []:
+        try:
+            key, secs = it.rsplit(":", 1)
+            codec, label = key.split("/", 1)
+            v = float(secs)
+        except (ValueError, AttributeError):
+            continue
+        if v > 0:
+            out[(codec, label)] = v
+    return out
+
+
 def _rung_dict(codec: str, r, ests: dict) -> dict:
     """Plan entry for one rung, with the design-time VMAF estimate attached when
     Go supplied one for (codec, label). temporal_worker passes est_vmaf on to
@@ -960,7 +985,17 @@ def _resolve_plan(args, info):
 
     Returns the chunks themselves, not just how many: this orchestrator is the
     sole authority on the boundaries and hands each worker its explicit span.
-    Workers no longer run plan_chunks, so a count alone is not enough."""
+    Workers no longer run plan_chunks, so a count alone is not enough.
+
+    Chunks are PER VARIANT (#362). Cloud has sized each (codec, rung) from its
+    own learned speed since the fan-out existed — so a cheap 360p rung is one
+    long chunk while 2160p HEVC is many short ones, and they finish together.
+    Local applied one size to everything, which is why "dynamic" was a fixed
+    2xsegment here: not a missing model, an unasked one.
+
+    Returns (rungs_by_codec, chunks_by_variant, default_chunks) — the third is
+    the uniform plan every variant used to share, still the answer for any rung
+    Go did not size and still what an older worker reads."""
     ladder_def = get_ladder(args.ladder)
     overrides = {"hevc": parse_bitrate_override(args.bitrate_override_hevc),
                  "h264": parse_bitrate_override(args.bitrate_override_h264), "av1": {}}
@@ -972,9 +1007,21 @@ def _resolve_plan(args, info):
                           min_res=args.min_res)
         if rr:
             rungs_by_codec[codec] = rr
-    chunks = _coalesce_runt_tail(
+    default_chunks = _coalesce_runt_tail(
         plan_chunks(info.duration_s, args.chunk_duration_s, _SEGMENT_DURATION_S))
-    return rungs_by_codec, chunks
+    sized = _parse_variant_chunks(getattr(args, "variant_chunk", []))
+    chunks_by_variant: dict = {}
+    for codec, rr in rungs_by_codec.items():
+        for r in rr:
+            cs = sized.get((codec, r.label))
+            # plan_chunks is the ONE planner either way — the per-variant path
+            # differs only in the seconds it is handed, so segment alignment,
+            # the 6s grid and the runt-tail fold cannot diverge between a sized
+            # rung and an unsized one.
+            chunks_by_variant[(codec, r.label)] = default_chunks if cs is None else \
+                _coalesce_runt_tail(
+                    plan_chunks(info.duration_s, cs, _SEGMENT_DURATION_S))
+    return rungs_by_codec, chunks_by_variant, default_chunks
 
 
 # Map a Temporal activity_id (set in EncodeWorkflow._phase) back to the UI stage
@@ -1329,7 +1376,9 @@ def run_temporal(args: argparse.Namespace) -> int:
     # read: that activity short-circuits on the .done this run just wrote, and
     # _build_mezzanine_on_host refuses to hand off until it has confirmed it.
     src_key = f"{prefix}/input{input_path.suffix}"
-    rungs_by_codec, chunks = _resolve_plan(args, info)
+    rungs_by_codec, chunks_by_variant, chunks = _resolve_plan(args, info)
+    # The uniform plan's count, still what an unsized rung gets. Per-variant
+    # counts come from chunks_by_variant — do not reuse this as "the" count.
     n_chunks = len(chunks)
     if not rungs_by_codec:
         print("error: no ladder rungs fit this source", file=sys.stderr)
@@ -1348,7 +1397,12 @@ def run_temporal(args: argparse.Namespace) -> int:
     groups = _plan_groups(rungs_by_codec, float(args.group_budget or 0))
     for c, bands in groups.items():
         for members in bands:
-            for ch in chunks:
+            # A band encodes as ONE activity per chunk, keyed by its LEAD rung —
+            # so the band's chunk grid is the lead's, which is also what
+            # temporal_worker dispatches it on. Reading the uniform plan here
+            # would key rows the run never produces once the lead is sized
+            # differently from it.
+            for ch in chunks_by_variant.get((c, members[0]), chunks):
                 _GROUP_KEYS[f"enc-{c}-{members[0]}-c{ch.index}"] = [
                     f"encode:{c}:{m}:chunk{ch.index}" for m in members]
     if groups:
@@ -1378,8 +1432,12 @@ def run_temporal(args: argparse.Namespace) -> int:
         _PREFETCH = _ChunkPrefetcher(bucket, f"{prefix}/work",
                                      Path(args.output_dir), set(host_package))
 
+    # Per-variant counts, which _emit_plan has always taken as a dict — it was
+    # simply handed the same number for every rung. The UI's chunk grid is drawn
+    # from these, so a sized rung whose count came from the uniform plan would
+    # draw cells no activity will ever fill.
     _emit_plan(rungs_by_codec,
-               {(c, r.label): n_chunks for c, rr in rungs_by_codec.items() for r in rr},
+               {k: len(v) for k, v in chunks_by_variant.items()},
                info.has_audio,
                sync_back=any(c not in host_package for c in rungs_by_codec))
     _emit_commercial_cost(rungs_by_codec, info, input_path,
@@ -1463,8 +1521,20 @@ def run_temporal(args: argparse.Namespace) -> int:
         # The boundaries themselves, so temporal_worker can hand each activity
         # its explicit span instead of every worker re-deriving the plan from its
         # own probe (agreement by contract, not by convention).
+        #
+        # The UNIFORM plan, kept for two readers: a rung Go did not size, and a
+        # worker running pre-#362 workflow code, which reads this key and knows
+        # nothing of the one below. Both get exactly today's behaviour.
         "chunks": [{"index": c.index, "start_s": c.start_s,
                     "duration_s": c.duration_s} for c in chunks],
+        # Per-variant boundaries (#362), keyed "codec/label" — JSON has no tuple
+        # keys, and this is the same spelling --variant-chunk and the VMAF
+        # estimates already use. A workflow that reads it dispatches each rung on
+        # its own grid; one that does not falls back to "chunks" above.
+        "chunks_by_variant": {
+            f"{c}/{label}": [{"index": ch.index, "start_s": ch.start_s,
+                              "duration_s": ch.duration_s} for ch in chs]
+            for (c, label), chs in chunks_by_variant.items()},
         # What those boundaries were planned against, for the worker's check.
         "content_duration_s": info.duration_s,
         "measure_vmaf": args.measure_vmaf, "burnin": args.burnin,
@@ -1660,6 +1730,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="design-time VMAF estimate for a rung (from the Go quality "
                         "curves) to burn into the overlay, e.g. hevc/2160p:82.4:1; "
                         "repeatable, one per rung")
+    p.add_argument("--variant-chunk", action="append", default=[], dest="variant_chunk",
+                   metavar="CODEC/LABEL:SECONDS",
+                   help="per-variant chunk length, sized by Go from learned encode "
+                        "speed (#362), e.g. hevc/2160p:36; repeatable, one per rung. "
+                        "Only sent for dynamic chunking. A rung with no entry uses "
+                        "--chunk-duration")
     p.add_argument("--bitrate-override-hevc", default=None, dest="bitrate_override_hevc")
     p.add_argument("--bitrate-override-h264", default=None, dest="bitrate_override_h264")
     p.add_argument("--chunk-duration", type=float, default=12.0,

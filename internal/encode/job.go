@@ -1116,13 +1116,17 @@ type JobConfig struct {
 	Time            string `json:"time"`
 	SegmentDuration string `json:"segment_duration"`
 	PartialDuration string `json:"partial_duration"`
-	// ChunkDuration tunes the cloud-batch encode granularity: "" or "dynamic"
-	// = size each variant's chunks by learned encode speed (slow → 30s floor,
-	// cheap → whole clip, so all variants finish ~together); "whole" = one job
-	// per variant (max efficiency, no joins); or a fixed seconds value
-	// (multiple of the 6s segment duration). On cloud-batch it sizes the Batch
-	// fan-out; on local it sizes cli_local's parallel chunk pool (see
-	// localChunkSeconds) — "dynamic"/"" default to 2×segment there.
+	// ChunkDuration tunes encode granularity on BOTH targets: "" or "dynamic"
+	// = size each variant's chunks by learned encode speed (slow → the
+	// dynamicMinChunkSeconds floor, cheap → whole clip, so all variants finish
+	// ~together); "whole" = one job per variant (max efficiency, no joins); or
+	// a fixed seconds value (multiple of the 6s segment duration).
+	//
+	// This used to say the floor was 30s and that local defaulted to 2×segment.
+	// The floor has been dynamicMinChunkSeconds (12) for some time, and #362
+	// gave local the same per-variant sizing cloud has — see variantChunkArgs.
+	// localChunkSeconds still resolves the ONE size a fixed or "whole" request
+	// means, and is the fallback for any rung the per-variant pass did not name.
 	ChunkDuration string `json:"chunk_duration,omitempty"`
 	GopDuration   string `json:"gop_duration"`
 	// OutputTag is appended to the output dir name ("<stem>_<tag>_<codec>"),
@@ -3625,16 +3629,21 @@ func (cfg *JobConfig) BurninEnabled() bool {
 	return cfg.Burnin == nil || *cfg.Burnin
 }
 
-// localChunkSeconds resolves the fixed chunk size for a LOCAL encode, driving
-// cli_local's --local-chunk-duration. Unlike the cloud (per-variant, complexity
-// aware), cli_local applies ONE chunk duration to every variant, so the cloud's
-// "dynamic"/"per-variant" modes collapse here to a fixed default of 2×segment
-// (12s by default): small enough that any real-length clip yields plenty of
-// chunks to fill the cores — a lone x265 encode only ~half-fills a box, so
-// chunking is what lets a single HEVC variant saturate the machine — yet large
-// enough to amortize 2-pass startup. "whole" disables chunking (0). A numeric
-// value is used verbatim. The result must stay a whole multiple of the segment
-// duration (plan_chunks enforces this; 2×segment always is).
+// localChunkSeconds resolves the ONE chunk size a local encode falls back to,
+// driving --chunk-duration. "whole" disables chunking (0); a numeric value is
+// used verbatim; "dynamic"/"" give 2×segment (12s by default) — small enough
+// that any real-length clip yields plenty of chunks to fill the cores (a lone
+// x265 encode only ~half-fills a box, so chunking is what lets a single HEVC
+// variant saturate the machine) yet large enough to amortize 2-pass startup.
+// The result must stay a whole multiple of the segment duration (plan_chunks
+// enforces this; 2×segment always is).
+//
+// Since #362 the dynamic case is no longer where a dynamic local run gets its
+// size: variantChunkArgs sizes each variant from learned speed, exactly as
+// cloud does, and this is what remains for a rung that pass did not name. It is
+// deliberately still a real answer rather than a panic — Go and Python resolve
+// rungs separately, and a label present in one and not the other must degrade
+// to the old uniform plan rather than fail the run.
 func (cfg *JobConfig) localChunkSeconds() float64 {
 	seg := 6.0
 	if cfg.SegmentDuration != "" {
@@ -3711,6 +3720,70 @@ func (m *Manager) vmafEstimateArgs(cfg JobConfig) []string {
 			}
 			out = append(out, "--vmaf-estimate",
 				fmt.Sprintf("%s/%s:%.1f:%d", codec, e.Label, e.Vmaf, clamped))
+		}
+	}
+	return out
+}
+
+// variantChunkArgs returns --variant-chunk args for cli_local_dist — one per
+// (codec, rung), sizing that variant's chunks from learned encode speed exactly
+// as the cloud path does (#362).
+//
+// ONLY for dynamic chunking. A fixed size is what the user asked for and is
+// passed through --chunk-duration untouched; "whole" likewise. Same rule as the
+// cloud budget's: never silently re-size an explicit request.
+//
+// Empty is a valid answer and means "size every variant the same", which is
+// what --chunk-duration already carries — so an orchestrator that does not
+// understand these, or a rung this does not name, keeps today's behaviour
+// rather than losing its plan. That tolerance is deliberate: Go and Python
+// resolve rungs separately (resolveRungs vs select_rungs) and a label present
+// in one and not the other must degrade, not fail. Same contract shape as
+// vmafEstimateArgs above, for the same reason.
+//
+// The sizing lives HERE and not in Python because the learned-speed key is a
+// cross-language contract with no schema, and #314 is what happens when two
+// languages derive it apart: both sides went on succeeding, and no h264 encode
+// moved the model for however long it took to notice. Python reads a number it
+// is handed; it does not re-derive the key.
+func (m *Manager) variantChunkArgs(cfg JobConfig, sourcePath string) []string {
+	if cfg.ChunkDuration != "" && cfg.ChunkDuration != "dynamic" {
+		return nil
+	}
+	if m.Ladders == nil || m.Speeds == nil {
+		return nil
+	}
+	ladderName := cfg.Ladder
+	if ladderName == "" {
+		ladderName = DefaultLadderName
+	}
+	ladderDef, ok := m.Ladders.Get(ladderName)
+	if !ok {
+		return nil
+	}
+	// One ffprobe each, once per file — the same three the cloud path already
+	// spends before buildSFNInput. fps matters most: encode time is per FRAME,
+	// so a 60fps source read as 30 picks a key that describes half the work.
+	srcWidth := probeSourceWidth(sourcePath)
+	srcFps := probeSourceFps(sourcePath)
+	clipS, err := probeDurationSeconds(sourcePath)
+	if err != nil {
+		clipS = 0 // unknown: quantizeChunkSeconds simply skips the clamp-to-clip
+	}
+	// A limit truncates the mezzanine, and every chunk is cut from that — so the
+	// plan is against the TRUNCATED length, the same clamp cli_local_dist applies
+	// to its own probe. Without it a 30s limit on a 4h source sizes chunks for
+	// the 4h.
+	if lim, ok := cfg.TimeLimitFor(clipS); ok {
+		clipS = lim
+	}
+	var out []string
+	for _, codec := range parseCodecSel(cfg.Codec) {
+		twoPass := ladderDef.twoPassFor(codec, cfg.HevcSinglePass)
+		for _, r := range m.Ladders.resolveRungs(ladderName, codec, cfg.MaxRes, cfg.MinRes, srcWidth) {
+			cs := dynamicLocalChunkSeconds(m.Speeds, codec, r.Height, twoPass, r.Preset, srcFps, clipS)
+			out = append(out, "--variant-chunk",
+				fmt.Sprintf("%s/%s:%s", codec, r.Label, strconv.FormatFloat(cs, 'f', -1, 64)))
 		}
 	}
 	return out
@@ -4003,6 +4076,11 @@ func (m *Manager) encodeFilesFrom(job *Job, tmpDir, script string, startIdx int)
 		if fileCfg.BurninEnabled() {
 			args = append(args, m.vmafEstimateArgs(fileCfg)...)
 		}
+		// Per-variant chunk sizing from learned speed, the local twin of what
+		// buildSFNInput does per variant (#362). Empty for a fixed or "whole"
+		// request, and empty is the old behaviour — --chunk-duration above still
+		// carries the one-size answer.
+		args = append(args, m.variantChunkArgs(fileCfg, filepath.Join(m.SourceDir, f))...)
 		if err := m.runFileContainer(job, i, script, args); err != nil {
 			return fmt.Errorf("%s: %w", f, err)
 		}
