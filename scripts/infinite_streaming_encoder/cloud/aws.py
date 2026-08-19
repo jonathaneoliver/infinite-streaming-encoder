@@ -133,6 +133,61 @@ def check_credentials() -> None:
         raise AuthError(f"AWS not authenticated in region {region()}: {e}") from e
 
 
+class ComputeEnvError(RuntimeError):
+    """A Batch compute environment cannot place work."""
+
+
+def check_compute_environments() -> None:
+    """Refuse to submit when no compute environment can place a job.
+
+    A CE whose launch template names a deleted AMI goes `status=INVALID` and
+    quietly places nothing: jobs submit, fan out, sit RUNNABLE, and the run
+    reports 0% with no hosts until somebody gives up. That is what happened on
+    2026-08-19 — two worker AMIs were deregistered directly rather than through
+    `make ami-down`, which clears the compute env's image_id_override FIRST, so
+    the environment was left pointing at an image id that no longer existed:
+
+        CLIENT_ERROR - You must use a valid fully-formed launch template.
+        The image id '[ami-05957e4ef915ce973]' does not exist
+
+    Nineteen minutes of a demo recording, and the only symptom was nothing
+    happening. One describe call at submit turns that into a sentence.
+
+    Deliberately NOT self-healing. The fix is `make deploy` (WORKER_AMI resolves
+    empty once the AMI is gone, so the apply clears the override) or
+    `make ami-down`, and both are infrastructure changes that belong to whoever
+    owns the account — not to a submit path that is trying to start an encode.
+
+    Degrades OPEN on an API error: if the describe itself fails we are no worse
+    informed than before this existed, and refusing every cloud encode because a
+    diagnostic call failed would be a worse bug than the one it guards.
+    """
+    try:
+        envs = batch_client().describe_compute_environments()["computeEnvironments"]
+    except Exception:
+        return
+    if not envs:
+        return
+    usable = [e for e in envs
+              if e.get("state") == "ENABLED" and e.get("status") != "INVALID"]
+    if usable:
+        return
+    lines = []
+    for e in envs:
+        why = (e.get("statusReason") or "").strip()
+        lines.append("  %s: state=%s status=%s%s" % (
+            e.get("computeEnvironmentName", "?"), e.get("state"),
+            e.get("status"), (" — " + why) if why else ""))
+    raise ComputeEnvError(
+        "no Batch compute environment can place work, so this encode would sit "
+        "RUNNABLE forever:\n" + "\n".join(lines)
+        + "\n\nAn INVALID environment usually means its launch template points at an "
+          "AMI that no longer exists. `make deploy` re-applies with whatever AMI is "
+          "actually available (none is fine — Batch falls back to its own), and "
+          "`make ami-down` is the supported way to remove a baked AMI without "
+          "stranding the pointer.")
+
+
 def resolve_al2023_ami(ami_id: str | None = None, ami_arch: str = "x86_64") -> str:
     """Return the configured AMI, or auto-resolve the AL2023 latest via SSM.
 

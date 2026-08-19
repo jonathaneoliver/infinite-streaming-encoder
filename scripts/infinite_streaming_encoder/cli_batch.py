@@ -1903,6 +1903,30 @@ def _stop_prior_executions(sfn, sm_arn: str, name_prefix: str) -> None:
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
+    # Can anything actually RUN this? A compute environment whose launch
+    # template names a deleted AMI is INVALID and places nothing: the execution
+    # starts, every chunk fans out, and the run sits at 0% with no hosts until a
+    # human gives up. Nineteen minutes of a demo recording went that way on
+    # 2026-08-19, and the only symptom was nothing happening.
+    #
+    # Checked BEFORE start_execution, so a refusal costs nothing — no execution
+    # to abort, no telemetry queue to reap, no staged objects to collect.
+    #
+    # Imported HERE, not at module scope: cloud.aws imports boto3 unguarded,
+    # while this module keeps boto3 optional so it can be imported without it.
+    # A top-level import made an optional dependency mandatory and broke two
+    # checks that import this file on a host that has no boto3.
+    try:
+        from infinite_streaming_encoder.cloud.aws import (
+            ComputeEnvError, check_compute_environments)
+    except ImportError:
+        pass                      # no boto3 here — nothing to check against
+    else:
+        try:
+            check_compute_environments()
+        except ComputeEnvError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return EXIT_NO_COMPUTE
     sfn = _sfn()
     with open(args.input_json) as f:
         input_doc = f.read()
@@ -2545,6 +2569,10 @@ def _write_pending_sidecar(dst_dir: Path, s3_prefix: str, codec: str,
 # transfer that died halfway — one is worth retrying and the other is not, and
 # both print about S3. Mirrored by exitStagingGone in internal/encode/remote.go.
 EXIT_STAGING_GONE = 4
+# Nothing can PLACE this work — a deleted-AMI launch template, or every compute
+# environment disabled. A different answer from "the encode failed": nothing
+# ran, and the fix is infrastructure rather than a retry.
+EXIT_NO_COMPUTE = 5
 
 
 def _mark_sidecar_gone(sidecar: Path, meta: dict, reason: str) -> None:

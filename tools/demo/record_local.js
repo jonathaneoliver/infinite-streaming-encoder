@@ -434,7 +434,7 @@ async function main() {
     await spotEstimate(`${optionDesc(target, 'cloud')} The estimate switches from time to money. ${h ? 'About ' + h + ' for this clip.' : ''}`); }
   await page.selectOption('#target', 'local');
   await sleep(1200);
-  await say(`${optionDesc(target, 'local')} And the estimate is time again.`);
+  await say('Returning to a local encode. And the estimate is time again.', 2600);
 
   const chunking = await readControl(page, '#chunk-duration');
   await explain('#chunk-duration', narrationFor(chunking));
@@ -487,6 +487,7 @@ async function main() {
   // Says what is actually selected. A hardcoded sentence here is what made the
   // old version claim HEVC was being dropped after the form stopped selecting
   // it — the narration must follow the run, not the other way round.
+  await point('#codec', 'codec');
   await say(CODECS.length > 1
     ? `Codec: ${CODEC_SAY}. Every codec is its own job, so this run is ${CODECS.length} jobs, one output directory each.`
     : `Codec: ${CODEC_SAY}, which is what the form starts with. Every codec is its own job, so this run is one job.`,
@@ -497,8 +498,11 @@ async function main() {
     if (want !== on) await click(`.codec-cb[value="${c}"]`, `${want ? 'check' : 'uncheck'} ${c}`);
   }
 
-  await say('The ladder is apple-uniq-live-xs. It carries the rungs and the delivery profile together.', 2600);
   await page.waitForSelector('.ladder-cb', { timeout: 30000 });
+  // The ladder LIST, not the individual checkbox: the sentence is about the
+  // ladder as a thing, and the list is what the viewer needs to find.
+  await point('#ladder-list', 'ladder list');
+  await say('The ladder is apple-uniq-live-xs. It carries the rungs and the delivery profile together.', 2600);
   for (const l of await page.locator('.ladder-cb').evaluateAll(e => e.map(x => ({ v: x.value, on: x.checked })))) {
     if (l.v !== LADDER && l.on) await click(`.ladder-cb[value="${l.v}"]`, `uncheck ${l.v}`);
   }
@@ -531,11 +535,15 @@ async function main() {
     // The profile's NUMBERS are on screen and read badly aloud — "1/2/6s" and
     // "0.25x" are for the eye. Name what the line contains instead.
     await spotlight('ladder:head',
-      'Its delivery profile: the VBV shaping, the segment and partial lengths, the GOP, and the suffix that tells go-live whether this ladder may be re-chopped.', 8000);
+      'Its delivery profile: the VBV shaping, the segment and partial lengths, the GOP, and the suffix. '
+      + 'A ladder that pins its segment length is tagged with that length and served exactly as encoded. '
+      + 'This one pins nothing and is tagged _xs — the flexible base, one encode that go-live re-chops into one, two and six second segments.', 14000);
     await spotlight('ladder:table',
       `The rungs${rungRows ? `, ${rungRows} of them` : ''}. Each one's resolution and target bitrate, and the step up from the rung below. Colour marks a step too small for the rung to earn its place, or a jump big enough to leave a hole.`, 8500);
     await spotlight('ladder:charts',
-      'And the shaping. Each bar runs from average to peak bitrate over a one, two and six second window, against Apple\'s limits — peak within one and a quarter times average for live, twice that for video on demand.', 8500);
+      'And the shaping. Each bar runs from average to peak bitrate over a one, two and six second window, against Apple\'s limits — peak within one and a quarter times average for live, twice that for video on demand. '
+      + 'This profile sits right on the live limit even at a one second chop. A ladder pinned to six seconds sits on the same limit at six — but chop it to one and its peak doubles. '
+      + 'That is the whole reason only this one may be re-chopped.', 15000);
 
     await tab('Originals');
     await sleep(1600);
@@ -706,6 +714,17 @@ async function main() {
   }
   global.__marks.encodeEnd = (Date.now() - t0) / 1000;
   const hosts = global.__hosts || [];
+  // Did it actually finish? Everything below describes a package that only
+  // exists if it did. A cloud rehearsal that was stopped from the AWS tab still
+  // reached here, said "the encode is complete", opened a directory left behind
+  // by an EARLIER run, and toured it — a walkthrough of someone else's output,
+  // narrated as this run's, and the process still exited 0.
+  const finished = global.__jobStatus === 'done';
+  if (!finished) {
+    await say(`The encode did not finish — it ended ${global.__jobStatus || 'unknown'}. `
+      + 'There is no output to show for this run.', 4000);
+    global.__failed = true;
+  } else {
   // Truthful either way — this is the line v1 got wrong.
   await say(hosts.length > 1
     ? `The chunks were encoded in parallel across ${hosts.length} machines: ${hosts.join(', ')}.`
@@ -720,9 +739,12 @@ async function main() {
   // one directory per codec, and "how many landed" is the whole point of that
   // half — read off the page rather than asserted, so a codec that produced
   // nothing is reported instead of narrated as a success.
-  const dirs = await page.evaluate((stem) =>
+  const dirs = await page.evaluate(([stem, tag]) =>
     [...document.querySelectorAll('.output-dir-name')].map(e => e.textContent.trim())
-      .filter(n => n.toLowerCase().startsWith(stem.toLowerCase())), STEM);
+      .filter(n => n.toLowerCase().startsWith(stem.toLowerCase()))
+      // The suffix is what makes a directory THIS run's. Matching the stem alone
+      // picked up an earlier take's output and toured it as if it were ours.
+      .filter(n => !tag || n.toLowerCase().endsWith('_' + tag.toLowerCase())), [STEM, TAG]);
   const dirName = dirs[0] || null;
   console.log('  output dirs:', JSON.stringify(dirs));
   global.__dirs = dirs;
@@ -766,6 +788,7 @@ async function main() {
     await sleep(1200);
   }
   await sleep(1500);
+  }  // end: only describe outputs when the encode actually finished
 
   await ctx.close();
   await browser.close();
@@ -804,6 +827,10 @@ async function main() {
   console.log('VIDEO:', video);
   console.log('HOSTS:', (global.__hosts || []).join(', ') || 'none');
   console.log('JOB_STATUS:', global.__jobStatus, 'OUTPUT_DIR:', dirName);
+  if (global.__failed) {
+    console.log('RECORDING IS NOT USABLE: the encode ended', global.__jobStatus);
+    process.exitCode = 1;   // after the artifacts are written, so they survive
+  }
 }
 
 main().catch(e => { console.error('FAILED:', e.message); process.exit(1); });
