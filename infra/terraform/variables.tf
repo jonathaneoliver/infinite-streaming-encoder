@@ -25,14 +25,38 @@ EOT
   default     = "latest"
 }
 
+# A missing or deregistered AMI does NOT fall back to pull-on-boot. It STRANDS
+# the compute environment, and this comment used to say the opposite — which is
+# what cost #370 its first hour, because the AMI is the last thing anyone
+# suspects when jobs sit RUNNABLE and no host ever appears.
+#
+# Setting an override makes Batch generate and RETAIN its own launch-template
+# revision. Terraform does not own that copy. Setting this back to "" clears the
+# override and leaves the retained revision still naming the old id, so
+# deregistering the AMI it names produces:
+#
+#   CLIENT_ERROR - You must use a valid fully-formed launch template.
+#   The image id '[ami-05957e4ef915ce973]' does not exist
+#
+# Nothing boots. Jobs submit, fan out, sit RUNNABLE and report 0% with no hosts;
+# only `describe-compute-environments` says why. Recovery is to force a NEW
+# revision (apply a VALID override) or to recreate the environment —
+# `tofu taint module.compute.aws_batch_compute_environment.spot_graviton` then
+# apply, which is what actually worked: the replacement carries no retained
+# revision and the queue is re-pointed in the same apply.
+#
+# `make ami-down` is NOT yet a safe removal path. It clears the override and
+# then deregisters the AMIs, which is precisely the stranding sequence above
+# (#370). Until that lands, clear the AMI by recreating the environment.
 variable "worker_ami_id" {
   description = <<EOT
-Optional pre-baked worker AMI id (from `make bake-ami`) with the encoder image
+Optional pre-baked worker AMI id (from `make ami-up`) with the encoder image
 already loaded, so cold instances skip the ~60s ECR pull. Empty => Batch's
 default ECS-optimized Graviton AMI. `make infra-apply` resolves this from the
-AMI tagged with the current image SHA, so it's opt-in and self-correcting:
-bake before an encode session, `make unbake-ami` after to drop the standing
-EBS-snapshot cost back to $0. A missing/stale AMI just falls back to pull-on-boot.
+AMI tagged with the current image SHA, so it's opt-in: bake before an encode
+session and clear it after to drop the standing EBS-snapshot cost back to $0.
+Removing an AMI that is (or was) wired here is NOT self-correcting — see the
+comment above before deregistering anything.
 EOT
   type        = string
   default     = ""
