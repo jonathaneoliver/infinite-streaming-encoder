@@ -5511,8 +5511,12 @@ let _lastFleet = null;
 // (before any stage landed on it) and when it was FREED (it vanishes from the
 // inventory). Both are live-only, so they fill in when the page is open and are
 // simply absent otherwise — drawn as nothing rather than guessed.
-const _fleetSeen = new Map();   // id -> {launch, vcpus, type, gone}
+const _fleetSeen = new Map();   // id -> {launch, vcpus, type, gone, seen}
 const _FLEET_LANE_KEEP_MS = 45 * 60 * 1000;
+// How long a lane may keep billing on an unrefreshed observation. Generous
+// against the 10s poll — this is a guard against the tab being CLOSED, not
+// against a slow tick.
+const _FLEET_STALE_MS = 2 * 60 * 1000;
 
 function _recordFleetLanes(instances) {
     const now = Date.now();
@@ -5535,19 +5539,23 @@ function _recordFleetLanes(instances) {
             rec.gone = ta;
         } else if (i.state === 'terminated' || i.state === 'shutting-down') {
             // Terminated but EC2 gave no parseable time: it is gone, we just
-            // cannot say precisely when. Better an approximate boundary than
-            // billing it forever.
-            rec.gone = rec.gone || now;
+            // cannot say precisely when. Bill to the last poll that SAW it
+            // running, not to now — `now` is the upper bound of our ignorance,
+            // and the gap between the two is however long nobody was looking.
+            rec.gone = rec.gone || rec.seen || now;
         } else {
             live.add(i.id);
             rec.gone = null;
+            // The last moment we have PROOF it was running. Every "we no longer
+            // see it" path below stamps this rather than now — see #368.
+            rec.seen = now;
         }
         _fleetSeen.set(i.id, rec);
     });
     // Fallback for a box that disappears from the payload entirely without ever
     // being reported terminated — it cannot still be running, so stop the meter.
     _fleetSeen.forEach((rec, id) => {
-        if (!live.has(id) && rec.gone == null) rec.gone = now;
+        if (!live.has(id) && rec.gone == null) rec.gone = rec.seen || now;
         if (rec.gone && now - rec.gone > _FLEET_LANE_KEEP_MS) _fleetSeen.delete(id);
     });
 }
@@ -6004,7 +6012,14 @@ function _fleetLanesHtml(opts) {
         // L.alive is what makes this provable rather than assumed — see the lane
         // build. A box we have genuinely lost track of still yields null and
         // still reads "freed time unknown", which is the honest answer there.
-        const tailTo = local ? runEnd : (L.gone || ((jobLive || L.alive) ? now : null));
+        // `now` only while the belief is FRESH. L.alive is refreshed by the
+        // inventory poll, which runs only while the AWS tab is on screen (#228),
+        // so an unrefreshed lane would accrue for as long as nobody looked —
+        // which is exactly how #368 rendered four minutes as sixty-two.
+        const aliveTo = (L.seen && (Date.now() - L.seen) > _FLEET_STALE_MS)
+            ? L.seen
+            : now;
+        const tailTo = local ? runEnd : (L.gone || ((jobLive || L.alive) ? aliveTo : null));
         if (tailTo && tailTo > lastEnd) {
             const d = tailTo - lastEnd;
             tailMs += d * v;
