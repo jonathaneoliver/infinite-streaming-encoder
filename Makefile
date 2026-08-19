@@ -1586,6 +1586,71 @@ smoke: reject-stale-target require-paths build   ## end-to-end smoke: tiny clip 
 #    pull, then the encode. Minutes, not seconds, hence the far larger timeout.
 SMOKE_CLOUD_TIMEOUT ?= 1800
 
+# ---------------------------------------------------------------------------
+# Recording the demo video.
+#
+# THREE demos, and until now the only way to pick one was to type the right env
+# vars at the right recorder by hand. That is how a take gets made with the
+# wrong flags, and a take is 30 minutes of encoding at the SHORT end — so the
+# cost of getting it wrong is not re-running a command, it is an afternoon.
+#
+#   demo-local    h264 alone, full control tour     the first half
+#   demo-codecs   h264 + hevc, tour skipped         the second half
+#   demo-cloud    the AWS Batch demo                COSTS MONEY
+#   demo-pair     local then codecs, in that order  what join.py expects
+#
+# `demo-pair` exists because the ordering is load-bearing: `codecs` re-encodes
+# over the output `local` produced, so running them the other way round films
+# the archive story backwards.
+#
+# NODE_PATH is set here rather than in anyone's shell because playwright lives
+# with the pre-in-tree tooling under $(HOME)/Desktop, not in this checkout.
+DEMO_NODE_PATH ?= $(HOME)/Desktop/encoder-demo/tools/node_modules
+DEMO_SOURCE    ?= smoke.mp4
+DEMO_TAG       ?= demo
+DEMO_LADDER    ?= apple-uniq-live-xs
+DEMO_SAY       ?=
+DEMO_ENV        = NODE_PATH="$(DEMO_NODE_PATH)" SOURCE="$(DEMO_SOURCE)" \
+                  TAG="$(DEMO_TAG)" LADDER="$(DEMO_LADDER)" \
+                  $(if $(DEMO_SAY),SOURCE_SAY="$(DEMO_SAY)",)
+
+# Every preflight the /demo skill lists, as a target rather than as prose. The
+# job check is the one that has actually cost a take: a demo submitted alongside
+# a real encode competes for the same worker pool, and the fan-out it exists to
+# show gets starved.
+.PHONY: require-demo-ready
+require-demo-ready:
+	@command -v node >/dev/null || { echo ">>> node is not on PATH"; exit 1; }
+	@NODE_PATH="$(DEMO_NODE_PATH)" node -e "require('playwright')" 2>/dev/null || { \
+	  echo ">>> playwright not resolvable from $(DEMO_NODE_PATH)"; \
+	  echo "    npm install playwright@1.62.1 there, or set DEMO_NODE_PATH"; exit 1; }
+	@curl -sf http://localhost:$(PORT)/api/jobs >/dev/null 2>&1 || { \
+	  echo ">>> no server on :$(PORT) — run 'make farm-dev-up' first"; exit 1; }
+	@out=$$(curl -s http://localhost:$(PORT)/api/jobs) || { \
+	  echo ">>> could not read /api/jobs — refusing rather than guessing"; exit 1; }; \
+	 n=$$(printf '%s' "$$out" | python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(1 for j in d if j.get('status') not in ('done','failed','cancelled','move-failed')))") || { \
+	  echo ">>> could not parse /api/jobs — refusing rather than guessing"; exit 1; }; \
+	 [ "$$n" = "0" ] || { echo ">>> $$n non-terminal job(s) — a demo would compete with them for the fleet"; exit 1; }
+
+.PHONY: demo-local demo-codecs demo-cloud demo-pair
+demo-local: require-demo-ready  ## record demo half ONE: h264 alone, full control tour
+	cd tools/demo && $(DEMO_ENV) CODEC=h264 OUTDIR="$(if $(DEMO_OUTDIR),$(DEMO_OUTDIR),video-local)" node record_local.js
+
+demo-codecs: require-demo-ready ## record demo half TWO: h264+hevc, tour skipped (run demo-local first)
+	cd tools/demo && $(DEMO_ENV) CODEC=h264,hevc TOUR=0 OUTDIR="$(if $(DEMO_OUTDIR),$(DEMO_OUTDIR),video-codecs)" node record_local.js
+
+demo-cloud: require-demo-ready  ## record the CLOUD demo (COSTS MONEY — spot capacity + media transfer)
+	@[ "$(DEMO_CLOUD_OK)" = "1" ] || { \
+	  echo ">>> the cloud demo launches real spot capacity and transfers media."; \
+	  echo "    Re-run with DEMO_CLOUD_OK=1 to confirm you meant to spend money."; exit 1; }
+	cd tools/demo && $(DEMO_ENV) OUTDIR="$(if $(DEMO_OUTDIR),$(DEMO_OUTDIR),video-cloud)" node record_cloud.js
+
+demo-pair:  ## record both local halves in the order join.py expects
+	@$(MAKE) demo-local
+	@$(MAKE) demo-codecs
+	@echo ">>> both halves recorded. Narrate each with narrator_app.py, then:"
+	@echo "    python3 tools/demo/join.py <local>.mp4 <codecs>.mp4 encoder-demo-full.mp4"
+
 .PHONY: smoke-cloud
 smoke-cloud: require-paths require-s3-bucket  ## end-to-end CLOUD smoke against the DEPLOYED stack: tiny clip -> Batch -> assert media came back (COSTS MONEY)
 	@: $${STATE_MACHINE_ARN:?STATE_MACHINE_ARN is not set — the cloud-batch target is not configured, so there is nothing to smoke. See infra/terraform/README.md}

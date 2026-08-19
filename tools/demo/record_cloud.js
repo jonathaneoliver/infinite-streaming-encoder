@@ -53,6 +53,22 @@ window.__clickPulse = () => { const r = document.getElementById('__pwring'); if 
   r.style.opacity = '1'; setTimeout(() => { r.style.opacity = '0'; }, 380); };
 window.__say = (text) => { window.__ui(); const b = document.getElementById('__pwcap');
   b.textContent = text; b.style.opacity = text ? '1' : '0'; };
+// Kept in step with record_local.js by hand, which is the whole problem: this
+// is the SECOND copy of the same fix, and #354 predicted it ("worth factoring
+// out at a third"). A spotlight is held for the seconds its caption plays, and
+// the cloud Jobs view is if anything MORE alive than the local one — chunks
+// arrive as Batch places them, the fleet grows as spot capacity boots. Measured
+// once, the box sat still while its subject moved out from under it.
+window.__spotTrack = (key) => {
+  window.__spotUntrack();
+  window.__spotTimer = setInterval(() => {
+    const r = window.__rectOf(key);
+    if (r) window.__spot(r);
+  }, 400);
+};
+window.__spotUntrack = () => {
+  if (window.__spotTimer) { clearInterval(window.__spotTimer); window.__spotTimer = null; }
+};
 window.__spot = (rect) => { window.__ui(); const b = document.getElementById('__pwbox');
   if (!rect) { b.style.opacity = '0'; return; }
   b.style.left = (rect.x - 6) + 'px'; b.style.top = (rect.y - 6) + 'px';
@@ -219,8 +235,9 @@ async function main() {
     await page.evaluate(rr => window.__spot(rr), r);
     await page.evaluate(([x, y]) => window.__moveCursor(x, y),
       [Math.round(r.x + Math.min(r.w / 2, 420)), Math.round(Math.max(r.y + 26, 40))]);
+    await page.evaluate(k => window.__spotTrack(k), key);
     await say(caption, holdMs);
-    await page.evaluate(() => window.__spot(null));
+    await page.evaluate(() => { window.__spotUntrack(); window.__spot(null); });
   }
 
   await page.goto(BASE, { waitUntil: 'domcontentloaded' });
@@ -444,6 +461,18 @@ async function main() {
     await sleep(3000);
     global.__marks.encodeEnd = (Date.now() - t0) / 1000;
   const hosts = global.__hosts || [];
+  // Did it actually finish? Everything below describes a package that exists
+  // only if it did. This rehearsal was stopped from the AWS tab mid-run and
+  // still reached here, said "the encode is complete", opened a directory left
+  // by an EARLIER local run, and toured it as this run's output — then exited
+  // 0. On the cloud path that is the likelier failure of the two, because an
+  // execution can be aborted by anyone with the AWS tab open.
+  const finished = global.__jobStatus === 'done';
+  if (!finished) {
+    await say(`The encode did not finish — it ended ${global.__jobStatus || 'unknown'}. `
+      + 'There is no output to show for this run.', 4000);
+    global.__failed = true;
+  } else {
   // Truthful either way — this is the line v1 got wrong.
   await say(hosts.length > 1
     ? `The chunks were encoded across ${hosts.length} Batch instances.`
@@ -478,6 +507,7 @@ async function main() {
     await sleep(1200);
   }
   await sleep(1500);
+  }  // end: only describe outputs when the encode actually finished
 
   await ctx.close();
   await browser.close();
@@ -521,6 +551,10 @@ async function main() {
   console.log('VIDEO:', video);
   console.log('HOSTS:', (global.__hosts || []).join(', ') || 'none');
   console.log('JOB_STATUS:', global.__jobStatus, 'OUTPUT_DIR:', dirName);
+  if (global.__failed) {
+    console.log('RECORDING IS NOT USABLE: the encode ended', global.__jobStatus);
+    process.exitCode = 1;   // after the artifacts are written, so they survive
+  }
 }
 
 main().catch(e => { console.error('FAILED:', e.message); process.exit(1); });

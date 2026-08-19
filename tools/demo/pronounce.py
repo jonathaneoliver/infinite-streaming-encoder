@@ -85,6 +85,11 @@ BASE_SPEECH = [
     (r"\bGOP\b", "gop"),
     (r"\bOUTPUT_DIR\b", "the output directory"),
     (r"apple-uniq-live-xs", "apple uniq live x s"),
+    # The output TAG, spoken as its letters. Written with the underscore because
+    # that is how it appears in a directory name and on the ladder card, which
+    # is what the caption shows; the underscore is not spoken. Ordered after the
+    # ladder name above, which contains "xs" and must keep winning.
+    (r"\b_?xs\b", "x s"),
     # Since #356 the narration is the app's OWN description text, which is
     # written to be read rather than heard — so it uses the symbols prose uses.
     # "~4 minutes" is silent or literal depending on the engine; neither is the
@@ -140,6 +145,7 @@ BASE_SPEECH = [
 # `audition.py` speaks this list.
 SAMPLES = [
     "a one second GOP",
+    "tagged _xs, the flexible base",
     "AWS Batch",
     "the VBV is tight",
     "CPU bound",
