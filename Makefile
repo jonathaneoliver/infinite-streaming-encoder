@@ -671,6 +671,15 @@ USE_AMI ?=
 WORKER_AMI ?= $(shell aws ec2 describe-images --owners self --region $(AWS_REGION) \
 	--filters "Name=tag:image_tag,Values=$(IMAGE_TAG)" "Name=state,Values=available" \
 	--query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text 2>/dev/null | grep -v '^None$$' || true)
+# NOT exported (#370). deploy chains sub-makes, and make builds a recipe's
+# environment BEFORE the recipe runs — so the parent expands this before ami-up
+# has baked anything, gets nothing, and the bare `export` at the top of this file
+# hands every $(MAKE) an empty WORKER_AMI that `?=` then treats as already set.
+# `USE_AMI=1 make deploy` could not wire an AMI it baked in the same run.
+#
+# Placement matters and is easy to get wrong: `unexport` BEFORE the definition
+# does nothing, because the bare export re-exports it. It must come after.
+unexport WORKER_AMI
 
 ecr-login:
 	@: $${ECR_REPO:?ECR_REPO empty — run `make infra-apply` first, or set it in .env}
@@ -1042,16 +1051,14 @@ ami-up:             ## build a worker AMI with the current image pre-pulled (kee
 	  packer build -var region=$(AWS_REGION) -var ecr_repo=$(ECR_REPO) \
 	    -var image_tag=$(IMAGE_TAG) worker-ami.pkr.hcl
 	@echo ">>> keeping only infinite-streaming-encoder-worker-$(IMAGE_TAG); removing any older worker AMIs..."
-	@wired=$$(aws batch describe-compute-environments --region $(AWS_REGION) \
-	    --query "computeEnvironments[?contains(computeEnvironmentName,'infinite-streaming-encoder')].computeResources.ec2Configuration[0].imageIdOverride | [0]" \
-	    --output text 2>/dev/null); [ "$$wired" = "None" ] && wired=""; \
+	@wired=$$(AWS_REGION=$(AWS_REGION) bash scripts/wired_amis.sh); \
 	  ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
 	    --filters "Name=tag:Name,Values=infinite-streaming-encoder-worker" \
 	    --query "Images[?Tags[?Key=='image_tag'&&Value!='$(IMAGE_TAG)']].ImageId" --output text); \
 	  for ami in $$ids; do \
 	    [ "$$ami" = "None" ] && continue; \
-	    if [ "$$ami" = "$$wired" ]; then \
-	      echo "  keep $$ami (wired to the compute env — deregistering would strand Batch; run infra-apply to rewire or ami-down to clear first)"; continue; fi; \
+	    if printf '%s\n' "$$wired" | grep -qx "$$ami"; then \
+	      echo "  keep $$ami (Batch can still boot it — deregistering would strand the compute env)"; continue; fi; \
 	    snaps=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) --image-ids $$ami \
 	      --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' --output text); \
 	    echo "deregister $$ami"; aws ec2 deregister-image --region $(AWS_REGION) --image-id $$ami; \
@@ -1101,12 +1108,18 @@ ami-check:          ## warn when the wired worker AMI was baked for a different 
 	    fi; \
 	  fi
 
-ami-down:           ## clear the compute-env AMI pointer, THEN delete the AMIs (self-clearing, no dangling ref)
-	# Clear the compute env's image_id_override FIRST so we never delete an AMI
-	# the env still points at — no dangling pointer, no manual follow-up apply.
-	# Targeted to the compute env only (won't touch job defs). Guarded so it
-	# no-ops on an already-destroyed stack (cloud-down calls this after
-	# teardown, when there's nothing left in state to apply).
+ami-down:           ## clear the compute-env AMI pointer, then delete any AMI Batch can no longer boot
+	# Clearing image_id_override is NOT sufficient and never was (#370). Batch
+	# generates its own launch-template revision when an override is set, keeps
+	# it, and validates the compute env against that copy — which terraform does
+	# not own and cannot clear. Deregistering an AMI that copy still names is
+	# what put the environment INVALID for a day on 2026-08-19.
+	#
+	# So: clear the pointer (still worth doing — it stops the NEXT revision
+	# naming it), then refuse to delete anything Batch can still boot, and say
+	# what to do instead. Targeted to the compute env only (won't touch job
+	# defs). Guarded so it no-ops on an already-destroyed stack (cloud-down
+	# calls this after teardown, when there's nothing left in state to apply).
 	@if cd $(TF_DIR) && tofu state list 2>/dev/null | grep -q 'aws_batch_compute_environment.spot_graviton'; then \
 	  echo ">>> clearing compute-env AMI pointer (-> pull-on-boot)..."; \
 	  AWS_REGION=$(AWS_REGION) tofu apply -auto-approve \
@@ -1116,13 +1129,25 @@ ami-down:           ## clear the compute-env AMI pointer, THEN delete the AMIs (
 	@ids=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) \
 	    --filters "Name=tag:Name,Values=infinite-streaming-encoder-worker" --query 'Images[].ImageId' --output text); \
 	  if [ -z "$$ids" ] || [ "$$ids" = "None" ]; then echo "no infinite-streaming-encoder-worker AMI to remove"; else \
+	  wired=$$(AWS_REGION=$(AWS_REGION) bash scripts/wired_amis.sh); \
 	  for ami in $$ids; do \
+	    if printf '%s\n' "$$wired" | grep -qx "$$ami"; then \
+	      echo "  REFUSING to deregister $$ami — Batch can still boot it."; \
+	      echo "     Clearing image_id_override does not clear the launch-template"; \
+	      echo "     revision Batch generated for itself. Deleting it now would put"; \
+	      echo "     the compute environment INVALID and it would place no jobs."; \
+	      echo "     Recreate the environment instead, which drops the retained"; \
+	      echo "     revision with it:"; \
+	      echo "       cd $(TF_DIR) && tofu taint module.compute.aws_batch_compute_environment.spot_graviton"; \
+	      echo "       make infra-apply"; \
+	      continue; fi; \
 	    snaps=$$(aws ec2 describe-images --owners self --region $(AWS_REGION) --image-ids $$ami \
 	      --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' --output text); \
 	    echo "deregister $$ami"; aws ec2 deregister-image --region $(AWS_REGION) --image-id $$ami; \
 	    for s in $$snaps; do echo "  delete snapshot $$s"; aws ec2 delete-snapshot --region $(AWS_REGION) --snapshot-id $$s; done; \
 	  done; fi
-	@echo ">>> Removed. Compute env is on pull-on-boot; nothing dangling."
+	@echo ">>> Done. Anything Batch could still boot was kept, not deleted —"
+	@echo "    an AMI left behind here is the guard working, not a leak."
 
 # ---- Cost teardown -----------------------------------------------------------
 # cloud-clear kills everything that bills while IDLE without destroying the

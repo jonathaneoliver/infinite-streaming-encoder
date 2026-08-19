@@ -45,9 +45,19 @@ EOT
 # apply, which is what actually worked: the replacement carries no retained
 # revision and the queue is re-pointed in the same apply.
 #
-# `make ami-down` is NOT yet a safe removal path. It clears the override and
-# then deregisters the AMIs, which is precisely the stranding sequence above
-# (#370). Until that lands, clear the AMI by recreating the environment.
+# `make ami-down` is the supported removal path (#370). It asks
+# scripts/wired_amis.sh what Batch can ACTUALLY boot — the override AND the
+# ImageId of every version of every Batch-lt-* template — and refuses to
+# deregister anything still reachable. It does not trust image_id_override,
+# which reads null exactly when it has just been emptied, and is therefore
+# null in the one state where the guard matters most.
+#
+# Do not deregister a worker AMI by hand. The override is not the record of
+# what Batch will boot; the revision Batch generated for itself is, and
+# deleting an image that revision still names is what strands the environment.
+#
+# If one is already stranded, no apply rescues it — recreate the environment
+# (see above), which drops the retained revision with it.
 variable "worker_ami_id" {
   description = <<EOT
 Optional pre-baked worker AMI id (from `make ami-up`) with the encoder image
