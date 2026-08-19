@@ -39,7 +39,7 @@ case "$tgt" in
   local-dist|cloud-batch) ok "DEFAULT_TARGET=$tgt (accepted alias for ${tgt%%-*})" ;;
   *)                      bad "DEFAULT_TARGET=$tgt is not a valid target (local | cloud)" ;;
 esac
-cod="${DEFAULT_CODEC:-both}"
+cod="${DEFAULT_CODEC:-h264}"
 case "$cod" in
   h264|hevc|av1|both|all) ok "DEFAULT_CODEC=$cod" ;;
   *[!a-z0-9,]*|"")        warn "DEFAULT_CODEC=$cod looks off (expected h264|hevc|av1|both|all or a comma list)" ;;

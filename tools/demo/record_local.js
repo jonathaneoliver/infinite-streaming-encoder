@@ -25,7 +25,23 @@ const WORK = process.env.DEMO_DIR || path.join(os.homedir(), 'Desktop', 'encoder
 const OUT = path.join(WORK, process.env.OUTDIR || 'video4');
 // Parameterised so the same drive works for a 20s fixture or a 5-minute 4K clip.
 const SOURCE = process.env.SOURCE || 'smoke.mp4';
-const CODEC = process.env.CODEC || 'h264';
+// CODEC is a LIST. The demo is now recorded as two halves that join like the
+// local/cloud pair does: h264 alone, then h264+hevc. One recorder drives both,
+// because the only differences are which boxes are ticked and whether the
+// control tour plays — a third recorder would have been a third copy of the
+// cursor/caption/spotlight scaffolding that the two existing ones already
+// duplicate.
+const CODECS = (process.env.CODEC || 'h264').split(',').map(c => c.trim()).filter(Boolean);
+const CODEC = CODECS.join(',');
+const FULL_TOUR = process.env.TOUR !== '0';
+// Spoken names, not the flag values: "h264" is read aloud as a word by the TTS.
+const CODEC_NAMES = { h264: 'H.264', hevc: 'HEVC', av1: 'AV1' };
+const CODEC_SAY = CODECS.map(c => CODEC_NAMES[c] || c)
+  .reduce((a, x, i, arr) => a + (i === 0 ? '' : i === arr.length - 1 ? ' and ' : ', ') + x, '');
+// TOUR=0 skips the control tour and the estimate-scaling demo, exactly as the
+// cloud half does — it opens on "Same ladder as before" rather than explaining
+// twenty-two controls a viewer has just been shown. Only the SECOND half of a
+// joined pair should set it.
 const LADDER = process.env.LADDER || 'apple-uniq-live-xs';
 const TAG = process.env.TAG || '';
 // A second clip, used only to show the prediction scaling. Never encoded.
@@ -58,6 +74,23 @@ window.__clickPulse = () => { const r = document.getElementById('__pwring'); if 
   r.style.opacity = '1'; setTimeout(() => { r.style.opacity = '0'; }, 380); };
 window.__say = (text) => { window.__ui(); const b = document.getElementById('__pwcap');
   b.textContent = text; b.style.opacity = text ? '1' : '0'; };
+// A spotlight is held for six to eight seconds while its caption plays, and on
+// the Jobs tab the thing under it is ALIVE — chunk cells fill in, rows are
+// added, the fleet panel repaints, and the page reflows around all of it. The
+// rect was measured once, so the box sat still while its subject grew out from
+// under it: the caption described one region and the frame drew another.
+// Re-measure while the caption runs. __find is re-run each tick deliberately —
+// a re-render replaces the element, so a cached node would go stale.
+window.__spotTrack = (key) => {
+  window.__spotUntrack();
+  window.__spotTimer = setInterval(() => {
+    const r = window.__rectOf(key);
+    if (r) window.__spot(r);
+  }, 400);
+};
+window.__spotUntrack = () => {
+  if (window.__spotTimer) { clearInterval(window.__spotTimer); window.__spotTimer = null; }
+};
 window.__spot = (rect) => { window.__ui(); const b = document.getElementById('__pwbox');
   if (!rect) { b.style.opacity = '0'; return; }
   b.style.left = (rect.x - 6) + 'px'; b.style.top = (rect.y - 6) + 'px';
@@ -82,9 +115,31 @@ window.__expandLists = () => {
 // window.scrollTo could not (the document itself does not scroll here).
 window.__find = (key) => {
   const panels = [...document.querySelectorAll('.output-details .ladder-panel')];
+  // The Ladders TAB card for window.__ladderName. Located by its <h3> text
+  // because the cards are rendered from the ladder names and carry no ids.
+  if (key.indexOf('ladder:') === 0) {
+    const want = window.__ladderName;
+    const card = [...document.querySelectorAll('#ladders-list > .panel')]
+      .find(c => ((c.querySelector('h3') || {}).textContent || '').trim() === want);
+    if (!card) return null;
+    const part = key.slice(7);
+    if (part === 'head') return card.querySelector('h3') ? card.querySelector('h3').parentElement : card;
+    // The table and the charts sit side by side in one flex row; take the row
+    // by the fact that it CONTAINS the table rather than by its inline style,
+    // which is the kind of selector that breaks on a cosmetic edit.
+    const row = [...card.querySelectorAll(':scope > div')].find(x => x.querySelector('table'));
+    if (part === 'table')  return row ? row.children[0] : card;
+    if (part === 'charts') return (row && row.children[1]) ? row.children[1] : card;
+    return card;
+  }
   if (key === 'estimate') return document.getElementById('encode-estimate');
   if (key === 'fleet')    return document.getElementById('jobs-local-metrics');
-  if (key === 'timeline-live') return document.getElementById('jobs-local-fleet');
+  if (key === 'fleet-live')    return document.getElementById('jobs-local-live')
+                                     || document.getElementById('jobs-local-fleet');
+  // The LANES, not the whole panel. Falls back to the panel so a recording made
+  // against an older server still frames something rather than skipping the beat.
+  if (key === 'timeline-live') return document.getElementById('jobs-local-lanes')
+                                     || document.getElementById('jobs-local-fleet');
   if (key === 'jobcard')  return (window.__jobId && document.getElementById('job-' + window.__jobId))
                                  || document.querySelector('#jobs-list .job');
   if (key === 'stages')   { const c = document.querySelector('#jobs-list .job'); 
@@ -224,8 +279,9 @@ async function main() {
     await page.evaluate(rr => window.__spot(rr), r);
     await page.evaluate(([x, y]) => window.__moveCursor(x, y),
       [Math.round(r.x + Math.min(r.w / 2, 420)), Math.round(Math.max(r.y + 26, 40))]);
+    await page.evaluate(k => window.__spotTrack(k), key);
     await say(caption, holdMs);
-    await page.evaluate(() => window.__spot(null));
+    await page.evaluate(() => { window.__spotUntrack(); window.__spot(null); });
   }
 
   await page.goto(BASE, { waitUntil: 'domcontentloaded' });
@@ -326,9 +382,10 @@ async function main() {
     });
     if (r) await page.evaluate(rr => window.__spot(rr), r);
     await say(caption);
-    await page.evaluate(() => window.__spot(null));
+    await page.evaluate(() => { window.__spotUntrack(); window.__spot(null); });
   };
 
+  if (FULL_TOUR) {
   // --- The control tour: the app's own words ------------------------------
   //
   // Nothing below writes a control description. Each line is read out of the
@@ -408,23 +465,37 @@ async function main() {
   for (const id of ['time-limit', 'output-tag', 'group-rungs', 'burnin', 'promote-after']) {
     await explain('#' + id, narrationFor(await readControl(page, '#' + id)));
   }
+  }  // end FULL_TOUR: the control tour
 
   // --- How the plan scales -------------------------------------------------
   //
   // Every figure spoken here is READ BACK from the page after the change
   // settles, never precomputed. If the estimate says something different from
   // what the narration claims, the narration is what changes.
-  // The scaling demo MUST start from the run's own selection. The codec
-  // checkboxes default to H.264 *and* HEVC, so running this first made the
-  // baseline two codecs while the narration said one — and the 'add HEVC'
-  // click then REMOVED it, halving the jobs under a caption claiming they
-  // doubled.
-  await say('First, the settings for this run.');
-  await say('Codec: H.264 only. Every codec becomes its own job, so dropping HEVC halves the work.', 2200);
-  for (const c of ['hevc', 'av1']) {
-    if (await page.locator(`.codec-cb[value="${c}"]`).isChecked()) await click(`.codec-cb[value="${c}"]`, `uncheck ${c}`);
+  // The scaling demo MUST start from the run's own selection. That used to be
+  // the trap here: the codec checkboxes defaulted to H.264 *and* HEVC, so
+  // running this first made the baseline two codecs while the narration said
+  // one — and the 'add HEVC' click then REMOVED it, halving the jobs under a
+  // caption claiming they doubled.
+  //
+  // The form now defaults to H.264 alone, so the narration states that rather
+  // than claiming a drop that no longer happens. The normalising clicks below
+  // STAY: they are what makes the baseline true whatever state the form is in,
+  // and they are the reason a changed default cannot silently re-open that gap.
+  await say(FULL_TOUR ? 'First, the settings for this run.'
+                     : 'Same clip and the same ladder as before. One thing changes.', 2400);
+  // Says what is actually selected. A hardcoded sentence here is what made the
+  // old version claim HEVC was being dropped after the form stopped selecting
+  // it — the narration must follow the run, not the other way round.
+  await say(CODECS.length > 1
+    ? `Codec: ${CODEC_SAY}. Every codec is its own job, so this run is ${CODECS.length} jobs, one output directory each.`
+    : `Codec: ${CODEC_SAY}, which is what the form starts with. Every codec is its own job, so this run is one job.`,
+    2600);
+  for (const c of ['h264', 'hevc', 'av1']) {
+    const want = CODECS.includes(c);
+    const on = await page.locator(`.codec-cb[value="${c}"]`).isChecked();
+    if (want !== on) await click(`.codec-cb[value="${c}"]`, `${want ? 'check' : 'uncheck'} ${c}`);
   }
-  if (!(await page.locator(`.codec-cb[value="${CODEC}"]`).isChecked())) await click(`.codec-cb[value="${CODEC}"]`, `check ${CODEC}`);
 
   await say('The ladder is apple-uniq-live-xs. It carries the rungs and the delivery profile together.', 2600);
   await page.waitForSelector('.ladder-cb', { timeout: 30000 });
@@ -434,6 +505,43 @@ async function main() {
   if (!(await page.locator(`.ladder-cb[value="${LADDER}"]`).isChecked())) await click(`.ladder-cb[value="${LADDER}"]`, `check ${LADDER}`);
   await sleep(2200);
 
+  // --- The ladder itself ---------------------------------------------------
+  //
+  // The narration has just claimed a ladder "carries the rungs and the delivery
+  // profile together" and then never showed either. They live on the Ladders
+  // tab, which already explains its own table and charts in a legend line — so
+  // the captions here say what that legend says rather than inventing a second
+  // account of the same colours. FIRST half only: the second one has just been
+  // told this ladder is unchanged.
+  if (FULL_TOUR) {
+    await page.evaluate(n => { window.__ladderName = n; }, LADDER);
+    await say('Before running it — this is the ladder we are about to encode with.', 2800);
+    await tab('Ladders');
+    await sleep(1800);
+
+    // Counted from the page, not assumed. A ladder edited between takes would
+    // otherwise be narrated with the previous take's rung count.
+    const rungRows = await page.evaluate(() => {
+      const t = window.__find('ladder:table');
+      return t ? t.querySelectorAll('tbody tr').length : 0;
+    });
+
+    await spotlight('ladder:card',
+      `${LADDER}. One object holding both halves: the rungs, and the delivery profile they are encoded to.`, 6000);
+    // The profile's NUMBERS are on screen and read badly aloud — "1/2/6s" and
+    // "0.25x" are for the eye. Name what the line contains instead.
+    await spotlight('ladder:head',
+      'Its delivery profile: the VBV shaping, the segment and partial lengths, the GOP, and the suffix that tells go-live whether this ladder may be re-chopped.', 8000);
+    await spotlight('ladder:table',
+      `The rungs${rungRows ? `, ${rungRows} of them` : ''}. Each one's resolution and target bitrate, and the step up from the rung below. Colour marks a step too small for the rung to earn its place, or a jump big enough to leave a hole.`, 8500);
+    await spotlight('ladder:charts',
+      'And the shaping. Each bar runs from average to peak bitrate over a one, two and six second window, against Apple\'s limits — peak within one and a quarter times average for live, twice that for video on demand.', 8500);
+
+    await tab('Originals');
+    await sleep(1600);
+  }
+
+  if (FULL_TOUR) {
   await say('The panel predicts the whole plan before anything runs. Watch it as the selection grows.');
   const base = headline(await settle());
   await spotEstimate(`One clip, one codec, one ladder. ${base ? 'About ' + base + '.' : ''}`);
@@ -470,6 +578,7 @@ async function main() {
   if (SECOND) await click(`#file-list input[value="${SECOND}"]`, `deselect ${SECOND}`);
   { const t = await settle(); const h = headline(t);
     await spotEstimate(`${h ? 'Back to about ' + h + '.' : 'Back to the original plan.'}`); }
+  }  // end FULL_TOUR: the estimate-scaling demo
 
   const est = await page.evaluate(() => {
     const e = document.getElementById('encode-estimate');
@@ -477,7 +586,7 @@ async function main() {
   });
   console.log('  [estimate]', est);
   global.__estimate = est;
-  await spotlight('estimate', 'On a local target the estimate predicts time, not money, and says whether it is measured or seeded.', 4000);
+  await spotlight('estimate', 'On a local target the estimate predicts time, not money.', 4000);
 
   if (TAG) {
     // An output suffix gives this run its own directory, so a source that
@@ -560,9 +669,11 @@ async function main() {
   await sleep(800);
 
   await spotlight('fleet',
-    'The fleet summary: which machines are up, how many cores are busy, and what they are doing right now.', 7000);
+    'The fleet summary: which machines are up, and how many cores are busy.', 6000);
+  await spotlight('fleet-live',
+    'What each machine is running right now. Its cores, how much of them is in use, and the chunks it has in flight.', 7000);
   await spotlight('timeline-live',
-    'The machine timeline. One lane per box, filling in as chunks land, showing where the run waited.', 7500);
+    'And the machine timeline: what ran where, over time. One lane per box, filling in as chunks land, so you can see which machine sat idle while another was still the tail.', 8000);
   // "One row per chunk, per rung" was WRONG, and had been since v1 of this
   // driver — it survived two rewrites and being brought in-tree unread. The
   // page groups by codec:tier (groupStagesForDisplay) and renders each chunk as
@@ -605,11 +716,37 @@ async function main() {
   await tab('Outputs');
   await sleep(2200);
   const STEM = SOURCE.replace(/\.[^.]+$/, '');
-  const dirName = await page.evaluate((stem) =>
+  // ALL of them, not the first match. The second half of a joined pair produces
+  // one directory per codec, and "how many landed" is the whole point of that
+  // half — read off the page rather than asserted, so a codec that produced
+  // nothing is reported instead of narrated as a success.
+  const dirs = await page.evaluate((stem) =>
     [...document.querySelectorAll('.output-dir-name')].map(e => e.textContent.trim())
-      .find(n => n.toLowerCase().startsWith(stem.toLowerCase())) || null, STEM);
-  console.log('  output dir:', dirName);
-  if (dirName) {
+      .filter(n => n.toLowerCase().startsWith(stem.toLowerCase())), STEM);
+  const dirName = dirs[0] || null;
+  console.log('  output dirs:', JSON.stringify(dirs));
+  global.__dirs = dirs;
+
+  // The three-area walkthrough belongs to the FIRST half only. Repeating it
+  // verbatim after a fade-to-black is the same tour twice, and it buries what
+  // the second half exists to show: that adding a codec added a package.
+  if (!FULL_TOUR) {
+    await say(dirs.length > 1
+      ? `${dirs.length} directories, one per codec: ${dirs.join(', ')}.`
+      : `One directory: ${dirName || 'none'}. The second codec produced no output.`,
+      5000);
+    // Open the one this half ADDED, not the one already toured. Derived from the
+    // codecs actually selected, so it keeps working when the added codec is AV1.
+    const added = dirs.find(d => CODECS.slice(1).some(c => d.includes(c)));
+    if (added) {
+      const escA = added.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      await click(`.output-dir:has(.output-dir-name:text-matches("^${escA}"))`, `open ${added}`);
+      await page.evaluate(() => window.__expandLists());
+      await sleep(2400);
+      await say('The package the second job produced — same ladder, same rungs, its own encode.', 4000);
+      await sleep(1200);
+    }
+  } else if (dirName) {
     const esc = dirName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     await click(`.output-dir:has(.output-dir-name:text-matches("^${esc}"))`, `open ${dirName}`);
     await page.evaluate(() => window.__expandLists());
@@ -653,14 +790,15 @@ async function main() {
   const m = global.__marks || {};
   const total = (Date.now() - t0) / 1000;
   const segments = [
-    { name: 'setup',   from: 0,               to: m.encodeStart ?? 0 },
+    { name: 'setup',   from: 0,                  to: m.encodeStart ?? 0 },
     { name: 'encode',  from: m.encodeStart ?? 0, to: m.encodeEnd ?? 0 },
     { name: 'outputs', from: m.encodeEnd ?? 0,   to: total },
   ];
   fs.writeFileSync(path.join(WORK, 'cues.json'), JSON.stringify({
     video, source: SOURCE, codec: CODEC, ladder: LADDER,
     jobId: global.__jobId, jobStatus: global.__jobStatus, hosts: global.__hosts,
-    estimate: global.__estimate, outputDir: dirName, segments, cues,
+    estimate: global.__estimate, outputDir: dirName, outputDirs: global.__dirs,
+    segments, cues,
   }, null, 2));
   console.log('SEGMENTS:', JSON.stringify(segments));
   console.log('VIDEO:', video);

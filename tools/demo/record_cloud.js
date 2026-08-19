@@ -265,7 +265,7 @@ async function main() {
   if (await skip.count() && await skip.isChecked()) {
     await click('#skip-media', 'uncheck leave-media-in-S3');
   }
-  await say('Codec: H.264 only. Every codec becomes its own job, so dropping HEVC halves the work.', 2200);
+  await say('Codec: H.264, which is what the form starts with. Every codec is its own job.', 2200);
   for (const c of ['hevc', 'av1']) {
     if (await page.locator(`.codec-cb[value="${c}"]`).isChecked()) await click(`.codec-cb[value="${c}"]`, `uncheck ${c}`);
   }
