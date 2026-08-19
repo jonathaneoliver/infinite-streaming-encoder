@@ -36,10 +36,13 @@ resource "aws_iam_role_policy_attachment" "spot_fleet_tagging" {
 #      (an immutable short-sha) is already on the box (baked into a
 #      custom AMI, or pulled by an earlier job on the same instance),
 #      skip the ~60s ECR pull. A tag that ISN'T cached still pulls
-#      normally, so a stale/missing AMI self-corrects: the cache is
-#      used only when it matches the deployed SHA. This is why we pin
-#      image_tag to a SHA (never `latest`) — prefer-cached + a mutable
-#      tag would serve a stale image.
+#      normally, so an AMI carrying the WRONG image self-corrects: the
+#      cache is used only when it matches the deployed SHA. That is a
+#      claim about image CONTENTS and nothing else — an AMI that no
+#      longer EXISTS strands the environment instead, and does not fall
+#      back to anything (see ec2_configuration below). This is why we
+#      pin image_tag to a SHA (never `latest`) — prefer-cached + a
+#      mutable tag would serve a stale image.
 #   2. Optionally boot from a pre-baked AMI (var.worker_ami_id) that
 #      already has the image loaded. Empty => Batch's default
 #      ECS-optimized Graviton AMI, which pulls on the first job.
@@ -128,12 +131,26 @@ resource "aws_batch_compute_environment" "spot_graviton" {
     # AMI — a launch-template image_id is silently ignored; Batch picks its
     # own LATEST ECS AMI instead (which is what left the baked AMI unused).
     #
-    # The block is ALWAYS present (not a dynamic for_each) so that clearing the
-    # AMI reliably resets it: worker_ami_id="" => image_id_override=null =>
-    # Batch falls back to its default LATEST ECS AMI. Removing the whole block
-    # instead can leave a stale override behind (Batch retains it), which is
-    # what would strand a deleted-AMI pointer. Keeping image_type pinned +
-    # override null is the clean "no custom AMI" state.
+    # The block is ALWAYS present (not a dynamic for_each) so image_type stays
+    # pinned whether or not an AMI is wired. It does NOT buy a reliable reset,
+    # and this comment used to say it did — the diagnosis it rested on (below)
+    # was right, and the conclusion drawn from it was exactly inverted.
+    #
+    # Batch generates and RETAINS its own launch-template revision when an
+    # override is set, and terraform does not own that copy. So
+    # worker_ami_id="" => image_id_override=null clears only what WE declare:
+    # the retained revision goes on naming the old AMI. Verified twice on
+    # 2026-08-19 — two separate `make deploy` runs left
+    # ec2Configuration = {imageType: ECS_AL2023} with no imageIdOverride while
+    # the environment kept reporting a dead AMI and stayed INVALID. A null
+    # override is therefore NOT "the clean no-custom-AMI state"; on the wire it
+    # is indistinguishable from the stranded one.
+    #
+    # To change what Batch actually boots, force a NEW revision (apply a VALID
+    # override) or recreate the environment:
+    #   tofu taint module.compute.aws_batch_compute_environment.spot_graviton
+    # The replacement carries no retained revision and the queue is re-pointed
+    # in the same apply. See #370 and worker_ami_id in ../../variables.tf.
     ec2_configuration {
       image_type        = "ECS_AL2023"
       image_id_override = var.worker_ami_id != "" ? var.worker_ami_id : null
