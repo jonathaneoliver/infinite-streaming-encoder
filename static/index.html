@@ -565,7 +565,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                      data-desc="Which encoders to run. Each codec is a separate job with its own output directory, so two codecs is two jobs, not one job twice as long.">
                     <label><input type="checkbox" class="codec-cb" value="h264" checked onchange="onCodecsChanged()"
                         data-desc="Plays everywhere. Fastest of the three to encode, and the one to pick when you only want the pipeline exercised."> H.264</label>
-                    <label><input type="checkbox" class="codec-cb" value="hevc" checked onchange="onCodecsChanged()"
+                    <label><input type="checkbox" class="codec-cb" value="hevc" onchange="onCodecsChanged()"
                         data-desc="Better quality per bit than H.264 and much slower. x265 tops out near two cores, so on the cloud path its chunk count IS its parallelism."> HEVC</label>
                     <label><input type="checkbox" class="codec-cb" value="av1" onchange="onCodecsChanged()"
                         data-desc="The slowest by a wide margin. Off by default — turn it on deliberately, not to see what happens."> AV1</label>
@@ -6580,6 +6580,19 @@ function _cpuSparkHtml(entry, staleAfterS) {
         + `CPU ${spark}<span style="color:#ccc">${pct}%</span></span> · `;
 }
 
+// The fleet panel answers TWO different questions and used to render them into
+// one element: the live rows say who is busy RIGHT NOW, the lanes say who ran
+// what OVER TIME (and who sat idle while another box was the tail). Sharing a
+// box meant neither could be pointed at on its own - the demo's "machine
+// timeline" spotlight covered the live rows too, framing both while describing
+// one. Separate ids, separate labels.
+function _lanesSection(lanesHtml) {
+    if (!lanesHtml) return '';
+    return `<div id="jobs-local-lanes" style="margin-top:14px">
+        <div style="font-size:12px;color:#ccc;font-weight:600;margin-bottom:6px">Machine timeline</div>
+        <div class="fleet-lanes">${lanesHtml}</div></div>`;
+}
+
 function renderLocalFleet() {
     const panel = document.getElementById('jobs-local-fleet-panel');
     const el = document.getElementById('jobs-local-fleet');
@@ -6595,7 +6608,7 @@ function renderLocalFleet() {
         const lanes = _fleetLanesHtml({ local: true });
         if (lanes) {
             panel.style.display = '';
-            el.innerHTML = `<div class="fleet-lanes">${lanes}</div>`;
+            el.innerHTML = _lanesSection(lanes);
         } else {
             panel.style.display = 'none';
         }
@@ -6626,8 +6639,10 @@ function renderLocalFleet() {
     // boxes make it MORE readable than the cloud's nine, and it answers the
     // question the live rows above cannot: not "who is busy now" but "who sat
     // idle while another machine was the tail".
-    el.innerHTML = bar + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div>`
-        + `<div class="fleet-lanes">${_fleetLanesHtml({ local: true })}</div>`;
+    el.innerHTML = `<div id="jobs-local-live">`
+        + `<div style="font-size:12px;color:#ccc;font-weight:600;margin-bottom:6px">Running now</div>`
+        + bar + `<div style="display:flex;flex-direction:column;gap:9px">${rows}</div></div>`
+        + _lanesSection(_fleetLanesHtml({ local: true }));
     const ls = document.getElementById('local-fleet-summary');
     if (ls) ls.textContent = `${usedCores}/${totalCores} cores · ${totalChunks} chunk${totalChunks !== 1 ? 's' : ''} · ${insts.length} machine${insts.length > 1 ? 's' : ''}`;
     // Local metrics tiles live in THIS panel (not the cloud one). Their own

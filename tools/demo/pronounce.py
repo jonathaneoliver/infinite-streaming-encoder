@@ -76,6 +76,13 @@ BASE_SPEECH = [
     # Written as ffmpeg, spoken as the letters. Without this the only way to
     # get the pronunciation right was to misspell it ON SCREEN.
     (r"(?i)\bffmpeg\b", "FF MPEG"),   # what actually sounded right when typed by hand
+    # Said as a WORD, not spelt — "gop", rhyming with top. Unlike H.264 above
+    # this has NOT been auditioned by ear; it is here because the narration says
+    # GOP (the ladder's delivery profile names it) and the table was silently
+    # passing it through, leaving the engine to guess between "gop" and
+    # "G O P". A guess the table makes is at least a guess someone can hear and
+    # correct — `python3 audition.py` speaks the sample below.
+    (r"\bGOP\b", "gop"),
     (r"\bOUTPUT_DIR\b", "the output directory"),
     (r"apple-uniq-live-xs", "apple uniq live x s"),
     # Since #356 the narration is the app's OWN description text, which is
@@ -132,6 +139,7 @@ BASE_SPEECH = [
 #
 # `audition.py` speaks this list.
 SAMPLES = [
+    "a one second GOP",
     "AWS Batch",
     "the VBV is tight",
     "CPU bound",

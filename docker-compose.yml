@@ -202,7 +202,7 @@ services:
       # os.Getenv/env() to cmd/server means adding a line here too.
       AUTO_WATCH: ${AUTO_WATCH:-true}
       DEFAULT_TARGET: ${DEFAULT_TARGET:-local}
-      DEFAULT_CODEC: ${DEFAULT_CODEC:-both}
+      DEFAULT_CODEC: ${DEFAULT_CODEC:-h264}
       DEFAULT_LADDER: ${DEFAULT_LADDER:-}
       DEFAULT_MAX_RES: ${DEFAULT_MAX_RES:-}
       DEFAULT_MIN_RES: ${DEFAULT_MIN_RES:-}

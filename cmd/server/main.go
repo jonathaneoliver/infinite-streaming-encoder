@@ -84,7 +84,7 @@ func main() {
 	autoWatch := flag.Bool("auto-watch", env("AUTO_WATCH", "true") == "true", "auto-encode new files in source dir")
 	watchInterval := flag.Duration("watch-interval", 30*time.Second, "filesystem watch polling interval")
 	defaultTarget := flag.String("default-target", env("DEFAULT_TARGET", "local"), "default encode target: local or cloud")
-	defaultCodec := flag.String("default-codec", env("DEFAULT_CODEC", "both"), "default codec: h264, hevc, both")
+	defaultCodec := flag.String("default-codec", env("DEFAULT_CODEC", "h264"), "default codec: h264, hevc, both")
 	defaultLadder := flag.String("default-ladder", env("DEFAULT_LADDER", encode.DefaultLadderName), "default encoding ladder profile")
 	defaultMaxRes := flag.String("default-max-res", env("DEFAULT_MAX_RES", ""), "default max resolution (empty = no limit)")
 	defaultMinRes := flag.String("default-min-res", env("DEFAULT_MIN_RES", ""), "default min resolution (empty = no floor)")
