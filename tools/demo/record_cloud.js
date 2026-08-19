@@ -467,6 +467,9 @@ async function main() {
   // by an EARLIER local run, and toured it as this run's output — then exited
   // 0. On the cloud path that is the likelier failure of the two, because an
   // execution can be aborted by anyone with the AWS tab open.
+  // Declared out here, not inside the branch: the console summary and the
+  // cues.json write below both read it, on either path.
+  let dirName = null;
   const finished = global.__jobStatus === 'done';
   if (!finished) {
     await say(`The encode did not finish — it ended ${global.__jobStatus || 'unknown'}. `
@@ -483,7 +486,7 @@ async function main() {
   await tab('Outputs');
   await sleep(2200);
   const STEM = SOURCE.replace(/\.[^.]+$/, '');
-  const dirName = await page.evaluate((stem) =>
+  dirName = await page.evaluate((stem) =>
     [...document.querySelectorAll('.output-dir-name')].map(e => e.textContent.trim())
       .find(n => n.toLowerCase().startsWith(stem.toLowerCase())) || null, STEM);
   console.log('  output dir:', dirName);

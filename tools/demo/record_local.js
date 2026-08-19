@@ -719,6 +719,10 @@ async function main() {
   // reached here, said "the encode is complete", opened a directory left behind
   // by an EARLIER run, and toured it — a walkthrough of someone else's output,
   // narrated as this run's, and the process still exited 0.
+  // Declared out here, not inside the branch: the console summary and the
+  // cues.json write below both read them, on either path.
+  let dirs = [];
+  let dirName = null;
   const finished = global.__jobStatus === 'done';
   if (!finished) {
     await say(`The encode did not finish — it ended ${global.__jobStatus || 'unknown'}. `
@@ -739,13 +743,13 @@ async function main() {
   // one directory per codec, and "how many landed" is the whole point of that
   // half — read off the page rather than asserted, so a codec that produced
   // nothing is reported instead of narrated as a success.
-  const dirs = await page.evaluate(([stem, tag]) =>
+  dirs = await page.evaluate(([stem, tag]) =>
     [...document.querySelectorAll('.output-dir-name')].map(e => e.textContent.trim())
       .filter(n => n.toLowerCase().startsWith(stem.toLowerCase()))
       // The suffix is what makes a directory THIS run's. Matching the stem alone
       // picked up an earlier take's output and toured it as if it were ours.
       .filter(n => !tag || n.toLowerCase().endsWith('_' + tag.toLowerCase())), [STEM, TAG]);
-  const dirName = dirs[0] || null;
+  dirName = dirs[0] || null;
   console.log('  output dirs:', JSON.stringify(dirs));
   global.__dirs = dirs;
 
