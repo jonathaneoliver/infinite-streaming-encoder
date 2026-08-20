@@ -529,7 +529,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <select id="chunk-duration"
                         data-desc="How each variant is split into pieces that encode in parallel.">
                     <option value="dynamic"
-                            data-desc="Sizes each variant from its learned encode speed, aiming at ~4 minutes of work per chunk — so a cheap rung is one long chunk, 4K HEVC is many short ones, and they finish together. Cloud sizes for Graviton; local sizes for the slowest box on the farm, since any worker can pick up any chunk.">Dynamic (learned encode speed)</option>
+                            data-desc="Sizes each variant from its learnt encode speed, aiming at ~4 minutes of work per chunk — so a cheap rung is one long chunk, 4K HEVC is many short ones, and they finish together. Cloud sizes for Graviton; local sizes for the slowest box on the farm, since any worker can pick up any chunk.">Dynamic (learnt encode speed)</option>
                     <option value="12" selected
                             data-desc="Maximum parallelism. Also the most chunk boundaries, each one a queue wait, a container start and an encoder reset.">12s chunks (max parallelism)</option>
                     <option value="30"
@@ -552,7 +552,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                 <label><input type="checkbox" id="skip-media" style="width:auto;min-width:auto"
                     data-desc="Brings home the manifests and metadata only — about 4 MB instead of 2.6 GB — and leaves the segments in S3. Fetch them later from Outputs, but within 7 days: after that the staging expires and the media is gone."> Leave media in S3 (fetch on demand)</label>
                 <label><input type="checkbox" id="defer-packaging" style="width:auto;min-width:auto"
-                    data-desc="The run finishes when the last chunk lands: no packaging, no sync-back, and none of the post-encode tail. Press Package in Outputs when you want it. Until then the chunks in S3 are the ONLY copy, and expiry costs the whole run."> Don't package yet (package on demand)</label>
+                    data-desc="The run finishes when the last chunk lands: no packaging, no sync-back, and none of the post-encode tail. Press Package in Outputs when you want it. Until then the chunks in S3 are the only copy, and expiry costs the whole run."> Don't package yet (package on demand)</label>
             </div>
             <div class="control-group">
                 <!-- A <label for> cannot point at a group of checkboxes, so the
@@ -566,7 +566,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     <label><input type="checkbox" class="codec-cb" value="h264" checked onchange="onCodecsChanged()"
                         data-desc="Plays everywhere. Fastest of the three to encode, and the one to pick when you only want the pipeline exercised."> H.264</label>
                     <label><input type="checkbox" class="codec-cb" value="hevc" onchange="onCodecsChanged()"
-                        data-desc="Better quality per bit than H.264 and much slower. x265 tops out near two cores, so on the cloud path its chunk count IS its parallelism."> HEVC</label>
+                        data-desc="Better quality per bit than H.264 and much slower. x265 tops out near two cores, so on the cloud path its chunk count is its parallelism."> HEVC</label>
                     <label><input type="checkbox" class="codec-cb" value="av1" onchange="onCodecsChanged()"
                         data-desc="The slowest by a wide margin. Off by default — turn it on deliberately, not to see what happens."> AV1</label>
                 </div>
@@ -574,7 +574,7 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group">
                 <label id="ladder-label">Ladder / Profile</label>
                 <div id="ladder-list" class="ladder-checks" role="group" aria-labelledby="ladder-label"
-                     data-desc="A ladder is the resolutions and bitrates AND the delivery timing that goes with them — segment, partial, GOP and VBV. Pick several to encode one source as several delivery profiles, one job each."></div>
+                     data-desc="A ladder is the resolutions and bitrates and the delivery timing that goes with them — segment, partial, GOP and VBV. Pick several to encode one source as several delivery profiles, one job each."></div>
             </div>
             <!-- Options are rebuilt from the SELECTED LADDER's real rung heights
                  by syncResTiers() — these placeholders only cover the moment

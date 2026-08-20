@@ -59,6 +59,96 @@ DEPLURALISE = [
     (r"\b1 hours\b", "1 hour"), (r"\b1 minutes\b", "1 minute"), (r"\b1 seconds\b", "1 second"),
 ]
 
+def _money(m):
+    """$1.59 -> "1 dollar 59".
+
+    Money went through the table untouched, so the engine was left to guess at
+    "$1.59" and guessed wrong — heard in the first finished take. Digits are
+    kept rather than spelled out, which is the same judgement as "H 264"
+    above: the engine reads them acceptably and the caption stays readable.
+    """
+    whole, cents = m.group(1), m.group(2)
+    # Sub-dollar amounts are cents, not "0 dollars 39" — which is how the spot
+    # savings line would otherwise be read.
+    if whole == "0" and cents and cents != "00":
+        return "%d cents" % int(cents)
+    unit = "dollar" if whole == "1" else "dollars"
+    if not cents or cents == "00":
+        return "%s %s" % (whole, unit)
+    return "%s %s %s" % (whole, unit, cents)
+
+
+_ONES = ("zero one two three four five six seven eight nine ten eleven twelve "
+         "thirteen fourteen fifteen sixteen seventeen eighteen nineteen").split()
+_TENS = ("", "", "twenty", "thirty", "forty", "fifty",
+         "sixty", "seventy", "eighty", "ninety")
+
+
+def _words(n):
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        t, o = divmod(n, 10)
+        return _TENS[t] + ("-" + _ONES[o] if o else "")
+    return None
+
+
+def _sentence_number(m):
+    """A digit STARTING a sentence is heard as a decimal: "the jobs. 2 codecs"
+    comes out as "the jobs point two codecs".
+
+    Only at a sentence boundary, and only where a word form exists — elsewhere
+    digits read correctly and are easier to follow in the caption, which is the
+    same judgement "H 264" is left on.
+    """
+    gap, num = m.group(1), int(m.group(2))
+    w = _words(num)
+    return gap + (w.capitalize() if w else m.group(2))
+
+
+def _resolution(m):
+    """1080p -> "ten eighty p", the way the number is actually said.
+
+    "1080 p" left the digits to the engine, which read them as a bare number
+    with a beat before the letter — "ten, eighty, p". Resolutions are spoken in
+    PAIRS ("seven twenty", "fourteen forty", "twenty-one sixty"), so say them
+    that way and keep the p attached to the last word.
+
+    Two-digit tails carry the conventions: 00 is "hundred" (1800 -> "eighteen
+    hundred"), and a tail under ten takes an "oh" (504 -> "five oh four").
+    """
+    n = m.group(1)
+    if len(n) not in (3, 4):
+        return n + " p"
+    head, tail = int(n[:-2]), int(n[-2:])
+    h = _words(head)
+    if h is None:
+        return n + " p"
+    if tail == 0:
+        return "%s hundred p" % h
+    if tail < 10:
+        return "%s oh %s p" % (h, _words(tail))
+    return "%s %s p" % (h, _words(tail))
+
+
+# Words the app CAPITALISES for emphasis. #356 made the narration read the
+# app's own descriptions, and those are written to be read on a screen, where
+# caps are emphasis. Spoken, an all-caps word is either shouted or spelled out
+# — "resolutions and bitrates A-N-D the delivery timing".
+#
+# Lowercased for SPEECH ONLY: the caption is burned from the cue text, so the
+# emphasis survives where it works and disappears where it does not. Listed
+# rather than detected, because the same shape is an acronym — HEVC, VBV, GOP,
+# DASH, HLS — and guessing wrong there is the louder failure.
+_EMPHASIS = ("AND OR NOT ALL ANY ONLY EVERY BOTH NEVER ALWAYS NO YES ONE TWO "
+             "THIS THAT THESE THOSE IS ARE WAS WERE NOW THEN WHOLE EACH SAME "
+             "MORE LESS BEFORE AFTER FIRST LAST NEW OLD OFF DOWN").split()
+
+
+def _deemphasise(m):
+    return m.group(0).lower()
+
+
 BASE_SPEECH = [
     (r"\bAWS\b", "A W S"), (r"\bVBV\b", "V B V"), (r"\bCPU\b", "C P U"),
     # LL-HLS BEFORE HLS, and this one really is an ordering dependency — unlike
@@ -83,6 +173,22 @@ BASE_SPEECH = [
     # "G O P". A guess the table makes is at least a guess someone can hear and
     # correct — `python3 audition.py` speaks the sample below.
     (r"\bGOP\b", "gop"),
+    (r"\$(\d+)(?:\.(\d{2}))?", _money),
+    # An ARROW is silent: "2 codecs -> 2 separate jobs" was read as though the
+    # arrow were not there, running the two halves together. The app uses it in
+    # its own ladder/codec note, so this reaches text no narrative file wrote.
+    (r"\s*→\s*", " means "),
+    (r"([.!?]\s+)(\d+)\b", _sentence_number),
+    # "Min Resolution" came out as "MINUTE resolution" — the engine expands the
+    # abbreviation itself, and nothing here was stopping it. Spelled out for the
+    # voice only; the caption still reads "Min Resolution", which is what the
+    # control is labelled on screen. Max is done together for symmetry, so the
+    # pair is not read half-abbreviated.
+    (r"\bMin(?=\s+[Rr]esolution\b)", "Minimum"),
+    (r"\bMax(?=\s+[Rr]esolution\b)", "Maximum"),
+    # Emphasis caps -> ordinary words. Word-boundaried and whole-word, so an
+    # acronym that merely CONTAINS one of these is untouched.
+    (r"\b(?:%s)\b" % "|".join(_EMPHASIS), _deemphasise),
     (r"\bOUTPUT_DIR\b", "the output directory"),
     (r"apple-uniq-live-xs", "apple uniq live x s"),
     # The output TAG, spoken as its letters. Written with the underscore because
@@ -97,6 +203,10 @@ BASE_SPEECH = [
     # comma-length pause only if it is one.
     (r"~(?=\d)", "about "),
     (r"\b(\d+(?:\.\d+)?)x\b", r"\1 times"),
+    # A FREESTANDING x between counts is a multiplication sign, not a letter:
+    # "2 ladders x 2 codecs" was read out as the letter. The rule above only
+    # catches it glued to a number ("2.6x"), which is the other way it appears.
+    (r"(?<=\w)\s+x\s+(?=\d)", " times "),
     (r"\s+—\s+", ", "),
     # A COLON is the same problem as the em dash above, and it was being fixed
     # the expensive way. Reviewing the hand edits made to a finished take, the
@@ -114,8 +224,20 @@ BASE_SPEECH = [
     # Since #356 the narration is largely the app's own data-desc text, which
     # uses colons freely ("Slow: one extra pass per rung"), so this now reaches
     # lines no narrative file could have edited.
+    # A LABEL colon wants a full stop, not a comma. "Codec: H.264" became
+    # "Codec, H 264" and the engine ran the comma straight into the letter name,
+    # so it came out as "codecs" — heard in the first finished take. A sentence
+    # break is long enough to stop the elision, and only the SPOKEN form
+    # changes: the burnt-in caption still reads "Codec:".
+    #
+    # Keyed on what FOLLOWS, which is where the elision comes from: a
+    # capitalised token is usually one the table spells out ("H 264", "H E V C",
+    # "A W S"), and a comma is too short a pause in front of a letter name.
+    # A lowercase word does not elide, so "Slow: one extra pass per rung" keeps
+    # the comma #361 chose and its test still passes.
+    (r":\s+(?=[A-Z])", ". "),
     (r":\s+", ", "),
-    (r"\b(\d+)p\b", r"\1 p"),
+    (r"\b(\d+)p\b", _resolution),
     # Durations as the app prints them: "1h 39m" is read "one aitch thirty nine
     # em" unless expanded. These reach the narration whenever a figure is quoted
     # back off the estimate panel.
@@ -145,6 +267,17 @@ BASE_SPEECH = [
 # `audition.py` speaks this list.
 SAMPLES = [
     "a one second GOP",
+    "about $1.59 for this clip",
+    "Codec: H.264 and HEVC",
+    # Reaches the general colon rule: the one above only fires before a
+    # capital, so without a lowercase example that rule has no sample.
+    "Slow: one extra pass per rung",
+    "2 codecs → 2 separate jobs",
+    "2 ladders x 2 codecs",
+    "Max Resolution and Min Resolution",
+    "1080p and 2160p rungs",
+    "bitrates AND the delivery timing",
+    "doubles the jobs. 2 codecs each",
     "tagged _xs, the flexible base",
     "AWS Batch",
     "the VBV is tight",

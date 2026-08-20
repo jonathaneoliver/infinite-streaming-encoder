@@ -15,8 +15,8 @@
 # as you want it READ.
 
 [00] Picking the same clip, this time for a cloud encode.
-[01] Target: cloud. The identical job goes to AWS Batch instead of the machines on this network.
-[02] Codec: H.264 only. Every codec becomes its own job, so dropping HEVC halves the work.
+[01] Target: cloud. Submits the job to AWS Batch on spot capacity, instead of the machines on this network.
+[02] Codec: H.264, which is what the form starts with. Every codec is its own job.
 [03] Same ladder as before: apple-uniq-live-xs.
 [04] On a cloud target the estimate is money: spot compute plus the egress to bring the media home.
 [05] An output suffix gives this run its own directory, so the existing encodes of this source are untouched.
@@ -29,7 +29,7 @@
 [12] Machines are up. Every chunk is now an independent Batch job, spread across as many instances as Batch will give us.
 [13] The encode has finished, but the instances are still up — idle, and still billing, until Batch scales them down.
 [14] The run reports what it actually cost, against what the same ladder would cost elsewhere — and how much of the machine time nobody was using.
-[15] The chunks were encoded across 7 Batch instances.
+[15] The chunks were encoded across 4 Batch instances.
 [16] The encode is complete. The Outputs tab lists what landed in OUTPUT_DIR.
 [17] The package opens into three areas.
 [18] First, the ladder that was encoded. Its profile and VBV settings, then every rung with its resolution and bitrate.

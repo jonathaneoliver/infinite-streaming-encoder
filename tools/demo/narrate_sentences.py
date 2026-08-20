@@ -30,7 +30,16 @@ SENT = os.path.join(DEMO_DIR, "sentences")
 CUEW = os.path.join(DEMO_DIR, "cue-audio")
 
 GAP_MS = int(os.environ.get("GAP_MS", "300"))
-HEAD_GAP_MS = int(os.environ.get("HEAD_GAP_MS", "500"))
+# Was 500ms. Since #356 the narration reads the app's own data-desc, so EVERY
+# control-tour line now opens with a label ("Codec.", "Duration.", "Shared
+# decode.") — a shape the heading rule was written before. Each sentence is a
+# separate TTS generation, so a one-word label already lands with its own
+# intonation contour; a half-second on top of that made the label sound
+# detached from the description it introduces. 300ms keeps the beat without the
+# seam. Still a separate generation, so the prosody differs a little either way
+# — joining the label to its first body sentence is the fix for that, at the
+# cost of regenerating every labelled cue.
+HEAD_GAP_MS = int(os.environ.get("HEAD_GAP_MS", "300"))
 MIN_GAP_MS = int(os.environ.get("MIN_GAP_MS", "120"))
 HEAD_MAX_WORDS = 5
 MIN_CLIP_S = 0.5
