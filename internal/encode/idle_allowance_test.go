@@ -12,12 +12,20 @@ import (
 // run was billed MACHINE time, so the same application quoted ~60% of what it
 // then reported — systematically, on every cloud run.
 //
-// These pin the one term that reconciles them (machine = allocated / (1 - idle))
-// and the rules the measurement has to follow to be worth trusting. The
-// estimate-vs-report agreement is the point; everything else here protects it.
+// #380: the term that reconciled them was a single idle FRACTION, and a
+// fraction is the wrong shape. Overhead is roughly constant per instance, so it
+// is 90%+ of a three-minute smoke run and 19% of a twenty-two-minute encode —
+// idle% describes RUN SIZE, not the fleet. Averaging across sizes described
+// smoke tests, because smoke tests are the numerous kind, and the app quoted
+// $1.59 for a run that cost $0.56 while claiming MediaConvert would charge
+// $1.00.
+//
+// These pin the replacement: machine = allocated/packing + fleetVCPU*edge/3600.
+// The estimate-vs-report agreement is still the point; what changed is that it
+// now has to hold at more than one size.
 
 // managerWithSamples builds a Manager whose rolling run log contains exactly
-// these samples, so the idle reader can be exercised without a cloud encode.
+// these samples, so the model can be exercised without a cloud encode.
 func managerWithSamples(t *testing.T, samples []RunSample) *Manager {
 	t.Helper()
 	dir := t.TempDir()
@@ -38,209 +46,232 @@ func managerWithSamples(t *testing.T, samples []RunSample) *Manager {
 	return m
 }
 
-// sample is a non-overlapping run at the given idle percent. Spans are laid out
-// back to back off the index so no two samples of the same batch overlap.
-func sample(i int, idlePct float64) RunSample {
+// shaped is a non-overlapping run that recorded its fleet shape. Spans are laid
+// out back to back off the index so no two samples of a batch overlap.
+//
+// The caller gives the two things being learned — the fleet's width and the
+// per-instance edge — and the machine figure follows from them, so a sample can
+// never describe a rental its own terms do not add up to.
+func shaped(i int, fleetVCPU, allocated, edgeSeconds, packing float64) RunSample {
 	start := int64(1_000_000 + i*10_000)
+	edgeHours := fleetVCPU * edgeSeconds / 3600.0
+	machine := allocated/packing + edgeHours
 	return RunSample{
-		TS: start + 5_000, IdlePct: idlePct, MachineVCPUHours: 10,
-		AllocatedVCPUHours: 10 * (1 - idlePct/100),
-		StartedAt:          start, EndedAt: start + 5_000,
+		TS: start + 5_000, StartedAt: start, EndedAt: start + 5_000,
+		MachineVCPUHours: machine, AllocatedVCPUHours: allocated,
+		IdlePct:   100 * (1 - allocated/machine),
+		FleetVCPU: fleetVCPU, EdgeVCPUHours: edgeHours,
 	}
 }
 
-func TestIdleAllowanceFallsBackToTheStatedAssumption(t *testing.T) {
-	// No history at all. The allowance must be the documented constant AND
-	// declare itself unmeasured — a UI that cannot tell an assumption from an
-	// observation is the defect this fixes, not the fix.
-	m := managerWithSamples(t, nil)
-	got, runs, measured := m.fleetIdleFraction()
-	if measured {
-		t.Fatal("no samples, yet the allowance claims to be measured")
+// legacy is a sample written before #380 — rental measured, fleet size not.
+func legacy(i int, idlePct float64) RunSample {
+	s := shaped(i, 16, 1, 100, 0.9)
+	s.FleetVCPU, s.EdgeVCPUHours, s.IdlePct = 0, 0, idlePct
+	return s
+}
+
+func TestOverheadModelFallsBackToStatedAssumptions(t *testing.T) {
+	// No history at all. Both terms must be the documented constants AND the
+	// model must declare itself unmeasured — a UI that cannot tell an
+	// assumption from an observation is the defect this fixes, not the fix.
+	f := managerWithSamples(t, nil).fleetOverheadModel()
+	if f.Measured || f.Runs != 0 {
+		t.Fatalf("no samples, yet the model claims measurement: %+v", f)
 	}
-	if runs != 0 {
-		t.Fatalf("runs = %d, want 0", runs)
-	}
-	if got != assumedFleetIdleFraction {
-		t.Fatalf("fraction = %v, want the stated assumption %v", got, assumedFleetIdleFraction)
+	if f.EdgeSeconds != assumedEdgeSeconds || f.Packing != assumedPackingEfficiency {
+		t.Fatalf("fallback terms = %v/%v, want %v/%v",
+			f.EdgeSeconds, f.Packing, assumedEdgeSeconds, assumedPackingEfficiency)
 	}
 }
 
-func TestIdleAllowanceIgnoresRunsWithNoRentalMeasurement(t *testing.T) {
-	// A local run, or a cloud run whose hosts never resolved, carries no rental
-	// figure. Treating a zero as "0% idle" would drag the median towards a
-	// number nobody measured and quietly restore the undercount.
+func TestOverheadModelSkipsSamplesWithNoFleetSize(t *testing.T) {
+	// Samples written before #380 recorded rental but not the fleet width, and
+	// the edge term divides by exactly that. There is no way to recover it
+	// afterwards, so they must be SKIPPED rather than guessed at — a guessed
+	// divisor teaches the model an overhead nobody measured.
+	m := managerWithSamples(t, []RunSample{legacy(0, 91), legacy(1, 94), legacy(2, 88)})
+	f := m.fleetOverheadModel()
+	if f.Measured {
+		t.Fatalf("pre-#380 samples were treated as measurements: %+v", f)
+	}
+	if f.EdgeSeconds != assumedEdgeSeconds {
+		t.Fatalf("edge = %v, want the assumption %v", f.EdgeSeconds, assumedEdgeSeconds)
+	}
+}
+
+func TestOverheadModelLearnsBothTerms(t *testing.T) {
 	m := managerWithSamples(t, []RunSample{
-		{TS: 1, SpotUSD: 1}, // no IdlePct, no MachineVCPUHours
-		{TS: 2, IdlePct: 41, MachineVCPUHours: 0},
+		shaped(0, 48, 14, 120, 0.90),
+		shaped(1, 48, 12, 120, 0.90),
+		shaped(2, 32, 6, 120, 0.90),
 	})
-	got, runs, measured := m.fleetIdleFraction()
-	if measured || runs != 0 || got != assumedFleetIdleFraction {
-		t.Fatalf("unusable samples were counted: %v / %d runs / measured=%v", got, runs, measured)
+	f := m.fleetOverheadModel()
+	if !f.Measured || f.Runs != 3 {
+		t.Fatalf("expected 3 measured runs, got %+v", f)
+	}
+	if f.EdgeSeconds < 119.9 || f.EdgeSeconds > 120.1 {
+		t.Fatalf("edge = %v, want 120", f.EdgeSeconds)
+	}
+	if f.Packing < 0.899 || f.Packing > 0.901 {
+		t.Fatalf("packing = %v, want 0.90", f.Packing)
 	}
 }
 
-func TestIdleAllowanceIsTheMedianNotTheMean(t *testing.T) {
-	// One pathological run must not set the price of every future estimate.
-	// Mean of these is ~50%; median is 40%.
+// THE REGRESSION. A model learned entirely from smoke runs must still price a
+// real encode correctly. Under the old fraction this was a 13x overcharge; the
+// whole reason the shape changed is that these two sizes share one fleet and
+// must share one model.
+func TestSmokeRunsDoNotPoisonTheEstimateForRealOnes(t *testing.T) {
+	var smoke []RunSample
+	for i := 0; i < 9; i++ {
+		// ~0.08 vCPU-hr of work on one 16-vCPU box: 91% idle, and correctly so.
+		smoke = append(smoke, shaped(i, 16, 0.08, 116, 0.91))
+	}
+	m := managerWithSamples(t, smoke)
+	f := m.fleetOverheadModel()
+
+	// Sanity: those samples really are the pathological ones.
+	if idle := f.idleFraction(0.08, 16); idle < 0.80 {
+		t.Fatalf("a smoke run should still be mostly overhead, got idle=%v", idle)
+	}
+
+	// The real run: 14.56 allocated vCPU-hours across a 48-vCPU fleet, which
+	// actually rented 17.88 (#380's measurement).
+	got := f.machineVCPUHours(14.56, 48)
+	if got < 17.0 || got > 18.5 {
+		t.Fatalf("real run priced at %v vCPU-hr, want ~17.9 (the measured rental)", got)
+	}
+	if idle := f.idleFraction(14.56, 48); idle < 0.10 || idle > 0.25 {
+		t.Fatalf("derived idle for the real run = %v, want ~0.19", idle)
+	}
+	// The old model's answer, kept as a number rather than a memory: a median
+	// of these samples' idle_pct is ~0.91, which divides to 11x the truth.
+	if bad := 14.56 / (1 - 0.91); bad < 100 {
+		t.Fatalf("the old model is supposed to be catastrophic here, got %v", bad)
+	}
+}
+
+func TestOverheadModelIsTheMedianNotTheMean(t *testing.T) {
+	// One pathological run must not set the price of every estimate — the
+	// reason the median was chosen in the first place, and still true.
 	m := managerWithSamples(t, []RunSample{
-		sample(0, 38), sample(1, 40), sample(2, 42), sample(3, 80),
+		shaped(0, 48, 10, 100, 0.9),
+		shaped(1, 48, 10, 100, 0.9),
+		shaped(2, 48, 10, 4000, 0.9),
 	})
-	got, runs, measured := m.fleetIdleFraction()
-	if !measured {
-		t.Fatal("four usable samples, yet not reported as measured")
-	}
-	if runs != 4 {
-		t.Fatalf("runs = %d, want 4", runs)
-	}
-	if got < 0.40-1e-9 || got > 0.41+1e-9 {
-		t.Fatalf("fraction = %v, want the median ~0.41 (mean would be ~0.50)", got)
+	if f := m.fleetOverheadModel(); f.EdgeSeconds < 99.9 || f.EdgeSeconds > 100.1 {
+		t.Fatalf("edge = %v, want the median 100 rather than the mean", f.EdgeSeconds)
 	}
 }
 
-func TestIdleAllowanceExcludesOverlappingRuns(t *testing.T) {
-	// _emit_machine_rental attributes a concurrent run's time on a shared
-	// instance to whichever run is reporting, so an overlapping sample reads
-	// high for a reason that says nothing about how the fleet packs one run.
-	// Counting those turns a systematic undercount into a systematic overcount.
-	overlapA := RunSample{TS: 30, IdlePct: 90, MachineVCPUHours: 10, StartedAt: 100, EndedAt: 200}
-	overlapB := RunSample{TS: 31, IdlePct: 88, MachineVCPUHours: 10, StartedAt: 150, EndedAt: 250}
-	solo := RunSample{TS: 32, IdlePct: 40, MachineVCPUHours: 10, StartedAt: 400, EndedAt: 500}
-
-	m := managerWithSamples(t, []RunSample{overlapA, overlapB, solo})
-	got, runs, measured := m.fleetIdleFraction()
-	if !measured {
-		t.Fatal("one clean sample survives, so the allowance is measured")
-	}
-	if runs != 1 {
-		t.Fatalf("runs = %d, want 1 — both overlapping runs must be dropped", runs)
-	}
-	if got < 0.399 || got > 0.401 {
-		t.Fatalf("fraction = %v, want the solo run's 0.40", got)
+func TestOverheadModelExcludesOverlappingRuns(t *testing.T) {
+	// _emit_machine_rental counts a concurrent run's time on a shared instance
+	// as this run's overhead, so an overlapping sample reads high for a reason
+	// that says nothing about how the fleet packs one run.
+	a := shaped(0, 48, 10, 100, 0.9)
+	b := shaped(1, 48, 10, 4000, 0.9)
+	b.StartedAt, b.EndedAt = a.StartedAt+1, a.EndedAt+1 // overlaps a
+	m := managerWithSamples(t, []RunSample{a, b})
+	f := m.fleetOverheadModel()
+	if f.Runs != 0 {
+		t.Fatalf("overlapping pair should leave nothing usable, got %d runs", f.Runs)
 	}
 }
 
-func TestIdleAllowanceKeepsSamplesWithNoRecordedSpan(t *testing.T) {
-	// Records written before the span was persisted have no start/end. Dropping
-	// them as "might have overlapped" would strand the allowance on its
-	// assumption for another ten runs, so they count.
-	m := managerWithSamples(t, []RunSample{
-		{TS: 1, IdlePct: 44, MachineVCPUHours: 10},
-		{TS: 2, IdlePct: 44, MachineVCPUHours: 10},
-	})
-	got, runs, measured := m.fleetIdleFraction()
-	if !measured || runs != 2 {
-		t.Fatalf("spanless samples were dropped: %d runs, measured=%v", runs, measured)
+func TestOverheadModelClampsPacking(t *testing.T) {
+	// Packing divides. A degenerate sample near zero would send every estimate
+	// towards infinity — the hazard maxFleetIdleFraction used to guard, in the
+	// term that replaced it.
+	m := managerWithSamples(t, []RunSample{shaped(0, 48, 0.001, 100, 0.01)})
+	if f := m.fleetOverheadModel(); f.Packing < minPackingEfficiency {
+		t.Fatalf("packing %v below the floor %v", f.Packing, minPackingEfficiency)
 	}
-	if got < 0.439 || got > 0.441 {
-		t.Fatalf("fraction = %v, want 0.44", got)
+	// And the floor has to hold at the point of use, not only at the source.
+	f := fleetOverhead{EdgeSeconds: 100, Packing: 0}
+	if got := f.machineVCPUHours(10, 48); got > 10/minPackingEfficiency+2 {
+		t.Fatalf("a zero packing term was not floored: %v", got)
 	}
 }
 
-func TestIdleAllowanceIsClampedAndBounded(t *testing.T) {
-	// A degenerate sample — a run whose instances were almost entirely someone
-	// else's — divides the estimate towards infinity. Clamp keeps a bad
-	// measurement merely wrong rather than catastrophic.
-	m := managerWithSamples(t, []RunSample{sample(0, 99.9), sample(1, 99.9)})
-	got, _, _ := m.fleetIdleFraction()
-	if got > maxFleetIdleFraction+1e-9 {
-		t.Fatalf("fraction = %v, want clamped to %v", got, maxFleetIdleFraction)
-	}
-}
-
-func TestIdleAllowanceUsesOnlyRecentRuns(t *testing.T) {
-	// A fleet-packing improvement has to show up without anyone editing a
-	// constant, so old runs must age out of the window.
+func TestOverheadModelUsesOnlyRecentRuns(t *testing.T) {
 	var samples []RunSample
-	for i := 0; i < fleetIdleRuns*2; i++ {
-		idle := 80.0 // ancient, badly-packed history
-		if i >= fleetIdleRuns {
-			idle = 20.0 // the recent, better-packed runs
-		}
-		samples = append(samples, sample(i, idle))
+	for i := 0; i < fleetIdleRuns+5; i++ {
+		samples = append(samples, shaped(i, 48, 10, 4000, 0.9)) // stale, absurd
 	}
-	m := managerWithSamples(t, samples)
-	got, runs, _ := m.fleetIdleFraction()
-	if runs != fleetIdleRuns {
-		t.Fatalf("runs = %d, want the %d-run window", runs, fleetIdleRuns)
+	for i := 0; i < fleetIdleRuns; i++ {
+		samples = append(samples, shaped(100+i, 48, 10, 100, 0.9)) // recent
 	}
-	if got < 0.199 || got > 0.201 {
-		t.Fatalf("fraction = %v, want the recent 0.20 — old runs did not age out", got)
+	f := managerWithSamples(t, samples).fleetOverheadModel()
+	if f.Runs != fleetIdleRuns {
+		t.Fatalf("window = %d runs, want %d", f.Runs, fleetIdleRuns)
+	}
+	if f.EdgeSeconds > 101 {
+		t.Fatalf("edge = %v — stale runs are still in the window", f.EdgeSeconds)
 	}
 }
 
-// TestEstimateAndReportShareOneBasis is the acceptance criterion from #237.
-//
-// The finished run prices MACHINE vCPU-hours (_emit_cost_summary, on the
-// rental); the estimator predicts ALLOCATED vCPU-hours. They reconcile through
-// exactly one term, machine = allocated / (1 - idle). This pins that the
-// estimator applies it — and applies it as a real function of the measured
-// idle, not as a fixed fudge that happens to look right at one value.
-//
-// Deliberately NOT written as `allocated := got * (1-idle)` and then comparing
-// back: that recovers the input from the output and passes no matter what the
-// code does. Two DIFFERENT measured fleets are compared instead, so the scaling
-// has to actually track the measurement.
+// The estimate and the finished run must be computed on one basis. That was
+// #237's finding and it survives the change of model: what the estimator
+// predicts as rental is what the run reports as rental.
 func TestEstimateAndReportShareOneBasis(t *testing.T) {
 	cfg := JobConfig{Codec: "h264", Ladder: DefaultLadderName}
 	const w, fps, dur = 3840, 30, 600.0
 
-	idle40 := managerWithSamples(t, []RunSample{sample(0, 40), sample(1, 40)})
-	idle20 := managerWithSamples(t, []RunSample{sample(0, 20), sample(1, 20)})
-	noHistory := managerWithSamples(t, nil)
+	tight := managerWithSamples(t, []RunSample{
+		shaped(0, 48, 14, 60, 0.95), shaped(1, 48, 14, 60, 0.95)})
+	loose := managerWithSamples(t, []RunSample{
+		shaped(0, 48, 14, 600, 0.70), shaped(1, 48, 14, 600, 0.70)})
 
-	got40, ond40, f40, runs, measured := idle40.projectCloudCostDetail(cfg, w, fps, dur)
-	got20, _, f20, _, _ := idle20.projectCloudCostDetail(cfg, w, fps, dur)
-	assumed, _, fAssumed, _, wasMeasured := noHistory.projectCloudCostDetail(cfg, w, fps, dur)
-	if got40 <= 0 || got20 <= 0 {
+	spotTight, ondTight, idleTight, runs, measured := tight.projectCloudCostDetail(cfg, w, fps, dur)
+	spotLoose, _, idleLoose, _, _ := loose.projectCloudCostDetail(cfg, w, fps, dur)
+	if spotTight <= 0 || spotLoose <= 0 {
 		t.Skip("seed ladder or speed model unavailable")
 	}
 	if !measured || runs != 2 {
-		t.Fatalf("expected a measured allowance over 2 runs, got measured=%v runs=%d", measured, runs)
-	}
-	if f40 < 0.399 || f40 > 0.401 || f20 < 0.199 || f20 > 0.201 {
-		t.Fatalf("idle fractions not read back: %v / %v", f40, f20)
+		t.Fatalf("expected a measured model over 2 runs, got measured=%v runs=%d", measured, runs)
 	}
 
-	// A fleet that wastes 40% must be quoted more than one that wastes 20%, in
-	// exactly the ratio the two measurements imply: (1-0.20)/(1-0.40) = 1.3333.
-	// A hardcoded multiplier — or no multiplier — fails here.
-	wantRatio := (1 - f20) / (1 - f40)
-	if ratio := got40 / got20; ratio < wantRatio*0.999 || ratio > wantRatio*1.001 {
-		t.Fatalf("cost ratio between a 40%%-idle and a 20%%-idle fleet = %v, want %v", ratio, wantRatio)
+	// A fleet that boots slowly and packs badly must be quoted MORE. The
+	// direction is the assertion; the exact ratio depends on the seed ladder.
+	if spotLoose <= spotTight {
+		t.Fatalf("a wasteful fleet was quoted no more than a tight one: %v vs %v", spotLoose, spotTight)
+	}
+	if idleLoose <= idleTight {
+		t.Fatalf("derived idle did not follow the model: %v vs %v", idleLoose, idleTight)
 	}
 
-	// Scaling is applied to on-demand identically — the two rates must not drift
-	// onto different bases, which is the #217 failure this repo already paid for.
-	if r := ond40 / got40; r < awsOndemandVCPUHourUSD/awsSpotVCPUHourUSD*0.999 ||
+	// Both rates must stay on one basis — the #217 failure this repo already
+	// paid for, where three spot constants drifted apart in three files.
+	if r := ondTight / spotTight; r < awsOndemandVCPUHourUSD/awsSpotVCPUHourUSD*0.999 ||
 		r > awsOndemandVCPUHourUSD/awsSpotVCPUHourUSD*1.001 {
-		t.Fatalf("on-demand/spot = %v, want the rate ratio %v", r, awsOndemandVCPUHourUSD/awsSpotVCPUHourUSD)
+		t.Fatalf("on-demand/spot = %v, want the rate ratio %v", r,
+			awsOndemandVCPUHourUSD/awsSpotVCPUHourUSD)
 	}
 
-	// With no history the quote stands on the stated assumption, and says so.
-	// Equal to the 40% fleet only because the assumption IS 40% — derived from
-	// the constant, so editing it moves both together.
-	if wasMeasured {
-		t.Fatal("no samples, yet the estimate claims a measured allowance")
-	}
-	if fAssumed != assumedFleetIdleFraction {
-		t.Fatalf("assumed fraction = %v, want %v", fAssumed, assumedFleetIdleFraction)
-	}
-	if want := got40 * (1 - f40) / (1 - fAssumed); assumed < want*0.999 || assumed > want*1.001 {
-		t.Fatalf("assumption-based quote %v does not follow the same formula (want %v)", assumed, want)
+	// The displayed allowance must be the one that priced the run. #237's rule
+	// is that it is never folded in silently, which is worth nothing if the
+	// number shown is not the number applied.
+	if idleTight <= 0 || idleTight >= 1 {
+		t.Fatalf("derived idle %v is not a fraction", idleTight)
 	}
 }
 
-// TestPersistedSampleCarriesTheIdleFields closes the loop: the reader above is
-// worthless if the writer drops the fields. This is the seam a rename would
-// break silently, since inventory.py reads the same file by name.
-func TestPersistedSampleCarriesTheIdleFields(t *testing.T) {
+// TestPersistedSampleCarriesTheFleetShape closes the loop: the model is
+// worthless if the writer drops the fields it learns from.
+func TestPersistedSampleCarriesTheFleetShape(t *testing.T) {
 	m := managerWithSamples(t, nil)
 	end := time.Unix(5_000, 0)
 	job := &Job{
 		ID: "1", StartedAt: time.Unix(1_000, 0), EndedAt: &end,
 		IdlePct: 41.5, MachineVCPUHours: 11.85, AllocatedVCPUHours: 7.29,
 		EncodeTotalS: 120,
+		Rentals: []MachineRental{
+			{ID: "i-a", VCPUs: 16, LaunchedAt: 1_000, FirstJobAt: 1_040,
+				LastJobAt: 4_900, EndedAt: 5_000},
+			{ID: "i-b", VCPUs: 8, LaunchedAt: 1_000, FirstJobAt: 1_060,
+				LastJobAt: 4_800, EndedAt: 5_000},
+		},
 	}
 	m.persistSpotSample(job)
 
@@ -253,7 +284,16 @@ func TestPersistedSampleCarriesTheIdleFields(t *testing.T) {
 		t.Fatalf("rental fields not round-tripped: %+v", s)
 	}
 	if s.StartedAt != 1_000 || s.EndedAt != 5_000 {
-		t.Fatalf("run span not recorded (%d..%d) — overlap exclusion depends on it", s.StartedAt, s.EndedAt)
+		t.Fatalf("run span not recorded (%d..%d) — overlap exclusion depends on it",
+			s.StartedAt, s.EndedAt)
+	}
+	if s.FleetVCPU != 24 {
+		t.Fatalf("fleet width = %v, want 24 (16+8)", s.FleetVCPU)
+	}
+	// i-a: 40s before, 100s after, x16. i-b: 60s before, 200s after, x8.
+	if want := (16*140.0 + 8*260.0) / 3600.0; s.EdgeVCPUHours < want*0.999 ||
+		s.EdgeVCPUHours > want*1.001 {
+		t.Fatalf("edge = %v vCPU-hr, want %v", s.EdgeVCPUHours, want)
 	}
 
 	// The on-disk names are a cross-language contract with inventory.py's
@@ -274,8 +314,25 @@ func TestPersistedSampleCarriesTheIdleFields(t *testing.T) {
 	}
 }
 
+// A box still alive at the end has no measurable tail, and a box that never
+// reported its jobs has no measurable edge at all. Both must contribute their
+// WIDTH — they were rented — without teaching the model an overhead nobody saw.
+func TestFleetShapeCountsWidthButNotUnmeasuredEdges(t *testing.T) {
+	fleet, edge := fleetShape([]MachineRental{
+		{VCPUs: 16, LaunchedAt: 1_000, FirstJobAt: 1_100, LastJobAt: 4_000,
+			EndedAt: 4_500, Alive: true}, // tail unknown: still running
+		{VCPUs: 8, LaunchedAt: 1_000, EndedAt: 4_500}, // never reported a job
+	})
+	if fleet != 24 {
+		t.Fatalf("fleet width = %v, want 24 — a rented box counts either way", fleet)
+	}
+	if want := 16 * 100.0 / 3600.0; edge < want*0.999 || edge > want*1.001 {
+		t.Fatalf("edge = %v, want only the measured 100s pre-job slice (%v)", edge, want)
+	}
+}
+
 // A job carrying only rental data — no spot cost, no reclaim — must still be
-// recorded, or the very first cloud runs never seed the allowance.
+// recorded, or the very first cloud runs never seed the model.
 func TestPersistKeepsARentalOnlyRun(t *testing.T) {
 	m := managerWithSamples(t, nil)
 	m.persistSpotSample(&Job{ID: "1", IdlePct: 38})

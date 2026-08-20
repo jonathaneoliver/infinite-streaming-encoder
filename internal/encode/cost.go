@@ -52,7 +52,34 @@ const EgressUSDPerGB = 0.09
 // shown, and it is self-correcting: the first finished cloud run replaces it
 // with that run's own figure, so nobody ever has to edit this constant to track
 // a fleet that got better at packing.
+//
+// Retained only as the last-resort display value for a run whose fleet size
+// cannot be predicted. The allowance itself is no longer a fraction — see
+// fleetOverheadModel for why a single percentage cannot be right at more than
+// one run size.
 const assumedFleetIdleFraction = 0.40
+
+// assumedEdgeSeconds and assumedPackingEfficiency are fleetOverheadModel's
+// terms before this install has measured a cloud run that recorded its fleet
+// size. Both are the medians measured on the reference account (#380): 33-38s
+// before an instance's first job, 76-87s after its last, and 91-92% of a live
+// instance's vCPU allocated while it works.
+//
+// Unlike the fraction they replace, being wrong here is proportionate: a bad
+// edge figure misprices the fixed overhead, not the whole run.
+const assumedEdgeSeconds = 116.0
+const assumedPackingEfficiency = 0.91
+
+// minPackingEfficiency floors what the measurement may claim. Packing divides,
+// so a degenerate sample near zero sends the estimate to infinity — the same
+// hazard maxFleetIdleFraction guards, in the term that replaced it.
+const minPackingEfficiency = 0.25
+
+// maxFleetVCPU caps the predicted fleet when the run has never reported the
+// compute environment's ceiling. One wave of a 12-rung h264 ladder reserves 96
+// vCPU; the reference environment tops out at 48, and predicting a fleet the
+// account cannot launch would price overhead that will never be rented.
+const maxFleetVCPU = 48.0
 
 // maxFleetIdleFraction caps what the measurement is allowed to claim. A sample
 // approaching 1.0 divides the estimate towards infinity, and the sample most
@@ -68,48 +95,109 @@ const maxFleetIdleFraction = 0.85
 // pathological run must not set the price of every future estimate.
 const fleetIdleRuns = 10
 
-// fleetIdleFraction is the share of rented machine time that no job allocated,
-// measured over recent cloud runs. Returns (fraction, runs, measured) — `runs`
-// is how many samples backed it, and `measured` is false when the answer is the
-// stated assumption rather than an observation.
+// fleetOverhead is what turns allocated vCPU-hours into RENTED ones:
 //
-// This exists because the estimate and the finished run were computed on
-// different bases and disagreed by 1.6-1.8x (#237). projectCloudCost predicts
-// ALLOCATED vCPU-hours; AWS bills the INSTANCE, launch to termination, boot and
-// image pull and scale-down tail included. The two reconcile through exactly one
-// term — machine = allocated / (1 - idle) — and this measures it.
+//	machine = allocated/Packing + fleetVCPU*EdgeSeconds/3600
 //
-// OVERLAPPING RUNS ARE EXCLUDED. _emit_machine_rental attributes a concurrent
-// run's time on a shared instance to whichever run is reporting, so a sample
-// taken while another encode was live reads high for a reason that says nothing
-// about how the fleet packs one run. Including those biases the allowance up and
-// turns a systematic undercount into a systematic overcount.
-func (m *Manager) fleetIdleFraction() (fraction float64, runs int, measured bool) {
+// EdgeSeconds is boot, image pull and the scale-down tail — a fixed slice of
+// every instance's life, whatever the run does. Packing is how much of a live
+// instance's vCPU is allocated while it is working; Batch packs by reservation
+// and cannot always fill a box.
+//
+// This replaced a single idle FRACTION (#237, broken by #380). The fraction was
+// not merely mis-tuned — it was the wrong shape. Overhead is roughly constant
+// per instance, so it is 90%+ of a three-minute smoke run and 19% of a
+// twenty-two-minute encode: idle% is a property of RUN SIZE, not of the fleet.
+// Averaging it across sizes describes whichever size is most numerous, and
+// small runs always are, because smoke tests outnumber real encodes. On the
+// reference account that quoted $1.59 for a run that cost $0.56, next to a
+// comparison line claiming MediaConvert would charge $1.00.
+//
+// The median stays, for the reason it was chosen: one pathological run must not
+// set the price of every estimate. What changed is what it is a median OF.
+type fleetOverhead struct {
+	EdgeSeconds float64
+	Packing     float64
+	Runs        int
+	Measured    bool
+}
+
+// machineVCPUHours converts predicted allocation into predicted rental.
+func (f fleetOverhead) machineVCPUHours(allocated, fleetVCPU float64) float64 {
+	p := f.Packing
+	if p < minPackingEfficiency {
+		p = minPackingEfficiency
+	}
+	return allocated/p + fleetVCPU*f.EdgeSeconds/3600.0
+}
+
+// idleFraction is the model's answer to the question the UI still asks: what
+// share of the rental will no job allocate? Derived rather than stored, so the
+// displayed allowance can never drift from the arithmetic that priced the run.
+func (f fleetOverhead) idleFraction(allocated, fleetVCPU float64) float64 {
+	machine := f.machineVCPUHours(allocated, fleetVCPU)
+	if machine <= 0 || allocated <= 0 {
+		return assumedFleetIdleFraction
+	}
+	idle := 1 - allocated/machine
+	if idle < 0 {
+		return 0
+	}
+	if idle > maxFleetIdleFraction {
+		return maxFleetIdleFraction
+	}
+	return idle
+}
+
+// fleetOverheadModel measures both terms over recent cloud runs.
+//
+// A sample can only contribute if it recorded its FLEET SIZE, which samples
+// written before #380 did not — the edge term is per-instance-vCPU and there is
+// no way to recover the divisor after the fact. Those samples are skipped
+// rather than guessed at, so the model degrades to its stated assumptions and
+// re-learns from the next real run.
+func (m *Manager) fleetOverheadModel() fleetOverhead {
 	samples := m.readRunSamples()
-	var usable []float64
+	var edges, packs []float64
 	for i, s := range samples {
-		if s.IdlePct <= 0 || s.MachineVCPUHours <= 0 {
-			continue // not a cloud run, or rental could not be measured
+		if s.FleetVCPU <= 0 || s.MachineVCPUHours <= 0 || s.AllocatedVCPUHours <= 0 {
+			continue
 		}
 		if runOverlapsAny(s, samples, i) {
 			continue
 		}
-		usable = append(usable, s.IdlePct/100.0)
+		edges = append(edges, s.EdgeVCPUHours*3600.0/s.FleetVCPU)
+		// Packing is measured against the machine time that is NOT edge: the
+		// two terms must not both claim the same unallocated hour, or the model
+		// double-counts precisely the overhead it exists to predict.
+		if working := s.MachineVCPUHours - s.EdgeVCPUHours; working > 0 {
+			packs = append(packs, s.AllocatedVCPUHours/working)
+		}
 	}
-	if len(usable) == 0 {
-		return assumedFleetIdleFraction, 0, false
+	if len(edges) == 0 {
+		return fleetOverhead{EdgeSeconds: assumedEdgeSeconds, Packing: assumedPackingEfficiency}
 	}
-	if len(usable) > fleetIdleRuns {
-		usable = usable[len(usable)-fleetIdleRuns:]
+	if len(edges) > fleetIdleRuns {
+		edges = edges[len(edges)-fleetIdleRuns:]
 	}
-	f := median(usable)
-	if f < 0 {
-		f = 0
+	if len(packs) > fleetIdleRuns {
+		packs = packs[len(packs)-fleetIdleRuns:]
 	}
-	if f > maxFleetIdleFraction {
-		f = maxFleetIdleFraction
+	f := fleetOverhead{EdgeSeconds: median(edges), Packing: assumedPackingEfficiency,
+		Runs: len(edges), Measured: true}
+	if len(packs) > 0 {
+		f.Packing = median(packs)
 	}
-	return f, len(usable), true
+	if f.EdgeSeconds < 0 {
+		f.EdgeSeconds = 0
+	}
+	if f.Packing > 1 {
+		f.Packing = 1
+	}
+	if f.Packing < minPackingEfficiency {
+		f.Packing = minPackingEfficiency
+	}
+	return f
 }
 
 // runOverlapsAny reports whether samples[i]'s run span intersects any other
@@ -186,7 +274,8 @@ func (m *Manager) projectCloudCost(cfg JobConfig, sourceWidth, fps int, duration
 // invisible 1.7x multiplier on a number sitting next to the Encode button is how
 // this went unnoticed in the first place.
 func (m *Manager) projectCloudCostDetail(cfg JobConfig, sourceWidth, fps int, durationS float64) (spot, ondemand, idle float64, idleRuns int, idleMeasured bool) {
-	idle, idleRuns, idleMeasured = m.fleetIdleFraction()
+	f := m.fleetOverheadModel()
+	idle, idleRuns, idleMeasured = assumedFleetIdleFraction, f.Runs, f.Measured
 	if m.Speeds == nil || m.Ladders == nil || durationS <= 0 {
 		return 0, 0, idle, idleRuns, idleMeasured
 	}
@@ -194,13 +283,13 @@ func (m *Manager) projectCloudCostDetail(cfg JobConfig, sourceWidth, fps int, du
 	if ladderName == "" {
 		ladderName = DefaultLadderName
 	}
-	// machine = allocated / (1 - idle). Guarded because a clamped-but-still-high
-	// fraction divides hard; maxFleetIdleFraction keeps this well away from zero.
-	scale := 1.0
-	if d := 1.0 - idle; d > 0 {
-		scale = 1.0 / d
-	}
+	// ALLOCATION FIRST, overhead second. The two cannot be folded into one loop
+	// any more: the edge term is per-instance, so it needs the fleet width, and
+	// the fleet width is only known once every rung has been resolved and
+	// priced. Scaling inside the loop is what made the old fraction look like a
+	// per-variant property when it never was.
 	ladderDef, _ := m.Ladders.Get(ladderName)
+	var allocated, waveVCPU float64
 	for _, c := range parseCodecSel(cfg.Codec) {
 		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
 			twoPass := ladderDef.twoPassFor(c, cfg.HevcSinglePass)
@@ -210,12 +299,48 @@ func (m *Manager) projectCloudCostDetail(cfg JobConfig, sourceWidth, fps int, du
 			}
 			vcpuStr, _ := variantResourcesFor(c, r.Height)
 			vcpu, _ := strconv.ParseFloat(vcpuStr, 64)
-			wallHours := (durationS / sp) / 3600.0
-			spot += wallHours * vcpu * awsSpotVCPUHourUSD * scale
-			ondemand += wallHours * vcpu * awsOndemandVCPUHourUSD * scale
+			allocated += (durationS / sp) / 3600.0 * vcpu
+			// One wave: every rung has chunks ready at once, so this is the
+			// parallel demand Batch sees at t=0 and scales towards.
+			waveVCPU += vcpu
 		}
 	}
-	return spot, ondemand, idle, idleRuns, idleMeasured
+	if allocated <= 0 {
+		return 0, 0, idle, idleRuns, idleMeasured
+	}
+	fleetVCPU := predictedFleetVCPU(waveVCPU, m.cloudMaxVCPUs())
+	machine := f.machineVCPUHours(allocated, fleetVCPU)
+	idle = f.idleFraction(allocated, fleetVCPU)
+	return machine * awsSpotVCPUHourUSD, machine * awsOndemandVCPUHourUSD, idle, idleRuns, idleMeasured
+}
+
+// predictedFleetVCPU is how wide a fleet this run will rent: the parallel
+// demand of one wave of chunks, capped by what the compute environment will
+// actually launch. Batch scales towards the queue and stops at the ceiling, so
+// a 12-rung h264 ladder asking for 96 vCPU against a 48 vCPU environment rents
+// 48 — and predicting 96 would price twice the boot overhead the run can incur.
+func predictedFleetVCPU(waveVCPU, cap float64) float64 {
+	if cap > 0 && waveVCPU > cap {
+		return cap
+	}
+	if waveVCPU < 0 {
+		return 0
+	}
+	return waveVCPU
+}
+
+// cloudMaxVCPUs is the compute environment's ceiling as the last cloud run
+// reported it (ENCODER-STATS max_vcpus), falling back to the reference
+// environment's width. Read from history rather than configured, so raising
+// maxvCpus with `make cloud-scale` is reflected in the next estimate without a
+// redeploy or a second place to keep in step.
+func (m *Manager) cloudMaxVCPUs() float64 {
+	for _, j := range m.Jobs() {
+		if j.MaxVcpus > 0 {
+			return float64(j.MaxVcpus)
+		}
+	}
+	return maxFleetVCPU
 }
 
 // localFleetPerfCores is the local fleet's total parallel perf-core budget: the

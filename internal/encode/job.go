@@ -2622,6 +2622,54 @@ type RunSample struct {
 	AllocatedVCPUHours float64 `json:"allocated_vcpu_hours,omitempty"`
 	StartedAt          int64   `json:"started_at,omitempty"`
 	EndedAt            int64   `json:"ended_at,omitempty"`
+	// FleetVCPU and EdgeVCPUHours are what fleetOverheadModel learns from, both
+	// summed over this run's Rentals (#380).
+	//
+	// FleetVCPU is the fleet's total reserved width; EdgeVCPUHours is the vCPU
+	// time between an instance appearing and its first job, plus its last job
+	// and its termination — boot, image pull, scale-down tail.
+	//
+	// They exist because the allowance they replaced was a PERCENTAGE, and a
+	// percentage cannot describe a fixed overhead across runs three orders of
+	// magnitude apart in size. Splitting rental into a per-instance part and a
+	// per-work part needs the divisor, and the divisor is the fleet size —
+	// which no sample before #380 recorded, so those samples cannot be
+	// back-filled and are skipped by the model rather than guessed at.
+	FleetVCPU     float64 `json:"fleet_vcpu,omitempty"`
+	EdgeVCPUHours float64 `json:"edge_vcpu_hours,omitempty"`
+}
+
+// fleetShape sums a run's rentals into the two terms fleetOverheadModel learns
+// from. Returns zeroes when the run reported no per-instance detail, which is
+// what tells the model to skip the sample.
+//
+// An instance with no recorded first/last job contributes its WIDTH but no
+// edge: it was rented, so it belongs in the divisor, and inventing an edge for
+// it would teach the model an overhead nobody measured. An instance still alive
+// at the end contributes no tail for the same reason — its end is "as of now"
+// and the real tail is still to come, so counting it would learn a tail that is
+// systematically short.
+func fleetShape(rentals []MachineRental) (fleetVCPU, edgeVCPUHours float64) {
+	for _, r := range rentals {
+		if r.VCPUs <= 0 {
+			continue
+		}
+		v := float64(r.VCPUs)
+		fleetVCPU += v
+		if r.LaunchedAt <= 0 || r.FirstJobAt <= 0 || r.LastJobAt <= 0 {
+			continue
+		}
+		pre := float64(r.FirstJobAt - r.LaunchedAt)
+		if pre < 0 {
+			pre = 0
+		}
+		post := 0.0
+		if !r.Alive && r.EndedAt > r.LastJobAt {
+			post = float64(r.EndedAt - r.LastJobAt)
+		}
+		edgeVCPUHours += v * (pre + post) / 3600.0
+	}
+	return fleetVCPU, edgeVCPUHours
 }
 
 // runSamplesPath is the single definition of the rolling log's location. Shared
@@ -2654,12 +2702,14 @@ func (m *Manager) persistSpotSample(job *Job) {
 	if job.EndedAt != nil {
 		ended = job.EndedAt.Unix()
 	}
+	fleetVCPU, edgeVCPUHours := fleetShape(job.Rentals)
 	samples := append(m.readRunSamples(), RunSample{
 		TS: time.Now().Unix(), LostS: job.ReclaimLostS, TotalS: job.EncodeTotalS,
 		SpotUSD: job.SpotUSD, OnDemandUSD: job.OnDemandUSD, SavedUSD: job.SavedUSD,
 		IdlePct: job.IdlePct, MachineVCPUHours: job.MachineVCPUHours,
 		AllocatedVCPUHours: job.AllocatedVCPUHours,
 		StartedAt:          started, EndedAt: ended,
+		FleetVCPU: fleetVCPU, EdgeVCPUHours: edgeVCPUHours,
 	})
 	if len(samples) > 5000 {
 		samples = samples[len(samples)-5000:]
