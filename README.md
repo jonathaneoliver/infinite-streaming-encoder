@@ -20,7 +20,8 @@
   — one clip encoded twice: first across a farm of three machines, then on AWS
   Batch spot capacity. Chaptered.
   <br>
-  <sub>Also attached to <a href="https://github.com/jonathaneoliver/infinite-streaming-encoder/releases/tag/v0.2.0">v0.2.0</a> if you would rather download it.</sub>
+  <sub>AI-authored and AI-narrated — the script is the app's own UI text, and the voice is a synthetic clone of mine.
+  Also attached to <a href="https://github.com/jonathaneoliver/infinite-streaming-encoder/releases/tag/v0.2.0">v0.2.0</a> if you would rather download it.</sub>
 </p>
 
 A **parallel, chunking video encoder**: it splits each source into chunks and
