@@ -589,7 +589,7 @@ async function main() {
   // Fast-forward the ENCODING only. Startup and the idle tail stay real-time.
   const ffwd = (m.chunksStart && m.chunksEnd && m.chunksEnd - m.chunksStart > 60)
     ? [{ from: m.chunksStart, to: m.chunksEnd, factor: 30, label: 'FFWD x30',
-         text: 'The encoding itself, fast-forwarded thirty times.' }]
+         text: 'Fast-forwarded thirty times.' }]
     : [];
   emit('cues.json', JSON.stringify({
     ffwd,

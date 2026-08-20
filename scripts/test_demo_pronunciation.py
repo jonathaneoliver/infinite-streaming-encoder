@@ -106,7 +106,19 @@ says("at 13:24:51 the chunk started", "at 13:24:51 the chunk started")
 says("see https://example.com/x", "see https://example.com/x")
 
 print("\nresolutions")
-says("1080p", "1080 p")
+# Said in PAIRS, the way the number is actually spoken. "1080 p" handed the
+# digits to the engine, which read them as a bare number and put a beat before
+# the letter. Both halves matter: the pairing AND the p staying attached.
+says("1080p", "ten eighty p")
+says("720p", "seven twenty p")
+says("2160p", "twenty-one sixty p")
+# A round hundred is not "eighteen zero zero", and a tail under ten takes an
+# "oh" — the two conventions that make a general digit-pairing rule wrong.
+says("1800p", "eighteen hundred p")
+says("504p", "five oh four p")
+# Only a bare resolution. "1080p60" is a format name, not a rung, and reading
+# it aloud in pairs would be worse than leaving the digits alone.
+says("1080p60", "1080p60")
 
 print("\nprose symbols — new since #356, when the narration became the app's own text")
 # The descriptions in static/index.html are written to be READ. They use the
@@ -114,14 +126,23 @@ print("\nprose symbols — new since #356, when the narration became the app's o
 # every caption was hand-written for the ear.
 says("~4 minutes", "about 4 minutes")
 says("2.6x cheaper", "2.6 times cheaper")
-says("rungs — 1080p and below — in bands", "rungs, 1080 p and below, in bands")
+says("rungs — 1080p and below — in bands", "rungs, ten eighty p and below, in bands")
 # A tilde not introducing a number is left alone: it is a path, not an
 # approximation, and "about /Users" is nonsense.
 says("~/Desktop", "~/Desktop")
 
+print("\nemphasis caps — the app writes for a screen, where caps are emphasis")
+# Spoken, an all-caps word is shouted or spelled. Lowercased for SPEECH only:
+# the caption is burned from the cue text, so the emphasis stays on screen.
+says("bitrates AND the delivery timing", "bitrates and the delivery timing")
+says("x265 IS the slow one", "x265 is the slow one")
+# The same shape is an acronym, which is why the list is enumerated rather
+# than detected. Guessing wrong here is the louder failure of the two.
+says("HEVC and VBV", "H E V C and V B V")
+
 print("\na whole caption, the way one actually reads")
 says("The 6s ladder at 1080p took 1h 39m on ffmpeg.",
-     "The 6 seconds ladder at 1080 p took 1 hour 39 minutes on FF MPEG.")
+     "The 6 seconds ladder at ten eighty p took 1 hour 39 minutes on FF MPEG.")
 
 print("\nthe de-pluralising tail must stay LAST — the one load-bearing ordering")
 # It repairs "1 hours" / "1 minutes" / "1 seconds" left by the expansions above

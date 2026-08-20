@@ -11,6 +11,12 @@
 
 <p align="center"><em>One HEVC/H.264 cloud encode fanned out over 10 spot instances (96/96 vCPU busy, 151 Batch jobs, $1.38/hr) — live chunk grid, cost tracking, and a per-variant progress DAG with an ETA and a MediaConvert/on-demand/spot cost comparison.</em></p>
 
+<p align="center">
+  <a href="https://github.com/jonathaneoliver/infinite-streaming-encoder/releases/tag/v0.2.0"><strong>▶ Watch the demo</strong></a>
+  — an 18-minute narrated walkthrough: a full encode on the local farm, then the
+  same clip on AWS Batch spot capacity.
+</p>
+
 A **parallel, chunking video encoder**: it splits each source into chunks and
 fans the encode out — many chunks at once — across either **AWS Batch spot
 instances** or a **local farm of your own computers**. Same pipeline both ways;

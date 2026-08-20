@@ -14,45 +14,50 @@
 # Text is expanded for the voice automatically (4K -> "four K"), so write it
 # as you want it READ.
 
-[00] Infinite Streaming Encoder. ffmpeg, Go and python encoding farm using AWS or local machines.
+[00] Infinite Streaming Encoder. An ffmpeg parallel encoder farm using local networked machines or AWS cloud.
 [01] The Originals tab lists the source files on the master.
 [02] Selecting a five and a half minute 4K FPV clip.
 [03] These are the encoding options. Everything that decides what gets produced, and where it runs.
 [04] Here is what each control does.
-[05] Target is where the encode runs. \nLocal spreads it across the machines on this network. Cloud submits it to AWS Batch instead.
-[06] Choosing cloud reveals three more controls, for spot capacity, leaving the media in S3, and deferring packaging. The estimate switches from time to money. About $3.80 for this clip.
-[07] Back to local, and the estimate is time again.
-[08] Chunking is how each rung is split for parallel encoding.
-[09] Dynamic sizes each chunk from learnt encode speed, aiming for about four minutes of work per chunk.
-[10] Twelve second chunks cut it as finely as the segments allow, for maximum parallelism across the farm.
-[11] Codec -  H.264, HEVC or AV1. Each one becomes its own job, because they share no work after the mezzanine.
-[12] The ladder carries the rungs and the delivery profile together. Segment length, partial length, GOP and VBV. \nSelect several and the same source is encoded several ways, one job each.
-[13] Max and min resolution drop the rungs taller or shorter than the values you set, selecting a band from the ladder.
-[14] Duration encodes only the first part of the clip. Useful for testing a long source quickly.
-[15] Output suffix names the output directory, so comparison encodes of one source sit side by side instead of replacing each other.
-[16] Shared decode encodes the lower rungs in bands that share one decode per chunk, instead of decoding the same chunk once per rung.
-[17] Burn-in writes timecode, bitrate and codec onto every frame. Useful for diagnosis, switched off for clean output.
-[18] Promote copies each finished output to the delivery host as soon as it is done.
-[19] The panel predicts the whole plan before anything runs. Watch it as the selection grows.
-[20] One clip, two codecs, one ladder. About 1h 39m.
-[21] 2 files and 2 codecs give us  4 separate jobs, one output each. The prediction is now about 5hours  18m
-[22] Removing HEVC reduces the jobs. 1 file gives us  1 job. About 1h 39m now, because HEVC was far slower than H.264.
-[23] A second ladder encodes the same sources again as a different delivery profile\n2 files and  2 laddersgive us 4 separate jobs, one output each.
-[24] 
-[25] 
-[26] Now the settings for this run.
-[27] Codec  \nH.264 only. Every codec becomes its own job, so dropping HEVC halves the work.
-[28] The ladder is apple-uniq-live-xs. It carries the rungs and the delivery profile together.
-[29] On a local target the estimate predicts time, not money, and says whether it is measured or seeded.
-[30] An output suffix gives this run its own directory, so the existing encodes of this source are untouched.
-[31] Encode/Rencode starts the actual encoding. This directory is new, so everything is produced fresh.
-[32] The job is now a Temporal workflow \nor Batch for AWS Cloud.
-[33] The fleet summary\nwhich machines are up, how many cores are busy, and what they are doing right now.
-[34] The machine timeline. One lane per box, filling in as chunks land, showing where the run waited.
-[35] And the job itself, expanded into its stages. One row per variant, one cell per chunk, filling in as each completes.
-[36] The chunks were encoded in parallel across 3 machines: mac, macmini, ubuntu.
-[37] The encode  is  complete. \nThe Outputs tab lists what landed in OUTPUT_DIR.
-[38] The package opens into three areas.
-[39] First, the ladder that was encoded. Its profile and VBV settings, then every rung with its resolution and bitrate.
-[40] Second, the phase table. Every phase with its span, the CPU it consumed, and its peak memory.
-[41] Third, the chunk timeline. One lane per machine, coloured by rung, so you can see which box encoded what.
+[05] Target. Where the encode runs.
+[06] Selecting Cloud. Submits the job to AWS Batch on spot capacity. Costs money, and adds controls for spot, leaving media in S3, and deferred packaging. The estimate switches from time to money. About $1.59 for this clip.
+[07] Returning to a local encode. And the estimate is time again.
+[08] Chunking. How each variant is split into pieces that encode in parallel.
+[09] Selecting Dynamic. Sizes each variant from its learnt encode speed, aiming at ~4 minutes of work per chunk — so a cheap rung is one long chunk, 4K HEVC is many short ones, and they finish together. Cloud sizes for Graviton; local sizes for the slowest box on the farm, since any worker can pick up any chunk.
+[10] Selecting 12 second chunks. Maximum parallelism. Also the most chunk boundaries, each one a queue wait, a container start and an encoder reset.
+[11] Codec. Which encoders to run. Each codec is a separate job with its own output directory, so two codecs is two jobs, not one job twice as long.
+[12] Ladder / Profile. A ladder is the resolutions and bitrates and the delivery timing that goes with them — segment, partial, GOP and VBV. Pick several to encode one source as several delivery profiles, one job each.
+[13] Max Resolution. Drops ladder rungs taller than this. The tiers listed come from the selected ladder's real rung heights, not a fixed set. Min Resolution. Drops ladder rungs shorter than this. With Max Resolution it selects a contiguous band of the ladder rather than a top or a bottom.
+[14] Duration. Encode only the first N seconds, snapped to a whole segment so chunk boundaries still land on segment edges. Blank encodes the whole clip, and so does any value at or above the clip's own length.
+[15] Output suffix. Appended to the output directory name, after the codec. Set one to keep comparison encodes of the same source side by side instead of each archiving the last.
+[16] Shared decode. Encodes the decode-dominated rungs — 1080p and below — in bands of three that share one decode per chunk instead of one ffmpeg each. Local target only. The ladder and every rung's settings are unchanged, so the output is the same.
+[17] Burn-in text overlay. Burns timecode, bitrate, codec, resolution, encoder and a watermark into every variant, so a frame says what produced it. On by default; uncheck for clean output.
+[18] Promote after encode. Rsyncs each finished output to the live locations as soon as the job completes, instead of pressing Promote per output afterwards. Best-effort: a failed copy is logged and does not fail the encode.
+[19] First, the settings for this run.
+[20] Codec: H.264, which is what the form starts with. Every codec is its own job, so this run is one job.
+[21] The ladder is apple-uniq-live-xs. It carries the rungs and the delivery profile together.
+[22] Before running it — this is the ladder we are about to encode with.
+[23] apple-uniq-live-xs. One object holding both halves: the rungs, and the delivery profile they are encoded to.
+[24] Its delivery profile: the VBV shaping, the segment and partial lengths, the GOP, and the suffix. A ladder that pins its segment length is tagged with that length and served exactly as encoded. This one pins nothing and is tagged _xs — the flexible base, one encode that go-live re-chops into one, two and six second segments.
+[25] The rungs, 14 of them. Each one's resolution and target bitrate, and the step up from the rung below. Colour marks a step too small for the rung to earn its place, or a jump big enough to leave a hole.
+[26] And the shaping. Each bar runs from average to peak bitrate over a one, two and six second window, against Apple's limits — peak within one and a quarter times average for live, twice that for video on demand. This profile sits right on the live limit even at a one second chop. A ladder pinned to six seconds sits on the same limit at six — but chop it to one and its peak doubles. That is the whole reason only this ladder may be re-chopped.
+[27] The panel predicts the whole plan before anything runs. Watch it as the selection grows.
+[28] One clip, one codec, one ladder. About 32m 22s.
+[29] Adding HEVC doubles the jobs. 2 codecs → 2 separate jobs, one output each. About 1h 39m now, because HEVC is far slower than H.264.
+[30] A second ladder encodes the same sources again as a different delivery profile. 2 ladders x 2 codecs → 4 separate jobs, one output each. About 3h 18m.
+[31] Back to one clip, one codec, one ladder for this run.
+[32] Back to about 32m 22s.
+[33] On a local target the estimate predicts time, not money.
+[34] An output suffix gives this run its own directory, so the existing encodes of this source are untouched.
+[35] Re-encode replaces the existing output. The previous copy is archived, never deleted.
+[36] The job is now a Temporal workflow. Chunks go onto one queue that every worker polls.
+[37] The fleet summary: which machines are up, and how many cores are busy.
+[38] What each machine is running right now. Its cores, how many are in use, and the chunks it has in flight.
+[39] And the machine timeline: what ran where, over time. One lane per box, filling in as chunks land, so you can see which machine sat idle while another was still the tail.
+[40] And the job itself, expanded into its stages. One row per variant, one cell per chunk, filling in as each completes.
+[41] The chunks were encoded in parallel across 3 machines: mac, ubuntu, macmini.
+[42] The encode is complete. The Outputs tab lists what landed in OUTPUT_DIR.
+[43] The package opens into three areas.
+[44] First, the ladder that was encoded. Its profile and VBV settings, then every rung with its resolution and bitrate.
+[45] Second, the phase table. Every phase with its span, the CPU it consumed, and its peak memory.
+[46] Third, the chunk timeline. One lane per machine, coloured by rung, so you can see which box encoded what.

@@ -40,6 +40,31 @@ def esc(t):
     return t.replace("\\", "\\\\").replace("{", "(").replace("}", ")").replace("\n", "\\N")
 
 
+# Roughly how many characters fit on one line at a given size. Helvetica Neue
+# averages about half its point size per character; measured against the real
+# captions rather than derived, and only ever used to DECIDE a size, never to
+# place text — libass does the actual wrapping.
+CHAR_W = 0.5
+LINE_H = 1.22          # line height as a multiple of font size
+
+
+def fit_size(text, width, strip, base):
+    """The largest size <= base at which `text` wraps into the strip.
+
+    A caption longer than the strip can hold is the reason WrapStyle was 2:
+    with wrapping off it stayed on one line and ran off the side, which at
+    least kept the app visible. Wrapping fixes the overflow and creates the
+    height problem, so both have to be solved together or the fix trades one
+    defect for a worse one.
+    """
+    for size in range(base, 15, -1):
+        per_line = max(1, int(width / (size * CHAR_W)))
+        lines = max(1, -(-len(text) // per_line))       # ceil
+        if lines * size * LINE_H <= strip:
+            return size, lines
+    return 16, max(1, -(-len(text) // max(1, int(width / (16 * CHAR_W)))))
+
+
 def main():
     data = json.load(open(CUES))
     cues = data["cues"]
@@ -47,7 +72,7 @@ def main():
 ScriptType: v4.00+
 PlayResX: {W}
 PlayResY: {H}
-WrapStyle: 2
+WrapStyle: 0
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
@@ -58,6 +83,7 @@ Style: Cap,{FONT},{SIZE},&H00F7EDE6,&H00F7EDE6,&H00000000,&H00000000,0,0,0,0,100
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     lines = []
+    shrunk = []
     for i, c in enumerate(cues):
         start = c["at"]
         # A caption stays up until the NEXT one replaces it — which is what the
@@ -72,9 +98,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             end = min(end, start + PERSIST_MAX)
         if end <= start or not c["text"].strip():
             continue          # a cleared cue is a DELETED cue, not a blank caption
-        lines.append("Dialogue: 0,%s,%s,Cap,,0,0,0,,%s" % (ts(start), ts(end), esc(c["text"])))
+        # Per-line size override only when the caption needs one, so ordinary
+        # captions render exactly as before and only the long ones change.
+        size, n = fit_size(c["text"], W - 2 * LEFT, STRIP, SIZE)
+        tag = "" if size >= SIZE else "{\\fs%d}" % size
+        if size < SIZE:
+            shrunk.append((i, len(c["text"]), size, n))
+        lines.append("Dialogue: 0,%s,%s,Cap,,0,0,0,,%s%s" % (ts(start), ts(end), tag, esc(c["text"])))
     open(OUT, "w").write(head + "\n".join(lines) + "\n")
     print("wrote %s — %d events, %dx%d, size %d, marginV %d" % (OUT, len(lines), W, H, SIZE, MARGV))
+    # Say which captions had to shrink. A caption quietly rendered at 17px is
+    # the kind of thing nobody notices until it is on a screen behind someone.
+    for i, chars, size, n in shrunk:
+        print("  [%02d] %d chars -> size %d, %d lines" % (i, chars, size, n))
     return 0
 
 

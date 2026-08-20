@@ -556,7 +556,7 @@ async function main() {
     await spotlight('ladder:charts',
       'And the shaping. Each bar runs from average to peak bitrate over a one, two and six second window, against Apple\'s limits — peak within one and a quarter times average for live, twice that for video on demand. '
       + 'This profile sits right on the live limit even at a one second chop. A ladder pinned to six seconds sits on the same limit at six — but chop it to one and its peak doubles. '
-      + 'That is the whole reason only this one may be re-chopped.', 15000);
+      + 'That is the whole reason only this ladder may be re-chopped.', 15000);
 
     await tab('Originals');
     await sleep(1600);
@@ -692,7 +692,7 @@ async function main() {
   await spotlight('fleet',
     'The fleet summary: which machines are up, and how many cores are busy.', 6000);
   await spotlight('fleet-live',
-    'What each machine is running right now. Its cores, how much of them is in use, and the chunks it has in flight.', 7000);
+    'What each machine is running right now. Its cores, how many are in use, and the chunks it has in flight.', 7000);
   await spotlight('timeline-live',
     'And the machine timeline: what ran where, over time. One lane per box, filling in as chunks land, so you can see which machine sat idle while another was still the tail.', 8000);
   // "One row per chunk, per rung" was WRONG, and had been since v1 of this
