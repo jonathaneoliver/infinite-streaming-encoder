@@ -200,6 +200,13 @@ def _worker():
 def load_cues():
     with open(STATE["cues_path"]) as f:
         data = json.load(f)
+    # Stamp what the RECORDER said, once, the first time a script is opened.
+    # Without a baseline there is no way to tell a line the drive generated from
+    # one somebody rewrote — and after a re-record that is the first thing you
+    # want to know, because the generated ones move with the app while the hand
+    # edits do not. setdefault, so re-opening never re-baselines an edit.
+    for c in data.get("cues", []):
+        c.setdefault("orig", c.get("text", ""))
     STATE["cues"] = data
     return data
 
@@ -265,6 +272,108 @@ def build_cue_audio(text, voice=None):
     return out, d
 
 
+# --- previous versions of a line ----------------------------------------
+#
+# Rewriting a line loses what it said, and a RE-RECORD loses the whole previous
+# script: the tracked narrative is matched by INDEX, so a take with a different
+# cue count cannot be loaded onto it at all (42 lines against 47 cues, the day
+# this was written).
+#
+# The version STORE already exists and is not this app: tools/demo/narrative/*.txt
+# is tracked in git precisely so `git diff` shows what changed about what is
+# SAID. So read the versions out of git rather than inventing a parallel pile of
+# dated files beside the cues.
+#
+# Matching is by CONTENT, never by index — that is what makes a 42-line script
+# usable against a 47-cue take: a surviving line is found where it landed, not
+# where it used to sit.
+import difflib as _difflib
+import subprocess as _sub
+
+NARRATIVE_REFS = []          # --ref, absolute paths
+_VERSION_CACHE = {"key": None, "refs": []}
+
+
+def _parse_narrative(text):
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"^\[(\d+)\]\s*(.*)$", line)
+        if m:
+            out.append(m.group(2).replace("\\n", " ").strip())
+    return out
+
+
+def _git(args, cwd):
+    try:
+        r = _sub.run(["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=10)
+        return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _reference_sources():
+    """Each --ref file as it is NOW, plus every committed revision of it."""
+    key = tuple(NARRATIVE_REFS)
+    if _VERSION_CACHE["key"] == key:
+        return _VERSION_CACHE["refs"]
+
+    refs = []
+    for path in NARRATIVE_REFS:
+        if not os.path.exists(path):
+            continue
+        d = os.path.dirname(path)
+        top = _git(["rev-parse", "--show-toplevel"], d).strip()
+        rel = os.path.relpath(path, top) if top else None
+
+        try:
+            refs.append({"label": "working copy",
+                         "texts": _parse_narrative(open(path).read())})
+        except Exception:
+            pass
+
+        if rel:
+            log = _git(["log", "--format=%h|%ad|%s", "--date=short", "--", rel], top)
+            for line in log.splitlines()[:8]:
+                sha, date, subj = (line.split("|", 2) + ["", ""])[:3]
+                blob = _git(["show", f"{sha}:{rel}"], top)
+                texts = _parse_narrative(blob)
+                if texts:
+                    refs.append({"label": f"{date} {sha}", "hint": subj[:60],
+                                 "texts": texts})
+    _VERSION_CACHE["key"] = key
+    _VERSION_CACHE["refs"] = refs
+    return refs
+
+
+def _norm(s):
+    return re.sub(r"[^a-z0-9 ]", "", (s or "").lower())
+
+
+def versions_for(text, orig=None):
+    """Best content match from each source, skipping any that is already what
+    the cue says — a version identical to the current line is not a choice.
+
+    The as-recorded text leads the list when it differs, so undoing an edit is
+    the same one-click gesture as adopting an older wording."""
+    cur = _norm(text)
+    seen, out = {cur}, []
+    if orig is not None and _norm(orig) != cur and orig.strip():
+        seen.add(_norm(orig))
+        out.append({"label": "as recorded", "hint": "what the drive generated",
+                    "text": orig, "score": 1.0})
+    for ref in _reference_sources():
+        best, score = None, 0.0
+        for t in ref["texts"]:
+            r = _difflib.SequenceMatcher(None, cur, _norm(t)).ratio()
+            if r > score:
+                best, score = t, r
+        if best and score >= 0.45 and _norm(best) not in seen:
+            seen.add(_norm(best))
+            out.append({"label": ref["label"], "hint": ref.get("hint", ""),
+                        "text": best, "score": round(score, 2)})
+    return out
+
+
 def cue_status(i, c):
     if not c["text"].strip():
         cues = STATE["cues"]["cues"]
@@ -276,7 +385,10 @@ def cue_status(i, c):
     have = dur_cached(p) > 0.2
     cues = STATE["cues"]["cues"]
     slot = (cues[i + 1]["at"] - c["at"]) if i + 1 < len(cues) else None
+    orig = c.get("orig", c["text"])
     return {"i": i, "at": c["at"], "text": c["text"], "spoken": ns.for_speech(c["text"]),
+            "orig": orig, "edited": orig.strip() != c["text"].strip(),
+            "versions": versions_for(c["text"], orig),
             "holdMs": c.get("holdMs"), "slot": slot,
             "audio": bool(have), "dur": dur_cached(p) if have else None,
             "overrun": bool(have and slot and dur_cached(p) > slot)}
@@ -809,12 +921,19 @@ def main():
     ap.add_argument("--cues", required=True)
     ap.add_argument("--port", type=int, default=8777)
     ap.add_argument("--strip", type=int, default=130, help="caption strip height in px")
+    ap.add_argument("--ref", action="append", default=[], metavar="NARRATIVE.txt",
+                    help="a tracked narrative to offer per cue, with every committed "
+                         "revision of it; repeatable. Matched by content, so a script "
+                         "from a take with a different cue count still applies.")
     a = ap.parse_args()
     global STRIP
     STRIP = a.strip
     STATE["video"] = os.path.abspath(a.video)
     STATE["cues_path"] = os.path.abspath(a.cues)
+    NARRATIVE_REFS.extend(os.path.abspath(r) for r in a.ref)
     load_cues()
+    for r in NARRATIVE_REFS:
+        print("  ref  : %s" % r)
     threading.Thread(target=presample_all, daemon=True).start()
     print("narration editor: http://localhost:%d" % a.port)
     print("  video: %s" % STATE["video"])

@@ -423,6 +423,19 @@ async function main() {
     'These are the encoding options. Everything that decides what gets produced, and where it runs.');
   await say('Here is what each control does.');
 
+  // A spoken name for an option, from the option's OWN label — nothing here
+  // keeps a second copy of it (#356). Two normalisations, both for the ear: the
+  // parenthetical gloss is dropped, and "12s chunks" becomes "12 second
+  // chunks", because pronounce.py reads a bare "12s" as "12 seconds" and
+  // "12 seconds chunks" is not English.
+  const optName = (ctl, value) => {
+    const o = ((ctl && ctl.options) || []).find(x => x.value === value);
+    return ((o && o.label) || value)
+      .replace(/\s*\(.*\)\s*$/, '')
+      .replace(/\b(\d+)s\b/, '$1 second')
+      .replace(/\b(\d+)m\b/, '$1 minute');
+  };
+
   const target = await readControl(page, '#target');
   await explain('#target', narrationFor(target));
   // A native select popup is an OS widget and does not appear in a page
@@ -431,7 +444,7 @@ async function main() {
   await page.selectOption('#target', 'cloud');
   await sleep(1200);
   { const h = headline(await settle());
-    await spotEstimate(`${optionDesc(target, 'cloud')} The estimate switches from time to money. ${h ? 'About ' + h + ' for this clip.' : ''}`); }
+    await spotEstimate(`Selecting ${optName(target, 'cloud')}. ${optionDesc(target, 'cloud')} The estimate switches from time to money. ${h ? 'About ' + h + ' for this clip.' : ''}`); }
   await page.selectOption('#target', 'local');
   await sleep(1200);
   await say('Returning to a local encode. And the estimate is time again.', 2600);
@@ -445,7 +458,7 @@ async function main() {
     for (const v of ['dynamic', '12']) {
       await page.selectOption('#chunk-duration', v);
       await sleep(1000);
-      await say(optionDesc(chunking, v));
+      await say(`Selecting ${optName(chunking, v)}. ${optionDesc(chunking, v)}`);
     }
     await page.selectOption('#chunk-duration', orig);
     await sleep(600);
@@ -691,8 +704,18 @@ async function main() {
     'And the job itself, expanded into its stages. One row per variant, one cell per chunk, filling in as each completes.', 7500);
   await say('', 0);
 
+  // The encode is the long middle, and it is the part worth WATCHING: the job
+  // card's chunk grid fills in cell by cell, one per chunk per variant. The
+  // last spotlight before this leaves the page on the fleet lanes, so the whole
+  // encode used to be framed on a panel that barely changes while the
+  // interesting thing happened off screen — 32 minutes of it on the first real
+  // take.
+  await page.evaluate(() => window.__scrollTo('jobcard'));
+  await sleep(900);
+
   const started = Date.now();
   let last = '';
+  let ticks = 0;
   while (Date.now() - started < ENCODE_TIMEOUT_MS) {
     const st = await page.evaluate(async (SRC) => {
       const r = await fetch('/api/jobs'); const j = await r.json();
@@ -707,6 +730,10 @@ async function main() {
     const line = `${st.status} ${st.pct != null ? Math.round(st.pct) + '%' : ''} hosts=${(st.hosts || []).join(',')}`;
     if (line !== last) { console.log('  [job]', line); last = line; }
     await openDetails();          // every SSE re-render can reset the fold
+    // Re-centre now and then, not every tick: the card GROWS as rows arrive, so
+    // it drifts out of frame, but scrolling every four seconds would read as
+    // jitter once the fast-forward compresses this stretch.
+    if (++ticks % 8 === 0) await page.evaluate(() => window.__scrollTo('jobcard'));
     if (['done', 'failed', 'move-failed', 'cancelled'].includes(st.status)) {
       global.__jobStatus = st.status; global.__hosts = st.hosts || []; global.__jobId = st.id; break;
     }
@@ -798,18 +825,52 @@ async function main() {
   await browser.close();
 
   const fs = require('fs');
-  const files = fs.readdirSync(OUT).filter(f => f.endsWith('.webm'));
-  const video = files.length ? OUT + '/' + files[0] : null;
-  fs.writeFileSync(path.join(WORK, 'narration.txt'),
+  // The NEWEST webm, not readdir's first. A re-record into the same OUTDIR
+  // leaves the previous take's file beside the new one, and files[0] picked the
+  // stale one — so cues.json carried this run's timings pointing at the last
+  // run's video. Narrating that applies the wrong cue times to the wrong
+  // picture, and it looks fine until someone watches it.
+  //
+  // Same class as the output directory this run adopted before it was scoped by
+  // tag, and the cues.json that survived a crash to be paired with a fresh
+  // narration.txt. Third time: a stale sibling artifact getting picked up
+  // because the selector was "whatever is there" rather than "the one we made".
+  const files = fs.readdirSync(OUT).filter(f => f.endsWith('.webm'))
+    .map(f => ({ f, t: fs.statSync(OUT + '/' + f).mtimeMs }))
+    .sort((a, b) => b.t - a.t);
+  const video = files.length ? OUT + '/' + files[0].f : null;
+
+  // Every artifact goes to the RUN's directory first, and to $WORK second.
+  //
+  // Both recorders wrote only to $WORK, which is shared — so recording the
+  // second half of a joinable pair destroyed the first half's cues.json,
+  // silently, and the only symptom was a cue count that had changed. It took
+  // rebuilding 47 cues out of a log to notice, and the pair workflow makes this
+  // the NORMAL case rather than an edge one: two takes, one file.
+  //
+  // The per-run copy is authoritative. The $WORK copy is a convenience meaning
+  // "the most recent take", and it is still overwritten — but now that is
+  // harmless, because nothing is only there. Both consumers can be pointed at
+  // the real one: narrate_sentences.py honours CUES/VIDEO/OUTV, and
+  // narrator_app.py takes --cues/--video.
+  const emit = (name, body) => {
+    fs.writeFileSync(path.join(OUT, name), body);
+    fs.writeFileSync(path.join(WORK, name), body);
+  };
+
+  if (files.length > 1) {
+    console.log(`  (${files.length} webm files in ${OUT} — using the newest, ${files[0].f})`);
+  }
+  emit('narration.txt',
     cues.map(c => forSpeech(c.text)).join('\n') + '\n');
-  fs.writeFileSync(path.join(WORK, 'captions.txt'), cues.map(c => c.text).join('\n') + '\n');
+  emit('captions.txt', cues.map(c => c.text).join('\n') + '\n');
   const ts = s => {
     const p = (n, w = 2) => String(n).padStart(w, '0');
     return `${p(Math.floor(s / 3600))}:${p(Math.floor(s % 3600 / 60))}:${p(Math.floor(s % 60))},${p(Math.round((s % 1) * 1000), 3)}`;
   };
-  fs.writeFileSync(path.join(WORK, 'narration.srt'), cues.map((c, i) =>
+  emit('narration.srt', cues.map((c, i) =>
     `${i + 1}\n${ts(c.at)} --> ${ts(i + 1 < cues.length ? cues[i + 1].at : c.at + 5)}\n${c.text}\n`).join('\n'));
-  fs.writeFileSync(path.join(WORK, 'narration-spoken.srt'), cues.map((c, i) =>
+  emit('narration-spoken.srt', cues.map((c, i) =>
     `${i + 1}\n${ts(c.at)} --> ${ts(i + 1 < cues.length ? cues[i + 1].at : c.at + 5)}\n${forSpeech(c.text)}\n`).join('\n'));
   // Segments, so the encode middle can be sped up mechanically. `encode` runs
   // from the moment the Jobs tab opens to the moment the job goes terminal —
@@ -821,12 +882,13 @@ async function main() {
     { name: 'encode',  from: m.encodeStart ?? 0, to: m.encodeEnd ?? 0 },
     { name: 'outputs', from: m.encodeEnd ?? 0,   to: total },
   ];
-  fs.writeFileSync(path.join(WORK, 'cues.json'), JSON.stringify({
+  emit('cues.json', JSON.stringify({
     video, source: SOURCE, codec: CODEC, ladder: LADDER,
     jobId: global.__jobId, jobStatus: global.__jobStatus, hosts: global.__hosts,
     estimate: global.__estimate, outputDir: dirName, outputDirs: global.__dirs,
     segments, cues,
   }, null, 2));
+  console.log('ARTIFACTS:', OUT, '(also copied to', WORK + ', which the NEXT take overwrites)');
   console.log('SEGMENTS:', JSON.stringify(segments));
   console.log('VIDEO:', video);
   console.log('HOSTS:', (global.__hosts || []).join(', ') || 'none');
