@@ -25,7 +25,7 @@ and one term reconciles them:
 machine = allocated / (1 - idle)
 ```
 
-with `idle` from `fleetIdleFraction`, learned from past runs.
+with the overhead learned from past runs by `fleetOverheadModel` — a fixed per-instance edge (boot, image pull, scale-down tail) plus a packing efficiency, rather than one idle percentage. A percentage cannot be right at more than one run size (#380).
 
 ### Why the allowance is shown and never folded in
 
