@@ -1190,6 +1190,18 @@ type JobConfig struct {
 	// It does NOT make an encode VMAF-eligible: any drawn pixels bias a
 	// full-reference metric, so meta.go still treats burn-in as ineligible.
 	BurninMode string `json:"burnin_mode,omitempty"`
+	// SlowPreset trades encode time for compression efficiency on every rung:
+	// SVT-AV1 preset 2 (from the default 6) and x264/x265 `slower` (from
+	// `medium`). Off by default — it is expensive, and how expensive is codec-
+	// specific: measured at 5.3x (1080p) and 5.7x (2160p) for av1, unmeasured
+	// for x26x.
+	//
+	// It overrides the PRESET FIELD of each resolved rung rather than appending
+	// an encoder argument, which is what keeps `speedKey` honest: the planner,
+	// the learned-speed store and the encoder then all name the same preset.
+	// Appending `-preset 2` through a ladder's extra_args also works and is
+	// invisible to all three (see docs/ladders-and-delivery.md).
+	SlowPreset bool `json:"slow_preset,omitempty"`
 	// PromoteAfter rsyncs each produced output to the configured PROMOTE_DESTS
 	// (local + remote live libraries) once the encode succeeds and moves to
 	// OUTPUT_DIR — the automatic version of the per-output Promote button.
@@ -3881,7 +3893,7 @@ func (m *Manager) variantChunkArgs(cfg JobConfig, sourcePath string) []string {
 	var out []string
 	for _, codec := range parseCodecSel(cfg.Codec) {
 		twoPass := ladderDef.twoPassFor(codec, cfg.HevcSinglePass)
-		for _, r := range m.Ladders.resolveRungs(ladderName, codec, cfg.MaxRes, cfg.MinRes, srcWidth) {
+		for _, r := range withPreset(m.Ladders.resolveRungs(ladderName, codec, cfg.MaxRes, cfg.MinRes, srcWidth), codec, cfg.SlowPreset) {
 			cs := dynamicLocalChunkSeconds(m.Speeds, codec, r.Height, twoPass, r.Preset, srcFps, clipS)
 			out = append(out, "--variant-chunk",
 				fmt.Sprintf("%s/%s:%s", codec, r.Label, strconv.FormatFloat(cs, 'f', -1, 64)))
@@ -3961,6 +3973,12 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 		args = append(args, "--no-burnin")
 	} else if cfg.BurninLight() {
 		args = append(args, "--burnin-mode", BurninModeLight)
+	}
+	// Slower preset on every rung (av1 2, x26x slower). A flag rather than an
+	// extra_args string so the orchestrator stamps it onto each rung's PRESET,
+	// which is what the worker encodes at AND what the learned-speed key names.
+	if cfg.SlowPreset {
+		args = append(args, "--slow-preset")
 	}
 	// Shared decode for the bottom N rungs (#317). Env, not a job field: it is a
 	// property of the BOX (how much oversubscription its slots can take), not of
@@ -4430,7 +4448,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// Source fps: keys the speed model (encode time ∝ frame count), so chunk
 		// sizes/priorities match the graviton keys learned at the same rate.
 		srcFps := probeSourceFps(localSrc)
-		inputJSON, expEnc, err := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnv(), m.packageOnHost(job.Config), m.deferPackaging(job.Config), srcWidth, srcFps, durationS, timeLimitS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), m.vmafEstimates(job.Config), job.AppendLog)
+		inputJSON, expEnc, err := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnv(), m.packageOnHost(job.Config), m.deferPackaging(job.Config), job.Config.SlowPreset, srcWidth, srcFps, durationS, timeLimitS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), m.vmafEstimates(job.Config), job.AppendLog)
 		if err != nil {
 			// Fail the job rather than submit. A replayed job whose ladder was
 			// renamed or deleted reaches here having passed submit validation
@@ -4798,7 +4816,7 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached bool, burnin string, packageOnHost, deferPackaging bool, sourceWidth, sourceFps int, clipDurationS, timeLimitS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int, error) {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached bool, burnin string, packageOnHost, deferPackaging, slowPreset bool, sourceWidth, sourceFps int, clipDurationS, timeLimitS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int, error) {
 	if ladderName == "" {
 		ladderName = DefaultLadderName
 	}
@@ -4884,7 +4902,7 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 	// been sized. Resolving first makes the budget answerable.
 	var planned []plannedVariant
 	for _, c := range codecs {
-		rungs := store.resolveRungs(ladderName, c, maxRes, minRes, sourceWidth)
+		rungs := withPreset(store.resolveRungs(ladderName, c, maxRes, minRes, sourceWidth), c, slowPreset)
 		if len(rungs) == 0 {
 			continue
 		}

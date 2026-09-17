@@ -502,6 +502,10 @@ class EncodeWorkflow:
                     "--chunk-span", f"{float(c['duration_s']):.6f}",
                     "--content-duration", f"{content_duration_s:.6f}",
                     "--s3-mezz", mezz, "--s3-out", s3_work]
+            # The rung's preset, when the plan carries one. Absent in a plan
+            # from an older orchestrator, where cli_phase's own default stands.
+            if r.get("preset"):
+                args += ["--preset", str(r["preset"])]
             if tp:
                 args.append("--two-pass")
             if ea:

@@ -644,6 +644,10 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
                     data-desc="Encodes the decode-dominated rungs — 1080p and below — in bands of three that share one decode per chunk instead of one ffmpeg each. Local target only. The ladder and every rung's settings are unchanged, so the output is the same."> Shared decode</label>
             </div>
             <div class="control-group" style="padding-top:22px">
+                <label><input type="checkbox" id="slow-preset" style="width:auto;min-width:auto"
+                    data-desc="Encodes every rung at a slower preset — SVT-AV1 preset 2 instead of 6, x264/x265 'slower' instead of 'medium'. Better compression for the same bitrate, at roughly 5x the encode time for AV1. Measured on one 4K clip: about +1.3 VMAF at equal bitrate."> Slow preset</label>
+            </div>
+            <div class="control-group" style="padding-top:22px">
                 <label><input type="checkbox" id="burnin" checked onchange="_vmafBurninSync(false)" style="width:auto;min-width:auto"
                     data-desc="Burns timecode, bitrate, codec, resolution, encoder and a watermark into every variant, so a frame says what produced it. On by default; uncheck for clean output."> Burn-in text overlay</label>
                 <select id="burnin-mode" style="margin-top:4px"
@@ -2685,6 +2689,7 @@ async function startEncode(force = false) {
         chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
         force_reencode: force,
+        slow_preset: document.getElementById('slow-preset').checked,
         burnin: document.getElementById('burnin').checked,
         // Sent only when it deviates from the default, so a normal submit's payload
         // is byte-unchanged and the server's zero value means the full overlay.
@@ -7171,6 +7176,7 @@ async function forceReencode(fileName, _clickAt) {
         chunk_duration: document.getElementById('chunk-duration').value,
         use_spot: document.getElementById('use-spot').checked,
         force_reencode: true,
+        slow_preset: document.getElementById('slow-preset').checked,
         burnin: document.getElementById('burnin').checked,
         // Sent only when it deviates from the default, so a normal submit's payload
         // is byte-unchanged and the server's zero value means the full overlay.

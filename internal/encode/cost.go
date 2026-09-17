@@ -291,7 +291,7 @@ func (m *Manager) projectCloudCostDetail(cfg JobConfig, sourceWidth, fps int, du
 	ladderDef, _ := m.Ladders.Get(ladderName)
 	var allocated, waveVCPU float64
 	for _, c := range parseCodecSel(cfg.Codec) {
-		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
+		for _, r := range withPreset(m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth), c, cfg.SlowPreset) {
 			twoPass := ladderDef.twoPassFor(c, cfg.HevcSinglePass)
 			sp := m.Speeds.Speed("graviton", c, r.Height, twoPass, r.Preset, fps)
 			if sp <= 0 {
@@ -395,7 +395,7 @@ func (m *Manager) projectLocalWallDetail(cfg JobConfig, sourceWidth, fps int, du
 	var learned, rungs int
 	ladderDef, _ := m.Ladders.Get(ladderName)
 	for _, c := range parseCodecSel(cfg.Codec) {
-		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
+		for _, r := range withPreset(m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth), c, cfg.SlowPreset) {
 			twoPass := ladderDef.twoPassFor(c, cfg.HevcSinglePass)
 			sp, n := m.Speeds.LocalSpeedN(c, r.Height, twoPass, r.Preset, fps)
 			if sp <= 0 {
@@ -585,7 +585,7 @@ func (m *Manager) projectSaaSCosts(cfg JobConfig, sourceWidth, fps int, duration
 	}
 	ladderDef, _ := m.Ladders.Get(ladderName)
 	for _, c := range parseCodecSel(cfg.Codec) {
-		for _, r := range m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth) {
+		for _, r := range withPreset(m.Ladders.resolveRungs(ladderName, c, cfg.MaxRes, cfg.MinRes, sourceWidth), c, cfg.SlowPreset) {
 			commercial += minutes*_commercialRate(r.Height, c)*cMult + minutes*_commercialRepackPerMin
 			mediaconvert += minutes * _mcRate(r.Height, c) * mcMult
 			coconut += minutes * _coconutRate(r.Height)
@@ -832,7 +832,7 @@ func (m *Manager) ladderOutputGB(cfg JobConfig, sourceWidth int, durationS float
 		return 0
 	}
 	for _, codec := range parseCodecSel(cfg.Codec) {
-		for _, r := range m.Ladders.resolveRungs(ladderName, codec, cfg.MaxRes, cfg.MinRes, sourceWidth) {
+		for _, r := range withPreset(m.Ladders.resolveRungs(ladderName, codec, cfg.MaxRes, cfg.MinRes, sourceWidth), codec, cfg.SlowPreset) {
 			kbps += r.Bitrate
 		}
 	}

@@ -352,6 +352,175 @@ VMAF 95 the player reported. These exist to measure our ladders AGAINST, and for
 the SHAPE — climb resolution fast at the bottom, then hold the top resolution
 and buy quality.
 
+## Measured: what bit depth and preset actually cost (AV1)
+
+Five arms of one clip at two rungs, each differing from the baseline in ONE
+thing. The point is the ratios; the absolute seconds are this machine on this
+content, and the absolute VMAF is this content at a deliberately starved
+bitrate.
+
+**Exactly what was encoded** (measured 2026-09-17; nothing here generalises
+beyond this configuration):
+
+| | |
+| --- | --- |
+| source | `insane_fpv_shots_hydrofoil_windsurfing.mkv` — 3840x2160, AV1, 8-bit, 29.97fps (30000/1001), 334s |
+| window | the **first 30s** (`time: "30"`, already a whole number of 6s segments, so nothing was snapped) |
+| codec | **AV1 only** (libsvtav1) |
+| **rungs** | **two, run separately**: `1920x1080 @ 1020 kbps` and `3840x2160 @ 1962 kbps` — the `netflix-av1` 1080p and TOP rungs, each isolated into single-rung `nf-av1-1080-*` / `nf-av1-2160-*` ladders so a job is one encode |
+| profile | 6s segments, 0.2s parts, **6s GOP** (keyint 180), 2-pass, burn-in **OFF** |
+| VBV | 200% / 2.0x on the ladder, **inert for av1** (see below) |
+| **where** | **one machine — the MacBook Pro.** macmini and ubuntu disabled via `POST /api/dist/workers/{machine}`, the UI's own toggle |
+| **how** | **`chunk_duration: "whole"`** — no chunking, so each arm is ONE ffmpeg process, and arms run one at a time |
+| image | `dev-worktree-zippy-sleep-b124048` — ffmpeg `N-126593-gbc46eab87c-20260916`, SVT-AV1 `v4.2.0-73-gfb0ed7e59` |
+| VMAF | `vmaf_4k_v0.6.1` for both rungs, scored against the same 30s of source, both sides converted to 10-bit, 901 frames per arm. The 1080p arms are upscaled to 2160p first (what a viewer on a 4K screen sees); the 2160p arms are native, no resampling |
+
+Every arm differs only in `extra_args`. **Delivered bitrate is measured** — the
+rung directory's bytes over the media's real duration — not assumed from the
+target, because an arm that quietly spent less is being judged on a smaller
+budget.
+
+### 1080p @ 1020 kbps
+
+| arm | delivered | encode | vs base | mean | vs base |
+| --- | --- | --- | --- | --- | --- |
+| preset 6, 8-bit (what the pipeline does) | 1027.1 kbps | 48.1s | 1.00x | 49.25 | — |
+| 10-bit, preset 6 | 1027.3 kbps | 52.9s | **1.10x** | 49.63 | **+0.37** |
+| 10-bit, preset 4 | 1026.3 kbps | 76.0s | 1.58x | 50.01 | +0.75 |
+| 10-bit, preset 2 | 1027.2 kbps | 253.9s | 5.28x | 51.16 | +1.91 |
+
+All four delivered 1027 kbps to within 1 kbps — a genuinely equal-budget
+comparison.
+
+| arm | min | p5 | p25 | med | p75 | p95 | mean |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| preset 6, 8-bit | 4.9 | 19.0 | 33.9 | 46.9 | 68.4 | 79.7 | 49.25 |
+| 10-bit, preset 6 | 4.9 | 18.6 | 33.5 | 47.5 | 69.1 | 81.0 | 49.63 |
+| 10-bit, preset 4 | 5.9 | 18.8 | 33.2 | 48.1 | 70.2 | 82.4 | 50.01 |
+| 10-bit, preset 2 | 6.2 | 19.1 | 34.0 | 49.6 | 72.2 | 83.3 | 51.16 |
+
+### 2160p @ 1962 kbps
+
+| arm | delivered | encode | vs base | mean | vs base |
+| --- | --- | --- | --- | --- | --- |
+| preset 6, 8-bit | 1950.7 kbps | 125.9s | 1.00x | 53.67 | — |
+| 10-bit, preset 6 | 1952.5 kbps | 153.0s | **1.22x** | 53.72 | **+0.05** |
+| 10-bit, preset 4 | **1872.6 kbps** | 227.6s | 1.81x | 54.21 | +0.54 |
+| 10-bit, preset 2 | **1866.0 kbps** | 716.0s | 5.69x | 54.63 | +0.96 |
+| 10-bit, preset 2, target +5% | 2038.8 kbps | 843.9s | 6.70x | **55.40** | **+1.73** |
+
+| arm | min | p5 | p25 | med | p75 | p95 | mean | harm |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| preset 6, 8-bit | 6.1 | 20.2 | 36.5 | 57.8 | 71.0 | 80.3 | 53.67 | 43.57 |
+| 10-bit, preset 6 | 5.8 | 20.1 | 36.3 | 57.3 | 71.0 | 80.9 | 53.72 | 43.53 |
+| 10-bit, preset 4 | 5.7 | 20.1 | 36.8 | 57.2 | 72.6 | 81.6 | 54.21 | 43.81 |
+| 10-bit, preset 2 | 5.3 | 20.2 | 37.2 | 58.3 | 73.7 | 82.2 | 54.63 | 44.03 |
+| 10-bit, preset 2, +5% | 5.3 | 20.2 | 37.3 | 59.7 | 74.0 | 83.2 | 55.40 | 44.48 |
+
+### What the numbers say
+
+**10-bit earns its keep at 1080p and NOT at 2160p** — the opposite of the
+intuition that it should matter most where quantisation is heaviest. At 1080p it
+buys +0.37 mean for +10% encode time. At 2160p it buys **+0.05 for +22%**, and
+its harmonic mean is *lower* than the baseline's (43.53 vs 43.57) — noise, not a
+gain. At 4K the per-pixel budget is so small that quantisation error dwarfs the
+rounding error 10-bit removes, and this content has no smooth gradients for it
+to protect. Cost rises with resolution (bytes per sample double, and a 4K
+working set stops fitting in cache) exactly as the benefit falls.
+
+**The slow presets UNDERSPEND at 2160p, which hides their gain.** Preset 4 and
+preset 2 delivered ~1870 kbps against the baseline's 1951 — 4.5% fewer bits for
+the same target, because better decisions reach the rate-distortion point with
+less. Raising preset 2's target by 5% (to 2060, delivering 2039) recovered
+**+0.77 mean**, so preset 2's real gain over base is ~**+1.7**, not +0.96. A
+comparison at nominally equal targets is not a comparison at equal bitrate.
+
+**The bits-to-VMAF slope at this rung is ~0.084 VMAF per 1% of bitrate**
+(+0.77 over +9.2%), and it converts the preset question into a budget one:
+buying preset 2's ~+1.7 with bitrate instead would take roughly 20% more bits at
+preset 6 and NO extra CPU, against 5.7x the encode time. Which lever is right
+depends on whether CPU or bandwidth is the scarce resource — for a delivery
+ladder it is usually bandwidth, which is the case FOR the slow preset.
+
+**Every arm is flat or slightly WORSE at p5/p25 and better from the median up.**
+The hardest frames are bitrate-starved and no amount of encoder effort rescues
+them; the gain lands in the moderate frames. A mean alone hides that, which is
+why the percentiles are recorded.
+
+### How the measurement was got wrong first — six times
+
+Each of these produced a confident, plausible, wrong table:
+
+1. **A chunked farm measurement cannot answer "what does this option cost".**
+   Three chunks land on three boxes that differ ~3x in speed, and each arm draws
+   a different mix — so the totals compare machines, not options. Measured
+   against the single-machine truth, the farm overstated every cost: 10-bit by
+   **27%** (1.66x vs 1.22x), preset 4 by 25%, preset 2 by 16%. The smallest
+   effect was distorted most. The farm answers "when is my encode done"; one
+   box, one process answers "what does this cost".
+2. **Concurrency.** Under `MAX_CONCURRENT=2` two arms shared the fleet and two
+   did not, which made preset 4 look FASTER than the baseline (42.8s vs 52.1s
+   active). See "Four numbers for how long did this job take".
+3. **`active` is not encoder time.** It is the union of every stage, and about
+   half of a 30s job is mezzanine + audio + packaging + dispatch. At job level
+   10-bit measured 0.97x — i.e. nothing. Only the `encode:*` stages move.
+4. **Chunk content differs.** chunk2 (the clip's last 10s) was consistently the
+   cheapest in every round, so which box drew it changed the total.
+5. **`-t` before the OUTPUT does not truncate the reference.** With `-f null`
+   the source decodes to the end of the clip while the 30s distorted stream
+   freezes on its last frame: 10,022 frames scored for a 899-frame window, mean
+   25, min 0.58. `-t` goes before each `-i`. **The frame count is the check** —
+   every table above is 901 frames.
+6. **Alignment must be proven.** Score a short window with the distorted stream
+   shifted -1/0/+1 frames: +1 collapsed to 26.09 against 48.15 aligned, so the
+   pair is not running ahead. The chunk joins are the other tell — 3 chunks over
+   30s put keyframes at frames 300 and 600, and the scores spike there
+   (57.4 -> 75.9, 41.9 -> 58.1), which can only line up if the timelines do.
+
+**The reference can be the source.** `mezzanine.py` builds the mezzanine with
+`-c copy`, so its frames ARE the source's and the first 30s of either is the
+same pixels — convenient, because local-dist's mezzanine lives in
+`$TMP_DIR/<jobid>/.mezz-work` and is deleted on every terminal outcome. Audio
+and mezzanine are in any case excluded by summing only `encode:*`: audio
+measured 4.1s in every arm, and the mezzanine was a cache hit throughout.
+
+### Two knobs reachable from a ladder, one not
+
+`extra_args` are appended AFTER the codec args, and ffmpeg takes the LAST
+occurrence of an option, so a ladder can override what the encoder hardcodes —
+verified, not assumed (`-preset 6 ... -preset 4` yields preset 4, and
+`-pix_fmt yuv420p ... -pix_fmt yuv420p10le` yields 10-bit):
+
+| knob | from a ladder? | how |
+| --- | --- | --- |
+| bit depth | yes | `"av1": "-pix_fmt yuv420p10le"` |
+| preset | yes | `"av1": "-preset 4"` (av1 presets are NUMBERS; the pipeline hardcodes 6) |
+| scaler flags | **no** | the scale filter is built inside `burnin.build_filter`; a second `-vf` replaces the whole chain, burn-in and tpad included |
+
+**`-maxrate`/`-bufsize` never reach av1 at all** — libsvtav1 rejects a peak cap
+outside CRF mode ("Max Bitrate only supported with CRF mode"), so
+`encode_variants` omits them for that codec and av1 runs plain VBR to the target
+average. A ladder's VBV fields are therefore inert for AV1: they shape h264 and
+hevc only.
+
+**10-bit is for HEVC and AV1, never h264.** H.264 High 10 has essentially no
+hardware decode support, and the h264 ladder exists for maximum compatibility.
+
+### The trap this experiment walked into
+
+**A preset set through `extra_args` is invisible to the learned-speed model.**
+`speedKey` is `machine:codec:height:passes:preset:fps` and takes `preset` from
+`Rung.preset` — which is `"medium"` for every av1 rung, because the av1 preset
+is hardcoded in `_codec_specific_args` and an override arrives later in the
+argv. So preset 2 chunks (**5.3x slower at 1080p, 5.7x at 2160p**) write samples
+onto the same key as preset 6, and `dynamicChunkSecondsAt` then sizes av1 chunks
+from a blend of three presets.
+
+It is the #314 shape exactly: one rule, copied somewhere that cannot see the
+override. Running these arms contaminated `av1:1080` and `av1:2160` on this
+fleet; `scripts/purge_speed_keys.py` clears them, with the server stopped. The
+real fix is for the key to carry the preset that was USED.
+
 ## The intended experiment
 
 The reason the tight-VBV work exists: **compare 1s/2s/6s segments cut

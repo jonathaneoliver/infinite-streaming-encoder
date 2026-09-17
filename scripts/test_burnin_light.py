@@ -67,7 +67,7 @@ check("JEO_1080p_5800k" in light,
 check(light_label(ctx()) == "JEO_1080p_5800k",
       f"light_label: got {light_label(ctx())}")
 check("VMAF~93" not in light, "light mode must not draw the VMAF-estimate row")
-check(light.startswith("scale=1920:1080,"),
+check(light.startswith("scale=1920:1080:flags="),
       f"light mode must keep the scale filter first: {light}")
 
 # The full overlay is unchanged by this work: 5 labels + the VMAF row.

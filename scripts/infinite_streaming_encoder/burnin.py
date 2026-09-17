@@ -34,6 +34,21 @@ FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 # both sides, which is what an older worker does with "light" already.
 MODE_FULL = "full"
 MODE_LIGHT = "light"
+
+# Scaler used for every rung's downscale. ffmpeg's default is bicubic; lanczos
+# resolves fine detail more sharply, and the two rounding flags stop the
+# resampler quantising intermediate values on a coarse grid the way the default
+# fast path does.
+#
+# It is effectively free — resampling is noise beside motion estimation — and it
+# applies to the DOWNSCALE, so it does nothing for a rung at the source's own
+# resolution, where `scale` is a no-op. That is also why it is not in the
+# bit-depth/preset measurements: at the 2160p rung of a 2160p source there was
+# nothing to resample.
+#
+# Recorded per encode (encode.json `scale_flags`), because an output encoded
+# before this default cannot be told apart from one after it by any other means.
+SCALE_FLAGS = "lanczos+accurate_rnd+full_chroma_int"
 # Match bash's escape style for the initial timecode.
 INITIAL_TIMECODE = r"00\:00\:00\:00"
 
@@ -139,7 +154,7 @@ def build_filter(ctx: BurninContext, burnin: bool = True, mode: str = MODE_FULL)
     silently missing the label it is supposed to be identified by.
     """
     tier = ctx.tier
-    chain: list[str] = [f"scale={tier.width}:{tier.height}"]
+    chain: list[str] = [f"scale={tier.width}:{tier.height}:flags={SCALE_FLAGS}"]
 
     padding_enabled = ctx.padding_duration_s > 0
     if padding_enabled:

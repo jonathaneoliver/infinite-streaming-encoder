@@ -863,7 +863,13 @@ def _rung_dict(codec: str, r, ests: dict) -> dict:
     """Plan entry for one rung, with the design-time VMAF estimate attached when
     Go supplied one for (codec, label). temporal_worker passes est_vmaf on to
     cli_phase --est-vmaf so the worker burns it into the overlay."""
-    d = {"label": r.label, "width": r.width, "height": r.height, "bitrate": r.bitrate}
+    d = {"label": r.label, "width": r.width, "height": r.height,
+         "bitrate": r.bitrate,
+         # The preset the worker must encode at. Published per rung rather than
+         # once per job because a rung may carry its own ([w,h,kbps,preset]),
+         # and read with .get on the worker so a plan from an older
+         # orchestrator still means "cli_phase's default".
+         "preset": r.preset}
     e = ests.get((codec, r.label))
     if e:
         d["est_vmaf"], d["est_vmaf_clamped"] = e
@@ -1729,6 +1735,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-burnin", action="store_false", dest="burnin", default=True,
                    help="disable the burnt-in text overlay on every variant; "
                         "on by default")
+    p.add_argument("--slow-preset", action="store_true", dest="slow_preset",
+                   help="trade encode time for compression: SVT-AV1 preset 2 "
+                        "(from 6) and x264/x265 -preset slower (from medium). "
+                        "Measured ~5.3x-5.7x for av1; x26x is unmeasured. The "
+                        "preset REPLACES the rung's, so the learned-speed key "
+                        "sees it")
     p.add_argument("--burnin-mode", dest="burnin_mode", default="",
                    choices=["", "full", "light"],
                    help="overlay style when burn-in is on: 'full' (five stacked "

@@ -200,6 +200,40 @@ def _cgroup_cpu_quota() -> int | None:
     return None
 
 
+# Encoding pixel format per codec. HEVC and AV1 encode 10-bit even from an
+# 8-bit source: the extra precision is INTERNAL — it does not add information,
+# it stops the encoder adding error. Rounding through prediction, transform and
+# motion-compensated interpolation no longer compounds on a coarse grid, and a
+# smooth gradient has more than 256 levels to sit on, so it codes cheaply
+# instead of banding. Measured on one 4K clip (docs/ladders-and-delivery.md
+# § "Measured: what bit depth and preset actually cost"): +0.37 VMAF for +10%
+# encode time at 1080p, and +0.05 for +22% at 2160p — the gain falls with
+# resolution while the cost rises, so this is worth more on the lower rungs.
+#
+# H.264 stays 8-bit and must: High 10 has essentially no hardware decode
+# support, and the h264 ladder exists for maximum compatibility. A 10-bit h264
+# rendition would play on fewer devices than the codec is chosen for.
+_PIX_FMT = {"h264": "yuv420p", "hevc": "yuv420p10le", "av1": "yuv420p10le"}
+
+# SVT-AV1's preset is a NUMBER (0 slowest … 13 fastest), where x264/x265 take
+# names. A ladder rung carries one `preset` string for whichever codec it
+# describes, so an av1 rung holding a name (every shipped ladder says "medium")
+# means "no opinion" and falls back to this.
+_AV1_DEFAULT_PRESET = "6"
+
+
+def _av1_preset(preset: str) -> str:
+    """The SVT-AV1 preset number to use for a rung.
+
+    Numeric means the caller chose deliberately — the Slow-preset job flag, or a
+    ladder rung written `[w, h, kbps, "2"]`. Anything else is an x26x name that
+    cannot mean anything here, so it degrades to the default rather than being
+    passed to SVT, which would reject it and fail the encode.
+    """
+    p = (preset or "").strip()
+    return p if p.isdigit() else _AV1_DEFAULT_PRESET
+
+
 def _codec_specific_args(
     codec: str,
     target_kbps: int,
@@ -232,7 +266,7 @@ def _codec_specific_args(
             "-x265-params",
             f"keyint={k}:min-keyint={k}:scenecut=0:open-gop=0:pools={pools}:frame-threads=0"
             + _pass_suffix(pass_num, stats_path),
-            "-pix_fmt", "yuv420p",
+            "-pix_fmt", _PIX_FMT["hevc"],
         ]
     if codec == "h264":
         return [
@@ -242,7 +276,7 @@ def _codec_specific_args(
             "-x264-params",
             f"keyint={k}:min-keyint={k}:scenecut=0:open-gop=0"
             + _pass_suffix(pass_num, stats_path),
-            "-pix_fmt", "yuv420p",
+            "-pix_fmt", _PIX_FMT["h264"],
         ]
     if codec == "av1":
         # `lp` (logical processors) is SVT-AV1's thread budget, and it is NOT
@@ -268,14 +302,20 @@ def _codec_specific_args(
         lp = f":lp={n}" if n else ":lp=0"
         return [
             "-c:v", "libsvtav1",
-            # preset 6 (was 8): SVT-AV1 parallelizes across more cores at slower
-            # presets and gives better quality — 6 scales onto a big Graviton box
-            # (where x265 stalls at ~2 cores) at a modest speed cost vs 8.
-            "-preset", "6",
+            # Default preset 6 (was 8): SVT-AV1 parallelizes across more cores at
+            # slower presets and gives better quality — 6 scales onto a big
+            # Graviton box (where x265 stalls at ~2 cores) at a modest speed cost
+            # vs 8. The rung's preset WINS when it is numeric, which is how the
+            # Slow-preset flag (av1 -> 2) and a hand-written `[w,h,kbps,"4"]`
+            # rung reach the encoder. It used to be hardcoded, so av1 silently
+            # ignored every preset a ladder specified — and `speedKey` reads the
+            # rung's preset, so the learned model could not see the difference
+            # either.
+            "-preset", _av1_preset(preset),
             "-svtav1-params", f"keyint={k}:scd=0{lp}",
             "-g", str(k),
             "-force_key_frames", f"expr:gte(n,n_forced*{k})",
-            "-pix_fmt", "yuv420p",
+            "-pix_fmt", _PIX_FMT["av1"],
         ]
     raise EncodeError(f"unsupported codec: {codec}")
 

@@ -50,6 +50,16 @@ type encodeMeta struct {
 	// does: a score, or an eyeball comparison, is only interpretable alongside
 	// how many pixels the overlay was covering.
 	BurninMode string `json:"burnin_mode,omitempty"`
+	// Preset, PixFmt and ScaleFlags are the three encode properties that are
+	// otherwise UNRECOVERABLE from an output directory. Two of them changed
+	// their defaults once already (10-bit for hevc/av1, lanczos scaling), and
+	// an output encoded before that change is indistinguishable from one after
+	// it by any other means — same names, same manifests, same rung dirs. A
+	// VMAF score or an A/B comparison is only interpretable if these are known,
+	// so unlike Burnin they are recorded ALWAYS, not only when they deviate.
+	Preset     string `json:"preset,omitempty"`
+	PixFmt     string `json:"pix_fmt,omitempty"`
+	ScaleFlags string `json:"scale_flags,omitempty"`
 	Source     string `json:"source,omitempty"`
 	// TimeLimitS is JobConfig.Time — the ffmpeg `-t` cap. Recorded because it's
 	// the ONE mezzanine-re-derivation input encode.json otherwise lacked (#117):
@@ -308,6 +318,9 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 		ForceReencode:        cfg.ForceReencode,
 		Burnin:               burnin,
 		BurninMode:           burninMode,
+		Preset:               presetForCodec(codec, cfg.SlowPreset),
+		PixFmt:               pixFmtForCodec(codec),
+		ScaleFlags:           ScaleFlags,
 		Source:               strings.Join(cfg.Files, ", "),
 		TimeLimitS:           cfg.Time,
 		SourceSize:           srcSize,
@@ -348,6 +361,9 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 	} else if cfg.BurninLight() {
 		line += " burnin=light"
 	}
+	// Always: these are the properties a bare output directory cannot otherwise
+	// answer for, and the ones whose defaults have moved (see encodeMeta).
+	line += fmt.Sprintf(" preset=%s pix_fmt=%s", presetForCodec(codec, cfg.SlowPreset), pixFmtForCodec(codec))
 	// Provenance in the manifest itself, so a bare output dir handed to someone
 	// else still answers "what encoded this?" without encode.json.
 	if meta.FfmpegVersion != "" {

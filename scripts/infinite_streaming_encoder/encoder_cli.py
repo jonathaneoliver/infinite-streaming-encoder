@@ -143,6 +143,7 @@ _BOOL_FIELDS = {
     "measure_vmaf": "measure_vmaf",
     "vmaf_prescale": "vmaf_prescale",
     "group_rungs": "group_rungs",
+    "slow_preset": "slow_preset",
 }
 
 # TRI-STATE. These are pointers in JobConfig, where nil means "use the server
@@ -272,6 +273,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--group-rungs", action="store_true",
                    help="encode the decode-dominated rungs in bands sharing one "
                         "decode per chunk (#317, local only)")
+    g.add_argument("--slow-preset", action="store_true",
+                   help="encode every rung at a slower preset: SVT-AV1 2 (from "
+                        "6), x264/x265 'slower' (from 'medium'). Better "
+                        "compression at the same bitrate for roughly 5x the "
+                        "encode time on av1 (~+1.3 VMAF at equal bitrate, "
+                        "measured on one 4K clip)")
 
     g = p.add_argument_group("mode")
     g.add_argument("--dry-run", action="store_true",

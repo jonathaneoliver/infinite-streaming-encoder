@@ -202,6 +202,9 @@ check:                ## run the same static checks CI runs (gofmt/vet/build/tes
 	printf '  py burninlight '; \
 	if out=$$(python3 scripts/test_burnin_light.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
+	printf '  py encdefaults '; \
+	if out=$$(python3 scripts/test_encode_defaults.py 2>&1); then echo "ok"; \
+	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
 	printf '  py deferpkg    '; \
 	if out=$$(python3 scripts/test_deferred_packaging.py 2>&1); then echo "ok"; \
 	else echo "FAIL"; echo "$$out" | sed 's/^/                 /'; fail=1; fi; \
