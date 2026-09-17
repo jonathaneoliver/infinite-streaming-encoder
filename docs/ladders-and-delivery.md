@@ -62,10 +62,26 @@ peak / avg  =  maxrate_percent/100  +  bufsize_multiplier / T
 A **large** buffer lets a **short** segment burst. This is the whole reason a
 tight VBV is needed if one encode is to be cut at several segment durations:
 
-Apple's guidance, which the chart colours against: **<=1.25x avg for live,
-<=2x for VOD**.
+What the chart colours against: **<=2x avg for VOD, <=1.25x avg for live**.
+Only the first of those is Apple's. Read the spec carefully, because the two
+halves are not the same kind of rule:
 
-The live ladders are deliberately **peak-matched** at that 1.25x cap, so a
+| rule | says | is it peak/avg? |
+| --- | --- | --- |
+| 1.30 (VOD) | peak SHOULD be no more than **200% of the average bit rate** | **yes** |
+| 1.26/1.27 (VOD) | average and peak MUST be **within 10%** of the declared `AVERAGE-BANDWIDTH` / `BANDWIDTH` | no — accuracy of the declaration |
+| 1.28 (live) | average over ~1h MUST be **< 110% of `AVERAGE-BANDWIDTH`** | no — declaration again |
+| 1.29 (live) | measured peak MUST be **< 125% of `BANDWIDTH`** | no — measured against the DECLARED peak, not the average |
+
+**There is no peak/avg bound for live in the spec.** 1.29's 125% is the
+tolerance between what you measure and what you advertised, so a live stream
+satisfies it at any peak/avg as long as `BANDWIDTH` is honest. The 1.25x here is
+OURS: holding peak within 1.25x of average is what keeps a rung's declared
+`BANDWIDTH` close to its average, and adjacent rungs therefore far enough apart
+for a player selecting on `BANDWIDTH` to use them. It is stricter than Apple
+requires, and the reason to keep it is re-choppability at 1s, not compliance.
+
+The live ladders are deliberately **peak-matched** at that 1.25x figure, so a
 comparison between them is not confounded by peak. What differs is the BUFFER
 each can afford, which is what committing to a segment length buys:
 
@@ -78,8 +94,8 @@ each can afford, which is what committing to a segment length buys:
 | `apple-uniq-vod` | 200% | 2.00 | 60.0 | 2.33x at 6s | — |
 
 The flexible base still pays the 1s price at every length — that has not
-changed, and it is the cost of re-choppability. What changed is HOW the 1.25x
-allowance is split between the two knobs.
+changed, and it is the cost of re-choppability. What changed is HOW our 1.25x
+budget is split between the two knobs.
 
 **The split matters as much as the bound.** `peak/avg = maxrate% + bufsize/T`,
 so at T=1s every point of maxrate given up buys 0.01x of buffer directly. The
@@ -214,9 +230,9 @@ tree that says so.
 
 **`_xs` is a claim about the encode, and no check ties it to the claim.** The
 flexible base's VBV is split 100% maxrate + 0.25x buffer precisely so that
-`peak/avg = 1.00 + 0.25/T` still satisfies Apple's 1.25x live bound **at T=1s**
-— that bound holding at the shortest chop is what makes the encode safe to
-re-chop at all. But the tag is derived from `segment_duration` being unset and
+`peak/avg = 1.00 + 0.25/T` still lands on our 1.25x live figure **at T=1s** (see
+the VBV section: that figure is ours, not a rule from Apple's spec) — holding it
+at the shortest chop is what makes the encode safe to re-chop at all. But the tag is derived from `segment_duration` being unset and
 from nothing else. A ladder with looser VBV that pins no segment derives `xs`
 just the same, and asserts a re-choppability its own numbers do not support.
 **Not enforced** — the relation is in `ladder_store.go`'s description of
@@ -247,6 +263,8 @@ destructive.
 | `apple-uniq-live-2s` | 110 | 0.30 | 2 | 0.2 | 2 | `2s` (derived) |
 | `apple-uniq-live-6s` | 110 | 0.90 | 6 | 0.2 | 6 | `6s` (derived) |
 | `apple-uniq-vod` | 200 | 2.00 | 6 | 0 | 6 | **`vod` (explicit)** |
+| `netflix-av1` | 200 | 2.00 | 6 | 0.2 | 6 | **`nf6s` (explicit)** |
+| `netflix-dv-hevc` | 200 | 2.00 | 6 | 0.2 | 6 | **`nf6s` (explicit)** |
 
 `apple-uniq-vod` carries an EXPLICIT tag because it pins 6s and would otherwise
 derive `6s` — the same as `apple-uniq-live-6s`, which is a different encode
@@ -259,6 +277,80 @@ comparison between them is like-for-like at every rung.
 
 No stored ladder sets `output_tag`; every tag seen on disk is either derived
 (`xs`) or was typed per encode.
+
+## The Netflix ladders: measured, then altered
+
+`netflix-av1` and `netflix-dv-hevc` are the only ladders here whose rungs were
+**not chosen**. They were read out of a live Netflix player while a transparent
+bridge walked the client's downlink cap up in 5% steps, and each rung's
+resolution and bitrate come from the player's own diagnostics. The full record,
+with the method and its caveats, is [issue
+#394](https://github.com/jonathaneoliver/infinite-streaming-encoder/issues/394);
+this section says only what was CHANGED to make them ladders in this system.
+
+They are seeds rather than user ladders because reference data that lives in one
+box's `ladders.json` is not a reference — a state wipe, a fresh install or a
+second machine each loses it, and the measurement cost most of a day on real
+hardware.
+
+**What is theirs, unaltered:** every bitrate, the rung count, and the ordering.
+`netflix-av1` is 8 rungs from 63 to 1962 kbps (AV1, 8-bit SDR, 24 fps);
+`netflix-dv-hevc` is 11 rungs from 111 to 11846 kbps (Dolby Vision HEVC, same
+title, selected purely by the DISPLAY's dynamic range).
+
+**What we changed, and why:**
+
+1. **Resolutions, where Netflix repeated one.** HLS variant directories are
+   named `<height>p` (`manifests._resolution_name`), so a ladder that reuses a
+   resolution collides with itself — one rung overwrites the other. Netflix
+   repeats 608x342 (63 + 97 kbps), 1920x1080 (543 + 1020) and 3840x2160 (all
+   five of the DV ladder's top rungs). The **lower** rung of each repeat steps
+   down by the smallest exact-16:9 increment and the measured resolution stays
+   on the **upper** one:
+
+   | ladder | as measured | as stored |
+   | --- | --- | --- |
+   | `netflix-av1` | 608x342 @ 63 | **576x324** @ 63 |
+   | `netflix-av1` | 1920x1080 @ 543 | **1888x1062** @ 543 |
+   | `netflix-dv-hevc` | 3840x2160 @ 778 / 1154 / 4213 / 8366 | **3712x2088 / 3744x2106 / 3776x2124 / 3808x2142** |
+
+   18px of height is the minimum step that stays exactly 16:9 with even
+   dimensions, because an exact 16:9 height must divide by 18. It is the same
+   device `apple-uniq` uses on Apple's own duplicate (768x432 at 730 and 1100
+   became 704x396 and 768x432). Keeping the measured resolution on the TOP rung
+   of each group matters: that rung is then the pixel-exact one, so the sharpest
+   scaling and the highest bitrate coincide and quality still rises
+   monotonically.
+
+   The cost is a ~1.7% pixel reduction at an unchanged bitrate, so a nudged
+   rung's bits/pixel runs ~1.7% high against Netflix's figure. Negligible beside
+   1.38x-1.92x rung steps, but systematic — do not read a nudged rung as a
+   like-for-like against the measured number.
+
+2. **The delivery profile is entirely ours.** Segment duration, partials, GOP
+   and VBV are **not observable from outside a player**, so they had to be
+   chosen rather than copied: 6s segments, 0.2s LL-HLS parts, 6s GOP, and the
+   VOD VBV (200% / 2.0x) on the grounds that these are VOD encodes and a loose
+   VBV is what lets per-shot bit allocation show up at all. With `gop == segment`,
+   parts are INDEPENDENT only at segment boundaries — the same tradeoff
+   `apple-uniq-live-6s` carries.
+
+3. **An explicit `nf6s` tag**, for the reason `apple-uniq-vod` carries `vod`:
+   pinning 6s would otherwise derive `6s` and collide with
+   `apple-uniq-live-6s`. Both Netflix ladders share the one tag safely, because
+   their codecs differ and the codec is already in the directory name.
+
+**One rung per codec column, and no h264.** Each ladder carries only the codec
+it was measured on, so a job selecting h264 against either fails with the #289
+"no rungs for this codec" error. That is the intended behaviour: there is no
+measured h264 ladder to invent one from.
+
+**The bitrates are not targets.** They are the output of Netflix's per-shot
+optimiser on one title, and #394's own data shows three adjacent episodes
+disagreeing by up to 16% at 4K. Our encoder at 543 kbps/1080p will not reach the
+VMAF 95 the player reported. These exist to measure our ladders AGAINST, and for
+the SHAPE — climb resolution fast at the bottom, then hold the top resolution
+and buy quality.
 
 ## The intended experiment
 
