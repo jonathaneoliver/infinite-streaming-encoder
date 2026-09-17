@@ -139,6 +139,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-burnin", action="store_false", dest="burnin", default=True,
                    help="disable the burnt-in text overlay (timecode/rate/codec/"
                         "watermark labels); on by default.")
+    p.add_argument("--burnin-mode", dest="burnin_mode", default="",
+                   choices=["", "full", "light"],
+                   help="overlay style when burn-in is on: 'full' (five stacked "
+                        "labels, the default) or 'light' (one static "
+                        "JEO_<rung>_<kbps>k label, so a quality measurement is "
+                        "barely biased but the rung is still identifiable)")
 
     # Local parallelism: fill a multi-core box by running encodes concurrently
     # (a single x265 encode only ~half-fills a machine). With a chunk duration,
@@ -411,6 +417,7 @@ def run_full(args: argparse.Namespace) -> int:
             },
             extra_args={c: ladder_extra_args(ladder_def, c) for c in ("h264", "hevc", "av1")},
             burnin=args.burnin,
+            burnin_mode=(getattr(args, "burnin_mode", "") or "full"),
         )
 
         print(f"[phase 3] encoding variants: codec={args.codec} "

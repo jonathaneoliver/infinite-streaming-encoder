@@ -646,6 +646,11 @@ h1 { font-size: 1.5rem; margin-bottom: 0; color: #fff; }
             <div class="control-group" style="padding-top:22px">
                 <label><input type="checkbox" id="burnin" checked onchange="_vmafBurninSync(false)" style="width:auto;min-width:auto"
                     data-desc="Burns timecode, bitrate, codec, resolution, encoder and a watermark into every variant, so a frame says what produced it. On by default; uncheck for clean output."> Burn-in text overlay</label>
+                <select id="burnin-mode" style="margin-top:4px"
+                    data-desc="Full draws the five stacked labels. Minimal draws one static JEO_<rung>_<kbps>k label instead: the timecode row re-renders every frame and so costs bits continuously, where a static label is free after each keyframe. Use Minimal to compare picture quality while still being able to tell the rungs apart.">
+                    <option value="full">Overlay: full</option>
+                    <option value="light">Overlay: minimal (rung label only)</option>
+                </select>
                 <span id="vmaf-burnin-hint" style="display:none;color:#d0a24a;font-size:11px">⚠ overlay biases VMAF — uncheck for accurate scores</span>
             </div>
             <div class="control-group" id="promote-group" style="display:none;padding-top:22px">
@@ -2681,6 +2686,9 @@ async function startEncode(force = false) {
         use_spot: document.getElementById('use-spot').checked,
         force_reencode: force,
         burnin: document.getElementById('burnin').checked,
+        // Sent only when it deviates from the default, so a normal submit's payload
+        // is byte-unchanged and the server's zero value means the full overlay.
+        ...(document.getElementById('burnin-mode')?.value === 'light' ? {burnin_mode: 'light'} : {}),
         promote: document.getElementById('promote-after').checked
     };
     // #214 — send only for cloud targets. The server field is a *bool, so
@@ -7164,6 +7172,9 @@ async function forceReencode(fileName, _clickAt) {
         use_spot: document.getElementById('use-spot').checked,
         force_reencode: true,
         burnin: document.getElementById('burnin').checked,
+        // Sent only when it deviates from the default, so a normal submit's payload
+        // is byte-unchanged and the server's zero value means the full overlay.
+        ...(document.getElementById('burnin-mode')?.value === 'light' ? {burnin_mode: 'light'} : {}),
         promote: document.getElementById('promote-after').checked
     };
 

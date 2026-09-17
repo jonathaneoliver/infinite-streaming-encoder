@@ -131,6 +131,7 @@ _STR_FIELDS = {
     "padding": "padding",
     "cpu_arch": "cpu_arch",
     "output_tag": "output_tag",
+    "burnin_mode": "burnin_mode",
 }
 
 # Plain booleans: false IS the default, so sending it changes nothing.
@@ -208,6 +209,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "Keeps comparison encodes of one source side by side "
                         "instead of archiving each other — e.g. 'local12'. "
                         "Blank uses the ladder's default (usually 'xs').")
+    g.add_argument("--burnin-mode", default="", choices=["", "full", "light"],
+                   help="overlay style when the burn-in text is on: 'full' (five "
+                        "stacked labels, the default) or 'light' (one static "
+                        "JEO_<rung>_<kbps>k label, so the picture is barely "
+                        "affected but the rung is still identifiable). Use "
+                        "--no-burnin to turn the overlay off entirely.")
 
     g = p.add_argument_group("where to run it")
     g.add_argument("--target", choices=["local", "cloud"], default="",

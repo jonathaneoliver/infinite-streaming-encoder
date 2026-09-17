@@ -436,6 +436,10 @@ class EncodeWorkflow:
         # build on this (build amortizes only across >= a few renditions).
         num_variants = sum(len(ci["rungs"]) for ci in plan["codecs"].values())
         bn = plan.get("burnin", True)  # job-level text-overlay toggle (default on)
+        # Which overlay when it is on: "full" (default) or "light" (one static
+        # rung label). plan.get, so a plan from an older orchestrator reads as
+        # full — the same degradation the cloud path gets from BURNIN=light.
+        bn_mode = str(plan.get("burnin_mode") or "").strip().lower()
         specs = []
         for codec, ci in plan["codecs"].items():
             tp = ci["two_pass"]
@@ -506,6 +510,10 @@ class EncodeWorkflow:
                 args.append("--measure-vmaf")
             if not bn:
                 args.append("--no-burnin")
+            elif bn_mode == "light":
+                # One static label; the VMAF-estimate row is not drawn in this
+                # mode, so --est-vmaf would be dead weight in the argv.
+                args += ["--burnin-mode", "light"]
             elif r.get("est_vmaf") is not None:
                 # Design-time VMAF estimate for the overlay (Go looked it up from
                 # the quality curves; cli_local_dist attached it to the rung). Only

@@ -1174,6 +1174,22 @@ type JobConfig struct {
 	// local encoder via --no-burnin and to cloud-batch via the BURNIN env in
 	// each variant job's containerOverrides. See BurninEnabled.
 	Burnin *bool `json:"burnin,omitempty"`
+	// BurninMode picks WHICH overlay is drawn when Burnin is on: "" / "full"
+	// (the five-label stack) or "light" (one static JEO_<rung>_<kbps>k label).
+	// Light exists so an encode being measured carries as few drawn pixels as
+	// possible while still naming its own rung — the timecode row re-renders
+	// every frame and so costs bits continuously, where one static label is
+	// inter-predicted for free after each keyframe.
+	//
+	// It travels to the cloud INSIDE the existing BURNIN env ("true"/"false"/
+	// "light") rather than as a new variable, so no state-machine or job-
+	// definition change is needed and this ships without a deploy; a worker on
+	// older code reads "light" as truthy and draws the full overlay. Locally it
+	// is --burnin-mode. Unknown values mean full on every path.
+	//
+	// It does NOT make an encode VMAF-eligible: any drawn pixels bias a
+	// full-reference metric, so meta.go still treats burn-in as ineligible.
+	BurninMode string `json:"burnin_mode,omitempty"`
 	// PromoteAfter rsyncs each produced output to the configured PROMOTE_DESTS
 	// (local + remote live libraries) once the encode succeeds and moves to
 	// OUTPUT_DIR — the automatic version of the per-output Promote button.
@@ -3672,11 +3688,46 @@ func snapToSegment(secs, segS float64) float64 {
 	return n * segS
 }
 
+// Burn-in overlay modes. Mirrors burnin.MODE_FULL / MODE_LIGHT in
+// scripts/infinite_streaming_encoder/burnin.py — a cross-language contract with
+// no schema, so the spellings must match. Both sides read anything else as
+// full.
+const (
+	BurninModeFull  = "full"
+	BurninModeLight = "light"
+)
+
 // BurninEnabled reports whether the text overlay should be burnt in. Default is
 // on: a nil Burnin (older jobs / omitted by the client) counts as enabled, and
 // only an explicit false disables it.
 func (cfg *JobConfig) BurninEnabled() bool {
 	return cfg.Burnin == nil || *cfg.Burnin
+}
+
+// BurninLight reports whether the MINIMAL overlay was asked for — one static
+// rung label instead of the five-label stack. False when burn-in is off
+// entirely, so callers can ask this one question instead of two.
+//
+// The comparison is case-insensitive and anything unrecognised is full, which
+// is the same rule cli_phase._burnin_mode applies at the other end. Both sides
+// degrade toward a legible overlay: an encode silently missing the label it is
+// meant to be identified BY is the worse failure.
+func (cfg *JobConfig) BurninLight() bool {
+	return cfg.BurninEnabled() && strings.EqualFold(strings.TrimSpace(cfg.BurninMode), BurninModeLight)
+}
+
+// BurninEnv is the BURNIN value the cloud path puts on every variant job:
+// "false" when off, "light" for the minimal overlay, "true" otherwise. One
+// variable carries both facts — see JobConfig.BurninMode for why.
+func (cfg *JobConfig) BurninEnv() string {
+	switch {
+	case !cfg.BurninEnabled():
+		return "false"
+	case cfg.BurninLight():
+		return BurninModeLight
+	default:
+		return "true"
+	}
 }
 
 // localChunkSeconds resolves the ONE chunk size a local encode falls back to,
@@ -3908,6 +3959,8 @@ func (cfg *JobConfig) distArgsForFile(sourceDir, outputDir, filename, jobID stri
 	}
 	if !cfg.BurninEnabled() {
 		args = append(args, "--no-burnin")
+	} else if cfg.BurninLight() {
+		args = append(args, "--burnin-mode", BurninModeLight)
 	}
 	// Shared decode for the bottom N rungs (#317). Env, not a job field: it is a
 	// property of the BOX (how much oversubscription its slots can take), not of
@@ -4377,7 +4430,7 @@ func (m *Manager) runOneCloudBatchSFN(job *Job, tmpDir, filename, bucket string,
 		// Source fps: keys the speed model (encode time ∝ frame count), so chunk
 		// sizes/priorities match the graviton keys learned at the same rate.
 		srcFps := probeSourceFps(localSrc)
-		inputJSON, expEnc, err := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnabled(), m.packageOnHost(job.Config), m.deferPackaging(job.Config), srcWidth, srcFps, durationS, timeLimitS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), m.vmafEstimates(job.Config), job.AppendLog)
+		inputJSON, expEnc, err := buildSFNInput(m.Ladders, m.Speeds, s3Input, s3Prefix, s3Mezz, job.Config.Ladder, job.Config.Codec, job.Config.MaxRes, job.Config.MinRes, job.Config.HevcSinglePass, cacheHit, job.Config.BurninEnv(), m.packageOnHost(job.Config), m.deferPackaging(job.Config), srcWidth, srcFps, durationS, timeLimitS, job.Config.ChunkDuration, job.Config.SegmentDuration, job.Config.PartialDuration, job.Config.GopDuration, m.jobPriorityBase(job), m.vmafEstimates(job.Config), job.AppendLog)
 		if err != nil {
 			// Fail the job rather than submit. A replayed job whose ladder was
 			// renamed or deleted reaches here having passed submit validation
@@ -4745,7 +4798,7 @@ func parseCodecSel(sel string) []string {
 	return out
 }
 
-func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached, burnin, packageOnHost, deferPackaging bool, sourceWidth, sourceFps int, clipDurationS, timeLimitS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int, error) {
+func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Prefix, s3Mezz, ladderName, codecSel, maxRes, minRes string, hevcSinglePass, mezzCached bool, burnin string, packageOnHost, deferPackaging bool, sourceWidth, sourceFps int, clipDurationS, timeLimitS float64, chunkCfg, segDur, partDur, gopDur string, priorityBase int, vmafEst map[string][2]string, logf func(string)) (string, int, error) {
 	if ladderName == "" {
 		ladderName = DefaultLadderName
 	}
@@ -5096,10 +5149,17 @@ func buildSFNInput(store *LadderStore, speeds *EncodeSpeedStore, s3Input, s3Pref
 		// input omits fails the state at runtime rather than being treated as
 		// absent, which is the #176 trap in a different costume.
 		"time_limit": strconv.FormatFloat(timeLimitS, 'f', -1, 64),
-		// Text-overlay toggle → BURNIN env on every variant job (see the ASL
+		// Text overlay → BURNIN env on every variant job (see the ASL
 		// containerOverrides). "true"/"false" so cli_phase's _env_flag_default_on
 		// reads it; on by default, only an explicit false disables it.
-		"burnin": strconv.FormatBool(burnin),
+		//
+		// It also carries the MODE: "light" means on, minimal overlay. Piggy-
+		// backing on this value rather than adding a BURNIN_MODE env is what
+		// keeps the state machine and every job definition unchanged, so the
+		// feature ships with a payload update and no deploy — and a worker on
+		// older code reads "light" as truthy and draws the full overlay, which
+		// is the degradation we want (see JobConfig.BurninMode).
+		"burnin": burnin,
 		// Banded priorities for the fixed phases (chunks carry their own banded
 		// priority per variant). Keeps a job's whole pipeline in one band so an
 		// earlier job's package isn't starved by a later job's chunks.

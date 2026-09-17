@@ -15,7 +15,9 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-from infinite_streaming_encoder.burnin import BurninContext, build_filter, rate_label
+from infinite_streaming_encoder.burnin import (
+    MODE_FULL, BurninContext, build_filter, rate_label,
+)
 from infinite_streaming_encoder.chunking import Chunk, plan_chunks
 from infinite_streaming_encoder.gop import keyint
 from infinite_streaming_encoder.ladder import (
@@ -110,6 +112,11 @@ class EncodeContext:
     # labels + the PADDING label). On by default; a job-level flag, not per-codec.
     # False → the -vf chain is just scale (+ any tpad padding), no drawtext.
     burnin: bool = True
+    # Which overlay when burnin is on: burnin.MODE_FULL (the five-label stack)
+    # or burnin.MODE_LIGHT (one static "JEO_<rung>_<kbps>k" label, for encodes
+    # whose quality is being measured). Unknown values mean FULL. Ignored
+    # entirely when burnin is False.
+    burnin_mode: str = MODE_FULL
     # Pre-formatted VMAF-estimate label for the burn-in overlay (e.g. "VMAF~93"),
     # or "" to omit that row. A design-time estimate the Go control plane looks up
     # from the quality curves per rung — see BurninContext.vmaf_label.
@@ -327,7 +334,7 @@ def build_ffmpeg_cmd(
         padding_duration_s=ctx.padding_duration_s,
         timecode_start_s=chunk.start_s if chunk else 0.0,
         vmaf_label=ctx.vmaf_label,
-    ), burnin=ctx.burnin)
+    ), burnin=ctx.burnin, mode=ctx.burnin_mode)
 
     if chunk is None:
         out_path = _variant_path(ctx.output_dir, codec, rung.label)

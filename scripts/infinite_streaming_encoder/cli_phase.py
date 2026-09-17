@@ -46,6 +46,7 @@ from infinite_streaming_encoder.audio import AudioSpec, create_audio
 from infinite_streaming_encoder.chunking import (
     Chunk, DEFAULT_CHUNK_DURATION_S, variant_object_name,
 )
+from infinite_streaming_encoder.burnin import MODE_FULL, MODE_LIGHT
 from infinite_streaming_encoder.encode_variants import (
     EncodeContext, concat_chunks, encode_variant, encode_variant_group,
     two_pass_for,
@@ -508,6 +509,23 @@ def _env_flag_default_on(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() not in ("0", "false", "no")
 
 
+def _burnin_mode(args: argparse.Namespace) -> str:
+    """Which overlay to draw: burnin.MODE_FULL unless LIGHT was asked for.
+
+    Two spellings because there are two transports, and deliberately NOT two
+    env vars: the cloud path carries the mode in BURNIN itself ("true" /
+    "false" / "light"), so nothing in the state machine or the job definitions
+    has to learn a new name — which is what lets this ship without a deploy.
+    A worker still on older code reads "light" as truthy and draws the full
+    overlay, the same degradation an unknown --burnin-mode gets.
+    """
+    if str(getattr(args, "burnin_mode", "") or "").strip().lower() == MODE_LIGHT:
+        return MODE_LIGHT
+    if os.environ.get("BURNIN", "").strip().lower() == MODE_LIGHT:
+        return MODE_LIGHT
+    return MODE_FULL
+
+
 def _env_num(name: str, default: float) -> float:
     """Numeric env var → float, or `default` if unset/unparseable. Used for the
     ladder-level VBV knobs (MAXRATE_PERCENT / BUFSIZE_MULT) the SFN injects."""
@@ -963,6 +981,7 @@ def phase_variant(args: argparse.Namespace) -> int:
         # Text overlay, on by default. Disabled by EITHER the --no-burnin flag
         # (local-dist path) OR a falsy BURNIN env (cloud SFN containerOverrides).
         burnin=getattr(args, "burnin", True) and _env_flag_default_on("BURNIN"),
+        burnin_mode=_burnin_mode(args),
         # Design-time VMAF estimate the Go control plane looked up per rung from
         # the quality curves, passed via --est-vmaf (local dist) or EST_VMAF env
         # (cloud SFN). Burned into the overlay as one row; "" omits it.
@@ -1762,6 +1781,12 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="disable the burnt-in text overlay (timecode/rate/codec/"
                         "watermark labels); on by default. Also honors BURNIN env "
                         "(0/false/no disables)")
+    v.add_argument("--burnin-mode", dest="burnin_mode", default="",
+                   choices=["", MODE_FULL, MODE_LIGHT],
+                   help="which overlay to draw when burn-in is on: 'full' (the "
+                        "five-label stack, the default) or 'light' (one static "
+                        "JEO_<rung>_<kbps>k label, for encodes whose quality is "
+                        "being measured). Also honors BURNIN=light")
     v.set_defaults(fn=phase_variant, burnin=True)
 
     a = sub.add_parser("audio")

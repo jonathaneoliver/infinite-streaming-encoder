@@ -1538,6 +1538,10 @@ def run_temporal(args: argparse.Namespace) -> int:
         # What those boundaries were planned against, for the worker's check.
         "content_duration_s": info.duration_s,
         "measure_vmaf": args.measure_vmaf, "burnin": args.burnin,
+        # Overlay style when burn-in is on. A key the workflow only forwards:
+        # an older worker ignores it and draws the full overlay (test_dist_stage_state
+        # pins the spelling, since a rename fails silently in both directions).
+        "burnin_mode": getattr(args, "burnin_mode", "") or "",
         "vmaf_prescale": getattr(args, "vmaf_prescale", False),
         # Ladder-level VBV. The workers read these as MAXRATE_PERCENT /
         # BUFSIZE_MULT; without them cli_phase falls back to the module defaults
@@ -1725,6 +1729,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-burnin", action="store_false", dest="burnin", default=True,
                    help="disable the burnt-in text overlay on every variant; "
                         "on by default")
+    p.add_argument("--burnin-mode", dest="burnin_mode", default="",
+                   choices=["", "full", "light"],
+                   help="overlay style when burn-in is on: 'full' (five stacked "
+                        "labels, the default) or 'light' (one static "
+                        "JEO_<rung>_<kbps>k label, so a quality measurement is "
+                        "barely biased but the rung is still identifiable)")
     p.add_argument("--vmaf-estimate", action="append", default=[], dest="vmaf_estimate",
                    metavar="CODEC/LABEL:VMAF:CLAMPED",
                    help="design-time VMAF estimate for a rung (from the Go quality "

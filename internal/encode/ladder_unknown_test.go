@@ -77,7 +77,7 @@ func TestNoRungsForCodecStaysADifferentMessage(t *testing.T) {
 func TestBuildSFNInputRefusesAnUnknownLadder(t *testing.T) {
 	_, _, err := buildSFNInput(testStore(t), LoadEncodeSpeedStore(""),
 		"s3://in/x.mp4", "s3://p", "s3://m", "apple-uniq-live-full", "h264",
-		"", "", false, false, true, false, false, 3840, 30, 334.4, 0,
+		"", "", false, false, "true", false, false, 3840, 30, 334.4, 0,
 		"12", "6", "0.2", "1.0", 9000, nil, nil)
 	if err == nil {
 		t.Fatal("unknown ladder produced an execution; want an error")
@@ -93,7 +93,7 @@ func TestBuildSFNInputRefusesAnUnknownLadder(t *testing.T) {
 func TestBuildSFNInputRefusesZeroVariants(t *testing.T) {
 	in, n, err := buildSFNInput(testStore(t), LoadEncodeSpeedStore(""),
 		"s3://in/x.mp4", "s3://p", "s3://m", DefaultLadderName, "h264",
-		"144p", "", false, false, true, false, false, 3840, 30, 334.4, 0,
+		"144p", "", false, false, "true", false, false, 3840, 30, 334.4, 0,
 		"12", "6", "0.2", "1.0", 9000, nil, nil)
 	if err == nil {
 		t.Fatalf("zero variants produced an execution (%d encodes): %s", n, in)

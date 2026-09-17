@@ -42,8 +42,15 @@ type encodeMeta struct {
 	// Burnin records the text-overlay toggle only when it DEVIATES from the
 	// default (on): a pointer left nil when burn-in was on, so existing outputs'
 	// encode.json is byte-unchanged; set to &false when the overlay was disabled.
-	Burnin *bool  `json:"burnin,omitempty"`
-	Source string `json:"source,omitempty"`
+	Burnin *bool `json:"burnin,omitempty"`
+	// BurninMode records "light" when the MINIMAL overlay was drawn (one static
+	// rung label instead of the five-label stack). Omitted for the default full
+	// overlay and when burn-in was off, so existing encode.json files are
+	// byte-unchanged. It matters after the fact for the same reason Burnin
+	// does: a score, or an eyeball comparison, is only interpretable alongside
+	// how many pixels the overlay was covering.
+	BurninMode string `json:"burnin_mode,omitempty"`
+	Source     string `json:"source,omitempty"`
 	// TimeLimitS is JobConfig.Time — the ffmpeg `-t` cap. Recorded because it's
 	// the ONE mezzanine-re-derivation input encode.json otherwise lacked (#117):
 	// the mezzanine is a stream copy, byte-identical given source + time limit, so
@@ -266,6 +273,12 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 		off := false
 		burnin = &off
 	}
+	// Same rule for the mode: recorded only when it deviates from the full
+	// overlay, so nothing changes for encodes that did not ask for light.
+	burninMode := ""
+	if cfg.BurninLight() {
+		burninMode = BurninModeLight
+	}
 	// VMAF provenance + state (#117). A score is present iff the aggregated VMAF
 	// map holds a measured mean for this codec — read from the map, not the built
 	// metaRungs, since those depend on the ladder being resolvable.
@@ -294,6 +307,7 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 		ChunkDuration:        cfg.ChunkDuration,
 		ForceReencode:        cfg.ForceReencode,
 		Burnin:               burnin,
+		BurninMode:           burninMode,
 		Source:               strings.Join(cfg.Files, ", "),
 		TimeLimitS:           cfg.Time,
 		SourceSize:           srcSize,
@@ -331,6 +345,8 @@ func (m *Manager) writeEncodeMeta(dirName string, cfg JobConfig, vmaf map[string
 	}
 	if !cfg.BurninEnabled() {
 		line += " burnin=off"
+	} else if cfg.BurninLight() {
+		line += " burnin=light"
 	}
 	// Provenance in the manifest itself, so a bare output dir handed to someone
 	// else still answers "what encoded this?" without encode.json.

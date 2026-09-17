@@ -191,7 +191,7 @@ func sfnInputForDefer(t *testing.T, codecSel string, packageOnHost, deferPkg boo
 	t.Helper()
 	in, _, err := buildSFNInput(LoadLadderStore(""), LoadEncodeSpeedStore(""),
 		"s3://in/x.mp4", "s3://p", "s3://m", "apple-uniq-live-xs", codecSel,
-		"", "", false, false, true, packageOnHost, deferPkg, 3840, 30, 334.4, 0,
+		"", "", false, false, "true", packageOnHost, deferPkg, 3840, 30, 334.4, 0,
 		"12", "6", "0.2", "1.0", 9000, nil, nil)
 	if err != nil {
 		t.Fatalf("buildSFNInput: %v", err)
