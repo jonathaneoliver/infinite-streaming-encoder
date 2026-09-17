@@ -204,6 +204,45 @@ _SEED_APPLE_H264_UNIQ_FULL = _SEED_APPLE_H264_UNIQ + [
     [2560, 1440, 13500], [3200, 1800, 19000], [3840, 2160, 27000],
 ]
 
+# The two MEASURED Netflix ladders (#394): rungs read out of a live player
+# rather than designed. Seeds because reference data that lives on one box is
+# not a reference — a state wipe or a second machine loses it, and the
+# measurement cost most of a day on real hardware.
+#
+# Bitrates are exactly as measured. Only repeated resolutions are nudged: HLS
+# variant directories are named <height>p, so a ladder that reuses a resolution
+# collides with itself. The lower rung of each repeat steps down by the
+# smallest exact-16:9 increment (18px of height) and the measured resolution
+# stays on the upper rung — the same device apple-uniq uses.
+#
+# The delivery profile (segment / partial / GOP / VBV) is OURS: none of it is
+# observable from a player. See docs/ladders-and-delivery.md "The Netflix
+# ladders". Kept in sync BY HAND with internal/encode/ladder_store.go.
+_SEED_NETFLIX_AV1 = [
+    [576, 324, 63],
+    [608, 342, 97],
+    [768, 432, 152],
+    [960, 540, 209],
+    [1280, 720, 322],
+    [1888, 1062, 543],
+    [1920, 1080, 1020],
+    [3840, 2160, 1962],
+]
+
+_SEED_NETFLIX_DV_HEVC = [
+    [608, 342, 111],
+    [768, 432, 113],
+    [960, 540, 138],
+    [1280, 720, 232],
+    [1920, 1080, 351],
+    [2560, 1440, 528],
+    [3712, 2088, 778],
+    [3744, 2106, 1154],
+    [3776, 2124, 4213],
+    [3808, 2142, 8366],
+    [3840, 2160, 11846],
+]
+
 SEED_LADDERS: dict[str, dict] = {
     "apple": {
         "description": "Apple HLS Authoring Spec bitrates — per-codec, multi-rung.",
@@ -352,6 +391,38 @@ SEED_LADDERS: dict[str, dict] = {
             "h264": _SEED_APPLE_H264_UNIQ,
             "hevc": _SEED_APPLE_HEVC_UNIQ,
             "av1":  _SEED_APPLE_HEVC_UNIQ,
+        },
+    },
+    "netflix-av1": {
+        "description": "MEASURED from a live Netflix player, not designed (Ladder B in issue #394). NETFLIX'S OWN STREAM TAGS: EVEAV1, MCCLEAREN_AV1, av1-hd-bitrate-capped, identPOI. 'av1-hd-bitrate-capped' is undocumented and is the best available explanation for how low this ladder tops out: every AV1 stream seen carrying it was served far cheaper at the same resolution than an untagged one (875 vs 2409 kbps at 1080p on two different titles). STREAM: av01.0.04M.08 (AV1 Main, profile 0, 8-bit, SDR), 24.000 fps, audio mp4a.40.5 HE-AAC 2.0 at 128 kbps. Served when the DISPLAY is SDR - dynamic range alone selects this ladder over the Dolby Vision one, live, mid-playback. MEASURED: title 81646429, 2026-09-13/14, 59 cap steps at 5% from 0.2 to 3.39 Mbit/s, every step guarded on title + codec + tags. RUNG NOTES: steps 1.38x-1.92x with no outlier. 63 + 97 share 342p as measured (a hold-resolution rung). 152->209 is the TIGHTEST step (1.38x) and therefore sets the largest peak/avg a VBR encode can carry before a rung's peak overlaps the next rung's average. 543->1020 is the 1080p hold rung: 1.88x the bits for +1 VMAF. 1020->1962 is the widest step (1.92x) and jumps 1080p straight to 4K - there is no 1440p rung, unlike the Dolby Vision ladder. Top-rung VMAF 103 is SATURATED; do not read it as quality headroom. The top rung may also be an artifact of the sweep stopping at a 3.39 Mbit/s cap, just above it. RESOLUTIONS NUDGED: Netflix repeats a resolution on two pairs (608x342 at 63+97, 1920x1080 at 543+1020). HLS variant dirs are named <height>p, so duplicates collide - the LOWER rung of each pair is stepped down by the smallest exact-16:9 increment (18px of height: 324p, 1062p) and the measured resolution is kept on the upper rung. Same device apple-uniq uses. DO NOT COPY THE BITRATES: they are the OUTPUT of per-shot optimisation on one piece of Netflix material. Three adjacent episodes of that show already disagree by up to 16%. Our encoder at 543 kbps/1080p will not reach their reported VMAF 95. DELIVERY PROFILE IS OURS - none of it is observable from a player: 6s segments, 0.2s LL-HLS parts, 6s GOP, VOD VBV (200% / 2.0x). With gop 6 == segment 6, parts are INDEPENDENT only at segment boundaries.",
+        "seed": True,
+        "maxrate_percent": 200,
+        "bufsize_multiplier": 2.0,
+        "segment_duration": "6",
+        "partial_duration": "0.2",
+        "gop_duration": "6",
+        # Explicit: the derived tag would be "6s", which apple-uniq-live-6s
+        # owns. Both Netflix ladders share this tag safely because their
+        # codecs differ, and the codec is already in the directory name.
+        "output_tag": "nf6s",
+        "codecs": {
+            "av1": _SEED_NETFLIX_AV1,
+        },
+    },
+    "netflix-dv-hevc": {
+        "description": "MEASURED from a live Netflix player, not designed (Ladder A in issue #394). NETFLIX'S OWN STREAM TAGS: CE4_DoVi_DO_v1, MCCLEAREN_DV, NOP, identPOI; content keys issued for 540/1080/2160. STREAM: dvhe.05.01 (HEVC Main 10, Dolby Vision profile 5), 24.000 fps, audio mp4a.40.5 HE-AAC 2.0 at 128 kbps. Served only when the DISPLAY is HDR - same machine, monitor, cable and session: toggling macOS HDR switched the ladder live, mid-playback. Browser, connector and colour gamut were each tested and none of them moved it. MEASURED: title 81646429, 2026-09-13/14, 5% cap steps, with 26 steps from 1.3 to 4.4 Mbit/s across the big gap alone. RUNG NOTES: the ladder climbs resolution fast at the bottom, then holds 4K and buys quality - five rungs at 2160p, the turn being at 778 kbps. Steps are ~1.5x except 1154->4213, a REAL 3.65x gap: swept at 5% throughout and the player never chose anything inside it. It sits exactly where VMAF saturates (94->100). 4213/8366/11846 score 100-102 = SATURATED, so they exist for bandwidth-rich clients, grain and dark scenes rather than for metric gain. The bottom rung's VMAF 30 is genuinely poor. A 1440p rung exists here (528 kbps) where the AV1 ladder has none. RESOLUTIONS NUDGED: the five 4K rungs are all 3840x2160 as measured and HLS variant dirs are named <height>p, so they would collide. The four lower ones step down by the smallest exact-16:9 increment (18px each: 2088p/2106p/2124p/2142p) and the measured 2160 stays on the top rung. Same device apple-uniq uses. DO NOT COPY THE BITRATES: they are the OUTPUT of per-shot optimisation on one title, and ours is an SDR encode, not Dolby Vision - these numbers describe an encode we do not produce. Their VMAF column is NOT comparable with the SDR ladder's (VMAF's standard model is built for SDR). Use this for the rung SHAPE. DELIVERY PROFILE IS OURS - none of it is observable from a player: 6s segments, 0.2s LL-HLS parts, 6s GOP, VOD VBV (200% / 2.0x). With gop 6 == segment 6, parts are INDEPENDENT only at segment boundaries.",
+        "seed": True,
+        "maxrate_percent": 200,
+        "bufsize_multiplier": 2.0,
+        "segment_duration": "6",
+        "partial_duration": "0.2",
+        "gop_duration": "6",
+        # Explicit: the derived tag would be "6s", which apple-uniq-live-6s
+        # owns. Both Netflix ladders share this tag safely because their
+        # codecs differ, and the codec is already in the directory name.
+        "output_tag": "nf6s",
+        "codecs": {
+            "hevc": _SEED_NETFLIX_DV_HEVC,
         },
     },
 }

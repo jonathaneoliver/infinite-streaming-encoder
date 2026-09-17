@@ -14,7 +14,7 @@ func sfnInputFor(t *testing.T, codecSel string, packageOnHost bool) map[string]a
 	t.Helper()
 	in, _, err := buildSFNInput(LoadLadderStore(""), LoadEncodeSpeedStore(""),
 		"s3://in/x.mp4", "s3://p", "s3://m", "apple-uniq-live-xs", codecSel,
-		"", "", false, false, true, packageOnHost, false, 3840, 30, 334.4, 0,
+		"", "", false, false, "true", packageOnHost, false, false, 3840, 30, 334.4, 0,
 		"12", "6", "0.2", "1.0", 9000, nil, nil)
 	if err != nil {
 		t.Fatalf("buildSFNInput: %v", err)
@@ -90,7 +90,7 @@ func TestHostPackagingCoversOnlyEncodedCodecs(t *testing.T) {
 func TestHostPackageIsAlwaysAList(t *testing.T) {
 	in, _, err := buildSFNInput(LoadLadderStore(""), LoadEncodeSpeedStore(""),
 		"s3://in/x.mp4", "s3://p", "s3://m", "apple-uniq-live-xs", "both",
-		"", "", false, false, true, false, false, 3840, 30, 334.4, 0,
+		"", "", false, false, "true", false, false, false, 3840, 30, 334.4, 0,
 		"12", "6", "0.2", "1.0", 9000, nil, nil)
 	if err != nil {
 		t.Fatalf("buildSFNInput: %v", err)

@@ -26,6 +26,29 @@ from infinite_streaming_encoder.ladder import Rung
 
 
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+# Overlay modes. FULL is the five-label stack this module was written for;
+# LIGHT is one static rung label (see build_filter). The strings are a
+# cross-language contract: Go sends them as the BURNIN env value on the cloud
+# path and as --burnin-mode locally, and an unrecognised value means FULL on
+# both sides, which is what an older worker does with "light" already.
+MODE_FULL = "full"
+MODE_LIGHT = "light"
+
+# Scaler used for every rung's downscale. ffmpeg's default is bicubic; lanczos
+# resolves fine detail more sharply, and the two rounding flags stop the
+# resampler quantising intermediate values on a coarse grid the way the default
+# fast path does.
+#
+# It is effectively free — resampling is noise beside motion estimation — and it
+# applies to the DOWNSCALE, so it does nothing for a rung at the source's own
+# resolution, where `scale` is a no-op. That is also why it is not in the
+# bit-depth/preset measurements: at the 2160p rung of a 2160p source there was
+# nothing to resample.
+#
+# Recorded per encode (encode.json `scale_flags`), because an output encoded
+# before this default cannot be told apart from one after it by any other means.
+SCALE_FLAGS = "lanczos+accurate_rnd+full_chroma_int"
 # Match bash's escape style for the initial timecode.
 INITIAL_TIMECODE = r"00\:00\:00\:00"
 
@@ -98,7 +121,17 @@ def _drawtext(
     return "drawtext=" + ":".join(parts)
 
 
-def build_filter(ctx: BurninContext, burnin: bool = True) -> str:
+def light_label(ctx: BurninContext) -> str:
+    """The single static label drawn in LIGHT mode: `JEO_<rung>_<kbps>k`.
+
+    Self-describing across ladders — the rung's label (its resolution, with the
+    `_1`/`_2` suffix a ladder that repeats one carries) plus the target bitrate,
+    so a frame identifies its rung without knowing which ladder produced it.
+    """
+    return f"JEO_{ctx.tier.label}_{ctx.tier.bitrate}k"
+
+
+def build_filter(ctx: BurninContext, burnin: bool = True, mode: str = MODE_FULL) -> str:
     """Return the full `-vf` filter expression for this variant.
 
     Filter chain: scale → (optional tpad) → drawtext×5 (+ optional PADDING).
@@ -107,9 +140,21 @@ def build_filter(ctx: BurninContext, burnin: bool = True) -> str:
     PADDING label) are omitted — the chain is just scale (+ optional tpad), so
     the output carries no burnt-in text. The tpad segment-boundary padding is
     NOT text and always stays; only the drawn labels are toggled off.
+
+    With `mode=MODE_LIGHT` a SINGLE static label is drawn instead of the stack
+    (see `light_label`). The point is bitrate, not tidiness: the timecode layer
+    re-renders every frame, so it is new content in every single frame and the
+    encoder pays for it continuously. One static label is inter-predicted for
+    free after the first frame of each GOP. The PADDING label survives because
+    it is `enable`-gated onto padded frames only, where there is nothing else to
+    spend bits on — and losing it would make padding invisible.
+
+    An unknown mode is FULL. This is the degradation an older caller gets, and
+    the safe direction: a legible overlay nobody asked for beats an encode
+    silently missing the label it is supposed to be identified by.
     """
     tier = ctx.tier
-    chain: list[str] = [f"scale={tier.width}:{tier.height}"]
+    chain: list[str] = [f"scale={tier.width}:{tier.height}:flags={SCALE_FLAGS}"]
 
     padding_enabled = ctx.padding_duration_s > 0
     if padding_enabled:
@@ -121,6 +166,23 @@ def build_filter(ctx: BurninContext, burnin: bool = True) -> str:
 
     if not burnin:
         # No text overlay: keep only the scale (+ tpad) geometry.
+        return ",".join(chain)
+
+    if mode == MODE_LIGHT:
+        chain.append(_drawtext(
+            light_label(ctx), fontsize=tier.fontsize_label, color="white",
+            x=tier.burnin_x, y=tier.burnin_y_tc,
+        ))
+        if padding_enabled:
+            chain.append(_drawtext(
+                "PADDING",
+                fontsize=tier.fontsize_tc * 2,
+                color="red",
+                box_opacity=0.9,
+                x="w-tw-10",
+                y=10,
+                enable=f"gte(t,{ctx.content_duration_s})",
+            ))
         return ",".join(chain)
 
     # Stack heights: timecode (tc), rate, [vmaf], codec/res/fps, encoder,

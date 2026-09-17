@@ -131,6 +131,7 @@ _STR_FIELDS = {
     "padding": "padding",
     "cpu_arch": "cpu_arch",
     "output_tag": "output_tag",
+    "burnin_mode": "burnin_mode",
 }
 
 # Plain booleans: false IS the default, so sending it changes nothing.
@@ -142,6 +143,7 @@ _BOOL_FIELDS = {
     "measure_vmaf": "measure_vmaf",
     "vmaf_prescale": "vmaf_prescale",
     "group_rungs": "group_rungs",
+    "slow_preset": "slow_preset",
 }
 
 # TRI-STATE. These are pointers in JobConfig, where nil means "use the server
@@ -208,6 +210,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "Keeps comparison encodes of one source side by side "
                         "instead of archiving each other — e.g. 'local12'. "
                         "Blank uses the ladder's default (usually 'xs').")
+    g.add_argument("--burnin-mode", default="", choices=["", "full", "light"],
+                   help="overlay style when the burn-in text is on: 'full' (five "
+                        "stacked labels, the default) or 'light' (one static "
+                        "JEO_<rung>_<kbps>k label, so the picture is barely "
+                        "affected but the rung is still identifiable). Use "
+                        "--no-burnin to turn the overlay off entirely.")
 
     g = p.add_argument_group("where to run it")
     g.add_argument("--target", choices=["local", "cloud"], default="",
@@ -265,6 +273,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--group-rungs", action="store_true",
                    help="encode the decode-dominated rungs in bands sharing one "
                         "decode per chunk (#317, local only)")
+    g.add_argument("--slow-preset", action="store_true",
+                   help="encode every rung at a slower preset: SVT-AV1 2 (from "
+                        "6), x264/x265 'slower' (from 'medium'). Better "
+                        "compression at the same bitrate for roughly 5x the "
+                        "encode time on av1 (~+1.3 VMAF at equal bitrate, "
+                        "measured on one 4K clip)")
 
     g = p.add_argument_group("mode")
     g.add_argument("--dry-run", action="store_true",

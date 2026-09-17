@@ -24,6 +24,69 @@ type ladderRung struct {
 	Preset  string
 }
 
+// DefaultPreset is what every rung encodes at unless a job asks for slower.
+const DefaultPreset = "medium"
+
+// presetForCodec maps the job-level Slow-preset flag onto the per-codec preset
+// the encoder actually takes. The two families do not share a scale: x264/x265
+// take NAMES, SVT-AV1 takes a NUMBER from 0 (slowest) to 13, so one flag cannot
+// be one string.
+//
+// Measured for av1 on one 4K clip (docs/ladders-and-delivery.md): preset 2 costs
+// 5.3x the encode time at 1080p and 5.7x at 2160p, for roughly +1.3 VMAF at
+// equal bitrate. The x26x side is NOT measured here — "slower" is chosen as the
+// step that corresponds in intent, and is expected to cost ~2.5-4x.
+func presetForCodec(codec string, slow bool) string {
+	if !slow {
+		return DefaultPreset
+	}
+	if codec == "av1" {
+		return "2"
+	}
+	return "slower"
+}
+
+// ScaleFlags mirrors burnin.SCALE_FLAGS — the scaler every rung's downscale
+// uses. Go never passes it to the encoder; it records it in encode.json so an
+// output can be told apart from one made before the default changed. Likewise
+// pixFmtForCodec below mirrors encode_variants._PIX_FMT. Both are
+// cross-language contracts with no schema, so a change on either side must be
+// made on both: pinned by scripts/test_encode_defaults.py.
+const ScaleFlags = "lanczos+accurate_rnd+full_chroma_int"
+
+// pixFmtForCodec is the encoding pixel format for a codec. HEVC and AV1 encode
+// 10-bit even from an 8-bit source (less rounding error through the codec, and
+// smooth gradients that do not band); h264 stays 8-bit because High 10 has
+// essentially no hardware decode support and the h264 ladder exists for
+// compatibility.
+func pixFmtForCodec(codec string) string {
+	if codec == "hevc" || codec == "av1" {
+		return "yuv420p10le"
+	}
+	return "yuv420p"
+}
+
+// withPreset stamps the effective preset onto a resolved rung list.
+//
+// It must be applied EVERYWHERE the rungs feed a speed lookup, not just where
+// they feed the encoder: `speedKey` carries the preset, so a run whose encoder
+// got preset 2 while the planner looked up "medium" would size its chunks from
+// a model of a 5x faster encode AND file its samples under the wrong key. That
+// is the trap the bit-depth/preset experiment fell into when the preset arrived
+// through `extra_args`, which nothing downstream could see.
+func withPreset(rungs []ladderRung, codec string, slow bool) []ladderRung {
+	if !slow || len(rungs) == 0 {
+		return rungs
+	}
+	p := presetForCodec(codec, true)
+	out := make([]ladderRung, len(rungs))
+	copy(out, rungs)
+	for i := range out {
+		out[i].Preset = p
+	}
+	return out
+}
+
 // sfnVariant is one entry in the SFN input's "variants" list. All the
 // worker-facing fields are strings because Batch job Parameters (Ref::x) are
 // string substitutions; Priority stays an int (SchedulingPriorityOverride

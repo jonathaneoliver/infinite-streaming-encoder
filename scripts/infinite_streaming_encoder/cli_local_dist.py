@@ -863,7 +863,13 @@ def _rung_dict(codec: str, r, ests: dict) -> dict:
     """Plan entry for one rung, with the design-time VMAF estimate attached when
     Go supplied one for (codec, label). temporal_worker passes est_vmaf on to
     cli_phase --est-vmaf so the worker burns it into the overlay."""
-    d = {"label": r.label, "width": r.width, "height": r.height, "bitrate": r.bitrate}
+    d = {"label": r.label, "width": r.width, "height": r.height,
+         "bitrate": r.bitrate,
+         # The preset the worker must encode at. Published per rung rather than
+         # once per job because a rung may carry its own ([w,h,kbps,preset]),
+         # and read with .get on the worker so a plan from an older
+         # orchestrator still means "cli_phase's default".
+         "preset": r.preset}
     e = ests.get((codec, r.label))
     if e:
         d["est_vmaf"], d["est_vmaf_clamped"] = e
@@ -1538,6 +1544,10 @@ def run_temporal(args: argparse.Namespace) -> int:
         # What those boundaries were planned against, for the worker's check.
         "content_duration_s": info.duration_s,
         "measure_vmaf": args.measure_vmaf, "burnin": args.burnin,
+        # Overlay style when burn-in is on. A key the workflow only forwards:
+        # an older worker ignores it and draws the full overlay (test_dist_stage_state
+        # pins the spelling, since a rename fails silently in both directions).
+        "burnin_mode": getattr(args, "burnin_mode", "") or "",
         "vmaf_prescale": getattr(args, "vmaf_prescale", False),
         # Ladder-level VBV. The workers read these as MAXRATE_PERCENT /
         # BUFSIZE_MULT; without them cli_phase falls back to the module defaults
@@ -1725,6 +1735,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-burnin", action="store_false", dest="burnin", default=True,
                    help="disable the burnt-in text overlay on every variant; "
                         "on by default")
+    p.add_argument("--slow-preset", action="store_true", dest="slow_preset",
+                   help="trade encode time for compression: SVT-AV1 preset 2 "
+                        "(from 6) and x264/x265 -preset slower (from medium). "
+                        "Measured ~5.3x-5.7x for av1; x26x is unmeasured. The "
+                        "preset REPLACES the rung's, so the learned-speed key "
+                        "sees it")
+    p.add_argument("--burnin-mode", dest="burnin_mode", default="",
+                   choices=["", "full", "light"],
+                   help="overlay style when burn-in is on: 'full' (five stacked "
+                        "labels, the default) or 'light' (one static "
+                        "JEO_<rung>_<kbps>k label, so a quality measurement is "
+                        "barely biased but the rung is still identifiable)")
     p.add_argument("--vmaf-estimate", action="append", default=[], dest="vmaf_estimate",
                    metavar="CODEC/LABEL:VMAF:CLAMPED",
                    help="design-time VMAF estimate for a rung (from the Go quality "
