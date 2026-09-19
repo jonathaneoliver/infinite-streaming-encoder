@@ -22,6 +22,10 @@ frame onto an exact integer-tick CFR grid derived from the source's nominal
 method (in-encode per-chunk, whole-variant, offline) agrees. Cost is up to a
 ~1-frame A/V shift inherent to any VFR->CFR relabel — correct for a CFR-output
 streaming pipeline. Leaving fps unset keeps the legacy plain stream-copy.
+
+Pass 2 snaps each packet by its OWN timestamp, not by its arrival index; see
+`build_setts_cmd`. Numbering by arrival index permutes the timestamps of any
+source with B-frames and costs a frame in every downstream encode (#406).
 """
 from __future__ import annotations
 
@@ -125,11 +129,29 @@ def build_ffmpeg_cmd(spec: MezzanineSpec, output_path: Path | None = None) -> li
 
 
 def build_setts_cmd(spec: MezzanineSpec, input_path: Path) -> list[str]:
-    """PASS 2 of the CFR relabel: rewrite every video packet's PTS/DTS onto the
-    exact grid (frame N -> N*ticks) via the `setts` bitstream filter. It's a
-    `-c copy`, so no decode/re-encode and no quality loss. `input_path` is pass
-    1's output (already on the `1/timescale` timebase, so `N*ticks` lands
-    cleanly). Requires `spec.fps_num`/`fps_den`.
+    """PASS 2 of the CFR relabel: snap every video packet's PTS/DTS onto the
+    exact grid via the `setts` bitstream filter. It's a `-c copy`, so no
+    decode/re-encode and no quality loss. `input_path` is pass 1's output
+    (already on the `1/timescale` timebase, so the snapped values land on whole
+    ticks). Requires `spec.fps_num`/`fps_den`.
+
+    **The slot comes from the packet's own PTS, never from its arrival index**
+    (#406). `setts` runs on PACKETS, which arrive in DECODE order, so the
+    obvious `pts=N*ticks` numbers them I, P, B, B - handing the P frame that
+    belongs at slot 3 the stamp for slot 1. The pictures still decode in the
+    right order, because the decoder reorders through its own buffer, so the
+    mezzanine looks correct to the eye and to a picture-order check; only its
+    timestamps are permuted. Anything that then RE-ENCODES from it places
+    frames by those timestamps and loses one, and every rung came out a frame
+    short with its alignment shifting at each chunk join.
+
+    It bites only sources with B-frames (`has_b_frames > 0`) - an AV1 source
+    with no reordering numbers identically either way, which is why this
+    survived until an H.264 MKV went through it.
+
+    `round(PTS/ticks)*ticks` keeps the exact grid AND the picture-to-time
+    mapping: each packet keeps the slot its own timestamp already names, and
+    the jitter the relabel exists to remove is what the rounding removes.
     """
     if not (spec.fps_num and spec.fps_den):
         raise MezzanineError("build_setts_cmd requires fps_num/fps_den")
@@ -137,7 +159,8 @@ def build_setts_cmd(spec: MezzanineSpec, input_path: Path) -> list[str]:
     return [
         "ffmpeg", "-y", "-i", str(input_path),
         "-map", "0", "-c", "copy",
-        "-bsf:v", f"setts=pts=N*{ticks}:dts=N*{ticks}",
+        "-bsf:v", (f"setts=pts=round(PTS/{ticks})*{ticks}"
+                   f":dts=round(DTS/{ticks})*{ticks}"),
         str(spec.output_path),
         "-loglevel", "error", "-stats",
     ]
