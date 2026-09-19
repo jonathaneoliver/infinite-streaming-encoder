@@ -10,10 +10,12 @@ one frame per hour.
 """
 from __future__ import annotations
 
+import bisect
 import json
 import subprocess
 from dataclasses import dataclass
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -107,3 +109,61 @@ def probe(path: Path, stream_index: int = 0) -> ProbeResult:
         has_audio=bool(audio_streams),
         video_codec=v.get("codec_name"),
     )
+
+
+@lru_cache(maxsize=8)
+def video_pts(path: Path) -> tuple[float, ...]:
+    """Every video frame's presentation timestamp, ascending.
+
+    Cached: a chunked encode asks for two boundaries per chunk, and decoding
+    the timestamp table of a multi-GB mezzanine once per question would cost
+    more than the encode.
+
+    Returns an empty tuple when ffprobe fails or the file has no timestamps,
+    which `frames_before` reads as "fall back to arithmetic".
+    """
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=True).stdout
+    except (subprocess.CalledProcessError, OSError):
+        return ()
+    vals = []
+    for tok in out.split():
+        tok = tok.strip(", ")
+        if not tok:
+            continue
+        try:
+            vals.append(float(tok))
+        except ValueError:
+            continue
+    return tuple(sorted(vals))
+
+
+def frames_before(t: float, fps: Fraction, path: Path | None = None) -> int:
+    """How many video frames have a presentation timestamp before `t`.
+
+    This is the boundary a chunked encode is cut on: ffmpeg's input `-ss t`
+    discards exactly these frames, so `frames_before(end) - frames_before(start)`
+    is the chunk's frame count.
+
+    **Read it from the file when we can** (#408). The arithmetic form
+    `ceil(t*fps)` is only correct while the frame grid is continuous, and a
+    source with a dropped frame does not have one: past the drop, frame index
+    and wall-clock time differ by one, so `ceil(t*fps)` names a different frame
+    than `-ss t` lands on. Every interior chunk boundary after the drop then
+    re-reads the frame the previous chunk already emitted, duplicating it and
+    shifting everything after by one — invisible in a total frame count, and
+    catastrophic at the first scene cut.
+
+    Falls back to the arithmetic when the timestamps cannot be read, because a
+    missing table must not stop an encode: that restores the previous behaviour
+    rather than inventing a new one.
+    """
+    if path is not None:
+        pts = video_pts(path)
+        if pts:
+            return bisect.bisect_left(pts, t - 1e-9)
+    x = Fraction(t) * fps
+    return max(0, -(-x.numerator // x.denominator))  # ceil(t * fps)

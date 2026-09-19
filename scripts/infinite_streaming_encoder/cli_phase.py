@@ -51,7 +51,7 @@ from infinite_streaming_encoder.encode_variants import (
     EncodeContext, concat_chunks, encode_variant, encode_variant_group,
     two_pass_for,
 )
-from infinite_streaming_encoder.ffprobe import probe
+from infinite_streaming_encoder.ffprobe import frames_before, probe
 from infinite_streaming_encoder.hls import (
     generate_fmp4_hls,
 )
@@ -1131,19 +1131,21 @@ def phase_variant(args: argparse.Namespace) -> int:
                     ctx.mezzanine_path, args.s3_mezz, info, cmn_w, cmn_h, _keyint)
                 if _built is not None:
                     vmaf_ref = _built
-            # This chunk's frame-exact length (same ceil(t*fps) math the encode
-            # uses, #90) so the audit can clamp both streams to it — otherwise the
-            # seeked reference window's ~1-frame seam drift injects a spurious
-            # 0-VMAF frame that pins min/harmonic to noise (#108). Whole-clip
-            # (chunk is None) needs no clamp.
+            # This chunk's frame-exact length (the SAME rule the encode bounds
+            # itself by, #90) so the audit can clamp both streams to it —
+            # otherwise the seeked reference window's ~1-frame seam drift injects
+            # a spurious 0-VMAF frame that pins min/harmonic to noise (#108).
+            # Whole-clip (chunk is None) needs no clamp.
+            #
+            # It must stay the same rule as the encode's: measuring a chunk
+            # against a differently-counted window is the misalignment this is
+            # meant to prevent. Hence one shared frames_before (#408) rather
+            # than a second copy of the arithmetic.
             n_frames = None
             if chunk is not None:
-                from fractions import Fraction
-
-                def _frames_before(t: float) -> int:
-                    x = Fraction(t) * info.fps
-                    return max(0, -(-x.numerator // x.denominator))  # ceil(t*fps)
-                n_frames = _frames_before(chunk.end_s) - _frames_before(chunk.start_s)
+                n_frames = (
+                    frames_before(chunk.end_s, info.fps, ctx.mezzanine_path)
+                    - frames_before(chunk.start_s, info.fps, ctx.mezzanine_path))
             r = measure_vmaf(
                 out_path, vmaf_ref, cmn_w, cmn_h,
                 pick_model(cmn_h),

@@ -19,6 +19,7 @@ from infinite_streaming_encoder.burnin import (
     MODE_FULL, BurninContext, build_filter, rate_label,
 )
 from infinite_streaming_encoder.chunking import Chunk, plan_chunks
+from infinite_streaming_encoder.ffprobe import frames_before
 from infinite_streaming_encoder.gop import keyint
 from infinite_streaming_encoder.ladder import (
     BUFSIZE_MULTIPLIER,
@@ -382,24 +383,26 @@ def build_ffmpeg_cmd(
         out_path = _chunk_path(ctx.output_dir, codec, rung.label, chunk.index)
     stats_path = _stats_path(ctx.output_dir, codec, rung.label, chunk) if pass_num else None
 
-    # Chunked encode: bound each chunk by an EXACT frame count from the global
-    # frame grid, not `-t seconds`. At a fractional fps (e.g. 30000/1001) a
-    # second-based `-t` makes every chunk independently round its own frame
-    # count, so the chunks over-emit and the concatenated variant runs longer
-    # than the source (+9 frames on a 334s 29.97fps clip; integer fps like 25 is
-    # unaffected). fb(t) = ceil(t*fps) = the number of frames with pts < t, which
-    # is exactly the boundary ffmpeg's input `-ss` uses to discard pre-seek
-    # frames — so adjacent chunks tile the grid with no overlap or gap. The final
-    # chunk stays unbounded (runs to EOF) so container-duration imprecision can't
-    # truncate or pad the tail. fps is a Fraction, so this is exact.
+    # Chunked encode: bound each chunk by an EXACT frame count, not `-t seconds`.
+    # At a fractional fps (e.g. 30000/1001) a second-based `-t` makes every chunk
+    # independently round its own frame count, so the chunks over-emit and the
+    # concatenated variant runs longer than the source (+9 frames on a 334s
+    # 29.97fps clip; integer fps like 25 is unaffected, #89).
+    #
+    # The count comes from the MEZZANINE'S OWN TIMESTAMPS, not from ceil(t*fps)
+    # (#408). The arithmetic is only correct while the frame grid is continuous;
+    # a source with a dropped frame does not have one, and past the drop it names
+    # a different frame than `-ss t` lands on. The chunk then over-runs its
+    # window, the next chunk re-reads its last frame, and everything after is one
+    # place out — which a total frame count cannot see, because the duplicate is
+    # offset by the drop. The final chunk stays unbounded (runs to EOF) so
+    # container-duration imprecision can't truncate or pad the tail.
     chunk_frames: int | None = None
     if chunk is not None:
-        def _frames_before(t: float) -> int:
-            x = Fraction(t) * ctx.fps          # frames with pts < t
-            return max(0, -(-x.numerator // x.denominator))  # ceil(t * fps)
         total_dur = ctx.content_duration_s + ctx.padding_duration_s
         if chunk.end_s < total_dur - 1e-6:     # interior chunk; last runs to EOF
-            chunk_frames = _frames_before(chunk.end_s) - _frames_before(chunk.start_s)
+            chunk_frames = (frames_before(chunk.end_s, ctx.fps, ctx.mezzanine_path)
+                            - frames_before(chunk.start_s, ctx.fps, ctx.mezzanine_path))
 
     cmd = ["ffmpeg", "-y"]
     if chunk is not None:
