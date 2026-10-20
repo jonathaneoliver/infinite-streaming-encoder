@@ -1,4 +1,4 @@
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 ARG VERSION=dev
 ARG GIT_SHA=unknown
 # IMAGE_TAG is the CONTENT hash (last commit touching Dockerfile/requirements/
