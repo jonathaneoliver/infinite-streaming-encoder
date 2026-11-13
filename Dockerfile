@@ -15,7 +15,7 @@ RUN CGO_ENABLED=0 go build \
     -ldflags "-X main.version=${VERSION} -X main.gitSha=${GIT_SHA} -X main.imageTag=${IMAGE_TAG}" \
     -o /encoder ./cmd/server
 
-FROM python:3.14-slim
+FROM python:3.15-slim
 
 ARG TARGETARCH
 ARG VERSION=dev
